@@ -3441,6 +3441,107 @@
             }
         }
 
+        // Normalize path for dedupe: strip leading ./ and trailing slash so "./model_avatar/X" matches "model_avatar/X"
+        function normalizeModelPath(p) {
+            return (p || '').trim().replace(/^\.\//, '').replace(/\/$/, '');
+        }
+
+        // Call scan endpoint, merge discovered paths into Live2D/VRM lists, rebuild dropdowns, persist
+        async function scanAndMergeModelAvatarLists() {
+            const live2dListEl = document.getElementById('live2d-model-list');
+            const live2dDropdownEl = document.getElementById('live2d-model-dropdown');
+            const vrmListEl = document.getElementById('vrm-model-list');
+            const vrmDropdownEl = document.getElementById('vrm-model-dropdown');
+            if (!live2dListEl || !vrmListEl) return;
+            const scanBtn = document.getElementById('scan-model-avatar-btn');
+            if (scanBtn) {
+                scanBtn.disabled = true;
+                scanBtn.textContent = 'Scanning…';
+            }
+            try {
+                const res = await fetch(`${PROXY_BASE_URL}/v1/model-avatar/scan`, {
+                    headers: { 'Authorization': `Bearer ${authToken}` }
+                });
+                if (!res.ok) {
+                    const msg = res.status === 401
+                        ? 'Scan failed. Sign in or start the server.'
+                        : (res.statusText || 'Scan failed. Is the server running?');
+                    if (typeof showToast === 'function') showToast(msg); else console.warn(msg);
+                    return;
+                }
+                const data = await res.json();
+                const scannedLive2d = Array.isArray(data.live2d) ? data.live2d : [];
+                const scannedVrm = Array.isArray(data.vrm) ? data.vrm : [];
+                // Merge Live2D: existing lines first (dedupe by normalized path), then append new from scan
+                const live2dLines = (live2dListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
+                const live2dNorm = new Set(live2dLines.map(normalizeModelPath));
+                const origLive2dCount = live2dLines.length;
+                scannedLive2d.forEach(path => {
+                    if (!live2dNorm.has(normalizeModelPath(path))) {
+                        live2dLines.push(path);
+                        live2dNorm.add(normalizeModelPath(path));
+                    }
+                });
+                live2dListEl.value = live2dLines.join('\n');
+                // Merge VRM: same
+                const vrmLines = (vrmListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.vrm'));
+                const vrmNorm = new Set(vrmLines.map(normalizeModelPath));
+                const origVrmCount = vrmLines.length;
+                scannedVrm.forEach(path => {
+                    if (!vrmNorm.has(normalizeModelPath(path))) {
+                        vrmLines.push(path);
+                        vrmNorm.add(normalizeModelPath(path));
+                    }
+                });
+                vrmListEl.value = vrmLines.join('\n');
+                // Rebuild Live2D dropdown from merged list
+                if (live2dDropdownEl) {
+                    const lines = (live2dListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
+                    live2dDropdownEl.innerHTML = lines.map(path => {
+                        const fileName = path.split('/').pop();
+                        const selected = path === modelPath ? ' selected' : '';
+                        return `<option value="${path}"${selected}>${fileName}</option>`;
+                    }).join('');
+                    if (modelPath && lines.indexOf(modelPath) === -1) {
+                        const opt = document.createElement('option');
+                        opt.value = modelPath;
+                        opt.textContent = modelPath.split('/').pop();
+                        opt.selected = true;
+                        live2dDropdownEl.appendChild(opt);
+                    } else if (modelPath) live2dDropdownEl.value = modelPath;
+                }
+                // Rebuild VRM dropdown from merged list
+                if (vrmDropdownEl) {
+                    const vrmLinesFinal = (vrmListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.vrm'));
+                    vrmDropdownEl.innerHTML = vrmLinesFinal.map(path => `<option value="${path}">${path.split('/').pop()}</option>`).join('');
+                    if (currentVRMModelPath) {
+                        if (vrmLinesFinal.indexOf(currentVRMModelPath) !== -1) vrmDropdownEl.value = currentVRMModelPath;
+                        else {
+                            const opt = document.createElement('option');
+                            opt.value = currentVRMModelPath;
+                            opt.textContent = currentVRMModelPath.split('/').pop();
+                            opt.selected = true;
+                            vrmDropdownEl.appendChild(opt);
+                            vrmDropdownEl.value = currentVRMModelPath;
+                        }
+                    }
+                }
+                saveToolSettings();
+                const addedLive2d = live2dLines.length - origLive2dCount;
+                const addedVrmCount = vrmLines.length - origVrmCount;
+                const feedback = (addedLive2d || addedVrmCount) ? `Added ${addedLive2d} Live2D, ${addedVrmCount} VRM model(s).` : 'No new models found.';
+                if (typeof showToast === 'function') showToast(feedback); else console.log(feedback);
+            } catch (err) {
+                const msg = 'Scan failed. Is the server running?';
+                if (typeof showToast === 'function') showToast(msg); else console.warn(msg, err);
+            } finally {
+                if (scanBtn) {
+                    scanBtn.disabled = false;
+                    scanBtn.textContent = 'Scan for new models';
+                }
+            }
+        }
+
         // --- Companions UI: list from server, add modal, load/delete ---
         async function fetchCompanionsList() {
             const url = `${PROXY_BASE_URL}/v1/companions`;
@@ -3630,6 +3731,11 @@
             // Add event listener for refresh button
             if (refreshTtsVoicesBtn) {
                 refreshTtsVoicesBtn.addEventListener('click', fetchTtsVoices);
+            }
+            // Add event listener for scan model avatar button (discovers new Live2D/VRM under model_avatar/)
+            const scanModelAvatarBtn = document.getElementById('scan-model-avatar-btn');
+            if (scanModelAvatarBtn) {
+                scanModelAvatarBtn.addEventListener('click', () => scanAndMergeModelAvatarLists());
             }
             
             console.log('Tool settings persistence enabled');

@@ -294,6 +294,12 @@
             margin-bottom: 15px;
         }
 
+        /* Scan for new models button in tools settings (Live2D/VRM lists) */
+        .scan-models-btn {
+            margin-top: 6px;
+            margin-bottom: 15px;
+        }
+
         /* Avatar Container - Center Stage - Always same responsive size */
         .avatar-wrapper {
             width: 100%;

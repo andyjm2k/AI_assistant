@@ -4393,6 +4393,48 @@ async def delete_companion(
 # ============================================================================
 
 # ============================================================================
+# MODEL AVATAR SCAN (discover *.model3.json and *.vrm under model_avatar/)
+# ============================================================================
+
+def scan_model_avatar_dir() -> Dict[str, Any]:
+    """
+    Recursively scan model_avatar directory for Live2D (.model3.json) and VRM (.vrm) files.
+    Returns paths relative to project root with ./ prefix and forward slashes for UI consistency.
+    """
+    model_avatar_dir = _PROJECT_ROOT / "model_avatar"
+    result = {"live2d": [], "vrm": []}
+    if not model_avatar_dir.is_dir():
+        result["message"] = "model_avatar directory not found"
+        return result
+    try:
+        # Collect Live2D model paths (one per file, any depth)
+        for p in model_avatar_dir.rglob("*.model3.json"):
+            if p.is_file():
+                rel = p.relative_to(_PROJECT_ROOT)
+                path_str = "./" + str(rel).replace("\\", "/")
+                result["live2d"].append(path_str)
+        result["live2d"].sort()
+        # Collect VRM model paths (one per file, any depth)
+        for p in model_avatar_dir.rglob("*.vrm"):
+            if p.is_file():
+                rel = p.relative_to(_PROJECT_ROOT)
+                path_str = "./" + str(rel).replace("\\", "/")
+                result["vrm"].append(path_str)
+        result["vrm"].sort()
+    except Exception as e:
+        result["message"] = str(e)
+    return result
+
+
+@app.get("/v1/model-avatar/scan")
+async def model_avatar_scan(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return lists of discovered Live2D and VRM model paths under model_avatar/ for tools settings."""
+    return scan_model_avatar_dir()
+
+
+# ============================================================================
 # GOOGLE DRIVE UPLOAD ENDPOINT
 # ============================================================================
 
