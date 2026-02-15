@@ -219,6 +219,18 @@
             </button>
         </div>
         <div class="settings-content">
+            <!-- Companions: saved tool-setting configs (server-stored) -->
+            <div class="companions-block">
+                <div class="companions-header">
+                    <h3 class="companions-heading">Companions</h3>
+                    <button type="button" class="companion-add-btn" id="companion-add-btn" title="Add new companion from current settings" aria-label="Add companion">
+                        <i class="fas fa-plus"></i>
+                    </button>
+                </div>
+                <ul class="companion-list" id="companion-list" aria-label="Saved companions">
+                    <!-- Populated by JS from GET /v1/companions -->
+                </ul>
+            </div>
             <!-- Tool Settings in Settings Menu -->
             <div class="collapsible">
                 <button type="button" class="collapsible-btn">Tool Settings</button>
@@ -393,6 +405,21 @@ Get VRM files from VRoid Studio or other 3D avatar creators">./model_avatar/Eva/
                     <span class="helper-text">Rotate the 3D model (degrees)</span>
 
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Companion modal (pops up when user clicks + Companion) -->
+    <div class="companion-modal-overlay" id="companion-modal-overlay" aria-hidden="true" style="display: none;">
+        <div class="companion-modal" id="companion-modal" role="dialog" aria-labelledby="companion-modal-title">
+            <h2 id="companion-modal-title">New companion</h2>
+            <label for="companion-name-input">Companion name</label>
+            <input type="text" id="companion-name-input" placeholder="e.g. Work EVA" maxlength="128">
+            <p class="companion-modal-hint">Current tool settings will be saved as this companion. You can load it later from the list.</p>
+            <p class="companion-modal-edit-hint"><button type="button" class="companion-edit-settings-link" id="companion-edit-settings-link">Edit current settings</button> in Tool Settings below, then return here to save.</p>
+            <div class="companion-modal-actions">
+                <button type="button" class="companion-modal-cancel" id="companion-modal-cancel">Cancel</button>
+                <button type="button" class="companion-modal-save" id="companion-modal-save">Save</button>
             </div>
         </div>
     </div>

@@ -27,6 +27,7 @@
             hamburgerBtn.addEventListener('click', function() {
                 settingsOverlay.classList.add('active');
                 settingsMenu.classList.add('active');
+                if (typeof renderCompanionList === 'function') renderCompanionList();
             });
 
             closeSettingsBtn.addEventListener('click', function() {
@@ -413,6 +414,9 @@
 
                 // Add event listeners to save tool settings when they change
                 setupToolSettingsPersistence();
+
+                // Companions UI: list, add modal, load/delete
+                setupCompanionsUI();
 
                 // Initialize conversation management system
                 loadConversations();
@@ -3208,144 +3212,366 @@
             requestAnimationFrame(animateMouth);
         }
 
-        // Function to save tool settings to localStorage
+        // Build full tool settings object from DOM (single source of truth for companion snapshot and localStorage)
+        function getToolSettingsFromDOM() {
+            const vrmVersionDropdown = document.getElementById('vrm-version-dropdown');
+            const voiceDropdown = document.getElementById('voice-dropdown');
+            const live2dDropdown = document.getElementById('live2d-model-dropdown');
+            const live2dList = document.getElementById('live2d-model-list');
+            const live2dOffsetRange = document.getElementById('live2d-offset-range');
+            const vrmDropdown = document.getElementById('vrm-model-dropdown');
+            const vrmList = document.getElementById('vrm-model-list');
+            const vrmScaleRange = document.getElementById('vrm-scale-range');
+            const vrmPositionXRange = document.getElementById('vrm-position-x-range');
+            const vrmPositionYRange = document.getElementById('vrm-position-y-range');
+            const vrmRotationRange = document.getElementById('vrm-rotation-range');
+            const vrmModeEl = document.getElementById('vrm-mode');
+            const avatarMode = (vrmModeEl && vrmModeEl.checked) ? 'vrm' : 'live2d';
+            return {
+                userName: userNameInput.value,
+                assistantName: assistantNameInput.value,
+                apiKey: apiKeyInput.value,
+                endpoint: endpointInput.value,
+                newsApiKey: newsApiKeyInput ? newsApiKeyInput.value : '',
+                systemPrompt: systemPromptInput.value,
+                webcamMode: document.getElementById('webcam-toggle').checked,
+                clipboardMode: document.getElementById('clipboard-toggle').checked,
+                muteMode: document.getElementById('mute-toggle').checked,
+                baseModel: baseModelDropdown ? baseModelDropdown.value : baseModel,
+                toolModel: toolModelDropdown ? toolModelDropdown.value : toolModel,
+                visionModel: visionModelDropdown ? visionModelDropdown.value : visionModel,
+                ttsService: ttsServiceOpenAI.checked ? 'openai' : 'microsoft',
+                ttsEndpoint: ttsEndpointInput.value,
+                ttsModel: ttsModelDropdown ? ttsModelDropdown.value : '',
+                ttsVoice: ttsVoiceDropdown ? ttsVoiceDropdown.value : '',
+                browserVoiceURI: voiceDropdown && voices[voiceDropdown.value] ? voices[voiceDropdown.value].voiceURI : null,
+                vrmVersion: vrmVersionDropdown ? vrmVersionDropdown.value : '1.0',
+                avatarMode: avatarMode,
+                live2dModel: live2dDropdown ? live2dDropdown.value : '',
+                live2dModelList: live2dList ? live2dList.value : '',
+                live2dOffset: live2dOffsetRange ? parseFloat(live2dOffsetRange.value) || 0 : 0,
+                vrmModel: vrmDropdown ? vrmDropdown.value : '',
+                vrmModelList: vrmList ? vrmList.value : '',
+                vrmScale: vrmScaleRange ? parseFloat(vrmScaleRange.value) || 1.0 : 1.0,
+                vrmPositionX: vrmPositionXRange ? parseFloat(vrmPositionXRange.value) || 0 : 0,
+                vrmPositionY: vrmPositionYRange ? parseFloat(vrmPositionYRange.value) || 0 : 0,
+                vrmRotation: vrmRotationRange ? parseInt(vrmRotationRange.value, 10) || 0 : 0,
+                live2dOffsets: live2dOffsets || {},
+                vrmPositions: vrmPositions || {}
+            };
+        }
+
+        // Function to save tool settings to localStorage (uses getToolSettingsFromDOM as single source)
         function saveToolSettings() {
             try {
-                const vrmVersionDropdown = document.getElementById('vrm-version-dropdown');
-                const voiceDropdown = document.getElementById('voice-dropdown');
-                const settings = {
-                    userName: userNameInput.value,
-                    assistantName: assistantNameInput.value,
-                    apiKey: apiKeyInput.value,
-                    endpoint: endpointInput.value,
-                    newsApiKey: newsApiKeyInput ? newsApiKeyInput.value : '',
-                    systemPrompt: systemPromptInput.value,
-                    webcamMode: document.getElementById('webcam-toggle').checked,
-                    clipboardMode: document.getElementById('clipboard-toggle').checked,
-                    muteMode: document.getElementById('mute-toggle').checked,
-                    baseModel: baseModelDropdown ? baseModelDropdown.value : baseModel,
-                    toolModel: toolModelDropdown ? toolModelDropdown.value : toolModel,
-                    visionModel: visionModelDropdown ? visionModelDropdown.value : visionModel,
-                    ttsService: ttsServiceOpenAI.checked ? 'openai' : 'microsoft', // Save TTS service selection
-                    ttsEndpoint: ttsEndpointInput.value, // Save TTS endpoint
-                    ttsModel: ttsModelDropdown.value, // Save TTS model
-                    ttsVoice: ttsVoiceDropdown.value, // Save TTS voice
-                    browserVoiceURI: voiceDropdown && voices[voiceDropdown.value] ? voices[voiceDropdown.value].voiceURI : null, // Save browser voice
-                    vrmVersion: vrmVersionDropdown ? vrmVersionDropdown.value : '1.0' // Save VRM version selection
-                };
+                const settings = getToolSettingsFromDOM();
                 localStorage.setItem('toolSettings', JSON.stringify(settings));
             } catch (error) {
                 console.warn('Error saving tool settings:', error);
             }
         }
 
-        // Function to load tool settings from localStorage
-        function loadToolSettings() {
-            try {
-                const savedSettings = localStorage.getItem('toolSettings');
-                if (savedSettings) {
-                    const settings = JSON.parse(savedSettings);
-                    
-                    // Restore User Name and Assistant Name
-                    if (settings.userName !== undefined) {
-                        userNameInput.value = settings.userName;
+        // Apply a settings object to DOM and globals; optionally re-initialize avatar if mode/model changed
+        function applyToolSettingsToDOM(settings) {
+            if (!settings || typeof settings !== 'object') return;
+            // User and API
+            if (settings.userName !== undefined) userNameInput.value = settings.userName;
+            if (settings.assistantName !== undefined) assistantNameInput.value = settings.assistantName;
+            if (settings.apiKey !== undefined) apiKeyInput.value = settings.apiKey;
+            if (settings.endpoint !== undefined) endpointInput.value = settings.endpoint;
+            if (newsApiKeyInput && settings.newsApiKey !== undefined) newsApiKeyInput.value = settings.newsApiKey;
+            if (settings.systemPrompt !== undefined) systemPromptInput.value = settings.systemPrompt;
+            if (settings.webcamMode !== undefined) document.getElementById('webcam-toggle').checked = settings.webcamMode;
+            if (settings.clipboardMode !== undefined) document.getElementById('clipboard-toggle').checked = settings.clipboardMode;
+            if (settings.muteMode !== undefined) {
+                document.getElementById('mute-toggle').checked = settings.muteMode;
+                isMuted = settings.muteMode;
+            }
+            // Models
+            if (settings.baseModel !== undefined) {
+                defaultBaseModel = settings.baseModel;
+                baseModel = settings.baseModel;
+                if (baseModelDropdown) baseModelDropdown.value = settings.baseModel;
+            }
+            if (settings.toolModel !== undefined) {
+                defaultToolModel = settings.toolModel;
+                toolModel = settings.toolModel;
+                if (toolModelDropdown) toolModelDropdown.value = settings.toolModel;
+            }
+            if (settings.visionModel !== undefined) {
+                defaultVisionModel = settings.visionModel;
+                visionModel = settings.visionModel;
+                if (visionModelDropdown) visionModelDropdown.value = settings.visionModel;
+            }
+            // TTS
+            if (settings.ttsService !== undefined) {
+                if (settings.ttsService === 'openai') ttsServiceOpenAI.checked = true;
+                else ttsServiceMicrosoft.checked = true;
+            }
+            if (settings.ttsEndpoint !== undefined && ttsEndpointInput) ttsEndpointInput.value = settings.ttsEndpoint;
+            if (settings.ttsModel !== undefined && ttsModelDropdown) ttsModelDropdown.value = settings.ttsModel;
+            if (settings.ttsVoice !== undefined && ttsVoiceDropdown) ttsVoiceDropdown.value = settings.ttsVoice;
+            const vrmVersionDropdown = document.getElementById('vrm-version-dropdown');
+            if (settings.vrmVersion !== undefined && vrmVersionDropdown) {
+                vrmVersionDropdown.value = settings.vrmVersion;
+                vrmVersion = settings.vrmVersion;
+            }
+            if (settings.browserVoiceURI !== undefined) {
+                try { localStorage.setItem(SELECTED_VOICE_STORAGE_KEY, settings.browserVoiceURI); } catch (e) {}
+                if (typeof loadVoices === 'function') loadVoices();
+            }
+            if (settings.ttsService === 'openai' && ttsServiceOpenAI) {
+                setTimeout(() => fetchTtsVoices(), 500);
+            } else if (settings.ttsVoice !== undefined && ttsVoiceDropdown) {
+                if (Array.from(ttsVoiceDropdown.options).some(o => o.value === settings.ttsVoice)) {
+                    ttsVoiceDropdown.value = settings.ttsVoice;
+                }
+            }
+            // Avatar: Live2D list and selection
+            const live2dListEl = document.getElementById('live2d-model-list');
+            const live2dDropdownEl = document.getElementById('live2d-model-dropdown');
+            if (settings.live2dModelList !== undefined && live2dListEl) live2dListEl.value = settings.live2dModelList;
+            if (settings.live2dModel !== undefined) modelPath = settings.live2dModel;
+            if (settings.live2dOffsets !== undefined && typeof settings.live2dOffsets === 'object') live2dOffsets = settings.live2dOffsets;
+            if (live2dListEl && live2dDropdownEl) {
+                const lines = (live2dListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
+                live2dDropdownEl.innerHTML = lines.map(path => {
+                    const fileName = path.split('/').pop();
+                    const selected = path === modelPath ? ' selected' : '';
+                    return `<option value="${path}"${selected}>${fileName}</option>`;
+                }).join('');
+                if (modelPath && lines.indexOf(modelPath) === -1) {
+                    const opt = document.createElement('option');
+                    opt.value = modelPath;
+                    opt.textContent = modelPath.split('/').pop();
+                    opt.selected = true;
+                    live2dDropdownEl.appendChild(opt);
+                } else if (modelPath) live2dDropdownEl.value = modelPath;
+            }
+            const live2dOffsetRangeEl = document.getElementById('live2d-offset-range');
+            const live2dOffsetValueEl = document.getElementById('live2d-offset-value');
+            const offsetVal = settings.live2dOffset !== undefined ? Number(settings.live2dOffset) : (live2dOffsets[modelPath] ?? 0);
+            if (live2dOffsetRangeEl) live2dOffsetRangeEl.value = offsetVal;
+            if (live2dOffsetValueEl) live2dOffsetValueEl.textContent = String(offsetVal);
+            // Avatar: VRM list and selection
+            const vrmListEl = document.getElementById('vrm-model-list');
+            const vrmDropdownEl = document.getElementById('vrm-model-dropdown');
+            if (settings.vrmModelList !== undefined && vrmListEl) vrmListEl.value = settings.vrmModelList;
+            if (settings.vrmModel !== undefined) currentVRMModelPath = settings.vrmModel;
+            if (settings.vrmPositions !== undefined && typeof settings.vrmPositions === 'object') vrmPositions = settings.vrmPositions;
+            if (vrmListEl && vrmDropdownEl) {
+                const vrmLines = (vrmListEl.value || '').split('\n').map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.vrm'));
+                vrmDropdownEl.innerHTML = vrmLines.map(path => `<option value="${path}">${path.split('/').pop()}</option>`).join('');
+                if (currentVRMModelPath) {
+                    if (vrmLines.indexOf(currentVRMModelPath) !== -1) vrmDropdownEl.value = currentVRMModelPath;
+                    else {
+                        const opt = document.createElement('option');
+                        opt.value = currentVRMModelPath;
+                        opt.textContent = currentVRMModelPath.split('/').pop();
+                        opt.selected = true;
+                        vrmDropdownEl.appendChild(opt);
+                        vrmDropdownEl.value = currentVRMModelPath;
                     }
-                    if (settings.assistantName !== undefined) {
-                        assistantNameInput.value = settings.assistantName;
+                }
+            }
+            const vrmScaleRangeEl = document.getElementById('vrm-scale-range');
+            const vrmScaleValueEl = document.getElementById('vrm-scale-value');
+            const vrmPosXEl = document.getElementById('vrm-position-x-range');
+            const vrmPosXValEl = document.getElementById('vrm-position-x-value');
+            const vrmPosYEl = document.getElementById('vrm-position-y-range');
+            const vrmPosYValEl = document.getElementById('vrm-position-y-value');
+            const vrmRotEl = document.getElementById('vrm-rotation-range');
+            const vrmRotValEl = document.getElementById('vrm-rotation-value');
+            const pos = vrmPositions[currentVRMModelPath] || { scale: 1.0, positionX: 0, positionY: 0, rotation: 0 };
+            const scale = settings.vrmScale !== undefined ? Number(settings.vrmScale) : pos.scale;
+            const posX = settings.vrmPositionX !== undefined ? Number(settings.vrmPositionX) : pos.positionX;
+            const posY = settings.vrmPositionY !== undefined ? Number(settings.vrmPositionY) : pos.positionY;
+            const rot = settings.vrmRotation !== undefined ? Number(settings.vrmRotation) : pos.rotation;
+            if (vrmScaleRangeEl) vrmScaleRangeEl.value = scale;
+            if (vrmScaleValueEl) vrmScaleValueEl.textContent = String(scale);
+            if (vrmPosXEl) vrmPosXEl.value = posX;
+            if (vrmPosXValEl) vrmPosXValEl.textContent = String(posX);
+            if (vrmPosYEl) vrmPosYEl.value = posY;
+            if (vrmPosYValEl) vrmPosYValEl.textContent = String(posY);
+            if (vrmRotEl) vrmRotEl.value = rot;
+            if (vrmRotValEl) vrmRotValEl.textContent = String(rot);
+            vrmPositions[currentVRMModelPath] = { scale, positionX: posX, positionY: posY, rotation: rot };
+            // Avatar mode radio and re-init
+            const live2dModeEl = document.getElementById('live2d-mode');
+            const vrmModeEl = document.getElementById('vrm-mode');
+            const newMode = (settings.avatarMode === 'vrm') ? 'vrm' : 'live2d';
+            if (live2dModeEl && vrmModeEl) {
+                if (newMode === 'vrm') vrmModeEl.checked = true;
+                else live2dModeEl.checked = true;
+            }
+            // Re-initialize avatar so the companion's model loads (always cleanup and init so model path change takes effect)
+            setTimeout(async () => {
+                try {
+                    const live2dContainer = document.getElementById('live2d-container');
+                    const vrmContainer = document.getElementById('vrm-container');
+                    if (newMode === 'vrm') {
+                        if (vrmContainer) vrmContainer.style.display = 'block';
+                        if (live2dContainer) live2dContainer.style.display = 'none';
+                        if (typeof cleanupVRM === 'function') cleanupVRM();
+                        if (typeof cleanupLive2D === 'function') cleanupLive2D();
+                        if (typeof initVRM === 'function') await initVRM();
+                    } else {
+                        if (live2dContainer) live2dContainer.style.display = 'block';
+                        if (vrmContainer) vrmContainer.style.display = 'none';
+                        if (typeof cleanupLive2D === 'function') cleanupLive2D();
+                        if (typeof cleanupVRM === 'function') cleanupVRM();
+                        if (typeof initLive2D === 'function') await initLive2D();
                     }
-                    
-                    // Restore other settings
-                    if (settings.apiKey !== undefined) {
-                        apiKeyInput.value = settings.apiKey;
-                    }
-                    if (settings.endpoint !== undefined) {
-                        endpointInput.value = settings.endpoint;
-                    }
-                    if (settings.newsApiKey !== undefined && newsApiKeyInput) {
-                        newsApiKeyInput.value = settings.newsApiKey;
-                    }
-                    if (settings.systemPrompt !== undefined) {
-                        systemPromptInput.value = settings.systemPrompt;
-                    }
-                    if (settings.webcamMode !== undefined) {
-                        document.getElementById('webcam-toggle').checked = settings.webcamMode;
-                    }
-                    if (settings.clipboardMode !== undefined) {
-                        document.getElementById('clipboard-toggle').checked = settings.clipboardMode;
-                    }
-                    if (settings.muteMode !== undefined) {
-                        document.getElementById('mute-toggle').checked = settings.muteMode;
-                        isMuted = settings.muteMode; // Update the isMuted variable as well
-                    }
+                } catch (e) { console.warn('Companion avatar re-init:', e); }
+            }, 100);
+        }
 
-                    if (settings.baseModel !== undefined) {
-                        defaultBaseModel = settings.baseModel;
-                        baseModel = settings.baseModel;
-                        if (baseModelDropdown) {
-                            baseModelDropdown.value = settings.baseModel;
-                        }
-                    }
-                    if (settings.toolModel !== undefined) {
-                        defaultToolModel = settings.toolModel;
-                        toolModel = settings.toolModel;
-                        if (toolModelDropdown) {
-                            toolModelDropdown.value = settings.toolModel;
-                        }
-                    }
-                    if (settings.visionModel !== undefined) {
-                        defaultVisionModel = settings.visionModel;
-                        visionModel = settings.visionModel;
-                        if (visionModelDropdown) {
-                            visionModelDropdown.value = settings.visionModel;
-                        }
-                    }
-                    
-                    // Restore TTS settings
-                    if (settings.ttsService !== undefined) {
-                        if (settings.ttsService === 'openai') {
-                            ttsServiceOpenAI.checked = true;
-                        } else {
-                            ttsServiceMicrosoft.checked = true;
-                        }
-                    }
-                    if (settings.ttsEndpoint !== undefined) {
-                        ttsEndpointInput.value = settings.ttsEndpoint;
-                    }
-                    if (settings.ttsModel !== undefined) {
-                        ttsModelDropdown.value = settings.ttsModel;
-                    }
-                    if (settings.ttsVoice !== undefined) {
-                        ttsVoiceDropdown.value = settings.ttsVoice;
-                    }
-                    
-                    // Restore VRM version setting
-                    const vrmVersionDropdown = document.getElementById('vrm-version-dropdown');
-                    if (settings.vrmVersion !== undefined && vrmVersionDropdown) {
-                        vrmVersionDropdown.value = settings.vrmVersion;
-                        vrmVersion = settings.vrmVersion; // Update the global variable
-                    }
-                    
-                    // Restore browser voice selection (must be done after voices are loaded)
-                    if (settings.browserVoiceURI !== undefined && settings.browserVoiceURI) {
-                        try {
-                            localStorage.setItem(SELECTED_VOICE_STORAGE_KEY, settings.browserVoiceURI);
-                        } catch (e) {
-                            console.warn('Could not restore browser voice URI:', e);
-                        }
-                    }
-                    
-                    // If OpenAI-compatible TTS is selected, fetch available voices
-                    if (settings.ttsService === 'openai' && ttsServiceOpenAI) {
-                        ttsServiceOpenAI.checked = true;
-                        // Fetch voices after a short delay to ensure DOM is ready
-                        setTimeout(() => fetchTtsVoices(), 500);
-                    }
-                    
-                    console.log('Tool settings loaded from localStorage');
+        // Function to load tool settings from localStorage or from a provided settings object (e.g. companion)
+        function loadToolSettings(optionalSettings) {
+            try {
+                const settings = optionalSettings != null
+                    ? optionalSettings
+                    : (() => { const s = localStorage.getItem('toolSettings'); return s ? JSON.parse(s) : null; })();
+                if (settings) {
+                    applyToolSettingsToDOM(settings);
+                    if (optionalSettings == null) console.log('Tool settings loaded from localStorage');
                 }
             } catch (error) {
                 console.warn('Error loading tool settings:', error);
             }
+        }
+
+        // --- Companions UI: list from server, add modal, load/delete ---
+        async function fetchCompanionsList() {
+            const url = `${PROXY_BASE_URL}/v1/companions`;
+            const res = await fetch(url, { headers: { 'Authorization': `Bearer ${authToken}` } });
+            if (!res.ok) throw new Error(res.statusText || 'Failed to fetch companions');
+            return res.json();
+        }
+
+        let activeCompanionId = null;
+
+        function renderCompanionList() {
+            const listEl = document.getElementById('companion-list');
+            if (!listEl) return;
+            listEl.innerHTML = '';
+            fetchCompanionsList().then(companions => {
+                if (!Array.isArray(companions)) return;
+                companions.forEach(c => {
+                    const li = document.createElement('li');
+                    li.setAttribute('data-companion-id', c.id);
+                    if (c.id === activeCompanionId) li.classList.add('companion-active');
+                    const nameSpan = document.createElement('span');
+                    nameSpan.textContent = c.name || c.id;
+                    nameSpan.className = 'companion-name';
+                    li.appendChild(nameSpan);
+                    const delBtn = document.createElement('button');
+                    delBtn.type = 'button';
+                    delBtn.className = 'companion-delete-btn';
+                    delBtn.setAttribute('aria-label', 'Delete companion');
+                    delBtn.innerHTML = '<i class="fas fa-trash-alt"></i>';
+                    delBtn.addEventListener('click', (e) => { e.stopPropagation(); deleteCompanion(c.id); });
+                    li.appendChild(delBtn);
+                    listEl.appendChild(li);
+                });
+            }).catch(err => {
+                console.warn('Companions list failed:', err);
+                listEl.innerHTML = '<li style="color:#888;">Unable to load companions</li>';
+            });
+        }
+
+        async function loadCompanion(id) {
+            const url = `${PROXY_BASE_URL}/v1/companions/${encodeURIComponent(id)}`;
+            const res = await fetch(url, { headers: { 'Authorization': `Bearer ${authToken}` } });
+            if (!res.ok) throw new Error(res.statusText || 'Companion not found');
+            const data = await res.json();
+            if (data.settings) {
+                applyToolSettingsToDOM(data.settings);
+                saveToolSettings();
+                activeCompanionId = id;
+                renderCompanionList();
+            }
+        }
+
+        async function deleteCompanion(id) {
+            const url = `${PROXY_BASE_URL}/v1/companions/${encodeURIComponent(id)}`;
+            const res = await fetch(url, { method: 'DELETE', headers: { 'Authorization': `Bearer ${authToken}` } });
+            if (!res.ok) throw new Error(res.statusText || 'Delete failed');
+            if (activeCompanionId === id) activeCompanionId = null;
+            renderCompanionList();
+        }
+
+        function setupCompanionsUI() {
+            const listEl = document.getElementById('companion-list');
+            const addBtn = document.getElementById('companion-add-btn');
+            const modalOverlay = document.getElementById('companion-modal-overlay');
+            const modal = document.getElementById('companion-modal');
+            const nameInput = document.getElementById('companion-name-input');
+            const saveBtn = document.getElementById('companion-modal-save');
+            const cancelBtn = document.getElementById('companion-modal-cancel');
+            if (!listEl || !addBtn || !modalOverlay || !saveBtn || !cancelBtn) return;
+
+            // Click on list item (excluding delete button): load companion
+            listEl.addEventListener('click', (e) => {
+                const t = e.target && e.target.nodeType === 1 ? e.target : e.target && e.target.parentNode;
+                const li = t && t.closest ? t.closest('li[data-companion-id]') : null;
+                if (!li || (t && t.closest && t.closest('.companion-delete-btn'))) return;
+                const id = li.getAttribute('data-companion-id');
+                if (id) loadCompanion(id).catch(err => console.warn('Load companion failed:', err));
+            });
+
+            addBtn.addEventListener('click', () => {
+                if (nameInput) nameInput.value = '';
+                modalOverlay.style.display = 'flex';
+                modalOverlay.setAttribute('aria-hidden', 'false');
+                if (nameInput) nameInput.focus();
+                renderCompanionList();
+            });
+
+            function closeCompanionModal() {
+                modalOverlay.style.display = 'none';
+                modalOverlay.setAttribute('aria-hidden', 'true');
+            }
+
+            cancelBtn.addEventListener('click', closeCompanionModal);
+            modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeCompanionModal(); });
+
+            const editSettingsLink = document.getElementById('companion-edit-settings-link');
+            if (editSettingsLink) {
+                editSettingsLink.addEventListener('click', () => {
+                    closeCompanionModal();
+                    const collapsible = document.querySelector('.collapsible');
+                    const content = collapsible && collapsible.querySelector('.collapsible-content');
+                    const btn = collapsible && collapsible.querySelector('.collapsible-btn');
+                    if (content && btn) {
+                        content.classList.add('active');
+                        btn.classList.add('active');
+                        btn.setAttribute('aria-expanded', 'true');
+                        content.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    }
+                });
+            }
+
+            saveBtn.addEventListener('click', async () => {
+                const name = (nameInput && nameInput.value || '').trim();
+                if (!name) return;
+                const settings = getToolSettingsFromDOM();
+                try {
+                    const res = await fetch(`${PROXY_BASE_URL}/v1/companions`, {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${authToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ name, settings })
+                    });
+                    if (!res.ok) throw new Error(await res.text() || 'Save failed');
+                    closeCompanionModal();
+                    renderCompanionList();
+                } catch (err) {
+                    console.warn('Save companion failed:', err);
+                }
+            });
         }
 
         // Function to setup event listeners for persisting tool settings

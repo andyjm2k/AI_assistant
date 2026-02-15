@@ -280,6 +280,20 @@ class PhilosopherResponse(BaseModel):
     data: Optional[Dict[str, Any]] = None
 
 
+# Pydantic models for companion config API (CATBot tool settings saved as named companions)
+class CompanionCreateRequest(BaseModel):
+    """Request body for creating a new companion."""
+    name: str
+    settings: Dict[str, Any]  # Full tool settings snapshot (serializable)
+
+
+class CompanionResponse(BaseModel):
+    """Single companion record (id, name, optional full settings)."""
+    id: str
+    name: str
+    settings: Optional[Dict[str, Any]] = None  # Omitted in list view, included in GET by id
+
+
 class ProxyFetchRequest(BaseModel):
     """Request body for POST /v1/proxy/fetch (avoids URL length limits on iOS Safari)."""
     url: str
@@ -303,6 +317,8 @@ TEAM_CONFIG_FILE = _PROJECT_ROOT / "config" / "team-config.json"
 # Optional: same system prompt / rules as web UI; when present, used for Telegram (overrides TELEGRAM_SYSTEM_PROMPT env)
 CATBOT_SYSTEM_PROMPT_FILE = _PROJECT_ROOT / "config" / "catbot_system_prompt.txt"
 SCRATCH_DIR = _PROJECT_ROOT / "scratch"
+# Companion configs stored as one JSON file per companion (server filesystem only)
+COMPANIONS_DIR = _PROJECT_ROOT / "config" / "companions"
 
 # Allowed file extensions for scratch file operations (path traversal mitigation)
 READ_ALLOWED_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
@@ -598,8 +614,9 @@ def _validate_telegram_secret(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Telegram secret required or invalid")
 
 
-# Create scratch directory if it doesn't exist
+# Create scratch and companions directories if they don't exist
 SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+COMPANIONS_DIR.mkdir(parents=True, exist_ok=True)
 load_users_db()
 
 # Global AutoGen team instance
@@ -4257,8 +4274,122 @@ async def delete_file(
             message=f"Error deleting file: {str(e)}"
         )
 
+
 # ============================================================================
-# END FILE OPERATIONS ENDPOINTS
+# COMPANIONS API (CATBot tool settings saved as static config files)
+# ============================================================================
+
+# Safe filename: only alphanumeric, hyphen, underscore (no path traversal, .json only)
+_COMPANION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def resolve_companion_path(companion_id: str) -> Path:
+    """
+    Resolve a companion id to a path under COMPANIONS_DIR.
+    Only allows safe ids (alphanumeric, hyphen, underscore); enforces .json.
+    Raises HTTPException 400 on invalid input.
+    """
+    if not companion_id or not companion_id.strip():
+        raise HTTPException(status_code=400, detail="Invalid companion id")
+    if not _COMPANION_ID_RE.match(companion_id):
+        raise HTTPException(status_code=400, detail="Invalid companion id: only letters, numbers, hyphen, underscore allowed")
+    # Build path: COMPANIONS_DIR / {id}.json
+    candidate = COMPANIONS_DIR / f"{companion_id}.json"
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail="Invalid companion id") from e
+    # Enforce containment under COMPANIONS_DIR
+    root = COMPANIONS_DIR.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid companion id")
+    if resolved.suffix.lower() != ".json":
+        raise HTTPException(status_code=400, detail="Invalid companion id")
+    return resolved
+
+
+@app.get("/v1/companions", response_model=List[CompanionResponse])
+async def list_companions(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """List all saved companions (id and name only for list view)."""
+    try:
+        result = []
+        for path in COMPANIONS_DIR.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                cid = data.get("id") or path.stem
+                name = data.get("name") or path.stem
+                result.append(CompanionResponse(id=cid, name=name, settings=None))
+            except (json.JSONDecodeError, OSError):
+                continue
+        result.sort(key=lambda c: c.name.lower())
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/companions/{companion_id}", response_model=CompanionResponse)
+async def get_companion(
+    companion_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Get one companion by id (full record including settings)."""
+    filepath = resolve_companion_path(companion_id)
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Companion not found")
+    try:
+        data = json.loads(filepath.read_text(encoding="utf-8"))
+        return CompanionResponse(
+            id=data.get("id", companion_id),
+            name=data.get("name", companion_id),
+            settings=data.get("settings"),
+        )
+    except (json.JSONDecodeError, OSError) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/companions", response_model=CompanionResponse)
+async def create_companion(
+    request: CompanionCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Create a new companion; server generates id (UUID), writes config/companions/{id}.json."""
+    import uuid
+    name = (request.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Companion name is required")
+    # Generate a URL-safe id (use uuid4 hex for simplicity and uniqueness)
+    cid = uuid.uuid4().hex
+    filepath = resolve_companion_path(cid)
+    record = {"id": cid, "name": name, "settings": request.settings or {}}
+    try:
+        filepath.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        return CompanionResponse(id=cid, name=name, settings=record["settings"])
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/v1/companions/{companion_id}")
+async def delete_companion(
+    companion_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Delete a companion by id."""
+    filepath = resolve_companion_path(companion_id)
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Companion not found")
+    try:
+        filepath.unlink()
+        return {"success": True, "message": f"Companion {companion_id} deleted"}
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# END COMPANIONS API
 # ============================================================================
 
 # ============================================================================
