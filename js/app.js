@@ -1,4 +1,4 @@
-﻿        // At the start of your script section, add these lines:
+        // At the start of your script section, add these lines:
         window.PIXI = PIXI;
         window.EventEmitter3.EventEmitter = EventEmitter3;
 
@@ -5753,23 +5753,15 @@ function saveWAVFile(wavBlob) {
             
             if (toolMatch && paramsMatch) {
                 try {
-                    const leading = contentWithoutCode.slice(0, toolMatch.index).trim();
-                    const trailing = contentWithoutCode.slice(paramsMatch.index + paramsMatch[0].length).trim();
-
-                    // Only treat as a real tool call if tags are top-level (no extra text around)
-                    if (leading || trailing) {
-                        console.log('Found tool tags but not at top-level; treating as plain text');
-                    } else {
-                        const toolName = toolMatch[1].trim();
-                        const parameters = JSON.parse(paramsMatch[1].trim());
-                        console.log('Successfully parsed XML format (top-level):', { toolName, parameters });
-                        return {
-                            function: {
-                                name: toolName,
-                                arguments: JSON.stringify(parameters)
-                            }
-                        };
-                    }
+                    const toolName = toolMatch[1].trim();
+                    const parameters = JSON.parse(paramsMatch[1].trim());
+                    console.log('Successfully parsed XML format:', { toolName, parameters });
+                    return {
+                        function: {
+                            name: toolName,
+                            arguments: JSON.stringify(parameters)
+                        }
+                    };
                 } catch (error) {
                     console.error('Error parsing XML tool response:', error);
                 }
