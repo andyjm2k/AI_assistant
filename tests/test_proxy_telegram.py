@@ -220,3 +220,117 @@ class TestTelegramToolsLoop:
         # Final reply should be the second LLM response (natural language)
         assert data.get("reply") == final_response
         assert data.get("conversation_id") == "tools-test"
+
+
+class TestIsTodoListQuery:
+    """Tests for _is_todo_list_query (skip memory injection for todo-list requests)."""
+
+    def test_todo_list_phrases_return_true(self):
+        """Phrases asking for current todo list return True."""
+        from src.servers.proxy_server import _is_todo_list_query
+        assert _is_todo_list_query("What's on my todo list?") is True
+        assert _is_todo_list_query("Show my tasks") is True
+        assert _is_todo_list_query("list my tasks") is True
+        assert _is_todo_list_query("my todo list") is True
+        assert _is_todo_list_query("what are my tasks") is True
+
+    def test_unrelated_queries_return_false(self):
+        """Unrelated messages return False."""
+        from src.servers.proxy_server import _is_todo_list_query
+        assert _is_todo_list_query("What's the weather?") is False
+        assert _is_todo_list_query("Search for AI news") is False
+        assert _is_todo_list_query("") is False
+
+
+class TestResolveTodoUserForTelegram:
+    """Tests for _resolve_todo_user_for_telegram (Telegram -> app username linking)."""
+
+    def test_linked_user_id_returns_app_username(self):
+        """When links file maps Telegram user_id to username, resolver returns username."""
+        from src.servers import proxy_server as ps
+        links_content = '{"6644154165": "andyjm2k"}'
+        with patch.object(ps, "TELEGRAM_USER_LINKS_FILE") as mock_path:
+            mock_path.exists.return_value = True
+            mock_path.read_text.return_value = links_content
+            out = ps._resolve_todo_user_for_telegram("6644154165", "6644154165")
+        assert out == "andyjm2k"
+
+    def test_no_link_returns_conversation_id(self):
+        """When no mapping exists, resolver returns conversation_id (or user_id)."""
+        from src.servers import proxy_server as ps
+        with patch.object(ps, "TELEGRAM_USER_LINKS_FILE") as mock_path:
+            mock_path.exists.return_value = False
+            out = ps._resolve_todo_user_for_telegram("6644154165", "6644154165")
+        assert out == "6644154165"
+
+    def test_user_id_normalized_to_string(self):
+        """user_id sent as number is normalized to string for lookup."""
+        from src.servers import proxy_server as ps
+        links_content = '{"6644154165": "andyjm2k"}'
+        with patch.object(ps, "TELEGRAM_USER_LINKS_FILE") as mock_path:
+            mock_path.exists.return_value = True
+            mock_path.read_text.return_value = links_content
+            # Simulate Pydantic/JSON giving int
+            out = ps._resolve_todo_user_for_telegram("6644154165", 6644154165)
+        assert out == "andyjm2k"
+
+
+class TestPhilosopherFileTools:
+    """Tests for file manipulation tools in philosopher mode (get_all_available_tools + execute_tool_for_philosopher)."""
+
+    @pytest.mark.asyncio
+    async def test_file_tools_included_when_file_ops_available(self):
+        """When FILE_OPS_AVAILABLE is True, get_all_available_tools includes read_file, write_file, list_files, delete_file."""
+        from src.servers import proxy_server as ps
+        with patch.object(ps, "MCP_AVAILABLE", False):
+            tools = await ps.get_all_available_tools()
+        names = [t.get("name") for t in tools]
+        assert "read_file" in names
+        assert "write_file" in names
+        assert "list_files" in names
+        assert "delete_file" in names
+
+    @pytest.mark.asyncio
+    async def test_execute_list_files_returns_string(self):
+        """execute_tool_for_philosopher list_files returns a string (empty workspace or file list)."""
+        from src.servers import proxy_server as ps
+        result = await ps.execute_tool_for_philosopher("list_files", {})
+        assert isinstance(result, str)
+        assert "scratch" in result.lower() or "empty" in result.lower() or "Files" in result
+
+    @pytest.mark.asyncio
+    async def test_run_workflow_tool_included_when_autogen_available(self):
+        """When AUTOGEN_AVAILABLE is True, get_all_available_tools includes runWorkflow."""
+        from src.servers import proxy_server as ps
+        with patch.object(ps, "MCP_AVAILABLE", False):
+            tools = await ps.get_all_available_tools()
+        names = [t.get("name") for t in tools]
+        if getattr(ps, "AUTOGEN_AVAILABLE", False):
+            assert "runWorkflow" in names
+        # If AutoGen not available, runWorkflow may be absent; test just ensures no crash
+
+    @pytest.mark.asyncio
+    async def test_execute_run_workflow_requires_content_prompt(self):
+        """execute_tool_for_philosopher runWorkflow without contentPrompt returns error message."""
+        from src.servers import proxy_server as ps
+        result = await ps.execute_tool_for_philosopher("runWorkflow", {})
+        assert isinstance(result, str)
+        assert "contentPrompt" in result or "required" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_run_deep_research_tool_included_when_browser_use_configured(self):
+        """When MCP_BROWSER_USE_HTTP_URL is set, get_all_available_tools includes run_deep_research."""
+        from src.servers import proxy_server as ps
+        with patch.object(ps, "MCP_AVAILABLE", False):
+            with patch.object(ps, "MCP_BROWSER_USE_HTTP_URL", "http://127.0.0.1:8383/mcp"):
+                tools = await ps.get_all_available_tools()
+        names = [t.get("name") for t in tools]
+        assert "run_deep_research" in names
+
+    @pytest.mark.asyncio
+    async def test_execute_run_deep_research_requires_research_task(self):
+        """execute_tool_for_philosopher run_deep_research without research_task returns error."""
+        from src.servers import proxy_server as ps
+        result = await ps.execute_tool_for_philosopher("run_deep_research", {})
+        assert isinstance(result, str)
+        assert "research_task" in result or "researchTask" in result or "required" in result.lower()

@@ -284,7 +284,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Backend: {backend_status}\n"
         f"Latency: {latency_ms}\n"
         f"Your messages: {message_total}\n"
-        f"User ID: `{user_id}`\n"
+        f"User ID: `{user_id}`\n\n"
+        "📋 *Todo sync with web app:* To see the same todo list in Telegram and the browser, "
+        "add a mapping in `config/telegram_user_links.json` on the server: "
+        f'`\"{user_id}\": \"your_web_username\"`. See config/TELEGRAM_TODO_LINK.md for details.'
     )
     await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
 

@@ -145,8 +145,15 @@ try:
     TELEGRAM_TOOLS_MODULE_AVAILABLE = True
 except ImportError as e:
     print(f"[WARN] Telegram tools module not available: {e}")
-    _telegram_tools = None
-    TELEGRAM_TOOLS_MODULE_AVAILABLE = False
+
+# Persistent todo store (per-user file storage)
+try:
+    from src.servers import todo_store as _todo_store
+    TODO_STORE_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] Todo store not available: {e}")
+    _todo_store = None
+    TODO_STORE_AVAILABLE = False
 
 # Load environment variables from .env file in project root
 if DOTENV_AVAILABLE:
@@ -215,6 +222,35 @@ class AuthTokenResponse(BaseModel):
 class AuthUserResponse(BaseModel):
     username: str
     created_at: str
+
+
+# Todo REST API request/response models (all endpoints require auth)
+class TodoAddRequest(BaseModel):
+    taskDescription: str
+
+
+class TodoUpdateRequest(BaseModel):
+    taskDescription: str
+
+
+class TodoListResponse(BaseModel):
+    tasks: List[str]
+    updated_at: Optional[str] = None
+
+
+class TodoExecuteRequest(BaseModel):
+    taskId: int
+    promptOverride: Optional[str] = None
+
+
+class TodoResumeRequest(BaseModel):
+    userMessage: str
+
+
+class TodoExecuteResponse(BaseModel):
+    status: str
+    message: str
+    taskId: Optional[int] = None
 
 
 class TelegramChatMessage(BaseModel):
@@ -321,8 +357,8 @@ SCRATCH_DIR = _PROJECT_ROOT / "scratch"
 COMPANIONS_DIR = _PROJECT_ROOT / "config" / "companions"
 
 # Allowed file extensions for scratch file operations (path traversal mitigation)
-READ_ALLOWED_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
-WRITE_ALLOWED_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf"}
+READ_ALLOWED_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".py", ".js", ".html"}
+WRITE_ALLOWED_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf", ".py", ".js", ".html"}
 # Allowed extensions for Google Drive upload (scratch workspace only; path exfiltration mitigation)
 DRIVE_UPLOAD_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
 # Max file size for read/write in bytes (10MB default), configurable via env
@@ -338,10 +374,60 @@ telegram_memory_cache: Dict[str, List[str]] = {}
 CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE = _PROJECT_ROOT / "config" / "catbot_system_prompt_with_tools.txt"
 TELEGRAM_TOOLS_ENABLED = os.getenv("TELEGRAM_TOOLS_ENABLED", "false").lower() == "true"
 TELEGRAM_TOOLS_MAX_ITERATIONS = max(1, min(10, int(os.getenv("TELEGRAM_TOOLS_MAX_ITERATIONS", "5"))))
+# Optional: map Telegram user_id or conversation_id to app username for shared todo list
+TELEGRAM_USER_LINKS_FILE = _PROJECT_ROOT / "config" / "telegram_user_links.json"
+
+
+def _resolve_todo_user_for_telegram(conversation_id: str, user_id: Optional[str]) -> str:
+    """
+    Resolve the todo user key for Telegram: if telegram_user_links.json maps this conversation
+    or user to an app username, return that; else return conversation_id (or user_id) for persistent per-chat todo.
+    """
+    mapping = {}
+    if TELEGRAM_USER_LINKS_FILE.exists():
+        try:
+            raw = TELEGRAM_USER_LINKS_FILE.read_text(encoding="utf-8")
+            mapping = json.loads(raw)
+            if not isinstance(mapping, dict):
+                mapping = {}
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Normalize to string (API may send user_id as number)
+    uid = str(user_id or "").strip()
+    cid = str(conversation_id or "").strip() or "default"
+    if uid and uid in mapping:
+        return str(mapping[uid]).strip() or cid
+    if cid in mapping:
+        return str(mapping[cid]).strip() or cid
+    return cid
 
 # Philosopher mode state storage (per conversation)
 philosopher_mode_active: Dict[str, bool] = {}
 philosopher_mode_instances: Dict[str, Any] = {}
+
+# Task execution: max iterations per run (configurable via .env)
+TASK_EXECUTION_MAX_ITERATIONS = max(1, min(100, int(os.getenv("TASK_EXECUTION_MAX_ITERATIONS", "20"))))
+# Per-user execution state: user_key -> { "task_id", "status", "executor" } (executor held for resume)
+task_execution_state: Dict[str, Dict[str, Any]] = {}
+
+# Task execution module (bounded LLM+tools loop for todo tasks)
+try:
+    from src.features.task_execution import TodoTaskExecutor
+    from src.features.task_execution import (
+        STATUS_EXECUTING,
+        STATUS_PAUSED_AWAITING_FEEDBACK,
+        STATUS_AWAITING_CONFIRMATION,
+        STATUS_CANCELLED,
+    )
+    TASK_EXECUTION_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] Task execution not available: {e}")
+    TodoTaskExecutor = None
+    TASK_EXECUTION_AVAILABLE = False
+    STATUS_EXECUTING = "executing"
+    STATUS_PAUSED_AWAITING_FEEDBACK = "paused_awaiting_feedback"
+    STATUS_AWAITING_CONFIRMATION = "awaiting_confirmation"
+    STATUS_CANCELLED = "cancelled"
 
 # Assistant context: current date, timezone, and knowledge-gap awareness (prepended to all chat system prompts)
 def _get_assistant_context_block() -> str:
@@ -394,7 +480,7 @@ def _get_telegram_system_prompt_base() -> str:
     return TELEGRAM_SYSTEM_PROMPT_ENV
 
 
-def _get_telegram_system_prompt_with_tools(conversation_id: str) -> str:
+def _get_telegram_system_prompt_with_tools(conversation_id: str, todo_user_key: Optional[str] = None) -> str:
     """Return the tool-capable system prompt for Telegram, with current todo and memory cache for this conversation."""
     content = ""
     if CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE.exists():
@@ -404,7 +490,11 @@ def _get_telegram_system_prompt_with_tools(conversation_id: str) -> str:
             print(f"Warning: Could not read {CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE}: {e}")
     if not content:
         content = _get_telegram_system_prompt_base()
-    todo_list = telegram_todo.get(conversation_id, [])
+    # Use persistent todo store when available and todo_user_key provided; else in-memory fallback
+    if todo_user_key and TODO_STORE_AVAILABLE and _todo_store:
+        todo_list = _todo_store.load_tasks(todo_user_key)
+    else:
+        todo_list = telegram_todo.get(conversation_id, [])
     mem_cache = telegram_memory_cache.get(conversation_id, [])
     todo_block = "\n".join([f"{i + 1}. {t}" for i, t in enumerate(todo_list)]) if todo_list else "(empty)"
     mem_block = "\n".join([f"{i + 1}. {m}" for i, m in enumerate(mem_cache)]) if mem_cache else "(empty)"
@@ -1068,12 +1158,11 @@ def load_servers():
                 sid = server.get("id")
                 if not sid:
                     continue
-                # Migrate: if has command but no preset_id, infer preset_id from name
-                if server.get("command") and not server.get("preset_id"):
-                    if "mcp-browser-use" in (server.get("name") or "").lower():
+                # Migrate: infer preset_id from name when missing (browser-use detection)
+                if not server.get("preset_id"):
+                    name = (server.get("name") or "").lower()
+                    if "mcp-browser-use" in name or "browser-use" in name or ("browser" in name and "use" in name):
                         server["preset_id"] = "browser-use"
-                    else:
-                        server["preset_id"] = None  # Legacy non-browser; not connectable until reconfigured
                 # Never retain command in memory
                 server.pop("command", None)
                 result[sid] = server
@@ -1769,9 +1858,9 @@ async def connect_server(
 
         # Inprocess preset (e.g. browser-use): no subprocess, mark connected
         preset_id = server.get("preset_id") or (
-            "browser-use" if "mcp-browser-use" in (server.get("name") or "").lower() else None
+            "browser-use" if _is_browser_use_server(server) else None
         )
-        if preset_id == "browser-use" or "mcp-browser-use" in (server.get("name") or "").lower():
+        if preset_id == "browser-use" or _is_browser_use_server(server):
             server["preset_id"] = preset_id or "browser-use"
             server["status"] = "connected"
             mcp_servers[server_id] = server
@@ -1828,7 +1917,7 @@ async def disconnect_server(
 
         # Check if this is the MCP Browser Use server
         server = mcp_servers.get(server_id)
-        if server and "mcp-browser-use" in server.get("name", "").lower():
+        if server and _is_browser_use_server(server):
             # Just mark as disconnected since we don't have a real connection
             server["status"] = "disconnected"
             mcp_servers[server_id] = server
@@ -1904,6 +1993,20 @@ async def _browser_use_http_call_tool(tool_name: str, parameters: Dict[str, Any]
     return {"content": content}
 
 
+def _is_browser_use_server(server: Optional[Dict[str, Any]]) -> bool:
+    """Return True if server is the browser-use preset (by preset_id or name). Used for routing tools and philosopher detection."""
+    if not server:
+        return False
+    name = (server.get("name") or "").lower()
+    preset_id = (server.get("preset_id") or "").lower()
+    return (
+        preset_id == "browser-use"
+        or "mcp-browser-use" in name
+        or "browser-use" in name
+        or ("browser" in name and "use" in name)
+    )
+
+
 # Browser automation tool endpoint (browser-use via HTTP; other servers via MCP client)
 @app.post("/v1/mcp/servers/{server_id}/tools/call")
 async def call_tool(server_id: str, request: ToolCallRequest):
@@ -1921,7 +2024,7 @@ async def call_tool(server_id: str, request: ToolCallRequest):
         print(f"🔍 [TOOLS/CALL] Parameters: {parameters}")
 
         # Browser-use preset: use HTTP client (no mcp_clients entry)
-        if server and "mcp-browser-use" in server.get("name", "").lower():
+        if server and _is_browser_use_server(server):
             try:
                 result = await _browser_use_http_call_tool(tool_name, parameters)
                 return {"result": result}
@@ -1964,7 +2067,7 @@ async def list_tools(server_id: str):
 
         server = mcp_servers.get(server_id)
         # Browser-use preset: list tools from HTTP server
-        if server and "mcp-browser-use" in server.get("name", "").lower():
+        if server and _is_browser_use_server(server):
             try:
                 result = await _browser_use_http_list_tools()
                 return {"result": result}
@@ -2083,6 +2186,301 @@ async def auth_me(current_user: Dict[str, Any] = Depends(get_current_user)):
     )
 
 
+# ============================================================================
+# TODO REST API (all endpoints require authentication)
+# ============================================================================
+
+@app.get("/v1/todo", response_model=TodoListResponse)
+async def todo_list(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Return the authenticated user's todo list. Requires JWT."""
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        raise HTTPException(status_code=503, detail="Todo store is not available.")
+    user_key = current_user["username"]
+    meta = _todo_store.load_tasks_with_meta(user_key)
+    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+
+
+@app.post("/v1/todo", response_model=TodoListResponse)
+async def todo_add(
+    request: TodoAddRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Add a task to the authenticated user's todo list. Requires JWT."""
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        raise HTTPException(status_code=503, detail="Todo store is not available.")
+    user_key = current_user["username"]
+    desc = (request.taskDescription or "").strip()
+    if not desc:
+        raise HTTPException(status_code=400, detail="taskDescription is required.")
+    tasks = _todo_store.add_task(user_key, desc)
+    meta = _todo_store.load_tasks_with_meta(user_key)
+    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+
+
+@app.patch("/v1/todo/{task_id}", response_model=TodoListResponse)
+async def todo_update(
+    task_id: int,
+    request: TodoUpdateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Update a task by 1-based index. Requires JWT."""
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        raise HTTPException(status_code=503, detail="Todo store is not available.")
+    user_key = current_user["username"]
+    desc = (request.taskDescription or "").strip()
+    if not desc:
+        raise HTTPException(status_code=400, detail="taskDescription is required.")
+    try:
+        _todo_store.update_task(user_key, task_id, desc)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    meta = _todo_store.load_tasks_with_meta(user_key)
+    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+
+
+@app.delete("/v1/todo/{task_id}", response_model=TodoListResponse)
+async def todo_delete(
+    task_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Delete a task by 1-based index. Requires JWT."""
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        raise HTTPException(status_code=503, detail="Todo store is not available.")
+    user_key = current_user["username"]
+    try:
+        _todo_store.delete_task(user_key, task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    meta = _todo_store.load_tasks_with_meta(user_key)
+    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+
+
+@app.delete("/v1/todo", response_model=TodoListResponse)
+async def todo_clear(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Clear all tasks for the authenticated user. Requires JWT."""
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        raise HTTPException(status_code=503, detail="Todo store is not available.")
+    user_key = current_user["username"]
+    _todo_store.clear_tasks(user_key)
+    return TodoListResponse(tasks=[], updated_at=None)
+
+
+# ============================================================================
+# TASK EXECUTION (internal helpers + REST; all REST require authentication)
+# ============================================================================
+
+def _write_task_exec_response_to_scratch(
+    user_key: str, task_id: Optional[int], status: str, message: str
+) -> None:
+    """
+    Write the task execution agent response to a timestamped text file in scratch.
+    Called whenever a run ends (completed, paused, awaiting confirmation, or cancelled).
+    """
+    try:
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.now().astimezone()
+        timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+        timestamp_human = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+        safe_user = re.sub(r"[^\w\-]", "_", (user_key or "unknown")[:64])
+        task_suffix = f"_task{task_id}" if task_id is not None else ""
+        filename = f"task_exec_{timestamp_file}_{safe_user}{task_suffix}.txt"
+        filepath = SCRATCH_DIR / filename
+        lines = [
+            f"Task execution response",
+            f"Date-time: {timestamp_human}",
+            f"Status: {status}",
+            f"Task ID: {task_id}" if task_id is not None else "Task ID: (none)",
+            "",
+            "--- Agent response ---",
+            "",
+            message or "(No response text)",
+        ]
+        filepath.write_text("\n".join(lines), encoding="utf-8")
+        print(f"[TASK_EXEC] Wrote response to {filepath}", flush=True)
+    except Exception as e:
+        print(f"[TASK_EXEC] Failed to write response to scratch: {e}", flush=True)
+
+
+async def _run_task_loop_background(user_key: str, executor: Any) -> None:
+    """
+    Run executor.run_loop() in background; update or clear task_execution_state in finally
+    so we never leave state stuck as 'executing' on exception or cancel.
+    """
+    status = STATUS_AWAITING_CONFIRMATION
+    message = "Execution stopped unexpectedly."
+    try:
+        status, message = await executor.run_loop()
+    except Exception as e:
+        status = STATUS_AWAITING_CONFIRMATION
+        message = str(e)
+        print(f"[TASK_EXEC] run_loop error for user {user_key}: {e}", flush=True)
+    finally:
+        # Only update if this user's state is still 'executing' (we own it)
+        state = task_execution_state.get(user_key)
+        if state and state.get("status") == STATUS_EXECUTING:
+            state["status"] = status
+            state["message"] = message or ""
+            # Always capture agent response to scratch with timestamp (paused, awaiting, cancelled, done)
+            _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
+            # Clear state on cancel so user can start a new execution
+            if status == STATUS_CANCELLED:
+                task_execution_state.pop(user_key, None)
+
+
+async def _task_execute_start(user_key: str, task_id: int, prompt_override: Optional[str]) -> tuple:
+    """Start task execution for user_key. Runs loop in background; returns immediately with status 'executing'."""
+    if not TASK_EXECUTION_AVAILABLE or not TodoTaskExecutor:
+        raise HTTPException(status_code=503, detail="Task execution is not available.")
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        raise HTTPException(status_code=503, detail="Todo store is not available.")
+    if user_key in task_execution_state:
+        raise HTTPException(status_code=409, detail="An execution is already active. Complete or cancel it first.")
+    tasks = _todo_store.load_tasks(user_key)
+    if task_id < 1 or task_id > len(tasks):
+        raise HTTPException(status_code=400, detail="Invalid task ID.")
+    task_description = tasks[task_id - 1]
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured.")
+    executor = TodoTaskExecutor(
+        api_key=api_key,
+        task_id=task_id,
+        task_description=task_description,
+        prompt_override=prompt_override,
+        max_iterations=TASK_EXECUTION_MAX_ITERATIONS,
+        tool_executor=execute_tool_for_philosopher,
+        get_tools_func=get_all_available_tools,
+    )
+    # Set state to 'executing' before starting so cancel/status work and we never leave state stuck
+    task_execution_state[user_key] = {"task_id": task_id, "status": STATUS_EXECUTING, "executor": executor, "message": None}
+    asyncio.create_task(_run_task_loop_background(user_key, executor))
+    return (STATUS_EXECUTING, "Task execution started. Ask me for status or to cancel.")
+
+
+async def _task_execute_resume(user_key: str, user_message: str) -> tuple:
+    """Resume paused execution. Returns (status, message)."""
+    if not TASK_EXECUTION_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Task execution is not available.")
+    state = task_execution_state.get(user_key)
+    if not state or state.get("status") != STATUS_PAUSED_AWAITING_FEEDBACK:
+        raise HTTPException(status_code=400, detail="No paused execution to resume.")
+    executor = state.get("executor")
+    if not executor:
+        task_execution_state.pop(user_key, None)
+        raise HTTPException(status_code=400, detail="Execution state lost. Start a new execution.")
+    executor.add_user_message(user_message or "")
+    try:
+        status, message = await executor.run_loop()
+        state["status"] = status
+        state["message"] = message or ""
+        # Capture agent response to scratch (paused or awaiting confirmation after resume)
+        _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
+        return (status, message or "Resumed.")
+    except Exception as e:
+        state["status"] = STATUS_AWAITING_CONFIRMATION
+        state["message"] = str(e)
+        _write_task_exec_response_to_scratch(user_key, state.get("task_id"), STATUS_AWAITING_CONFIRMATION, str(e))
+        return (STATUS_AWAITING_CONFIRMATION, str(e))
+
+
+@app.post("/v1/todo/execute", response_model=TodoExecuteResponse)
+async def todo_execute(
+    request: TodoExecuteRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Start task execution for the given todo task. Requires JWT. One active execution per user."""
+    user_key = current_user["username"]
+    status, message = await _task_execute_start(user_key, request.taskId, request.promptOverride)
+    return TodoExecuteResponse(status=status, message=message, taskId=request.taskId)
+
+
+@app.post("/v1/todo/execute/resume", response_model=TodoExecuteResponse)
+async def todo_execute_resume(
+    resume_request: TodoResumeRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Resume a paused task execution with user feedback. Requires JWT."""
+    user_key = current_user["username"]
+    state = task_execution_state.get(user_key)
+    status, message = await _task_execute_resume(user_key, resume_request.userMessage or "")
+    return TodoExecuteResponse(status=status, message=message, taskId=state.get("task_id") if state else None)
+
+
+@app.post("/v1/todo/{task_id}/complete", response_model=TodoListResponse)
+async def todo_task_complete(
+    task_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Human verification: mark task as complete and remove from list. Requires JWT."""
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        raise HTTPException(status_code=503, detail="Todo store is not available.")
+    user_key = current_user["username"]
+    task_execution_state.pop(user_key, None)
+    try:
+        _todo_store.delete_task(user_key, task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    meta = _todo_store.load_tasks_with_meta(user_key)
+    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+
+
+def _task_execute_cancel(user_key: str) -> tuple:
+    """Request cancel for current execution (soft cancel). Returns (ok, message)."""
+    state = task_execution_state.get(user_key)
+    if not state:
+        return (False, "No active execution to cancel.")
+    executor = state.get("executor")
+    if executor and hasattr(executor, "request_cancel"):
+        executor.request_cancel()
+        return (True, "Cancellation requested. The task will stop after the current step.")
+    task_execution_state.pop(user_key, None)
+    return (False, "No active execution to cancel.")
+
+
+def _task_execution_status(user_key: str) -> Optional[Dict[str, Any]]:
+    """Return current execution state for user_key, or None if none."""
+    state = task_execution_state.get(user_key)
+    if not state:
+        return None
+    return {"status": state.get("status"), "task_id": state.get("task_id"), "message": state.get("message")}
+
+
+@app.post("/v1/todo/execute/cancel", response_model=TodoExecuteResponse)
+async def todo_execute_cancel(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Cancel current task execution; task remains in list. Requires JWT."""
+    user_key = current_user["username"]
+    ok, msg = _task_execute_cancel(user_key)
+    task_id = task_execution_state.get(user_key, {}).get("task_id") if ok else None
+    return TodoExecuteResponse(status=STATUS_CANCELLED, message=msg, taskId=task_id)
+
+
+def _is_todo_list_query(message_text: str) -> bool:
+    """
+    Return True if the message is clearly asking for the current todo/task list.
+    Used to skip memory injection so the model uses manageTodoList tool instead of answering from memory.
+    """
+    if not message_text or len(message_text) > 500:
+        return False
+    lower = message_text.lower().strip()
+    # Phrases that indicate user wants current list (use tool), not memory-based answer
+    phrases = (
+        "what's on my todo",
+        "whats on my todo",
+        "what is on my todo",
+        "show my todo",
+        "list my todo",
+        "my todo list",
+        "show my tasks",
+        "list my tasks",
+        "what are my tasks",
+        "what's on my list",
+        "whats on my list",
+        "my tasks",
+        "my todos",
+    )
+    return any(p in lower for p in phrases)
+
+
 @app.post("/v1/telegram/chat", response_model=TelegramChatResponse)
 async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequest):
     """Process a Telegram chat message via OpenAI-compatible API."""
@@ -2101,6 +2499,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         )
 
     conversation_id = request.conversation_id or request.user_id or "default"
+    todo_user_key = _resolve_todo_user_for_telegram(conversation_id, request.user_id)
     history = telegram_conversations.setdefault(conversation_id, [])
 
     if request.history is not None:
@@ -2118,16 +2517,16 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     system_prompt = request.system_prompt
     if system_prompt is None:
         if TELEGRAM_TOOLS_ENABLED:
-            system_prompt = _get_telegram_system_prompt_with_tools(conversation_id)
+            system_prompt = _get_telegram_system_prompt_with_tools(conversation_id, todo_user_key=todo_user_key)
         else:
             system_prompt = _get_telegram_system_prompt_base()
 
     # Prepend assistant context (timezone + knowledge awareness)
     system_prompt = _get_assistant_context_block() + system_prompt
 
-    # Retrieve relevant memories if memory system is available
+    # Retrieve relevant memories if memory system is available (skip for todo-list queries so model uses manageTodoList tool)
     memory_context = ""
-    if MEMORY_AVAILABLE and memory_manager:
+    if MEMORY_AVAILABLE and memory_manager and not _is_todo_list_query(message_text):
         try:
             # Search for relevant memories based on the current message
             # Use a lower threshold (0.3) for automatic retrieval to catch more relevant memories
@@ -2247,6 +2646,11 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             tool_ctx = {
                 "conversation_id": conversation_id,
                 "user_id": request.user_id,
+                "todo_user_key": todo_user_key,
+                "task_execute_start": _task_execute_start,
+                "task_execute_resume": _task_execute_resume,
+                "task_execute_cancel": _task_execute_cancel,
+                "task_execution_status": _task_execution_status,
                 "todo_store": telegram_todo,
                 "memory_cache_store": telegram_memory_cache,
                 "do_search": _do_proxy_search,
@@ -2603,6 +3007,159 @@ async def get_all_available_tools() -> List[Dict]:
     else:
         print("[PHILOSOPHER] NEWS_API_KEY not configured, skipping news_search tool")
     
+    # 4. File manipulation tools (scratch directory only; when file ops available)
+    if FILE_OPS_AVAILABLE:
+        all_tools.append({
+            "name": "read_file",
+            "description": "Read a file from the scratch workspace. Supported: .txt, .docx, .xlsx, .xls, .pdf, .png, .jpg, .jpeg, .py, .js, .html. Use filename only (e.g. notes.txt), no path traversal.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Name of the file to read (e.g. notes.txt)",
+                    }
+                },
+                "required": ["filename"]
+            },
+            "server_id": "proxy_server"
+        })
+        all_tools.append({
+            "name": "write_file",
+            "description": "Write or overwrite a file in the scratch workspace. Supported: .txt, .docx, .xlsx, .xls, .pdf, .py, .js, .html. Use filename with extension or filename plus format.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Name of the file (e.g. report.txt or report with format)",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text content to write",
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "Format if filename has no extension (default: txt)",
+                        "default": "txt"
+                    }
+                },
+                "required": ["filename", "content"]
+            },
+            "server_id": "proxy_server"
+        })
+        all_tools.append({
+            "name": "list_files",
+            "description": "List all files in the scratch workspace with name, size, and modified time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+            "server_id": "proxy_server"
+        })
+        all_tools.append({
+            "name": "delete_file",
+            "description": "Delete a file from the scratch workspace. Use filename only (e.g. notes.txt).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Name of the file to delete",
+                    }
+                },
+                "required": ["filename"]
+            },
+            "server_id": "proxy_server"
+        })
+        print("[PHILOSOPHER] Added read_file, write_file, list_files, delete_file tools")
+    else:
+        print("[PHILOSOPHER] File ops not available, skipping file manipulation tools")
+    
+    # 5. runWorkflow (AutoGen team - code generation and automation)
+    if AUTOGEN_AVAILABLE:
+        all_tools.append({
+            "name": "runWorkflow",
+            "description": "Execute workflows for code generation and automation tasks using an AutoGen team. Use for tasks like building apps, generating code, or multi-step automation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contentPrompt": {
+                        "type": "string",
+                        "description": "The task to execute (e.g. 'build a javascript todo app', 'write a Python script that parses CSV')",
+                    }
+                },
+                "required": ["contentPrompt"]
+            },
+            "server_id": "proxy_server"
+        })
+        print("[PHILOSOPHER] Added runWorkflow tool")
+    else:
+        print("[PHILOSOPHER] AutoGen not available, skipping runWorkflow tool")
+    
+    # 6. run_browser_agent (standalone browser-use HTTP server; not tied to mcp_servers)
+    # Browser-use runs as a separate HTTP server (MCP_BROWSER_USE_HTTP_URL); add tool when URL is configured
+    run_browser_agent_tool = {
+        "name": "run_browser_agent",
+        "description": "Control a web browser using natural language commands. Executes browser automation tasks and returns results.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "instruction": {
+                    "type": "string",
+                    "description": "Natural language instruction for browser automation (e.g., 'Navigate to Google and search for cats')",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Maximum number of steps the agent should take",
+                    "default": 10
+                },
+                "use_vision": {
+                    "type": "boolean",
+                    "description": "Whether to use vision for understanding page content",
+                    "default": True
+                }
+            },
+            "required": ["instruction"]
+        },
+        "server_id": "proxy_server"
+    }
+    if MCP_BROWSER_USE_HTTP_URL:
+        all_tools.append(run_browser_agent_tool)
+        print(f"[PHILOSOPHER] Added run_browser_agent (standalone browser-use HTTP at {MCP_BROWSER_USE_HTTP_URL})")
+        # Deep research (same browser-use ecosystem; proxy forwards to MCP browser server on port 5001)
+        all_tools.append({
+            "name": "run_deep_research",
+            "description": "Performs comprehensive multi-step web research on a topic using multiple browser agents. Gathers information from many sources and returns a detailed research report with citations and findings. Use for in-depth research or comprehensive analysis requests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "research_task": {
+                        "type": "string",
+                        "description": "The research topic or question to investigate (e.g. 'What are the latest developments in quantum computing?', 'Compare the best electric vehicles available in 2024')",
+                    },
+                    "researchTask": {
+                        "type": "string",
+                        "description": "Same as research_task; the research topic or question.",
+                    },
+                    "max_parallel_browsers": {
+                        "type": "integer",
+                        "description": "Optional: maximum number of parallel browser instances (default 3, max 5)",
+                        "default": 3,
+                    },
+                    "maxParallelBrowsers": {
+                        "type": "integer",
+                        "description": "Optional: same as max_parallel_browsers",
+                    },
+                },
+                "required": [],
+            },
+            "server_id": "proxy_server"
+        })
+        print("[PHILOSOPHER] Added run_deep_research (deep research agent)")
+    else:
+        print("[PHILOSOPHER] MCP_BROWSER_USE_HTTP_URL not set, skipping run_browser_agent")
+    
     # Add MCP tools if MCP is available
     if MCP_AVAILABLE:
         # Debug: Check what servers are available
@@ -2610,41 +3167,18 @@ async def get_all_available_tools() -> List[Dict]:
         print(f"[PHILOSOPHER] Connected client IDs: {list(mcp_clients.keys())}")
         print(f"[PHILOSOPHER] Server IDs in mcp_servers: {list(mcp_servers.keys())}")
         
-        # First, check mcp_servers for connected browser-use servers
-        # (Browser-use servers are marked as connected but may not be in mcp_clients)
-        for server_id, server in mcp_servers.items():
-            server_status = server.get("status", "disconnected")
-            server_name = server.get("name", "").lower()
-            
-            # Check if this is a connected browser-use server
-            if server_status == "connected" and "mcp-browser-use" in server_name:
-                print(f"[PHILOSOPHER] Found connected browser-use server: {server_id}")
-                # Add browser automation tool
-                all_tools.append({
-                    "name": "run_browser_agent",
-                    "description": "Control a web browser using natural language commands. Executes browser automation tasks and returns results.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "instruction": {
-                                "type": "string",
-                                "description": "Natural language instruction for browser automation (e.g., 'Navigate to Google and search for cats')",
-                            },
-                            "max_steps": {
-                                "type": "integer",
-                                "description": "Maximum number of steps the agent should take",
-                                "default": 10
-                            },
-                            "use_vision": {
-                                "type": "boolean",
-                                "description": "Whether to use vision for understanding page content",
-                                "default": True
-                            }
-                        },
-                        "required": ["instruction"]
-                    },
-                    "server_id": server_id
-                })
+        # Optional: also add run_browser_agent from mcp_servers if user added browser-use as a server and connected it,
+        # and we did not already add it from MCP_BROWSER_USE_HTTP_URL (avoid duplicate)
+        if not MCP_BROWSER_USE_HTTP_URL:
+            for server_id, server in mcp_servers.items():
+                server_status = server.get("status", "disconnected")
+                if server_status == "connected" and _is_browser_use_server(server):
+                    print(f"[PHILOSOPHER] Found connected browser-use server in mcp_servers: {server_id}")
+                    all_tools.append({
+                        **run_browser_agent_tool,
+                        "server_id": server_id,
+                    })
+                    break  # only one browser-use
         
         # Get tools from each connected MCP client (non-browser-use servers)
         for server_id, client in mcp_clients.items():
@@ -2654,8 +3188,8 @@ async def get_all_available_tools() -> List[Dict]:
                 server = mcp_servers.get(server_id)
                 print(f"[PHILOSOPHER] Server config for {server_id}: {server}")
                 
-                if server and "mcp-browser-use" in server.get("name", "").lower():
-                    # Skip - already handled above
+                if server and _is_browser_use_server(server):
+                    # Skip - browser-use is added from MCP_BROWSER_USE_HTTP_URL or from mcp_servers above
                     print(f"[PHILOSOPHER] Skipping browser-use server {server_id} (already handled)")
                     continue
                 else:
@@ -2773,6 +3307,121 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             return f"Error executing news_search: {e.detail}"
         except Exception as e:
             return f"Error executing news_search: {str(e)}"
+    
+    # Handle file manipulation tools (scratch workspace)
+    elif tool_name == "read_file":
+        try:
+            filename = parameters.get("filename", "").strip()
+            if not filename:
+                return "Error: 'filename' is required for read_file"
+            result = await _read_file_internal(filename)
+            if not result.get("success"):
+                return result.get("message", "Read failed")
+            data = result.get("data", {})
+            content = data.get("content", "")
+            return content if content else "(empty file)"
+        except Exception as e:
+            return f"Error executing read_file: {str(e)}"
+    
+    elif tool_name == "write_file":
+        try:
+            filename = parameters.get("filename", "").strip()
+            content = parameters.get("content", "")
+            content = content if isinstance(content, str) else str(content)
+            fmt = (parameters.get("format") or "txt").strip() or "txt"
+            if not filename:
+                return "Error: 'filename' is required for write_file"
+            result = await _write_file_internal(filename, content, format=fmt)
+            if not result.get("success"):
+                return result.get("message", "Write failed")
+            return result.get("message", "File written.")
+        except Exception as e:
+            return f"Error executing write_file: {str(e)}"
+    
+    elif tool_name == "list_files":
+        try:
+            result = await _list_files_internal()
+            if not result.get("success"):
+                return result.get("message", "List failed")
+            files = result.get("files", [])
+            if not files:
+                return f"Scratch workspace is empty. (Directory: {result.get('scratch_dir', 'scratch')})"
+            lines = [f"{f.get('name', '?')} ({f.get('size', 0)} bytes)" for f in files]
+            return "Files in scratch workspace:\n" + "\n".join(lines)
+        except Exception as e:
+            return f"Error executing list_files: {str(e)}"
+    
+    elif tool_name == "delete_file":
+        try:
+            filename = parameters.get("filename", "").strip()
+            if not filename:
+                return "Error: 'filename' is required for delete_file"
+            result = await _delete_file_internal(filename)
+            if not result.get("success"):
+                return result.get("message", "Delete failed")
+            return result.get("message", "File deleted.")
+        except Exception as e:
+            return f"Error executing delete_file: {str(e)}"
+    
+    elif tool_name == "runWorkflow":
+        try:
+            content_prompt = (parameters.get("contentPrompt") or parameters.get("content_prompt") or "").strip()
+            if not content_prompt:
+                return "Error: 'contentPrompt' is required for runWorkflow"
+            if not AUTOGEN_AVAILABLE:
+                return "Error: Workflow (AutoGen) is not available."
+            result = await _do_autogen(content_prompt)
+            msg = result.get("output") or result.get("response") or str(result)
+            return msg
+        except HTTPException as e:
+            return f"Error executing runWorkflow: {e.detail}"
+        except Exception as e:
+            return f"Error executing runWorkflow: {str(e)}"
+    
+    # Handle run_browser_agent (standalone browser-use HTTP server; no mcp_servers entry required)
+    elif tool_name == "run_browser_agent":
+        if not MCP_BROWSER_USE_HTTP_URL:
+            return "Error: Browser-use is not configured (MCP_BROWSER_USE_HTTP_URL not set)."
+        try:
+            instruction = (parameters.get("instruction") or parameters.get("task") or "").strip()
+            if not instruction:
+                return "Error: 'instruction' is required for run_browser_agent"
+            result = await _browser_use_http_call_tool("run_browser_agent", parameters)
+            content = result.get("content", [])
+            if isinstance(content, list):
+                texts = [item.get("text", str(item)) for item in content if isinstance(item, dict)]
+                return "\n".join(texts) if texts else "Browser agent completed (no output)."
+            return str(content)
+        except Exception as e:
+            return f"Error executing run_browser_agent: {BROWSER_USE_HTTP_UNAVAILABLE_MSG} {str(e)}"
+    
+    # Handle run_deep_research (proxies to MCP browser server /api/deep-research on port 5001)
+    elif tool_name == "run_deep_research":
+        research_task = (parameters.get("research_task") or parameters.get("researchTask") or "").strip()
+        if not research_task:
+            return "Error: 'research_task' or 'researchTask' is required for run_deep_research."
+        max_parallel = parameters.get("max_parallel_browsers") or parameters.get("maxParallelBrowsers")
+        if max_parallel is not None:
+            try:
+                max_parallel = min(5, max(1, int(max_parallel)))
+            except (TypeError, ValueError):
+                max_parallel = 3
+        body = {"research_task": research_task}
+        if max_parallel is not None:
+            body["max_parallel_browsers"] = max_parallel
+        try:
+            result = await _do_deep_research(body)
+            # Flask returns { success, result, error }; proxy returns response.json()
+            report = result.get("result") or result.get("message") or result.get("output")
+            if report:
+                return str(report)
+            if not result.get("success", True) and result.get("error"):
+                return f"Deep research failed: {result.get('error')}"
+            return str(result)
+        except HTTPException as e:
+            return f"Error executing run_deep_research: {e.detail}"
+        except Exception as e:
+            return f"Error executing run_deep_research: {str(e)}"
     
     # Handle MCP tools
     elif MCP_AVAILABLE:
@@ -4061,6 +4710,22 @@ async def _list_files_internal() -> Dict[str, Any]:
         return {"success": True, "files": files, "count": len(files), "scratch_dir": str(SCRATCH_DIR)}
     except Exception as e:
         return {"success": False, "message": str(e), "files": []}
+
+
+async def _delete_file_internal(filename: str) -> Dict[str, Any]:
+    """Delete file from scratch dir. Returns dict with success, message. Used by philosopher and other server-side callers."""
+    if not FILE_OPS_AVAILABLE:
+        return {"success": False, "message": "File operations not available."}
+    try:
+        filepath = resolve_scratch_path(filename, READ_ALLOWED_EXTENSIONS)
+        if not filepath.exists():
+            return {"success": False, "message": f"File not found: {filename}"}
+        filepath.unlink()
+        return {"success": True, "message": f"Deleted {filename}"}
+    except HTTPException as e:
+        return {"success": False, "message": e.detail or "Invalid filename"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 
 @app.post("/v1/files/read", response_model=FileResponse)

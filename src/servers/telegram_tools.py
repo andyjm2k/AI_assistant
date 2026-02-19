@@ -1,6 +1,7 @@
 """
 Telegram tool parsing and execution for parity with the HTML client.
 Used only by the proxy Telegram chat endpoint; does not modify the web client.
+Todo list uses persistent todo_store when context provides todo_user_key.
 """
 
 import ast
@@ -8,6 +9,12 @@ import asyncio
 import json
 import re
 from typing import Any, Dict, List, Optional
+
+# Optional persistent todo store (used when todo_user_key is in context)
+try:
+    from src.servers import todo_store as _todo_store_module
+except ImportError:
+    _todo_store_module = None
 
 # Maximum length for calculate expression to avoid abuse
 CALC_EXPR_MAX_LEN = 200
@@ -18,8 +25,10 @@ CALC_ALLOWED_RE = re.compile(r"^[\d\s+\-*/().]+$")
 def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
     """
     Parse assistant content for a single tool call in the same format as the web client.
-    Looks for <tool>name</tool><parameters>{...}</parameters> at top-level (no leading/trailing text).
+    Looks for <tool>name</tool><parameters>{...}</parameters> or <tool_call>name</tool_call> variations.
     Strips fenced code blocks before matching so example snippets are not executed.
+    More lenient than before - extracts tool calls even if there's surrounding text (handles cases
+    where LLM outputs tool calls as text after task execution starts).
     Optionally supports JSON-style and contentPrompt fallbacks.
     Returns a dict with keys 'name' and 'arguments' (JSON string), or None if no valid tool call.
     """
@@ -27,20 +36,37 @@ def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
         return None
     # Strip fenced code blocks to avoid executing examples
     content_without_code = re.sub(r"```[\s\S]*?```", "", content)
-    # XML format: top-level only
+    # XML format: support both <tool> and <tool_call> tags (handle malformed XML where opening/closing tags differ)
+    # Try <tool> first (preferred format)
     tool_match = re.search(r"<tool>(.*?)</tool>", content_without_code)
+    if not tool_match:
+        # Fallback to <tool_call> if <tool> not found
+        tool_match = re.search(r"<tool_call>(.*?)</tool_call>", content_without_code)
+    if not tool_match:
+        # Also try mixed format: <tool_call>...</tool> (handle malformed XML)
+        tool_match = re.search(r"<tool_call>(.*?)</tool>", content_without_code)
+    if not tool_match:
+        # Or <tool>...</tool_call>
+        tool_match = re.search(r"<tool>(.*?)</tool_call>", content_without_code)
+    
     params_match = re.search(r"<parameters>([\s\S]*?)</parameters>", content_without_code)
     if tool_match and params_match:
         try:
-            leading = content_without_code[: tool_match.start()].strip()
-            trailing = content_without_code[params_match.end() :].strip()
-            if leading or trailing:
-                return None
+            # Extract tool call even if there's some surrounding text
+            # This handles cases where LLM outputs tool calls as text after task execution
             tool_name = tool_match.group(1).strip()
             params_str = params_match.group(1).strip()
+            # Validate that we have a valid tool name and parameters
+            if not tool_name:
+                return None
             params = json.loads(params_str)
+            # Return the parsed tool call regardless of surrounding text
+            # The strict leading/trailing check was too restrictive and prevented
+            # tool calls from being executed when LLM outputs them as text
             return {"name": tool_name, "arguments": json.dumps(params) if isinstance(params, dict) else params_str}
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError) as e:
+            # Log parsing errors for debugging
+            print(f"[TELEGRAM_TOOLS] Error parsing tool call: {e}")
             pass
     # JSON-style: content is JSON object
     trimmed = content.strip()
@@ -104,28 +130,32 @@ async def execute_telegram_tool(
     """
     Execute a single tool by name with the given arguments.
     context must include: conversation_id, and optionally:
-    - todo_store: Dict[str, list], memory_cache_store: Dict[str, list]
+    - todo_user_key: str (required for manageTodoList; uses persistent store only)
+    - memory_cache_store: Dict[str, list]
     - do_search, do_fetch, do_news, do_autogen, do_browser_agent, do_deep_research (async callables)
     - read_file_internal, write_file_internal, list_files_internal (callables)
     - upload_drive_internal (callable), memory_manager (object with store/search/list/delete)
     Returns a dict with success (bool), message (str), and optional data.
     """
     cid = context.get("conversation_id") or "default"
-    todo_store = context.get("todo_store") or {}
     memory_cache_store = context.get("memory_cache_store") or {}
-
-    def todo_list() -> List[str]:
-        return todo_store.setdefault(cid, [])
+    todo_user_key = context.get("todo_user_key")
 
     def mem_cache() -> List[str]:
         return memory_cache_store.setdefault(cid, [])
 
-    # --- manageTodoList ---
+    # --- manageTodoList --- (persistent store only; in-memory fallback disabled)
     if name == "manageTodoList":
         action = (arguments.get("action") or "").strip().lower()
         task_id = arguments.get("taskId")
         task_description = (arguments.get("taskDescription") or "").strip()
-        tasks = todo_list()
+        use_persistent = todo_user_key and _todo_store_module is not None
+        if not use_persistent:
+            return {
+                "success": False,
+                "message": "Todo list is not available (persistent store not configured). Please use the web app with sign-in or ensure the server has todo storage enabled.",
+            }
+        tasks = _todo_store_module.load_tasks(todo_user_key)
         if action == "list":
             if not tasks:
                 return {"success": True, "message": "Your todo list is empty."}
@@ -134,7 +164,7 @@ async def execute_telegram_tool(
         if action == "add":
             if not task_description:
                 return {"success": False, "message": "Task description is required."}
-            tasks.append(task_description)
+            _todo_store_module.add_task(todo_user_key, task_description)
             return {"success": True, "message": f"Added task: {task_description}"}
         if action == "update":
             if task_id is None or not task_description:
@@ -142,21 +172,75 @@ async def execute_telegram_tool(
             idx = int(task_id) if isinstance(task_id, (int, float)) else None
             if idx is None or idx < 1 or idx > len(tasks):
                 return {"success": False, "message": "Invalid task ID."}
-            old = tasks[idx - 1]
-            tasks[idx - 1] = task_description
-            return {"success": True, "message": f'Updated task {idx} from "{old}" to "{task_description}"'}
+            try:
+                _todo_store_module.update_task(todo_user_key, idx, task_description)
+            except ValueError:
+                return {"success": False, "message": "Invalid task ID."}
+            return {"success": True, "message": f'Updated task {idx} to "{task_description}"'}
         if action == "delete":
             if task_id is None:
                 return {"success": False, "message": "Task ID is required."}
             idx = int(task_id) if isinstance(task_id, (int, float)) else None
             if idx is None or idx < 1 or idx > len(tasks):
                 return {"success": False, "message": "Invalid task ID."}
-            deleted = tasks.pop(idx - 1)
-            return {"success": True, "message": f"Deleted task: {deleted}"}
+            try:
+                _todo_store_module.delete_task(todo_user_key, idx)
+            except ValueError:
+                return {"success": False, "message": "Invalid task ID."}
+            return {"success": True, "message": f"Deleted task {idx}."}
         if action == "clear":
-            tasks.clear()
+            _todo_store_module.clear_tasks(todo_user_key)
             return {"success": True, "message": "Todo list has been cleared."}
         return {"success": False, "message": "Invalid action."}
+
+    # --- executeTodoTask --- (start task execution; human must confirm to complete)
+    if name == "executeTodoTask":
+        task_id = arguments.get("taskId") or arguments.get("task_id")
+        prompt_override = arguments.get("promptOverride") or arguments.get("prompt_override") or ""
+        if task_id is None:
+            return {"success": False, "message": "Task ID is required."}
+        try:
+            tid = int(task_id) if isinstance(task_id, (int, float)) else int(str(task_id))
+        except (TypeError, ValueError):
+            return {"success": False, "message": "Invalid task ID."}
+        start_fn = context.get("task_execute_start")
+        if not start_fn:
+            return {"success": False, "message": "Task execution is not available."}
+        user_key = context.get("todo_user_key") or cid
+        try:
+            status, message = await start_fn(user_key, tid, (prompt_override or "").strip() or None)
+            return {"success": True, "message": message, "status": status}
+        except Exception as e:
+            msg = str(e)
+            if "409" in msg or "already active" in msg.lower():
+                return {"success": False, "message": "An execution is already active. Complete or cancel it first."}
+            if "400" in msg or "Invalid" in msg:
+                return {"success": False, "message": msg or "Invalid request."}
+            return {"success": False, "message": msg or "Task execution failed."}
+
+    # --- cancelTodoExecution --- (request soft cancel for current execution)
+    if name == "cancelTodoExecution":
+        cancel_fn = context.get("task_execute_cancel")
+        if not cancel_fn:
+            return {"success": False, "message": "Task execution cancel is not available."}
+        user_key = context.get("todo_user_key") or cid
+        ok, msg = cancel_fn(user_key)
+        return {"success": ok, "message": msg}
+
+    # --- getTodoExecutionStatus --- (return current execution status for user)
+    if name == "getTodoExecutionStatus":
+        status_fn = context.get("task_execution_status")
+        if not status_fn:
+            return {"success": True, "message": "No execution status available.", "data": None}
+        user_key = context.get("todo_user_key") or cid
+        state = status_fn(user_key)
+        if not state:
+            return {"success": True, "message": "No task is currently running or paused.", "data": None}
+        return {
+            "success": True,
+            "message": state.get("message") or f"Status: {state.get('status', 'unknown')}.",
+            "data": state,
+        }
 
     # --- manageMemoryCache ---
     if name == "manageMemoryCache":

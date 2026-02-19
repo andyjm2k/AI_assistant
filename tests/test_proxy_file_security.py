@@ -105,6 +105,20 @@ class TestResolveScratchPath:
         SCRATCH_DIR.resolve()
         result.resolve().relative_to(SCRATCH_DIR.resolve())
 
+    def test_scratch_py_js_html_read_allowed(self):
+        """Scratch directory allows .py, .js, .html for read (file management tools)."""
+        for name, ext in [("script.py", ".py"), ("app.js", ".js"), ("page.html", ".html")]:
+            result = resolve_scratch_path(name, READ_ALLOWED_EXTENSIONS)
+            assert result.suffix.lower() == ext
+            result.resolve().relative_to(SCRATCH_DIR.resolve())
+
+    def test_scratch_py_js_html_write_allowed(self):
+        """Scratch directory allows .py, .js, .html for write (file management tools)."""
+        for name, ext in [("script.py", ".py"), ("app.js", ".js"), ("page.html", ".html")]:
+            result = resolve_scratch_path(name, WRITE_ALLOWED_EXTENSIONS)
+            assert result.suffix.lower() == ext
+            result.resolve().relative_to(SCRATCH_DIR.resolve())
+
     def test_resolve_without_extension_allowlist_allows_any_extension(self):
         """When allowed_extensions is None, any extension is accepted (containment still enforced)."""
         # Still reject traversal

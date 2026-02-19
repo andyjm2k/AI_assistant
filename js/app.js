@@ -334,6 +334,7 @@
             setAuthToken(data.access_token);
             hideAuthOverlay();
             await runAppInitialization();
+            await fetchTodoListFromServer();
             return true;
         }
 
@@ -362,12 +363,12 @@
             if (appInitialized) return;
             appInitialized = true;
             try {
-                // Initialize variables from localStorage if available
+                // Initialize variables: todo from backend when authenticated, else localStorage fallback; memory from localStorage
                 try {
-                    todoList = JSON.parse(localStorage.getItem('todoList')) || [];
-                    memoryCache = JSON.parse(localStorage.getItem('memoryCache')) || [];
+                    await fetchTodoListFromServer();
+                    memoryCache = JSON.parse(localStorage.getItem('memoryCache') || storage.getItem('memoryCache')) || [];
                 } catch (storageError) {
-                    console.warn('Could not access localStorage:', storageError);
+                    console.warn('Could not load initial state:', storageError);
                     todoList = [];
                     memoryCache = [];
                 }
@@ -4340,9 +4341,37 @@ function saveWAVFile(wavBlob) {
         // Initialize storage
         storage.init();
 
-        // Storage helper functions
+        // Storage helper functions (saveTodoList used only when not using backend todo API)
         function saveTodoList() {
             storage.setItem('todoList', JSON.stringify(todoList));
+        }
+
+        // Fetch todo list from backend when authenticated; otherwise keep empty or localStorage fallback
+        async function fetchTodoListFromServer() {
+            if (!authToken) {
+                try {
+                    const saved = storage.getItem('todoList');
+                    if (saved) todoList = JSON.parse(saved);
+                    else todoList = [];
+                } catch (e) {
+                    todoList = [];
+                }
+                return;
+            }
+            try {
+                const res = await fetch(`${PROXY_BASE_URL}/v1/todo`, {
+                    headers: { 'Authorization': `Bearer ${authToken}` }
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    todoList = Array.isArray(data.tasks) ? data.tasks : [];
+                } else {
+                    todoList = [];
+                }
+            } catch (err) {
+                console.warn('Failed to fetch todo list from server:', err);
+                todoList = [];
+            }
         }
 
         function saveMemory() {
@@ -4744,18 +4773,14 @@ function saveWAVFile(wavBlob) {
         // Note: loadConversations() and event listeners are set up in DOMContentLoaded event
 
         try {
-            const savedTodoList = storage.getItem('todoList');
             const savedMemoryCache = storage.getItem('memoryCache');
-            
-            if (savedTodoList) {
-                todoList = JSON.parse(savedTodoList);
-            }
             if (savedMemoryCache) {
                 memoryCache = JSON.parse(savedMemoryCache);
             }
         } catch (error) {
             console.warn('Error loading from storage:', error);
         }
+        // Todo list is loaded from backend (or localStorage fallback) in fetchTodoListFromServer when runAppInitialization runs
 
         // Replace the ToolManager with OpenAI-style tool definitions
         const tools = [
@@ -4785,6 +4810,61 @@ function saveWAVFile(wavBlob) {
                         }
                     }
                 },
+            {
+                type: "function",
+                function: {
+                    name: "executeTodoTask",
+                    description: "Start execution of a todo task by number. The backend runs a bounded LLM+tools loop (search, files, etc.). Use when user says 'execute task N' or 'run task N'. You MUST call this with taskId set to the number the user said (1-based). If status is paused_awaiting_feedback, use resumeTodoExecution with the user's reply. If status is awaiting_confirmation, use completeTodoTask to mark it done when the user confirms.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            taskId: { type: "number", description: "1-based task index (required)" },
+                            promptOverride: { type: "string", description: "Optional goal for this run (e.g. 'research and compile a report on X')" }
+                        },
+                        required: ["taskId"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "resumeTodoExecution",
+                    description: "Resume a paused task execution after the user has provided feedback. Call when executeTodoTask returned status 'paused_awaiting_feedback' and the user has replied with their input.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            userMessage: { type: "string", description: "The user's feedback or answer to continue the task" }
+                        },
+                        required: ["userMessage"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "completeTodoTask",
+                    description: "Mark a todo task as complete and remove it from the list (human-in-the-loop). Call when executeTodoTask returned status 'awaiting_confirmation' and the user confirms they want to mark the task done.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            taskId: { type: "number", description: "1-based task index to mark complete (use the taskId from the execute response)" }
+                        },
+                        required: ["taskId"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "cancelTodoExecution",
+                    description: "Cancel the current task execution. The task stays on the list. Use when the user wants to stop the running execution or before starting another one if one is already active.",
+                    parameters: {
+                        type: "object",
+                        properties: {},
+                        required: []
+                    }
+                }
+            },
             {
                 type: "function",
                 function: {
@@ -5377,6 +5457,18 @@ function saveWAVFile(wavBlob) {
                     case "manageTodoList":
                         result = await handleTodoList(args);
                         break;
+                    case "executeTodoTask":
+                        result = await handleExecuteTodoTask(args);
+                        break;
+                    case "resumeTodoExecution":
+                        result = await handleResumeTodoExecution(args);
+                        break;
+                    case "completeTodoTask":
+                        result = await handleCompleteTodoTask(args);
+                        break;
+                    case "cancelTodoExecution":
+                        result = await handleCancelTodoExecution(args);
+                        break;
                     case "scrapeWebsite":
                         result = await handleWebScraping(args);
                         break;
@@ -5466,59 +5558,166 @@ function saveWAVFile(wavBlob) {
         }
 
 
-        // Individual tool handlers
+        // Individual tool handlers (todo uses REST API when authenticated, else local + localStorage)
         async function handleTodoList({ action, taskId, taskDescription }) {
-                    try {
-                        switch (action) {
-                            case "list":
-                                if (todoList.length === 0) {
-                            return { success: true, message: "Your todo list is empty." };
-                        }
-                        const taskList = todoList.map((task, index) => `${index + 1}. ${task}`).join('\n');
-                        return { success: true, message: "Here are your current tasks:\n" + taskList };
-
-                            case "add":
-                                if (!taskDescription) {
-                            return { success: false, message: "Task description is required." };
-                                }
-                                todoList.push(taskDescription);
-                        saveTodoList();
-                        return { success: true, message: `Added task: ${taskDescription}` };
-
-                            case "update":
-                                if (!taskId || !taskDescription) {
-                            return { success: false, message: "Both task ID and new description are required." };
-                                }
-                                if (taskId < 1 || taskId > todoList.length) {
-                            return { success: false, message: "Invalid task ID." };
-                                }
-                                const oldTask = todoList[taskId - 1];
-                                todoList[taskId - 1] = taskDescription;
-                        saveTodoList();
-                        return { success: true, message: `Updated task ${taskId} from "${oldTask}" to "${taskDescription}"` };
-
-                            case "delete":
-                                if (!taskId) {
-                            return { success: false, message: "Task ID is required." };
-                                }
-                                if (taskId < 1 || taskId > todoList.length) {
-                            return { success: false, message: "Invalid task ID." };
-                                }
-                                const deletedTask = todoList.splice(taskId - 1, 1)[0];
-                        saveTodoList();
-                        return { success: true, message: `Deleted task: ${deletedTask}` };
-
-                            case "clear":
-                                todoList = [];
-                        saveTodoList();
-                        return { success: true, message: "Todo list has been cleared." };
-
-                            default:
-                        return { success: false, message: "Invalid action." };
-                        }
-                    } catch (error) {
-                        console.error('Todo list operation error:', error);
+            const headers = { 'Content-Type': 'application/json' };
+            if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+            try {
+                if (authToken) {
+                    switch (action) {
+                        case "list":
+                            await fetchTodoListFromServer();
+                            if (todoList.length === 0) return { success: true, message: "Your todo list is empty." };
+                            const taskList = todoList.map((task, index) => `${index + 1}. ${task}`).join('\n');
+                            return { success: true, message: "Here are your current tasks:\n" + taskList };
+                        case "add":
+                            if (!taskDescription) return { success: false, message: "Task description is required." };
+                            const addRes = await fetch(`${PROXY_BASE_URL}/v1/todo`, {
+                                method: 'POST', headers,
+                                body: JSON.stringify({ taskDescription: taskDescription.trim() })
+                            });
+                            if (!addRes.ok) {
+                                const err = await addRes.json().catch(() => ({}));
+                                return { success: false, message: err.detail || addRes.statusText };
+                            }
+                            const addData = await addRes.json();
+                            todoList = addData.tasks || [];
+                            return { success: true, message: `Added task: ${taskDescription}` };
+                        case "update":
+                            if (!taskId || !taskDescription) return { success: false, message: "Both task ID and new description are required." };
+                            const updRes = await fetch(`${PROXY_BASE_URL}/v1/todo/${taskId}`, {
+                                method: 'PATCH', headers,
+                                body: JSON.stringify({ taskDescription: taskDescription.trim() })
+                            });
+                            if (!updRes.ok) {
+                                const err = await updRes.json().catch(() => ({}));
+                                return { success: false, message: err.detail || updRes.statusText };
+                            }
+                            const updData = await updRes.json();
+                            todoList = updData.tasks || [];
+                            return { success: true, message: `Updated task ${taskId} to "${taskDescription}"` };
+                        case "delete":
+                            if (!taskId) return { success: false, message: "Task ID is required." };
+                            const delRes = await fetch(`${PROXY_BASE_URL}/v1/todo/${taskId}`, { method: 'DELETE', headers });
+                            if (!delRes.ok) {
+                                const err = await delRes.json().catch(() => ({}));
+                                return { success: false, message: err.detail || delRes.statusText };
+                            }
+                            const delData = await delRes.json();
+                            todoList = delData.tasks || [];
+                            return { success: true, message: "Task deleted." };
+                        case "clear":
+                            const clearRes = await fetch(`${PROXY_BASE_URL}/v1/todo`, { method: 'DELETE', headers });
+                            if (!clearRes.ok) {
+                                const err = await clearRes.json().catch(() => ({}));
+                                return { success: false, message: err.detail || clearRes.statusText };
+                            }
+                            todoList = [];
+                            return { success: true, message: "Todo list has been cleared." };
+                        default:
+                            return { success: false, message: "Invalid action." };
+                    }
+                }
+                // Not authenticated: old localStorage path disabled; require sign-in for persistent todo
+                return { success: false, message: "Please sign in to use the todo list. Your tasks are stored when you're signed in." };
+            } catch (error) {
+                console.error('Todo list operation error:', error);
                 return { success: false, message: `Error: ${error.message}` };
+            }
+        }
+
+        async function handleExecuteTodoTask(args) {
+            // Normalize camelCase and snake_case (LLM may send either)
+            const taskId = args.taskId ?? args.task_id;
+            const promptOverride = (args.promptOverride ?? args.prompt_override ?? '').toString().trim() || null;
+            if (!authToken) return { success: false, message: "Please sign in to run task execution." };
+            if (taskId === undefined || taskId === null) return { success: false, message: "Task ID is required." };
+            try {
+                const res = await fetch(`${PROXY_BASE_URL}/v1/todo/execute`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                    body: JSON.stringify({ taskId: Number(taskId), promptOverride: promptOverride || null })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    // FastAPI validation returns detail as array; format readably
+                    const detail = data.detail;
+                    const message = Array.isArray(detail) && detail.length
+                        ? (detail[0].msg || detail[0].loc?.join('.') || JSON.stringify(detail[0]))
+                        : (typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : res.statusText));
+                    return { success: false, message: message };
+                }
+                return { success: true, message: data.message || "Execution started.", status: data.status, taskId: data.taskId };
+            } catch (err) {
+                return { success: false, message: err.message || "Task execution failed." };
+            }
+        }
+
+        async function handleResumeTodoExecution(args) {
+            const userMessage = (args.userMessage ?? args.user_message ?? '').toString().trim();
+            if (!authToken) return { success: false, message: "Please sign in to resume task execution." };
+            if (!userMessage) return { success: false, message: "userMessage is required to resume." };
+            try {
+                const res = await fetch(`${PROXY_BASE_URL}/v1/todo/execute/resume`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+                    body: JSON.stringify({ userMessage })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    const detail = data.detail;
+                    const message = Array.isArray(detail) && detail.length
+                        ? (detail[0].msg || detail[0].loc?.join('.') || JSON.stringify(detail[0]))
+                        : (typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : res.statusText));
+                    return { success: false, message: message };
+                }
+                return { success: true, message: data.message || "Resumed.", status: data.status, taskId: data.taskId };
+            } catch (err) {
+                return { success: false, message: err.message || "Resume failed." };
+            }
+        }
+
+        async function handleCompleteTodoTask(args) {
+            const taskId = args.taskId ?? args.task_id;
+            if (!authToken) return { success: false, message: "Please sign in to mark a task complete." };
+            if (taskId === undefined || taskId === null) return { success: false, message: "taskId is required." };
+            try {
+                const res = await fetch(`${PROXY_BASE_URL}/v1/todo/${Number(taskId)}/complete`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` }
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    const detail = data.detail;
+                    const message = Array.isArray(detail) && detail.length
+                        ? (detail[0].msg || detail[0].loc?.join('.') || JSON.stringify(detail[0]))
+                        : (typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : res.statusText));
+                    return { success: false, message: message };
+                }
+                return { success: true, message: "Task marked complete and removed from the list.", tasks: data.tasks };
+            } catch (err) {
+                return { success: false, message: err.message || "Complete failed." };
+            }
+        }
+
+        async function handleCancelTodoExecution() {
+            if (!authToken) return { success: false, message: "Please sign in to cancel task execution." };
+            try {
+                const res = await fetch(`${PROXY_BASE_URL}/v1/todo/execute/cancel`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` }
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    const detail = data.detail;
+                    const message = Array.isArray(detail) && detail.length
+                        ? (detail[0].msg || detail[0].loc?.join('.') || JSON.stringify(detail[0]))
+                        : (typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : res.statusText));
+                    return { success: false, message: message };
+                }
+                return { success: true, message: data.message || "Execution cancelled." };
+            } catch (err) {
+                return { success: false, message: err.message || "Cancel failed." };
             }
         }
 
@@ -6080,7 +6279,8 @@ function saveWAVFile(wavBlob) {
                 : content;
 
             // Try XML format first, but only if tags appear at top-level content
-            const toolMatch = contentWithoutCode.match(/<tool>(.*?)<\/tool>/);
+            // Support both <tool> and <tool_call> tags (handle malformed XML where opening/closing tags differ)
+            const toolMatch = contentWithoutCode.match(/<(?:tool|tool_call)>(.*?)<\/(?:tool|tool_call)>/);
             const paramsMatch = contentWithoutCode.match(/<parameters>([\s\S]*?)<\/parameters>/);
             
             if (toolMatch && paramsMatch) {
@@ -6781,7 +6981,7 @@ Parameters:
 }
 
 12. readFile
-Description: Reads a file from the scratch directory. Supports txt, docx, xlsx, pdf, and png formats.
+Description: Reads a file from the scratch directory. Supports txt, docx, xlsx, pdf, png, py, js, and html formats.
 Parameters:
 {
     "filename": "string (name of the file to read from the scratch directory)"
@@ -6794,7 +6994,7 @@ Parameters:
 }
 
 14. writeFile
-Description: Writes content to a file in the scratch directory. Supports txt, docx, xlsx, and pdf formats.
+Description: Writes content to a file in the scratch directory. Supports txt, docx, xlsx, pdf, py, js, and html formats.
 Parameters:
 {
     "filename": "string (name of the file to write)",
@@ -6947,10 +7147,11 @@ ${memoryCache.map((item, index) => `${index + 1}. ${item}`).join('\n')}`;
             // Preserve existing system prompt by default; user input overrides it
             let effectiveSystemPrompt = systemPromptInput.value.trim() || systemPrompt;
             
-            // Prepend context: timezone and knowledge-gap awareness (always applies)
+            // Prepend context: timezone, knowledge-gap awareness, and todo execution rules (always applies)
             const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
             const contextBlock = `Context: You are running in timezone ${userTimezone}. Use this when interpreting dates/times unless the user specifies otherwise.
 Knowledge awareness: Your training has a cutoff. Acknowledge your knowledge gap; do not assume the current year or recent events. When the user provides current facts, corrections, or information that differs from your training (e.g., "it's 2025 now", "that API changed"), accept them as authoritative and do not contradict them.
+Todo execution: When the user asks to execute a todo task by number (e.g. "execute task 2", "run task 3"), you MUST call executeTodoTask with taskId set to that number—do not only describe steps. If the result has status "paused_awaiting_feedback", ask the user for their input and then call resumeTodoExecution with their message. If the result has status "awaiting_confirmation", tell the user the task is done and call completeTodoTask with the taskId from the result when they confirm. If they get "already active", only one execution runs at a time—suggest cancelTodoExecution or waiting.
 
 `;
             effectiveSystemPrompt = contextBlock + effectiveSystemPrompt;

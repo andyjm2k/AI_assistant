@@ -359,6 +359,10 @@ Key environment variables (see `config/mcp_config.env.example` for complete list
 - `TELEGRAM_TOOLS_MAX_ITERATIONS`: Max tool-loop iterations per message (default: 5)
 - When tools are enabled, the following are used by specific tools if set (same as web UI): `BRAVE_API_KEY` (webSearch; else DuckDuckGo), `NEWS_API_KEY` (fetchNews), `GOOGLE_DRIVE_*` (uploadToGoogleDrive), memory/vector-store settings for store/search/list/delete memories. File tools use the proxy scratch directory; runWorkflow uses AutoGen/team-config.
 
+**Todo list (persistent, per user):** The todo list is stored in backend file storage (`todo_data/` by default, or `TODO_DATA_PATH`) per authenticated user. The web UI requires sign-in to load/save todo; tools (manageTodoList, executeTodoTask) call the proxy REST API. Telegram uses the same backend; optional **Telegram account linking** via `config/telegram_user_links.json` (mapping Telegram user ID or conversation ID to app username) lets the same todo list be shared between browser and Telegram. Without linking, Telegram uses a persistent per-chat list keyed by conversation ID.
+
+**Task Execution:** Users can say "execute task N" or "execute task N. &lt;prompt&gt;" to run a bounded LLM+tools loop on a todo item. The task is **never** auto-removed; a human must confirm completion (human-in-the-loop). Execution can pause for feedback. Configure `TASK_EXECUTION_MAX_ITERATIONS` (default 20) in `.env`. Available from both the HTML page and Telegram when tools are enabled.
+
 **System prompt / rules:** To use the same system context and rules as the web UI, put your prompt in `config/catbot_system_prompt.txt`. The proxy uses this file for Telegram when it exists (overrides `TELEGRAM_SYSTEM_PROMPT` env). A default file is included. See "Telegram tools" below for available tools and limitations when `TELEGRAM_TOOLS_ENABLED=true`.
 
 See `config/telegram_env_example.txt` for the full list and examples.
@@ -503,6 +507,19 @@ All services are configured to accept connections from devices on your local net
 - `GET /v1/files/list` - List all files in scratch directory
 - `DELETE /v1/files/delete/{filename}` - Delete a file from scratch directory
 
+**Todo list (all require authentication: `Authorization: Bearer <JWT>`):**
+- `GET /v1/todo` - List current user's tasks
+- `POST /v1/todo` - Add task (body: `{"taskDescription": "..."}`)
+- `PATCH /v1/todo/{task_id}` - Update task (body: `{"taskDescription": "..."}`)
+- `DELETE /v1/todo/{task_id}` - Delete task
+- `DELETE /v1/todo` - Clear all tasks
+
+**Task Execution (all require authentication):**
+- `POST /v1/todo/execute` - Start execution for a task (body: `{"taskId": 1, "promptOverride": "optional"}`)
+- `POST /v1/todo/execute/resume` - Resume paused execution (body: `{"userMessage": "..."}`)
+- `POST /v1/todo/{task_id}/complete` - Human verification: mark task complete and remove from list
+- `POST /v1/todo/execute/cancel` - Cancel current execution (task remains in list)
+
 **Utility:**
 - `GET /health` - Health check endpoint
 - `GET /test` - Simple test endpoint
@@ -572,7 +589,7 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 **Telegram tools (optional):**  
 Set `TELEGRAM_TOOLS_ENABLED=true` in the proxy environment to enable the same tool set as the web client. When enabled, the model can use tools (e.g. web search, read/write files in scratch, todo list, memory cache, workflows, news, calculate, store/search memories). The proxy parses `<tool>...</tool><parameters>...</parameters>` from the model reply, executes the tool server-side, and sends the result back to the model for a natural-language reply.
 
-- **Available in Telegram:** manageTodoList, manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message).
+- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked).
 - **Web-only in Telegram:** PDF to PowerPoint (`pdfToPowerPoint`) — the proxy returns a message directing the user to the CATBot web interface for this feature.
 - **Config:** `config/catbot_system_prompt_with_tools.txt` (included) defines the tool list and format; placeholders `{{MEMORY_CACHE}}` and `{{TODO_LIST}}` are filled per conversation. Max tool-loop iterations per message: `TELEGRAM_TOOLS_MAX_ITERATIONS` (default 5).
 
@@ -736,6 +753,10 @@ Install all Python dependencies with: `pip install -r requirements.txt`
    - Proxy server includes CORS middleware - ensure it's running
    - Check that requests are going to the correct port (8002 for proxy, 5001 for MCP browser server)
    - Verify browser console for specific CORS error messages
+
+10. **Todo list not syncing / Task execution not starting**
+   - **Todo:** Ensure you are signed in (JWT). Todo is stored per user in `todo_data/` (or `TODO_DATA_PATH`). For Telegram, use `config/telegram_user_links.json` to link your Telegram user ID to your app username so the same list appears in the web UI—see **config/TELEGRAM_TODO_LINK.md** for step-by-step instructions (get your Telegram ID with `/status` in the bot).
+   - **Task execution:** All todo/execution endpoints require authentication (Bearer token). Only one execution can be active per user; complete or cancel the current one before starting another. Set `TASK_EXECUTION_MAX_ITERATIONS` in `.env` if you need a higher iteration limit (default 20).
 
 ### Getting Help
 

@@ -74,17 +74,91 @@ class TestExecuteTelegramTool:
     """Tests for execute_telegram_tool (async) with mocked dependencies."""
 
     @pytest.mark.asyncio
-    async def test_manage_todo_list_add_and_list(self):
-        """manageTodoList add returns success; list with pre-populated store returns items."""
-        ctx = {"conversation_id": "cid1", "todo_store": {}, "memory_cache_store": {}}
-        r1 = await tg.execute_telegram_tool("manageTodoList", {"action": "add", "taskDescription": "Buy milk"}, ctx)
+    async def test_manage_todo_list_requires_persistent_store(self):
+        """manageTodoList without todo_user_key returns failure (old in-memory path disabled)."""
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}}
+        r = await tg.execute_telegram_tool("manageTodoList", {"action": "add", "taskDescription": "Buy milk"}, ctx)
+        assert r.get("success") is False
+        assert "not available" in r.get("message", "").lower() or "persistent" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_manage_todo_list_add_and_list_with_persistent_store(self):
+        """manageTodoList with todo_user_key and todo_store module uses persistent store."""
+        mock_store = MagicMock()
+        mock_store.load_tasks.return_value = []
+        ctx = {
+            "conversation_id": "cid1",
+            "todo_user_key": "user1",
+            "memory_cache_store": {},
+        }
+        with patch.object(tg, "_todo_store_module", mock_store):
+            r1 = await tg.execute_telegram_tool(
+                "manageTodoList", {"action": "add", "taskDescription": "Buy milk"}, ctx
+            )
         assert r1.get("success") is True
         assert "Added task" in r1.get("message", "")
-        # List with pre-populated store (same conversation_id) to verify list path
-        ctx["todo_store"]["cid1"] = ["Buy milk"]
-        r2 = await tg.execute_telegram_tool("manageTodoList", {"action": "list"}, ctx)
+        mock_store.add_task.assert_called_once_with("user1", "Buy milk")
+        # List: load_tasks returns the task
+        mock_store.load_tasks.return_value = ["Buy milk"]
+        with patch.object(tg, "_todo_store_module", mock_store):
+            r2 = await tg.execute_telegram_tool("manageTodoList", {"action": "list"}, ctx)
         assert r2.get("success") is True
         assert "Buy milk" in r2.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_execute_todo_task_requires_task_id(self):
+        """executeTodoTask without taskId returns failure."""
+        ctx = {"conversation_id": "c1", "todo_user_key": "u1", "task_execute_start": None}
+        r = await tg.execute_telegram_tool("executeTodoTask", {}, ctx)
+        assert r.get("success") is False
+        assert "Task ID" in r.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_execute_todo_task_calls_start_when_available(self):
+        """executeTodoTask with task_execute_start in context calls it."""
+        async def mock_start(user_key, task_id, prompt_override):
+            return ("executing", "Task execution started. Ask me for status or to cancel.")
+        ctx = {"conversation_id": "c1", "todo_user_key": "u1", "task_execute_start": mock_start}
+        r = await tg.execute_telegram_tool("executeTodoTask", {"taskId": 1}, ctx)
+        assert r.get("success") is True
+        assert r.get("status") == "executing"
+        assert "started" in r.get("message", "").lower() or "status" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_cancel_todo_execution_no_cancel_fn_returns_unavailable(self):
+        """cancelTodoExecution when task_execute_cancel not in context returns unavailable."""
+        ctx = {"conversation_id": "c1", "todo_user_key": "u1"}
+        r = await tg.execute_telegram_tool("cancelTodoExecution", {}, ctx)
+        assert r.get("success") is False
+        assert "not available" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_cancel_todo_execution_calls_cancel_fn(self):
+        """cancelTodoExecution with task_execute_cancel in context calls it and returns message."""
+        def mock_cancel(user_key):
+            return (True, "Cancellation requested. The task will stop after the current step.")
+        ctx = {"conversation_id": "c1", "todo_user_key": "u1", "task_execute_cancel": mock_cancel}
+        r = await tg.execute_telegram_tool("cancelTodoExecution", {}, ctx)
+        assert r.get("success") is True
+        assert "Cancellation" in r.get("message", "") or "stop" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_get_todo_execution_status_no_status_fn_returns_message(self):
+        """getTodoExecutionStatus when task_execution_status not in context returns no status."""
+        ctx = {"conversation_id": "c1", "todo_user_key": "u1"}
+        r = await tg.execute_telegram_tool("getTodoExecutionStatus", {}, ctx)
+        assert r.get("success") is True
+        assert r.get("data") is None
+
+    @pytest.mark.asyncio
+    async def test_get_todo_execution_status_returns_state_when_running(self):
+        """getTodoExecutionStatus with status fn returns current state when running."""
+        def mock_status(user_key):
+            return {"status": "executing", "task_id": 1, "message": "Working on it."}
+        ctx = {"conversation_id": "c1", "todo_user_key": "u1", "task_execution_status": mock_status}
+        r = await tg.execute_telegram_tool("getTodoExecutionStatus", {}, ctx)
+        assert r.get("success") is True
+        assert r.get("data") == {"status": "executing", "task_id": 1, "message": "Working on it."}
 
     @pytest.mark.asyncio
     async def test_manage_memory_cache_add_and_list(self):
