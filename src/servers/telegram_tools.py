@@ -92,6 +92,34 @@ def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def reply_looks_like_tool_call(content: str) -> bool:
+    """
+    Return True if content looks like raw tool-call XML and should not be shown to the user.
+    Used to fall back to tool result when the LLM returns only a tool call and no final text.
+    """
+    if not content or not isinstance(content, str):
+        return False
+    # Quick check: contains both tool tag and parameters tag (raw XML we never want to send to user)
+    return "<tool>" in content and "<parameters>" in content
+
+
+def tool_result_looks_like_error(message: str) -> bool:
+    """
+    Return True if a tool result message looks like an error and should not be shown raw to the user.
+    Used to show a friendly fallback in Telegram when a tool failed (e.g. 404, 500, fetch failed).
+    """
+    if not message or not isinstance(message, str):
+        return False
+    lower = message.strip().lower()
+    if "500:" in message or "404" in message or "403" in message:
+        return True
+    if "failed to fetch" in lower or "client error" in lower or "not found" in lower:
+        return True
+    if "http status" in lower or "connection error" in lower or "timeout" in lower:
+        return True
+    return False
+
+
 def _safe_calculate(expression: str) -> Optional[float]:
     """
     Evaluate a simple math expression safely. Only allows numbers and + - * / ( ).
@@ -314,12 +342,25 @@ async def execute_telegram_tool(
         do_fetch = context.get("do_fetch")
         if not do_fetch:
             return {"success": False, "message": "Web fetch is not available."}
+        # Accept single url or list urls; try each until one succeeds (scrape-with-retry)
         url = (arguments.get("url") or "").strip()
-        if not url:
-            return {"success": False, "message": "URL is required."}
-        out = await do_fetch(url)
-        content = (out.get("content") or "")[:4000]
-        return {"success": True, "message": f"Fetched content (snippet):\n{content}", "data": out}
+        urls_arg = arguments.get("urls")
+        if isinstance(urls_arg, list):
+            url_list = [u.strip() for u in urls_arg if u and isinstance(u, str) and u.strip()]
+        else:
+            url_list = [url] if url else []
+        if not url_list:
+            return {"success": False, "message": "URL or urls is required."}
+        last_error: Optional[str] = None
+        for one_url in url_list:
+            try:
+                out = await do_fetch(one_url)
+                content = (out.get("content") or "")[:4000]
+                return {"success": True, "message": f"Fetched content (snippet):\n{content}", "data": out}
+            except Exception as e:
+                last_error = str(e)
+                continue
+        return {"success": False, "message": last_error or "Failed to fetch any URL."}
 
     # --- webSearch ---
     if name == "webSearch":
@@ -331,7 +372,11 @@ async def execute_telegram_tool(
             return {"success": False, "message": "Query is required."}
         data = await do_search(query)
         results = data.get("results") or []
-        lines = [f"- {r.get('title', '')}: {r.get('snippet', '')}" for r in results[:5]]
+        # Include URL in each line so the model can pass them to scrapeWebsite (e.g. urls array for retry)
+        lines = [
+            f"- {r.get('title', '')}: {r.get('snippet', '')} | URL: {r.get('url', '')}"
+            for r in results[:5]
+        ]
         return {"success": True, "message": "Search results:\n" + "\n".join(lines) if lines else "No results.", "data": data}
 
     # --- fetchNews ---

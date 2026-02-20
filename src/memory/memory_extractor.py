@@ -64,14 +64,14 @@ class MemoryExtractor:
     async def extract_memories(
         self,
         messages: List[Dict[str, str]],
-        max_memories: int = 5,
+        max_memories: int = 3,
     ) -> List[Dict]:
         """
         Extract important memories from a conversation.
 
         Args:
             messages: List of conversation messages (role/content format)
-            max_memories: Maximum number of memories to extract
+            max_memories: Maximum number of memories to extract (at most; often 0)
 
         Returns:
             List of memory dictionaries with text, category, and confidence
@@ -86,42 +86,49 @@ class MemoryExtractor:
         # Build extraction prompt
         conversation_text = self._format_conversation(messages)
         
-        extraction_prompt = f"""Analyze the following conversation and identify important information about the user that should be remembered for future conversations.
+        extraction_prompt = f"""Analyze the following conversation and identify information about the user that is genuinely important to remember for future conversations.
 
-Focus on:
-- User preferences (likes, dislikes, preferences)
-- User habits (daily routines, work patterns, behaviors)
-- Facts about the user (location, occupation, interests)
-- User needs (goals, problems, requirements)
-- Relationships (people, pets, organizations mentioned)
+What counts as "important":
+- Something the USER explicitly said about themselves: preferences, situation, relationships, or needs
+- Specific and likely to be useful in future chats (e.g. "User prefers dark mode", "User lives in London")
+- Durable facts, not one-off context (e.g. avoid "User is working on X today" unless it reflects an ongoing need)
 
-Extract up to {max_memories} important pieces of information. For each, provide:
-1. A concise statement to remember (1-2 sentences)
-2. Category (preference, habit, fact, need, or relationship)
-3. Confidence level (high, medium, low)
+Do NOT include:
+- Inferred or vague observations the user did not state
+- One-off task context, small talk, or politeness ("thanks", "ok")
+- Generic statements or advice that could apply to anyone
+- Anything you are unsure about; when in doubt, omit it
 
-Format your response as JSON array:
-[
-  {{
-    "text": "User prefers dark mode interfaces",
-    "category": "preference",
-    "confidence": "high"
-  }},
-  ...
-]
+Categories (only if you extract): preference, habit, fact, need, relationship.
+
+Extract at most {max_memories} items. Often there will be zero. If nothing in this conversation meets the bar above, respond with an empty array: []
+
+For each item you do extract, provide:
+1. "text": concise statement (1-2 sentences)
+2. "category": one of preference, habit, fact, need, relationship
+3. "confidence": use "high" only when the user clearly stated it; otherwise "medium" or "low"
+
+Respond with a JSON array only, e.g. [] or [{{"text": "...", "category": "...", "confidence": "high"}}].
 
 Conversation:
 {conversation_text}
 
 JSON:"""
 
+        # System message: allow empty array and stress selectivity
+        system_content = (
+            "You are a memory extraction system. You output a JSON array of memories. "
+            "Return an empty array [] when nothing in the conversation is important enough to remember. "
+            "Do not try to fill the list; it is better to return nothing than to store low-value items. "
+            "Always respond with valid JSON only (a single array, or an object containing an array under 'memories' or 'items')."
+        )
         # Prepare request payload
         payload = {
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a memory extraction system. Extract important information from conversations in JSON format. Always respond with valid JSON only."
+                    "content": system_content
                 },
                 {
                     "role": "user",

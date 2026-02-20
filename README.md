@@ -480,7 +480,8 @@ All services are configured to accept connections from devices on your local net
 #### Proxy Server Endpoints (Port 8002)
 
 **Web Operations:**
-- `GET /v1/proxy/fetch` - Fetch web content from a URL
+- `GET /v1/proxy/fetch` - Fetch web content from a URL (query param)
+- `POST /v1/proxy/fetch` - Fetch web content; body: `{"url": "..."}` or `{"urls": ["...", "..."]}`. When `urls` is provided, the server tries each URL in order until one succeeds (scrape-with-retry), e.g. after a web search.
 - `GET /v1/proxy/search` - Perform web search (Brave Search or DuckDuckGo fallback)
 
 **AI & Chat:**
@@ -589,7 +590,7 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 **Telegram tools (optional):**  
 Set `TELEGRAM_TOOLS_ENABLED=true` in the proxy environment to enable the same tool set as the web client. When enabled, the model can use tools (e.g. web search, read/write files in scratch, todo list, memory cache, workflows, news, calculate, store/search memories). The proxy parses `<tool>...</tool><parameters>...</parameters>` from the model reply, executes the tool server-side, and sends the result back to the model for a natural-language reply.
 
-- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked).
+- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). The same optional `urls` behaviour is supported in the web (HTML) client.
 - **Web-only in Telegram:** PDF to PowerPoint (`pdfToPowerPoint`) — the proxy returns a message directing the user to the CATBot web interface for this feature.
 - **Config:** `config/catbot_system_prompt_with_tools.txt` (included) defines the tool list and format; placeholders `{{MEMORY_CACHE}}` and `{{TODO_LIST}}` are filled per conversation. Max tool-loop iterations per message: `TELEGRAM_TOOLS_MAX_ITERATIONS` (default 5).
 

@@ -4890,16 +4890,20 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "scrapeWebsite",
-                    description: "Fetches and summarizes content from a website",
+                    description: "Fetches and summarizes content from a website. Pass one url or multiple urls to try in order until one succeeds (scrape-with-retry).",
                     parameters: {
                         type: "object",
                         properties: {
                             url: {
                                 type: "string",
-                                description: "The URL of the website to scrape (must include http:// or https://)"
+                                description: "Single URL to scrape (must include http:// or https://)"
+                            },
+                            urls: {
+                                type: "array",
+                                items: { type: "string" },
+                                description: "Optional list of URLs to try in order; first successful fetch is returned (use after webSearch to retry on failure)"
                             }
-                        },
-                        required: ["url"]
+                        }
                     }
                 }
             },
@@ -6116,19 +6120,32 @@ function saveWAVFile(wavBlob) {
             }
         }
 
-        // Add this new handler function for web scraping
-        async function handleWebScraping({ url }) {
+        // Add this new handler function for web scraping (supports single url or urls[] for retry)
+        async function handleWebScraping({ url, urls }) {
             try {
-                // Reject 'pending' or invalid URLs so chain step fails clearly instead of throwing
-                if (!url || url === 'pending' || !url.startsWith('http')) {
+                // Build list: single url or urls array; filter invalid
+                const urlList = [];
+                if (url && url !== 'pending' && typeof url === 'string' && url.startsWith('http')) {
+                    urlList.push(url);
+                }
+                if (Array.isArray(urls)) {
+                    urls.forEach(u => {
+                        if (u && typeof u === 'string' && u.startsWith('http') && u !== 'pending') {
+                            urlList.push(u);
+                        }
+                    });
+                }
+                // Dedupe while preserving order
+                const toTry = [...new Set(urlList)];
+                if (toTry.length === 0) {
                     return {
                         success: false,
-                        message: 'No URL available from previous step. Run a web search first, or specify a URL to scrape.'
+                        message: 'No URL available from previous step. Run a web search first, or specify a URL (or urls array) to scrape.'
                     };
                 }
-                const urlObj = new URL(url);
-                // Use POST for proxy fetch to avoid URL length limits on iOS Safari and improve reliability
+                // Use POST for proxy fetch; proxy tries each URL until one succeeds when urls[] is sent
                 const proxyUrl = `${PROXY_BASE_URL}/v1/proxy/fetch`;
+                const body = toTry.length === 1 ? { url: toTry[0] } : { urls: toTry };
                 const response = await fetch(proxyUrl, {
                     method: 'POST',
                     headers: {
@@ -6136,7 +6153,7 @@ function saveWAVFile(wavBlob) {
                         'Accept': 'application/json',
                         'Authorization': `Bearer ${authToken}`
                     },
-                    body: JSON.stringify({ url: url })
+                    body: JSON.stringify(body)
                 });
 
                 if (!response.ok) {
@@ -6188,10 +6205,11 @@ function saveWAVFile(wavBlob) {
                 const summaryData = await summaryResponse.json();
                 if (summaryData.choices && summaryData.choices.length > 0) {
                     const summary = summaryData.choices[0].message.content;
-                            return { 
-                                success: true, 
-                        message: `Summary of ${url}:\n\n${summary}` 
-                            };
+                    const urlLabel = toTry.length === 1 ? toTry[0] : toTry[0] + (toTry.length > 1 ? ` (first of ${toTry.length} URLs)` : '');
+                    return {
+                        success: true,
+                        message: `Summary of ${urlLabel}:\n\n${summary}`
+                    };
                 } else {
                     throw new Error('Failed to generate summary');
                         }

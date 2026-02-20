@@ -332,7 +332,8 @@ class CompanionResponse(BaseModel):
 
 class ProxyFetchRequest(BaseModel):
     """Request body for POST /v1/proxy/fetch (avoids URL length limits on iOS Safari)."""
-    url: str
+    url: Optional[str] = None
+    urls: Optional[List[str]] = None  # Optional list: try each until one succeeds (scrape-with-retry)
 
 
 # Project root (two levels up from src/servers/proxy_server.py)
@@ -1393,16 +1394,30 @@ async def proxy_fetch_get(url: str, request: Request):
 
 @app.post("/v1/proxy/fetch")
 async def proxy_fetch_post(body: ProxyFetchRequest, request: Request):
-    """Fetch web content via POST body. Avoids URL length limits on iOS Safari."""
-    try:
-        result = await _do_proxy_fetch(body.url)
-        cors = build_cors_headers(request)
-        return JSONResponse(content=result, headers=cors)
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Proxy fetch error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch content: {str(e)}")
+    """Fetch web content via POST body. Use url (single) or urls (list); if urls, try each until one succeeds."""
+    # Build list: prefer urls if non-empty, else single url
+    to_try: List[str] = []
+    if body.urls:
+        to_try = [u.strip() for u in body.urls if u and isinstance(u, str) and u.strip()]
+    if not to_try and body.url:
+        to_try = [body.url.strip()]
+    if not to_try:
+        raise HTTPException(status_code=400, detail="Either 'url' or 'urls' is required")
+    last_error: Optional[Exception] = None
+    for one_url in to_try:
+        try:
+            result = await _do_proxy_fetch(one_url)
+            cors = build_cors_headers(request)
+            return JSONResponse(content=result, headers=cors)
+        except HTTPException:
+            raise
+        except Exception as e:
+            last_error = e
+            print(f"Proxy fetch failed for {one_url[:60]}...: {e}")
+            continue
+    if last_error:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch content: {str(last_error)}")
+    raise HTTPException(status_code=400, detail="No URLs to try")
 
 # Shared search logic for route and Telegram tool runner
 async def _do_proxy_search(query: str) -> Dict[str, Any]:
@@ -2624,6 +2639,11 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         reply = "I couldn't generate a response right now. Please try again shortly."
 
     # Tool loop: when tools enabled, parse for tool calls and execute up to TELEGRAM_TOOLS_MAX_ITERATIONS
+    # Track last tool result so we can show it to the user if the LLM never returns a final text reply
+    last_tool_result_message: Optional[str] = None
+    last_tool_success: Optional[bool] = None
+    # Friendly message when tool failed or returned an error (avoid showing raw 404/500 to user)
+    _telegram_tool_error_reply = "I wasn't able to get that information just now. Please try again or rephrase your question."
     if TELEGRAM_TOOLS_ENABLED and _telegram_tools is not None:
         working_messages: List[Dict[str, str]] = []
         if system_prompt:
@@ -2670,6 +2690,8 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             except Exception as e:
                 tool_result = {"success": False, "message": str(e)}
             result_message = tool_result.get("message", str(tool_result))
+            last_tool_result_message = result_message
+            last_tool_success = tool_result.get("success", True)
             working_messages.append({"role": "assistant", "content": reply})
             working_messages.append({"role": "user", "content": f"Tool result: {result_message}"})
             payload_tool = {"model": model_name, "messages": working_messages}
@@ -2684,13 +2706,34 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 print(f"Telegram tool-loop request error: {exc}")
                 break
             if response_tool.status_code != 200:
+                print(f"Telegram tool follow-up returned status {response_tool.status_code}, using tool result as reply")
+                reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
                 break
             data_tool = response_tool.json()
             choices_tool = data_tool.get("choices") or []
             if not choices_tool:
+                print("Telegram tool follow-up returned no choices, using tool result as reply")
+                reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
                 break
-            reply = (choices_tool[0].get("message") or {}).get("content") or reply
+            new_content = (choices_tool[0].get("message") or {}).get("content")
+            # If follow-up has no content (e.g. GLM 5 returns empty), use tool result so user never sees raw XML
+            if new_content is None or (isinstance(new_content, str) and not new_content.strip()):
+                print("Telegram tool follow-up returned empty content, using tool result as reply")
+                reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
+            else:
+                reply = new_content
             iterations += 1
+
+    # Never send raw tool-call XML to the user: if reply still looks like a tool call, show last tool result instead
+    if _telegram_tools is not None and _telegram_tools.reply_looks_like_tool_call(reply):
+        if last_tool_result_message is not None:
+            print("Telegram: reply was raw tool call, using last tool result for user")
+            if not last_tool_success or _telegram_tools.tool_result_looks_like_error(last_tool_result_message):
+                reply = _telegram_tool_error_reply
+            else:
+                reply = f"Here's what I found:\n\n{last_tool_result_message}"
+        else:
+            reply = "I used a tool but couldn't format the result. Please try again."
 
     history.append({"role": "assistant", "content": reply})
     trim_telegram_history(history)

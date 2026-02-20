@@ -63,6 +63,9 @@ class MemoryManager:
         self.search_limit = int(os.getenv("MEMORY_SEARCH_LIMIT", "5"))
         self.similarity_threshold = float(os.getenv("MEMORY_SIMILARITY_THRESHOLD", "0.7"))
         self.auto_extract = os.getenv("MEMORY_AUTO_EXTRACT", "true").lower() == "true"
+        # Pre-filter: skip extraction unless conversation has enough substance
+        self.extract_min_user_messages = int(os.getenv("MEMORY_EXTRACT_MIN_USER_MESSAGES", "2"))
+        self.extract_min_user_chars = int(os.getenv("MEMORY_EXTRACT_MIN_USER_CHARS", "80"))
 
     async def store_memory(
         self,
@@ -197,7 +200,7 @@ class MemoryManager:
     async def extract_memories_from_conversation(
         self,
         messages: List[Dict[str, str]],
-        max_memories: int = 5,
+        max_memories: int = 3,
     ) -> List[str]:
         """
         Extract important information from a conversation using LLM.
@@ -212,6 +215,14 @@ class MemoryManager:
         # Check if memory extractor is available
         if self.memory_extractor is None:
             print("Warning: Memory extractor is not available. Cannot extract memories from conversation.")
+            return []
+        
+        # Pre-filter: skip extraction if conversation lacks substance (saves LLM calls)
+        user_messages = [m for m in messages if (m.get("role") or "").lower() == "user"]
+        user_content_len = sum(len((m.get("content") or "").strip()) for m in user_messages)
+        if len(user_messages) < self.extract_min_user_messages:
+            return []
+        if user_content_len < self.extract_min_user_chars:
             return []
         
         # Extract memories using memory extractor

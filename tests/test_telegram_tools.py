@@ -22,15 +22,19 @@ class TestParseTelegramToolResponse:
         assert out.get("name") == "webSearch"
         assert json.loads(out["arguments"]) == {"query": "AI news"}
 
-    def test_xml_with_leading_text_returns_none(self):
-        """XML tool tags with leading text are not parsed (not top-level)."""
+    def test_xml_with_leading_text_still_parsed(self):
+        """Parser is lenient: tool call is extracted even with leading text (so we can execute it)."""
         content = 'Here is my answer: <tool>webSearch</tool>\n<parameters>{"query": "x"}</parameters>'
-        assert tg.parse_telegram_tool_response(content) is None
+        out = tg.parse_telegram_tool_response(content)
+        assert out is not None
+        assert out.get("name") == "webSearch"
 
-    def test_xml_with_trailing_text_returns_none(self):
-        """XML tool tags with trailing text are not parsed."""
+    def test_xml_with_trailing_text_still_parsed(self):
+        """Parser is lenient: tool call is extracted even with trailing text."""
         content = '<tool>webSearch</tool>\n<parameters>{"query": "x"}</parameters> Hope that helps!'
-        assert tg.parse_telegram_tool_response(content) is None
+        out = tg.parse_telegram_tool_response(content)
+        assert out is not None
+        assert out.get("name") == "webSearch"
 
     def test_fenced_code_block_containing_tool_ignored(self):
         """Tool tags inside fenced code blocks are stripped and not parsed as real tool call."""
@@ -68,6 +72,57 @@ class TestParseTelegramToolResponse:
     def test_no_tool_tags_returns_none(self):
         """Plain text with no tool format returns None."""
         assert tg.parse_telegram_tool_response("Just a normal reply.") is None
+
+
+class TestReplyLooksLikeToolCall:
+    """Tests for reply_looks_like_tool_call (used to avoid sending raw XML to the user)."""
+
+    def test_raw_tool_xml_returns_true(self):
+        """Content containing <tool> and <parameters> is detected as raw tool call."""
+        content = '<tool>scrapeWebsite</tool>\n<parameters>{"url": "https://example.com"}</parameters>'
+        assert tg.reply_looks_like_tool_call(content) is True
+
+    def test_plain_text_returns_false(self):
+        """Normal reply text returns False."""
+        assert tg.reply_looks_like_tool_call("Here is the weather for Sydney.") is False
+
+    def test_empty_or_none_returns_false(self):
+        """Empty string or None returns False."""
+        assert tg.reply_looks_like_tool_call("") is False
+        assert tg.reply_looks_like_tool_call(None) is False
+
+    def test_only_tool_tag_returns_false(self):
+        """Content with only <tool> (no <parameters>) returns False."""
+        assert tg.reply_looks_like_tool_call("<tool>webSearch</tool>") is False
+
+    def test_only_parameters_returns_false(self):
+        """Content with only <parameters> (no <tool>) returns False."""
+        assert tg.reply_looks_like_tool_call('<parameters>{"q": "x"}</parameters>') is False
+
+
+class TestToolResultLooksLikeError:
+    """Tests for tool_result_looks_like_error (friendly fallback when tool fails)."""
+
+    def test_500_message_returns_true(self):
+        """Message containing 500: is treated as error."""
+        assert tg.tool_result_looks_like_error("500: Failed to fetch content: Client error '404 Not Found'") is True
+
+    def test_404_in_message_returns_true(self):
+        """Message containing 404 is treated as error."""
+        assert tg.tool_result_looks_like_error("Client error '404 Not Found' for url 'https://bom.gov.au/...'") is True
+
+    def test_failed_to_fetch_returns_true(self):
+        """Message containing 'failed to fetch' is treated as error."""
+        assert tg.tool_result_looks_like_error("Failed to fetch content: timeout") is True
+
+    def test_plain_result_returns_false(self):
+        """Normal tool result text returns False."""
+        assert tg.tool_result_looks_like_error("Fetched content (snippet):\nToday's weather is fine.") is False
+
+    def test_empty_or_none_returns_false(self):
+        """Empty or None returns False."""
+        assert tg.tool_result_looks_like_error("") is False
+        assert tg.tool_result_looks_like_error(None) is False
 
 
 class TestExecuteTelegramTool:
@@ -198,9 +253,65 @@ class TestExecuteTelegramTool:
         assert r.get("success") is False
 
     @pytest.mark.asyncio
+    async def test_scrape_website_single_url_success(self):
+        """scrapeWebsite with single url calls do_fetch and returns content."""
+        async def fake_fetch(u):
+            return {"content": "Hello from page"}
+
+        ctx = {"do_fetch": fake_fetch}
+        r = await tg.execute_telegram_tool("scrapeWebsite", {"url": "https://example.com"}, ctx)
+        assert r.get("success") is True
+        assert "Hello from page" in r.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_scrape_website_urls_retry_second_succeeds(self):
+        """scrapeWebsite with urls list tries each until one succeeds (scrape-with-retry)."""
+        call_count = 0
+
+        async def fake_fetch(u):
+            nonlocal call_count
+            call_count += 1
+            if "fail" in u:
+                raise Exception("404 Not Found")
+            return {"content": "Success from " + u}
+
+        ctx = {"do_fetch": fake_fetch}
+        r = await tg.execute_telegram_tool(
+            "scrapeWebsite",
+            {"urls": ["https://fail.first/page", "https://ok.second/page"]},
+            ctx,
+        )
+        assert r.get("success") is True
+        assert "Success from https://ok.second/page" in r.get("message", "")
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_scrape_website_urls_all_fail_returns_last_error(self):
+        """scrapeWebsite with urls list returns last error when all fail."""
+        async def fake_fetch(u):
+            raise Exception("500 Server Error")
+
+        ctx = {"do_fetch": fake_fetch}
+        r = await tg.execute_telegram_tool(
+            "scrapeWebsite",
+            {"urls": ["https://a.com", "https://b.com"]},
+            ctx,
+        )
+        assert r.get("success") is False
+        assert "500 Server Error" in r.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_scrape_website_no_url_or_urls_returns_failure(self):
+        """scrapeWebsite without url or urls returns failure."""
+        ctx = {"do_fetch": AsyncMock(return_value={"content": "x"})}
+        r = await tg.execute_telegram_tool("scrapeWebsite", {}, ctx)
+        assert r.get("success") is False
+        assert "required" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
     async def test_web_search_calls_do_search(self):
         """webSearch calls do_search from context and returns result message."""
-        mock_results = {"results": [{"title": "A", "snippet": "B"}]}
+        mock_results = {"results": [{"title": "A", "snippet": "B", "url": "https://a.com"}]}
 
         async def fake_search(q):
             return mock_results
@@ -209,6 +320,7 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("webSearch", {"query": "test query"}, ctx)
         assert r.get("success") is True
         assert "A" in r.get("message", "") or "B" in r.get("message", "")
+        assert "https://a.com" in r.get("message", "")
 
     @pytest.mark.asyncio
     async def test_web_search_no_do_search_returns_unavailable(self):

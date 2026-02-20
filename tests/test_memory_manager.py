@@ -146,7 +146,10 @@ class TestMemoryManager:
 
     @pytest.mark.asyncio
     async def test_extract_memories_from_conversation(self, memory_manager):
-        """Test extracting memories from conversation."""
+        """Test extracting memories from conversation (pre-filter passes, extractor called)."""
+        # Ensure pre-filter passes: need at least 2 user messages and 80+ user chars
+        memory_manager.extract_min_user_messages = 2
+        memory_manager.extract_min_user_chars = 80
         # Mock memory extractor
         mock_extractor = AsyncMock(spec=MemoryExtractor)
         mock_extractor.extract_memories = AsyncMock(return_value=[
@@ -163,23 +166,35 @@ class TestMemoryManager:
                 "source": "conversation",
             },
         ])
-        
-        # Replace extractor
         memory_manager.memory_extractor = mock_extractor
-        
-        # Extract memories
+        # Two user messages with enough content to pass pre-filter (min 80 user chars)
+        messages = [
+            {"role": "user", "content": "I prefer dark mode for my IDE and terminal. It's easier on my eyes."},
+            {"role": "assistant", "content": "Noted!"},
+            {"role": "user", "content": "I also work late nights usually."},
+        ]
+        memory_ids = await memory_manager.extract_memories_from_conversation(
+            messages=messages,
+            max_memories=3,
+        )
+        mock_extractor.extract_memories.assert_called_once()
+        # Only high-confidence memories are stored
+        assert len(memory_ids) == 1
+
+    @pytest.mark.asyncio
+    async def test_extract_memories_skipped_when_conversation_too_short(self, memory_manager):
+        """Test that extraction is skipped when pre-filter fails (too few user messages/chars)."""
+        mock_extractor = AsyncMock(spec=MemoryExtractor)
+        memory_manager.memory_extractor = mock_extractor
+        # One user message only (below default min of 2)
         messages = [
             {"role": "user", "content": "I prefer dark mode"},
             {"role": "assistant", "content": "Noted!"},
         ]
         memory_ids = await memory_manager.extract_memories_from_conversation(
             messages=messages,
-            max_memories=5,
+            max_memories=3,
         )
-        
-        # Verify extractor was called
-        mock_extractor.extract_memories.assert_called_once()
-        
-        # Verify memories were stored (should be 2, both high/medium confidence)
-        assert len(memory_ids) == 2
+        mock_extractor.extract_memories.assert_not_called()
+        assert memory_ids == []
 

@@ -334,3 +334,44 @@ class TestPhilosopherFileTools:
         result = await ps.execute_tool_for_philosopher("run_deep_research", {})
         assert isinstance(result, str)
         assert "research_task" in result or "researchTask" in result or "required" in result.lower()
+
+
+class TestProxyFetchUrls:
+    """Tests for POST /v1/proxy/fetch with optional urls (scrape-with-retry)."""
+
+    def test_fetch_with_urls_tries_until_success(self):
+        """POST with urls list tries each URL until one succeeds."""
+        from src.servers import proxy_server as ps
+        client = _get_client()
+        call_log = []
+
+        async def mock_fetch(url):
+            call_log.append(url)
+            if "fail" in url:
+                raise Exception("404 Not Found")
+            return {"content": "Content from " + url}
+
+        with patch.object(ps, "_do_proxy_fetch", new=AsyncMock(side_effect=mock_fetch)):
+            resp = client.post(
+                "/v1/proxy/fetch",
+                json={"urls": ["https://fail.first/page", "https://ok.second/page"]},
+            )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("content") == "Content from https://ok.second/page"
+        assert len(call_log) == 2
+
+    def test_fetch_with_single_url_unchanged(self):
+        """POST with single url still works (backward compatible)."""
+        from src.servers import proxy_server as ps
+        client = _get_client()
+        with patch.object(ps, "_do_proxy_fetch", new=AsyncMock(return_value={"content": "Hello"})):
+            resp = client.post("/v1/proxy/fetch", json={"url": "https://example.com"})
+        assert resp.status_code == 200
+        assert resp.json().get("content") == "Hello"
+
+    def test_fetch_no_url_no_urls_returns_400(self):
+        """POST without url or urls returns 400."""
+        client = _get_client()
+        resp = client.post("/v1/proxy/fetch", json={})
+        assert resp.status_code == 400

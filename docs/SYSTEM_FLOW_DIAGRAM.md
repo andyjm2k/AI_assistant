@@ -448,6 +448,7 @@ This document diagrams the complete flow from user prompt through to system resp
 - **Tool Choice**: `"auto"` - LLM decides when to use tools
 - **Max Tokens**: `4096` for responses
 - **Temperature**: `0.7` for main responses, `0.3` for memory extraction
+- **scrapeWebsite (scrape-with-retry)**: Both the Telegram and web (HTML) tool paths support an optional `urls` array. When multiple URLs are provided (e.g. from a prior webSearch), the backend or proxy tries each URL in order until one succeeds, so a single 404 or fetch failure does not block the flow. Single `url` continues to work as before.
 
 ### Philosopher Mode
 - **Memory Search**: Disabled when `philosopherModeActive === true`
