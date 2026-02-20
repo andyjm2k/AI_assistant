@@ -181,12 +181,16 @@ class TodoTaskExecutor:
                 for tc in tool_calls:
                     fn = tc.get("function", {})
                     name = fn.get("name")
-                    args = fn.get("arguments", "{}")
+                    raw_args = fn.get("arguments", "{}")
+                    args = raw_args
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
                         except json.JSONDecodeError:
                             args = {}
+                    # Log raw arguments when empty or when write_file lacks filename (debug LLM tool-call issues)
+                    if not args or (name == "write_file" and not (args.get("filename") or args.get("content"))):
+                        print(f"[TASK_EXEC] Tool {name!r} raw arguments: {raw_args!r}", flush=True)
                     try:
                         result = await self.tool_executor(name, args)
                         self.messages.append({

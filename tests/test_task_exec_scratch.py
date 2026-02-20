@@ -69,3 +69,20 @@ class TestWriteTaskExecResponseToScratch:
         content = files[0].read_text(encoding="utf-8")
         assert "Status: cancelled" in content
         assert "(No response text)" in content
+
+    def test_includes_summary_and_what_to_do(self, tmp_path, monkeypatch):
+        """File includes SUMMARY and 'What you can do' so status is conclusive."""
+        monkeypatch.setattr("src.servers.proxy_server.SCRATCH_DIR", tmp_path)
+        _write_task_exec_response_to_scratch(
+            user_key="alice",
+            task_id=2,
+            status="awaiting_confirmation",
+            message="I have finished the work.",
+        )
+        files = list(tmp_path.glob("task_exec_*.txt"))
+        assert len(files) == 1
+        content = files[0].read_text(encoding="utf-8")
+        assert "SUMMARY:" in content
+        assert "Awaiting your confirmation" in content
+        assert "What you can do:" in content
+        assert "Confirm completion" in content

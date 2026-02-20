@@ -2290,6 +2290,7 @@ def _write_task_exec_response_to_scratch(
     """
     Write the task execution agent response to a timestamped text file in scratch.
     Called whenever a run ends (completed, paused, awaiting confirmation, or cancelled).
+    Includes a clear SUMMARY and "What you can do" so the file conclusively shows outcome and next steps.
     """
     try:
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
@@ -2300,11 +2301,28 @@ def _write_task_exec_response_to_scratch(
         task_suffix = f"_task{task_id}" if task_id is not None else ""
         filename = f"task_exec_{timestamp_file}_{safe_user}{task_suffix}.txt"
         filepath = SCRATCH_DIR / filename
+        # Human-readable summary so the file conclusively shows whether task is done, paused, or cancelled
+        if status == STATUS_AWAITING_CONFIRMATION:
+            summary = "Task run finished. Awaiting your confirmation to mark the task complete."
+            what_to_do = "Confirm completion (e.g. 'mark task complete' or use todo complete), or ask for status."
+        elif status == STATUS_PAUSED_AWAITING_FEEDBACK:
+            summary = "Paused for your feedback or input."
+            what_to_do = "Send your input to resume (e.g. via chat or execute/resume)."
+        elif status == STATUS_CANCELLED:
+            summary = "Execution was cancelled."
+            what_to_do = "You can start a new execution for a task if needed."
+        else:
+            summary = f"Status: {status}"
+            what_to_do = "Check status or resume/cancel as appropriate."
         lines = [
-            f"Task execution response",
+            "Task execution response",
+            "SUMMARY: " + summary,
+            "",
             f"Date-time: {timestamp_human}",
             f"Status: {status}",
             f"Task ID: {task_id}" if task_id is not None else "Task ID: (none)",
+            "",
+            "What you can do: " + what_to_do,
             "",
             "--- Agent response ---",
             "",
