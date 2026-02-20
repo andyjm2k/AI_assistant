@@ -4060,10 +4060,10 @@ async def proxy_whisper_options(request: Request):
         }
     )
 
-# Whisper proxy endpoint to handle CORS
+# Whisper proxy endpoint to handle CORS; compatible with OpenAI whisper-1 (passes key when needed)
 @app.post("/v1/audio/transcriptions")
 async def proxy_whisper(request: Request):
-    """Proxy Whisper transcription requests to handle CORS."""
+    """Proxy Whisper transcription requests to handle CORS. Client Authorization is for proxy auth only; upstream uses WHISPER_API_KEY."""
     try:
         # Get the form data from the request
         form_data = await request.form()
@@ -4073,8 +4073,11 @@ async def proxy_whisper(request: Request):
         
         print(f"📝 Proxying Whisper request to: {whisper_endpoint}")
         
-        # Get Authorization header from the request
-        auth_header = request.headers.get('Authorization', '')
+        # Outgoing auth to Whisper/OpenAI uses only WHISPER_API_KEY (client Authorization is for proxy auth, not forwarded)
+        forward_headers = {}
+        whisper_api_key = os.getenv("WHISPER_API_KEY")
+        if whisper_api_key:
+            forward_headers["Authorization"] = f"Bearer {whisper_api_key}"
         
         # Prepare the files and data for forwarding
         files = {}
@@ -4090,13 +4093,13 @@ async def proxy_whisper(request: Request):
                 data[key] = value
                 print(f"  📄 Field: {key} = {value}")
         
-        # Forward the request to the Whisper service
+        # Forward the request to the Whisper service (server key only; client auth stays between client and proxy)
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 whisper_endpoint,
                 files=files,
                 data=data,
-                headers={'Authorization': auth_header} if auth_header else {}
+                headers=forward_headers
             )
         
         print(f"✅ Whisper response status: {response.status_code}")
