@@ -5,7 +5,7 @@ Required for iOS Safari to access Web Audio API and microphone.
 This server prioritizes mkcert certificates (trusted) and falls back to
 self-signed certificates if mkcert is not available. Works with:
 - localhost
-- anton.local
+- Configurable hostname (HTTPS_CERT_HOSTNAME in .env, default anton.local)
 - IP addresses on your local network
 """
 import http.server
@@ -20,12 +20,26 @@ from pathlib import Path
 # Project root (two levels up from src/servers/https_server.py)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
+# Load .env from project root so HTTPS_CERT_HOSTNAME is available
+try:
+    from dotenv import load_dotenv
+    _env_path = _PROJECT_ROOT / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass
+
+# Primary hostname for cert CN, SANs, discovery and default cert filenames (configurable via .env)
+_CERT_HOSTNAME = (os.getenv("HTTPS_CERT_HOSTNAME") or "anton.local").strip()
+# Sanitize for glob: remove wildcards to avoid matching unintended files
+_CERT_HOSTNAME_GLOB = _CERT_HOSTNAME.replace("*", "").replace("?", "") or "anton.local"
+
 # Configuration
 PORT = 8000
 HOST = '0.0.0.0'  # Allow network access
 # Default certificate files (will be auto-detected if mkcert certificates exist)
-CERT_FILE = 'anton.local+2.pem'
-KEY_FILE = 'anton.local+2-key.pem'
+CERT_FILE = f"{_CERT_HOSTNAME}+2.pem"
+KEY_FILE = f"{_CERT_HOSTNAME}+2-key.pem"
 
 class MyHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Custom request handler with CORS headers for cross-origin requests."""
@@ -52,7 +66,7 @@ def get_local_ip():
 
 def generate_cert_with_openssl(hostnames, ips):
     """Generate certificate using OpenSSL command line tool."""
-    # Create a config file for OpenSSL with SANs
+    # Create a config file for OpenSSL with SANs (primary hostname from .env)
     config_content = f"""[req]
 distinguished_name = req_distinguished_name
 req_extensions = v3_req
@@ -63,7 +77,7 @@ C = US
 ST = Local
 L = Local
 O = CATBot
-CN = anton.local
+CN = {_CERT_HOSTNAME}
 
 [v3_req]
 keyUsage = keyEncipherment, dataEncipherment
@@ -72,7 +86,7 @@ subjectAltName = @alt_names
 
 [alt_names]
 DNS.1 = localhost
-DNS.2 = anton.local
+DNS.2 = {_CERT_HOSTNAME}
 IP.1 = 127.0.0.1
 """
     
@@ -80,9 +94,9 @@ IP.1 = 127.0.0.1
     for idx, ip in enumerate(ips, start=2):
         config_content += f"IP.{idx} = {ip}\n"
     
-    # Add additional hostnames
+    # Add additional hostnames (skip localhost and primary so we do not duplicate)
     for idx, hostname in enumerate(hostnames, start=3):
-        if hostname not in ['localhost', 'anton.local']:
+        if hostname not in ['localhost', _CERT_HOSTNAME]:
             config_content += f"DNS.{idx} = {hostname}\n"
     
     # Write config file
@@ -131,25 +145,25 @@ def generate_cert_with_cryptography(hostnames, ips):
             key_size=2048,
         )
         
-        # Build subject
+        # Build subject (primary hostname from .env)
         subject = issuer = x509.Name([
             x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
             x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Local"),
             x509.NameAttribute(NameOID.LOCALITY_NAME, "Local"),
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "CATBot"),
-            x509.NameAttribute(NameOID.COMMON_NAME, "anton.local"),
+            x509.NameAttribute(NameOID.COMMON_NAME, _CERT_HOSTNAME),
         ])
         
-        # Build SAN list
+        # Build SAN list (localhost, primary hostname, 127.0.0.1)
         san_list = [
             x509.DNSName("localhost"),
-            x509.DNSName("anton.local"),
+            x509.DNSName(_CERT_HOSTNAME),
             x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
         ]
         
-        # Add additional hostnames
+        # Add additional hostnames (skip localhost and primary to avoid duplicate)
         for hostname in hostnames:
-            if hostname not in ['localhost', 'anton.local']:
+            if hostname not in ['localhost', _CERT_HOSTNAME]:
                 san_list.append(x509.DNSName(hostname))
         
         # Add IP addresses
@@ -199,11 +213,11 @@ def generate_cert_with_cryptography(hostnames, ips):
 def check_mkcert_certificates():
     """Check if mkcert-generated certificates exist in certs/ or project root."""
     import glob
-    # Search in certs/ first, then project root
+    # Search in certs/ first, then project root (glob uses sanitized hostname)
     for search_dir in [_PROJECT_ROOT / "certs", _PROJECT_ROOT]:
         if not search_dir.exists():
             continue
-        cert_files = list(search_dir.glob("anton.local*.pem"))
+        cert_files = list(search_dir.glob(f"{_CERT_HOSTNAME_GLOB}*.pem"))
         cert_key_pairs = []
         for cert_path in cert_files:
             if '-key' in cert_path.name:
@@ -269,7 +283,7 @@ def generate_mkcert_certificate(hostnames, ips):
                               cwd=str(_PROJECT_ROOT))
         
         if result.returncode == 0:
-            # mkcert creates files like: anton.local+2.pem, anton.local+2-key.pem
+            # mkcert creates files like: <hostname>+2.pem, <hostname>+2-key.pem
             # Find the newly created certificate
             cert_file, key_file = check_mkcert_certificates()
             if cert_file and key_file:
@@ -323,9 +337,9 @@ def generate_self_signed_cert():
         except Exception:
             pass
     
-    # Try to generate with mkcert if it's installed
+    # Try to generate with mkcert if it's installed (hostname from .env)
     local_ip = get_local_ip()
-    hostnames = ['anton.local', 'localhost']
+    hostnames = [_CERT_HOSTNAME, 'localhost']
     ips = ['127.0.0.1']
     
     if local_ip:
@@ -344,7 +358,7 @@ def generate_self_signed_cert():
         print("   Windows: choco install mkcert")
         print("   Or download: https://github.com/FiloSottile/mkcert/releases")
         print("   Then run: mkcert -install")
-        print("   Then: mkcert anton.local localhost 127.0.0.1 <your-ip>\n")
+        print(f"   Then: mkcert {_CERT_HOSTNAME} localhost 127.0.0.1 <your-ip>\n")
     
     print("🔐 Generating self-signed certificate (will show as untrusted)...")
     
@@ -388,8 +402,8 @@ def main():
         print(f"❌ Certificate files not found: {CERT_FILE}, {KEY_FILE}")
         return
     
-    # Check if using mkcert certificate
-    is_mkcert = 'anton.local' in CERT_FILE and '+' in CERT_FILE
+    # Check if using mkcert certificate (hostname in filename and mkcert-style +N)
+    is_mkcert = _CERT_HOSTNAME in CERT_FILE and '+' in CERT_FILE
     
     # Create server
     try:
@@ -409,7 +423,7 @@ def main():
                 print("⚠️  Using self-signed certificate (will show as 'Not secure')")
             print("="*60)
             print(f"📱 Local access:     https://localhost:{PORT}")
-            print(f"📱 Hostname access:  https://anton.local:{PORT}")
+            print(f"📱 Hostname access:  https://{_CERT_HOSTNAME}:{PORT}")
             if local_ip:
                 print(f"📱 IP access:        https://{local_ip}:{PORT}")
             print("="*60)
@@ -417,7 +431,7 @@ def main():
                 print("\n💡 To get a trusted certificate:")
                 print("   1. Install mkcert: choco install mkcert")
                 print("   2. Install CA: mkcert -install")
-                print("   3. Generate cert: mkcert anton.local localhost 127.0.0.1 <your-ip>")
+                print(f"   3. Generate cert: mkcert {_CERT_HOSTNAME} localhost 127.0.0.1 <your-ip>")
                 print("   4. Restart this server")
             print("\n⚠️  iOS Safari Setup:")
             print("   1. Access the site from your iOS device")

@@ -178,6 +178,13 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
             else:
                 telegram_admins = _prompt("   Admin Telegram user ID(s), comma-separated", "")
 
+    # 6. HTTPS certificate hostname (for LAN access; used by https_server and proxy_server)
+    https_hostname = _prompt("7) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
+    if not https_hostname.strip():
+        https_hostname = "anton.local"
+    else:
+        https_hostname = https_hostname.strip()
+
     # Use existing .env or template with path substitution
     if env_path.exists():
         content = env_path.read_text(encoding="utf-8", errors="replace")
@@ -204,9 +211,12 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         content = _set_key_in_env_content(content, "TELEGRAM_ALLOW_ALL", telegram_allow_all)
         if telegram_admins:
             content = _set_key_in_env_content(content, "TELEGRAM_ADMIN_IDS", telegram_admins)
+    # Always write HTTPS hostname so https_server and proxy_server use it for cert discovery
+    content = _set_key_in_env_content(content, "HTTPS_CERT_HOSTNAME", https_hostname)
 
     env_path.write_text(content, encoding="utf-8")
     print("\nWrote", str(env_path))
+    print("   For HTTPS from other devices, run: mkcert", https_hostname, "localhost 127.0.0.1 <your-ip>")
     return True
 
 

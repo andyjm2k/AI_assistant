@@ -168,6 +168,11 @@ if DOTENV_AVAILABLE:
 else:
     print("⚠️  python-dotenv not available. Using system environment variables only.")
 
+# Primary hostname for SSL cert discovery (same as https_server; configurable via HTTPS_CERT_HOSTNAME in .env)
+_SSL_CERT_HOSTNAME = (os.environ.get("HTTPS_CERT_HOSTNAME") or "anton.local").strip()
+# Sanitize for glob to avoid matching unintended files
+_SSL_CERT_HOSTNAME_GLOB = _SSL_CERT_HOSTNAME.replace("*", "").replace("?", "") or "anton.local"
+
 # Pydantic models for request/response validation
 # Note: 'command' is intentionally not accepted from clients; only server-side presets are used.
 class ServerConfig(BaseModel):
@@ -5392,14 +5397,15 @@ def find_mkcert_certificates() -> Tuple[Optional[str], Optional[str]]:
     """
     Find mkcert-generated certificates in project root or certs/ directory.
     Returns a tuple of (cert_file, key_file) or (None, None) if not found.
-    mkcert creates files like: anton.local+2.pem, anton.local+2-key.pem, etc.
+    mkcert creates files like: <hostname>+2.pem, <hostname>+2-key.pem, etc.
+    Hostname comes from HTTPS_CERT_HOSTNAME in .env.
     """
-    # Search in certs/ first, then project root
+    # Search in certs/ first, then project root (glob uses sanitized hostname)
     search_dirs = [_PROJECT_ROOT / "certs", _PROJECT_ROOT]
     for search_dir in search_dirs:
         if not search_dir.exists():
             continue
-        cert_files = list(search_dir.glob("anton.local*.pem"))
+        cert_files = list(search_dir.glob(f"{_SSL_CERT_HOSTNAME_GLOB}*.pem"))
         # Filter out key files and find matching pairs
         cert_key_pairs = []
         for cert_path in cert_files:
@@ -5425,10 +5431,10 @@ def get_ssl_certificates() -> Tuple[Optional[str], Optional[str]]:
         print(f"[SSL] Found mkcert certificate: {cert_file}")
         return cert_file, key_file
     
-    # Fall back to default certificate file names in certs/ or project root
+    # Fall back to default certificate file names in certs/ or project root (hostname from .env)
     for base in [_PROJECT_ROOT / "certs", _PROJECT_ROOT]:
-        default_cert = base / "anton.local+2.pem"
-        default_key = base / "anton.local+2-key.pem"
+        default_cert = base / f"{_SSL_CERT_HOSTNAME}+2.pem"
+        default_key = base / f"{_SSL_CERT_HOSTNAME}+2-key.pem"
         if default_cert.exists() and default_key.exists():
             print(f"[SSL] Using default certificate: {default_cert}")
             return str(default_cert), str(default_key)
