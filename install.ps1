@@ -16,17 +16,16 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# 2. Git submodule (mcp-browser-use)
+# 2. Git submodule (mcp-browser-use) – init and update so submodule is fully populated
 Write-Host ([Environment]::NewLine + '[2/9] Initializing mcp-browser-use...') -ForegroundColor Yellow
 $mcpDir = Join-Path $ProjectRoot 'mcp-browser-use'
-if (Test-Path $mcpDir) {
-    $gitDir = Join-Path $mcpDir '.git'
-    if (Test-Path $gitDir) {
-        & git submodule update --init --recursive 2>$null
-        if ($LASTEXITCODE -ne 0) { Write-Host 'Note: git submodule update had issues (may be OK if not a submodule).' -ForegroundColor Gray }
-    }
-} else {
-    Write-Host 'mcp-browser-use directory not found. Clone it or add as submodule; see README.' -ForegroundColor Red
+$projectGitDir = Join-Path $ProjectRoot '.git'
+if (Test-Path $projectGitDir) {
+    & git submodule update --init --recursive
+    if ($LASTEXITCODE -ne 0) { Write-Host 'Note: git submodule update had issues (may be OK if no submodules).' -ForegroundColor Gray }
+}
+if (-not (Test-Path $mcpDir)) {
+    Write-Host 'mcp-browser-use directory not found. Clone with --recurse-submodules or add as submodule; see README.' -ForegroundColor Red
     exit 1
 }
 

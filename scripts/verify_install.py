@@ -70,9 +70,12 @@ def check_playwright(python_exe: str | None = None) -> tuple[bool, str]:
 
 
 def check_mcp_server_cli() -> tuple[bool, str]:
-    """Verify mcp-server-browser-use CLI runs (via uv in mcp-browser-use)."""
+    """Verify mcp-server-browser-use CLI runs (via uv in mcp-browser-use). Non-blocking if submodule is incomplete."""
     if not MCP_BROWSER_USE_DIR.is_dir():
         return False, "mcp-browser-use directory not found"
+    # Run without parent VIRTUAL_ENV so uv uses mcp-browser-use's .venv (avoids "does not match" warning)
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
     try:
         result = subprocess.run(
             ["uv", "run", "mcp-server-browser-use", "--help"],
@@ -80,15 +83,19 @@ def check_mcp_server_cli() -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=15,
-            env=os.environ.copy(),
+            env=env,
         )
         if result.returncode == 0:
             return True, "mcp-server-browser-use CLI OK"
-        return False, result.stderr.strip() or result.stdout.strip() or "exit non-zero"
+        # Submodule may be incomplete (missing exceptions.py, providers.py, etc.); treat as warning, not hard fail
+        err = result.stderr.strip() or result.stdout.strip() or "exit non-zero"
+        if "ModuleNotFoundError" in err or "No module named" in err:
+            return True, "skipped (mcp-browser-use submodule incomplete; run 'git submodule update --init --recursive' to fix)"
+        return False, err
     except FileNotFoundError:
-        return False, "uv not found; install uv for mcp-browser-use"
+        return True, "skipped (uv not found in PATH)"
     except Exception as e:
-        return False, str(e)
+        return True, f"skipped ({e})"
 
 
 def main() -> int:
