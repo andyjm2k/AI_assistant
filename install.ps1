@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $ProjectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Get-Location | Select-Object -ExpandProperty Path }
 Set-Location $ProjectRoot
 
-Write-Host ('CATBot installer — project root: ' + $ProjectRoot) -ForegroundColor Cyan
+Write-Host ('CATBot installer - project root: ' + $ProjectRoot) -ForegroundColor Cyan
 
 # 1. Prerequisites check
 Write-Host ([Environment]::NewLine + '[1/9] Checking prerequisites...') -ForegroundColor Yellow

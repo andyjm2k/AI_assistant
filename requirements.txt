@@ -24,8 +24,8 @@ python-telegram-bot[rate-limiter]>=20.0
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
 
-# Numerical computing (for vector store)
-numpy>=1.24.0
+# Numerical computing (for vector store). Use >=2.0 for Python 3.13 (pre-built wheels; 1.x builds from source and needs MSVC on Windows).
+numpy>=2.0.0
 
 # File operations libraries
 python-docx>=1.1.0
