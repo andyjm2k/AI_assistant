@@ -1,5 +1,7 @@
 """Unit tests for scripts/install_wizard.py (configuration wizard)."""
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -8,6 +10,7 @@ from scripts.install_wizard import (
     LLM_PROVIDERS,
     PROVIDER_API_KEY_VAR,
     _set_key_in_env_content,
+    run_wizard,
 )
 
 
@@ -74,3 +77,38 @@ def test_wizard_skip_wizard_exits_zero():
         assert wiz.main() == 0
     finally:
         sys.argv = old
+
+
+def test_run_wizard_writes_https_cert_hostname():
+    """run_wizard writes HTTPS_CERT_HOSTNAME to .env with prompted or default value."""
+    tmp_path = Path(tempfile.mkdtemp(prefix="test_wizard_", dir=str(Path(__file__).resolve().parent.parent)))
+    try:
+        env_path = tmp_path / ".env"
+        # Mock input: 1=ollama, default model, blank endpoint, blank brave, blank news, n=no telegram, custom hostname
+        with patch("builtins.input", side_effect=["1", "", "", "", "", "n", "mylan.local"]):
+            run_wizard(Path(tmp_path), env_path)
+        content = env_path.read_text(encoding="utf-8")
+        assert "HTTPS_CERT_HOSTNAME=mylan.local" in content
+    finally:
+        try:
+            tmp_path.joinpath(".env").unlink(missing_ok=True)
+            tmp_path.rmdir()
+        except Exception:
+            pass
+
+
+def test_run_wizard_uses_default_https_hostname_when_empty():
+    """run_wizard uses default anton.local when HTTPS hostname prompt is empty."""
+    tmp_path = Path(tempfile.mkdtemp(prefix="test_wizard_", dir=str(Path(__file__).resolve().parent.parent)))
+    try:
+        env_path = tmp_path / ".env"
+        with patch("builtins.input", side_effect=["1", "", "", "", "", "n", ""]):
+            run_wizard(Path(tmp_path), env_path)
+        content = env_path.read_text(encoding="utf-8")
+        assert "HTTPS_CERT_HOSTNAME=anton.local" in content
+    finally:
+        try:
+            tmp_path.joinpath(".env").unlink(missing_ok=True)
+            tmp_path.rmdir()
+        except Exception:
+            pass
