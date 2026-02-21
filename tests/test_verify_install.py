@@ -1,0 +1,81 @@
+"""Unit tests for scripts/verify_install.py (CATBot post-install verification)."""
+import pytest
+from pathlib import Path
+from scripts.verify_install import (
+    PROJECT_ROOT,
+    MCP_BROWSER_USE_DIR,
+    check_core,
+    check_autogen,
+    check_mcp,
+    check_playwright,
+    check_mcp_server_cli,
+)
+
+
+def test_project_root_is_parent_of_scripts():
+    """PROJECT_ROOT is the parent of the scripts directory."""
+    assert PROJECT_ROOT.name != "scripts"
+    assert (PROJECT_ROOT / "scripts").is_dir()
+    assert (PROJECT_ROOT / "scripts" / "verify_install.py").exists()
+
+
+def test_mcp_browser_use_path():
+    """MCP_BROWSER_USE_DIR is mcp-browser-use under project root."""
+    assert MCP_BROWSER_USE_DIR == PROJECT_ROOT / "mcp-browser-use"
+
+
+def test_check_core_returns_tuple():
+    """check_core returns (bool, str)."""
+    ok, msg = check_core()
+    assert isinstance(ok, bool)
+    assert isinstance(msg, str)
+    # In test env we likely have core deps
+    if ok:
+        assert "OK" in msg or "Core" in msg
+
+
+def test_check_autogen_returns_tuple():
+    """check_autogen returns (bool, str)."""
+    ok, msg = check_autogen()
+    assert isinstance(ok, bool)
+    assert isinstance(msg, str)
+
+
+def test_check_mcp_returns_tuple():
+    """check_mcp returns (bool, str)."""
+    ok, msg = check_mcp()
+    assert isinstance(ok, bool)
+    assert isinstance(msg, str)
+
+
+def test_check_playwright_returns_tuple():
+    """check_playwright returns (bool, str)."""
+    ok, msg = check_playwright()
+    assert isinstance(ok, bool)
+    assert isinstance(msg, str)
+
+
+def test_check_mcp_server_cli_returns_tuple():
+    """check_mcp_server_cli returns (bool, str)."""
+    ok, msg = check_mcp_server_cli()
+    assert isinstance(ok, bool)
+    assert isinstance(msg, str)
+    # If mcp-browser-use is missing, we get a clear message
+    if not MCP_BROWSER_USE_DIR.is_dir() and not ok:
+        assert "not found" in msg or "uv" in msg
+
+
+def test_main_exits_zero_or_one(monkeypatch):
+    """main() exits 0 when all checks pass, 1 when any fail."""
+    from scripts import verify_install
+
+    # Patched check functions must accept same signature as originals (python_exe optional)
+    monkeypatch.setattr(verify_install, "check_core", lambda *a, **kw: (True, "ok"))
+    monkeypatch.setattr(verify_install, "check_autogen", lambda *a, **kw: (True, "ok"))
+    monkeypatch.setattr(verify_install, "check_mcp", lambda *a, **kw: (True, "ok"))
+    monkeypatch.setattr(verify_install, "check_playwright", lambda *a, **kw: (True, "ok"))
+    monkeypatch.setattr(verify_install, "check_mcp_server_cli", lambda: (True, "ok"))
+    assert verify_install.main() == 0
+
+    monkeypatch.setattr(verify_install, "check_core", lambda *a, **kw: (False, "fail"))
+    assert verify_install.main() == 1

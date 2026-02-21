@@ -16,7 +16,7 @@
 
 If you want a personal, feature-rich assistant that combines conversational AI, browser automation, and immersive 3D avatars, this is it.
 
-[Installation Guide](INSTALL_GUIDE.md) · [Configuration](#configuration) · [Usage](#usage) · [Troubleshooting](#troubleshooting)
+[Installation Guide](#installation-guide) · [Automated install](#automated-install) · [Configuration](#configuration) · [Usage](#usage) · [Troubleshooting](#troubleshooting)
 
 ## Quick Start
 
@@ -37,13 +37,8 @@ venv\Scripts\activate
 # Linux/Mac:
 source venv/bin/activate
 
-# Install Python dependencies
-pip install fastapi uvicorn httpx pydantic python-dotenv
-pip install python-docx openpyxl PyPDF2 Pillow reportlab
-pip install autogen-agentchat autogen-core autogen-ext
-pip install "mcp>=1.6.0" "browser-use==0.1.41" playwright pyperclip
-pip install langchain-community langchain-mistralai==0.2.4 langchain-ibm==0.3.10 langchain_mcp_adapters==0.0.9 langgraph==0.3.34
-pip install json-repair MainContentExtractor==0.0.4 pydantic-settings typer "python-telegram-bot[rate-limiter]" flask flask-cors
+# Install Python dependencies (single source: requirements.txt)
+pip install -r requirements.txt
 
 # Install Playwright browsers
 playwright install
@@ -63,7 +58,26 @@ cp config/mcp_config.env.example .env
 python scripts/start_all.py
 ```
 
-Full setup guide: [Installation Guide](#installation-guide)
+Full setup guide: [Installation Guide](#installation-guide). For one-command setup on a new machine, see [Automated install](#automated-install).
+
+## Automated install
+
+On a **new machine** you can run the automated installer instead of following the Quick Start steps manually.
+
+**Prerequisites (install these first if missing):** Python 3.11+, Node.js 16+, Git, and [uv](https://github.com/astral-sh/uv) (e.g. `pip install uv`).
+
+- **Windows:** From project root run:
+  ```powershell
+  .\install.ps1
+  ```
+  or double-click `install.bat`. A **configuration wizard** will prompt for LLM provider, API keys, and optional Telegram; it writes `.env` for you. Then start with `start.bat` or `python scripts/start_all.py`.
+- **Linux/macOS:** From project root run:
+  ```bash
+  ./install.sh
+  ```
+  Then edit `.env` and start services (see [INSTALL.md](INSTALL.md)).
+
+See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line install, optional Whisper/Telegram).
 
 ## Highlights
 
@@ -133,9 +147,6 @@ npm install
 #### Option A: Using pip (Recommended)
 
 ```bash
-# Option: install everything from requirements.txt (includes Telegram bot)
-# pip install -r requirements.txt
-
 # Create a virtual environment (recommended)
 python -m venv venv
 
@@ -145,23 +156,8 @@ venv\Scripts\activate
 # Linux/Mac:
 source venv/bin/activate
 
-# Install core dependencies
-pip install fastapi uvicorn httpx pydantic python-dotenv
-
-# Install file operations dependencies
-pip install python-docx openpyxl PyPDF2 Pillow reportlab
-
-# Install AI frameworks
-pip install autogen-agentchat autogen-core autogen-ext
-
-# Install MCP and browser automation
-pip install "mcp>=1.6.0" "browser-use==0.1.41" playwright pyperclip
-
-# Install LangChain dependencies
-pip install langchain-community langchain-mistralai==0.2.4 langchain-ibm==0.3.10 langchain_mcp_adapters==0.0.9 langgraph==0.3.34
-
-# Install additional utilities
-pip install json-repair MainContentExtractor==0.0.4 pydantic-settings typer "python-telegram-bot[rate-limiter]" flask flask-cors
+# Install all Python dependencies from requirements.txt
+pip install -r requirements.txt
 
 # Install Playwright browsers
 playwright install
@@ -190,6 +186,22 @@ uv run playwright install
 # Return to project root
 cd ..
 ```
+
+#### Getting mcp-browser-use working in a new deployment (Windows, venv + pip)
+
+For a clean install of the MCP browser-use server in a new deployment (e.g. fresh clone or new machine), use a dedicated virtual environment and editable install:
+
+```batch
+deactivate
+cd C:\Users\pc\AI_assistant\mcp-browser-use
+rmdir /s /q .venv
+py -m venv .venv
+.venv\Scripts\activate
+py -m pip install -U pip
+pip install -e .
+```
+
+Replace `C:\Users\pc\AI_assistant\mcp-browser-use` with your actual path to the `mcp-browser-use` directory. Then install Playwright browsers: `playwright install` (or `py -m playwright install`). Return to the project root when done.
 
 **Resources:**
 - [UV Package Manager](https://github.com/astral-sh/uv)

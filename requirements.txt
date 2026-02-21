@@ -1,3 +1,7 @@
+# CATBot Python dependencies (installer + runtime).
+# Reviewed against venv and venv312; trimmed to match src imports and start_all.py.
+# mcp-browser-use submodule has its own pyproject.toml (uv sync there).
+
 # Core web framework and server
 fastapi>=0.104.0
 uvicorn>=0.24.0
@@ -13,7 +17,7 @@ python-dotenv>=1.0.0
 flask>=3.0.0
 flask-cors>=4.0.0
 
-# Telegram bot integration (bot uses httpx above for proxy requests; rate-limiter extra required for AIORateLimiter)
+# Telegram bot integration (rate-limiter extra required for AIORateLimiter)
 python-telegram-bot[rate-limiter]>=20.0
 
 # Testing framework
@@ -33,13 +37,26 @@ reportlab>=4.0.0
 # Cryptographic operations (for HTTPS server)
 cryptography>=41.0.0
 
-# MCP (Model Context Protocol) client library
-# Note: Package name may be 'mcp' or 'mcp-sdk' - verify with: pip search mcp
-mcp>=0.1.0
+# MCP and browser automation (browser-use runs in mcp-browser-use submodule via uv)
+mcp>=1.6.0
+playwright>=1.40.0
+pyperclip>=1.8.0
 
-# FastMCP HTTP client for mcp-server-browser-use (HTTP transport; same ref as mcp-browser-use)
+# FastMCP HTTP client for mcp-server-browser-use (align with mcp-browser-use submodule)
 fastmcp @ git+https://github.com/jlowin/fastmcp.git@3d6fd4650c4c59465fbd6983693952946259d354
 
-# AutoGen team chat and code execution (actor-critic workflow; Docker executor for code)
+# AutoGen team chat, code execution, and Studio UI (start_all.py runs autogenstudio serve)
 autogen-agentchat>=0.4.0
+autogen-core>=0.2.0
 autogen-ext[docker]>=0.4.0
+autogenstudio>=0.4.0
+
+# LangChain (used by proxy_server for MCP connect / LLM backends)
+langchain-core>=0.3.0
+langchain-openai>=0.3.0
+langchain-anthropic>=0.2.0
+langchain-google-genai>=2.0.0
+
+# Utilities
+pydantic-settings>=2.0.0
+typer>=0.12.0
