@@ -12,8 +12,11 @@ from pathlib import Path
 # Project root = parent of scripts directory
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_PROJECT_ROOT = SCRIPT_DIR.parent
+# Ensure project root is on path so "from scripts.xxx" works when run as scripts/install_wizard.py
+if str(DEFAULT_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(DEFAULT_PROJECT_ROOT))
 
-# LLM providers we prompt for (key in .env, display name)
+# LLM providers we prompt for (key in .env, display name) (key in .env, display name)
 LLM_PROVIDERS = [
     ("ollama", "Ollama (local)"),
     ("openai", "OpenAI (GPT)"),
