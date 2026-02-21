@@ -25,8 +25,10 @@ if (Test-Path $projectGitDir) {
     & git submodule update --init --recursive
     if ($LASTEXITCODE -ne 0) { Write-Host 'Note: git submodule update had issues (may be OK if no submodules).' -ForegroundColor Gray }
 }
-# If repo has no .gitmodules or submodule was never added, mcp-browser-use may be missing or empty; clone it
-$mcpHasContent = (Test-Path $mcpDir) -and (Test-Path (Join-Path $mcpDir 'pyproject.toml'))
+# Require full Saik0s tree (pyproject.toml + key source); incomplete/broken copies get replaced by fresh clone
+$mcpPyproject = Join-Path $mcpDir 'pyproject.toml'
+$mcpExceptions = Join-Path $mcpDir 'src/mcp_server_browser_use/exceptions.py'
+$mcpHasContent = (Test-Path $mcpDir) -and (Test-Path $mcpPyproject) -and (Test-Path $mcpExceptions)
 if (-not $mcpHasContent) {
     if (Test-Path $mcpDir) {
         Write-Host 'mcp-browser-use exists but is incomplete; cloning fresh copy...' -ForegroundColor Yellow
