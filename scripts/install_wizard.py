@@ -55,19 +55,27 @@ PROVIDER_API_KEY_VAR = {
 
 
 def _prompt(prompt: str, default: str = "", secret: bool = False) -> str:
-    """Read one line from stdin; return stripped value or default."""
+    """Read one line from stdin; return stripped value or default. Flushes stdout so prompts and input are visible when run from batch/PowerShell."""
     if default:
         prompt = f"{prompt} [{default}]: "
     else:
         prompt = f"{prompt}: "
+    # Flush so the prompt appears before we read (fixes buffering when run from install.bat / PowerShell)
+    sys.stdout.flush()
+    sys.stderr.flush()
     if secret:
-        try:
-            import getpass
-            value = getpass.getpass(prompt)
-        except Exception:
+        # On Windows, getpass can fail to capture when run from PowerShell/batch; use input() so we always capture
+        if os.name == "nt":
             value = input(prompt)
+        else:
+            try:
+                import getpass
+                value = getpass.getpass(prompt)
+            except Exception:
+                value = input(prompt)
     else:
         value = input(prompt)
+    sys.stdout.flush()
     value = value.strip()
     return value if value else default
 
@@ -135,6 +143,8 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     """
     print("\n--- CATBot configuration wizard ---\n")
     print("Answer the questions below. Press Enter to accept [defaults]. You can edit .env later.\n")
+    if os.name == "nt":
+        print("(On Windows, API keys will be visible as you type so they are captured correctly.)\n")
 
     # 1. LLM provider
     print("1) LLM provider (for chat and tools):")

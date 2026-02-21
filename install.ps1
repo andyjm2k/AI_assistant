@@ -16,16 +16,31 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# 2. Git submodule (mcp-browser-use) – init and update so submodule is fully populated
+# 2. mcp-browser-use: init submodule if configured, else clone so directory is fully populated
 Write-Host ([Environment]::NewLine + '[2/9] Initializing mcp-browser-use...') -ForegroundColor Yellow
 $mcpDir = Join-Path $ProjectRoot 'mcp-browser-use'
+$mcpRepoUrl = 'https://github.com/Saik0s/mcp-browser-use.git'
 $projectGitDir = Join-Path $ProjectRoot '.git'
 if (Test-Path $projectGitDir) {
     & git submodule update --init --recursive
     if ($LASTEXITCODE -ne 0) { Write-Host 'Note: git submodule update had issues (may be OK if no submodules).' -ForegroundColor Gray }
 }
+# If repo has no .gitmodules or submodule was never added, mcp-browser-use may be missing or empty; clone it
+$mcpHasContent = (Test-Path $mcpDir) -and (Test-Path (Join-Path $mcpDir 'pyproject.toml'))
+if (-not $mcpHasContent) {
+    if (Test-Path $mcpDir) {
+        Write-Host 'mcp-browser-use exists but is incomplete; cloning fresh copy...' -ForegroundColor Yellow
+        Remove-Item -Recurse -Force $mcpDir
+    }
+    Write-Host ('Cloning ' + $mcpRepoUrl + ' into mcp-browser-use...') -ForegroundColor Cyan
+    & git clone --depth 1 $mcpRepoUrl $mcpDir
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host 'Failed to clone mcp-browser-use. Check network and Git, then run install again.' -ForegroundColor Red
+        exit 1
+    }
+}
 if (-not (Test-Path $mcpDir)) {
-    Write-Host 'mcp-browser-use directory not found. Clone with --recurse-submodules or add as submodule; see README.' -ForegroundColor Red
+    Write-Host 'mcp-browser-use directory not found after init/clone. See README.' -ForegroundColor Red
     exit 1
 }
 
