@@ -200,7 +200,7 @@ class ReadFileRequest(BaseModel):
 class WriteFileRequest(BaseModel):
     filename: str  # Name of the file to write
     content: str  # Content to write to the file
-    format: Optional[str] = "txt"  # File format (txt, docx, xlsx, pdf)
+    format: Optional[str] = "txt"  # File format (txt, md, docx, xlsx, pdf)
 
 class FileResponse(BaseModel):
     success: bool  # Whether the operation was successful
@@ -363,10 +363,10 @@ SCRATCH_DIR = _PROJECT_ROOT / "scratch"
 COMPANIONS_DIR = _PROJECT_ROOT / "config" / "companions"
 
 # Allowed file extensions for scratch file operations (path traversal mitigation)
-READ_ALLOWED_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".py", ".js", ".html"}
-WRITE_ALLOWED_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf", ".py", ".js", ".html"}
+READ_ALLOWED_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".py", ".js", ".html"}
+WRITE_ALLOWED_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".py", ".js", ".html"}
 # Allowed extensions for Google Drive upload (scratch workspace only; path exfiltration mitigation)
-DRIVE_UPLOAD_EXTENSIONS = {".txt", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
+DRIVE_UPLOAD_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
 # Max file size for read/write in bytes (10MB default), configurable via env
 FILE_OPS_MAX_SIZE_BYTES = int(os.getenv("FILE_OPS_MAX_SIZE", "10485760"))
 
@@ -3077,7 +3077,7 @@ async def get_all_available_tools() -> List[Dict]:
     if FILE_OPS_AVAILABLE:
         all_tools.append({
             "name": "read_file",
-            "description": "Read a file from the scratch workspace. Supported: .txt, .docx, .xlsx, .xls, .pdf, .png, .jpg, .jpeg, .py, .js, .html. Use filename only (e.g. notes.txt), no path traversal.",
+            "description": "Read a file from the scratch workspace. Supported: .txt, .md, .docx, .xlsx, .xls, .pdf, .png, .jpg, .jpeg, .py, .js, .html. Use filename only (e.g. notes.txt), no path traversal.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3092,7 +3092,7 @@ async def get_all_available_tools() -> List[Dict]:
         })
         all_tools.append({
             "name": "write_file",
-            "description": "Write or overwrite a file in the scratch workspace. Supported: .txt, .docx, .xlsx, .xls, .pdf, .py, .js, .html. Use filename with extension or filename plus format.",
+            "description": "Write or overwrite a file in the scratch workspace. Supported: .txt, .md, .docx, .xlsx, .xls, .pdf, .py, .js, .html. Use filename with extension or filename plus format.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4711,7 +4711,7 @@ async def _read_file_internal(filename: str) -> Dict[str, Any]:
         if filepath.stat().st_size > FILE_OPS_MAX_SIZE_BYTES:
             return {"success": False, "message": "File too large"}
         ext = filepath.suffix.lower()
-        if ext == '.txt':
+        if ext in ['.txt', '.md']:
             content = read_text_file(filepath)
             return {"success": True, "message": f"Read {filename}", "data": {"content": content, "type": "text"}}
         if ext == '.docx':
@@ -4746,7 +4746,7 @@ async def _write_file_internal(filename: str, content: str, format: str = "txt")
             logical_name = f"{logical_name}.{format.lower()}"
         filepath = resolve_scratch_path(logical_name, WRITE_ALLOWED_EXTENSIONS)
         ext = filepath.suffix.lower()
-        if ext == '.txt':
+        if ext in ['.txt', '.md']:
             write_text_file(filepath, content)
         elif ext == '.docx':
             write_docx_file(filepath, content)
@@ -4804,7 +4804,7 @@ async def read_file(
 ):
     """
     Read a file from the scratch directory
-    Supports: txt, docx, xlsx, pdf, png
+    Supports: txt, md, docx, xlsx, pdf, png
     """
     if not FILE_OPS_AVAILABLE:
         raise HTTPException(
@@ -4829,7 +4829,7 @@ async def read_file(
         # Determine file extension
         file_ext = filepath.suffix.lower()
         # Read file based on extension
-        if file_ext == '.txt':
+        if file_ext in ['.txt', '.md']:
             content = read_text_file(filepath)
             return FileResponse(
                 success=True,
@@ -4873,7 +4873,7 @@ async def read_file(
             # Unsupported file type
             return FileResponse(
                 success=False,
-                message=f"Unsupported file type: {file_ext}. Supported types: txt, docx, xlsx, pdf, png"
+                message=f"Unsupported file type: {file_ext}. Supported types: txt, md, docx, xlsx, pdf, png"
             )
     
     except Exception as e:
@@ -4890,7 +4890,7 @@ async def write_file(
 ):
     """
     Write content to a file in the scratch directory
-    Supports: txt, docx, xlsx, pdf
+    Supports: txt, md, docx, xlsx, pdf
     """
     if not FILE_OPS_AVAILABLE:
         raise HTTPException(
@@ -4910,7 +4910,7 @@ async def write_file(
     file_ext = filepath.suffix.lower()
     try:
         # Write file based on extension
-        if file_ext == '.txt':
+        if file_ext in ['.txt', '.md']:
             write_text_file(filepath, request.content)
         
         elif file_ext == '.docx':
@@ -4926,7 +4926,7 @@ async def write_file(
             # Unsupported file type
             return FileResponse(
                 success=False,
-                message=f"Unsupported file type for writing: {file_ext}. Supported types: txt, docx, xlsx, pdf"
+                message=f"Unsupported file type for writing: {file_ext}. Supported types: txt, md, docx, xlsx, pdf"
             )
         
         # Return success response
