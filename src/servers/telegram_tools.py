@@ -345,12 +345,16 @@ async def execute_telegram_tool(
         prompt = (arguments.get("prompt") or "").strip()
         if not prompt:
             return {"success": False, "message": "prompt is required."}
-        timeout_seconds = arguments.get("timeoutSeconds")
-        result = await do_codex(prompt=prompt, timeout_seconds=timeout_seconds)
+        result = await do_codex(prompt=prompt)
         summary_file = result.get("summaryFile")
+        events_file = result.get("eventsFile")
+        last_message_file = result.get("lastMessageFile")
         exit_code = result.get("exitCode")
         timed_out = result.get("timedOut")
-        message = f"Codex CLI finished (exit_code={exit_code}, timed_out={timed_out}). Summary file: {summary_file}"
+        message = (
+            f"Codex CLI finished (exit_code={exit_code}, timed_out={timed_out}). "
+            f"Summary file: {summary_file}. Events file: {events_file}. Last message file: {last_message_file}"
+        )
         return {"success": True, "message": message, "data": result}
 
     # --- scrapeWebsite ---

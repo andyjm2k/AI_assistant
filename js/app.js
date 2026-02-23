@@ -6199,11 +6199,13 @@ function saveWAVFile(wavBlob) {
 
                 const data = await response.json();
                 const summaryFile = data.summaryFile ? `Summary file: ${data.summaryFile}` : 'Summary file not provided.';
+                const eventsFile = data.eventsFile ? `Events file: ${data.eventsFile}` : 'Events file not provided.';
+                const lastMessageFile = data.lastMessageFile ? `Last message file: ${data.lastMessageFile}` : 'Last message file not provided.';
                 const exitCode = data.exitCode !== undefined ? `exit_code=${data.exitCode}` : 'exit_code=unknown';
                 const timedOut = data.timedOut ? 'timed_out=true' : 'timed_out=false';
                 return {
                     success: data.success !== false,
-                    message: `Codex CLI finished (${exitCode}, ${timedOut}). ${summaryFile}`
+                    message: `Codex CLI finished (${exitCode}, ${timedOut}). ${summaryFile} ${eventsFile} ${lastMessageFile}`
                 };
             } catch (error) {
                 console.error('Codex CLI error:', error);

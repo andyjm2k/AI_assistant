@@ -356,7 +356,6 @@ Key environment variables (see `config/mcp_config.env.example` for complete list
 - `CODEX_CLI_PATH`: Path to the `codex` executable (default `codex` on PATH)
 - `CODEX_SANDBOX_MODE`: Sandbox policy (`read-only`, `workspace-write`, `danger-full-access`)
 - `CODEX_APPROVAL_POLICY`: Approval policy (`untrusted`, `on-request`, `on-failure`, `never`)
-- `CODEX_DISABLE_ALT_SCREEN`: Disable alternate screen for clean output capture (default true)
 - `CODEX_ENABLE_SEARCH`: Enable Codex built-in web search (default true)
 - `CODEX_TIMEOUT_SECONDS`: Default timeout in seconds (default 1800)
 

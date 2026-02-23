@@ -103,6 +103,14 @@ except ValueError:
     BOM_API_TIMEOUT_SECONDS = 12.0
 BOM_ALLOWED_HOST_SUFFIX = "bom.gov.au"
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "")
+    if value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+PROXY_RELOAD = _env_bool("PROXY_RELOAD", default=False)
+
 
 # Import memory system (with error handling)
 MEMORY_AVAILABLE = False
@@ -261,7 +269,6 @@ class TodoResumeRequest(BaseModel):
 
 class CodexExecRequest(BaseModel):
     prompt: str
-    timeoutSeconds: Optional[int] = None
 
 
 class TodoExecuteResponse(BaseModel):
@@ -539,9 +546,10 @@ CODEX_ENABLED = os.getenv("CODEX_ENABLED", "true").lower() == "true"
 CODEX_CLI_PATH = (os.getenv("CODEX_CLI_PATH") or "codex").strip() or "codex"
 CODEX_SANDBOX_MODE = (os.getenv("CODEX_SANDBOX_MODE") or "workspace-write").strip() or "workspace-write"
 CODEX_APPROVAL_POLICY = (os.getenv("CODEX_APPROVAL_POLICY") or "never").strip() or "never"
-CODEX_DISABLE_ALT_SCREEN = os.getenv("CODEX_DISABLE_ALT_SCREEN", "true").lower() == "true"
 CODEX_ENABLE_SEARCH = os.getenv("CODEX_ENABLE_SEARCH", "true").lower() == "true"
 CODEX_TIMEOUT_SECONDS = int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800"))
+CODEX_JSON_EVENTS = os.getenv("CODEX_JSON_EVENTS", "true").lower() == "true"
+CODEX_OUTPUT_LAST_MESSAGE = os.getenv("CODEX_OUTPUT_LAST_MESSAGE", "true").lower() == "true"
 
 # Auth configuration
 AUTH_USERS_FILE = _PROJECT_ROOT / "config" / "auth_users.json"
@@ -1865,6 +1873,10 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
         else:
             conversation_summary += "No messages returned from AutoGen team."
         print(f"✅ AutoGen team completed with {len(messages)} messages")
+        try:
+            _write_autogen_conversation_to_scratch(input_text, messages, conversation_summary)
+        except Exception as e:
+            print(f"[AUTOGEN] Failed to write conversation to scratch: {e}", flush=True)
         return {
             "output": conversation_summary,
             "response": conversation_summary,
@@ -1878,6 +1890,50 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"AutoGen team execution failed: {str(e)}")
 
 
+def _write_autogen_conversation_to_scratch(
+    input_text: str,
+    messages: List[Dict[str, str]],
+    conversation_summary: str,
+) -> str:
+    """Write AutoGen conversation to scratch and return filename."""
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().astimezone()
+    timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp_human = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    suffix = secrets.token_hex(4)
+    filename = f"autogen_run_{timestamp_file}_{suffix}.txt"
+    filepath = SCRATCH_DIR / filename
+    lines = [
+        "AutoGen team conversation log",
+        f"Date-time: {timestamp_human}",
+        "",
+        "Input:",
+        input_text or "(empty)",
+        "",
+        "--- Messages ---",
+    ]
+    if messages:
+        for i, msg in enumerate(messages, 1):
+            source = msg.get("source", "unknown")
+            content = msg.get("content", "")
+            lines.append(f"[{i}] {source}:")
+            lines.append(content if content else "(empty)")
+            lines.append("")
+    else:
+        lines.append("(No messages returned from AutoGen team)")
+        lines.append("")
+    lines.extend(
+        [
+            "--- Conversation Summary ---",
+            "",
+            conversation_summary or "(empty)",
+        ]
+    )
+    filepath.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[AUTOGEN] Wrote conversation to {filepath}", flush=True)
+    return filename
+
+
 def _write_codex_summary_to_scratch(
     prompt: str,
     command: List[str],
@@ -1886,6 +1942,8 @@ def _write_codex_summary_to_scratch(
     stderr: str,
     duration_ms: int,
     timed_out: bool,
+    events_file: Optional[str] = None,
+    last_message_file: Optional[str] = None,
 ) -> str:
     """Write Codex execution summary to scratch and return filename."""
     SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
@@ -1901,6 +1959,8 @@ def _write_codex_summary_to_scratch(
         f"Duration (ms): {duration_ms}",
         f"Timed out: {timed_out}",
         f"Exit code: {exit_code if exit_code is not None else 'N/A'}",
+        f"Events file: {events_file or 'N/A'}",
+        f"Last message file: {last_message_file or 'N/A'}",
         "",
         "Command:",
         " ".join(command),
@@ -1918,34 +1978,75 @@ def _write_codex_summary_to_scratch(
     return filename
 
 
-async def _run_codex_cli(prompt: str, timeout_seconds: Optional[int] = None) -> Dict[str, Any]:
+def _write_codex_error_to_scratch(
+    prompt: str,
+    command: List[str],
+    error_message: str,
+) -> str:
+    """Write Codex execution error to scratch and return filename."""
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().astimezone()
+    timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp_human = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    suffix = secrets.token_hex(4)
+    filename = f"codex_run_error_{timestamp_file}_{suffix}.txt"
+    filepath = SCRATCH_DIR / filename
+    lines = [
+        "Codex CLI execution error",
+        f"Date-time: {timestamp_human}",
+        "",
+        "Command:",
+        " ".join(command) if command else "(none)",
+        "",
+        "Prompt:",
+        prompt or "(empty)",
+        "",
+        "Error:",
+        error_message or "(empty)",
+    ]
+    filepath.write_text("\n".join(lines), encoding="utf-8")
+    return filename
+
+
+async def _run_codex_cli(prompt: str) -> Dict[str, Any]:
     if not CODEX_ENABLED:
         raise HTTPException(status_code=503, detail="Codex CLI tool is disabled.")
     prompt = (prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is required.")
-    timeout = CODEX_TIMEOUT_SECONDS if timeout_seconds is None else int(timeout_seconds)
+    timeout = CODEX_TIMEOUT_SECONDS
     if timeout <= 0:
-        raise HTTPException(status_code=400, detail="timeoutSeconds must be a positive integer.")
+        raise HTTPException(status_code=500, detail="CODEX_TIMEOUT_SECONDS must be a positive integer.")
     timeout = min(max(timeout, 60), 7200)
 
     sandbox_mode = CODEX_SANDBOX_MODE if CODEX_SANDBOX_MODE in ("read-only", "workspace-write") else "workspace-write"
     approval_policy = CODEX_APPROVAL_POLICY if CODEX_APPROVAL_POLICY in ("untrusted", "on-request", "on-failure", "never") else "never"
 
-    cmd: List[str] = [
-        CODEX_CLI_PATH,
+    cmd: List[str] = [CODEX_CLI_PATH]
+    if CODEX_ENABLE_SEARCH:
+        # --search is a top-level codex flag and must appear before the subcommand.
+        cmd.append("--search")
+    cmd.extend([
         "exec",
-        "-a",
-        approval_policy,
         "--sandbox",
         sandbox_mode,
         "-C",
         str(_PROJECT_ROOT),
-    ]
-    if CODEX_DISABLE_ALT_SCREEN:
-        cmd.append("--no-alt-screen")
-    if CODEX_ENABLE_SEARCH:
-        cmd.append("--search")
+    ])
+    if approval_policy == "never":
+        # codex exec no longer accepts -a; --full-auto is the supported non-interactive mode
+        cmd.append("--full-auto")
+    events_file = None
+    last_message_file = None
+    if CODEX_JSON_EVENTS:
+        cmd.append("--json")
+    if CODEX_OUTPUT_LAST_MESSAGE:
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.now().astimezone()
+        timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+        suffix = secrets.token_hex(4)
+        last_message_file = f"codex_last_message_{timestamp_file}_{suffix}.txt"
+        cmd.extend(["-o", str(SCRATCH_DIR / last_message_file)])
     cmd.append(prompt)
 
     start = time.time()
@@ -1970,11 +2071,21 @@ async def _run_codex_cli(prompt: str, timeout_seconds: Optional[int] = None) -> 
         stderr_text = (err_bytes or b"").decode("utf-8", errors="replace")
         exit_code = proc.returncode
     except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="Codex CLI not found. Ensure it is installed and on PATH.")
+        error_file = _write_codex_error_to_scratch(prompt, cmd, "Codex CLI not found. Ensure it is installed and on PATH.")
+        raise HTTPException(status_code=500, detail=f"Codex CLI not found. See {error_file} in scratch for details.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to execute Codex CLI: {str(e)}")
+        error_file = _write_codex_error_to_scratch(prompt, cmd, f"Failed to execute Codex CLI: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to execute Codex CLI. See {error_file} in scratch for details.")
     finally:
         duration_ms = int((time.time() - start) * 1000)
+
+    if CODEX_JSON_EVENTS:
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.now().astimezone()
+        timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+        suffix = secrets.token_hex(4)
+        events_file = f"codex_events_{timestamp_file}_{suffix}.jsonl"
+        (SCRATCH_DIR / events_file).write_text(stdout_text or "", encoding="utf-8")
 
     summary_file = _write_codex_summary_to_scratch(
         prompt=prompt,
@@ -1984,10 +2095,14 @@ async def _run_codex_cli(prompt: str, timeout_seconds: Optional[int] = None) -> 
         stderr=stderr_text,
         duration_ms=duration_ms,
         timed_out=timed_out,
+        events_file=events_file,
+        last_message_file=last_message_file,
     )
     return {
         "success": exit_code == 0 and not timed_out,
         "summaryFile": summary_file,
+        "eventsFile": events_file,
+        "lastMessageFile": last_message_file,
         "exitCode": exit_code,
         "timedOut": timed_out,
         "durationMs": duration_ms,
@@ -2023,7 +2138,7 @@ async def proxy_codex_exec(
 ):
     """Run Codex CLI non-interactively in sandboxed mode. Auth required."""
     _ = current_user  # keep for auth enforcement
-    return await _run_codex_cli(request.prompt, timeout_seconds=request.timeoutSeconds)
+    return await _run_codex_cli(request.prompt)
 
 # Allowed keys when persisting MCP server config (never persist 'command')
 MCP_SERVER_SAFE_KEYS = {"id", "name", "preset_id", "apiKey", "model", "url", "wsUrl", "status", "enabled"}
@@ -3489,10 +3604,6 @@ async def get_all_available_tools() -> List[Dict]:
                         "type": "string",
                         "description": "Task instructions for Codex (e.g. 'Add a new /v1/proxy/codex tool in the proxy server and update docs')",
                     },
-                    "timeoutSeconds": {
-                        "type": "integer",
-                        "description": "Optional timeout in seconds (default 1800; max 7200)",
-                    },
                 },
                 "required": ["prompt"]
             },
@@ -3800,10 +3911,9 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
     elif tool_name == "runCodexCli":
         try:
             codex_prompt = (parameters.get("prompt") or "").strip()
-            timeout_seconds = parameters.get("timeoutSeconds")
             if not codex_prompt:
                 return "Error: 'prompt' is required for runCodexCli"
-            result = await _run_codex_cli(codex_prompt, timeout_seconds=timeout_seconds)
+            result = await _run_codex_cli(codex_prompt)
             summary_file = result.get("summaryFile")
             exit_code = result.get("exitCode")
             timed_out = result.get("timedOut")
@@ -5836,7 +5946,7 @@ if __name__ == "__main__":
             "src.servers.proxy_server:app",
             host="0.0.0.0",
             port=8002,
-            reload=True,
+            reload=PROXY_RELOAD,
             log_level="info",
             ssl_keyfile=key_file,
             ssl_certfile=cert_file
@@ -5848,6 +5958,6 @@ if __name__ == "__main__":
             "src.servers.proxy_server:app",
             host="0.0.0.0",
             port=8002,
-            reload=True,
+            reload=PROXY_RELOAD,
             log_level="info"
         )
