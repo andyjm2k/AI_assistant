@@ -96,6 +96,13 @@ MCP_BROWSER_USE_HTTP_URL = os.environ.get("MCP_BROWSER_USE_HTTP_URL", "http://12
 BROWSER_USE_HTTP_UNAVAILABLE_MSG = (
     "Browser-use HTTP server not available. Start it with: uv run mcp-server-browser-use server (in mcp-browser-use directory)."
 )
+BOM_API_BASE_URL = os.environ.get("BOM_API_BASE_URL", "https://api.weather.bom.gov.au/v1").strip().rstrip("/")
+try:
+    BOM_API_TIMEOUT_SECONDS = float(os.environ.get("BOM_API_TIMEOUT_SECONDS", "12"))
+except ValueError:
+    BOM_API_TIMEOUT_SECONDS = 12.0
+BOM_ALLOWED_HOST_SUFFIX = "bom.gov.au"
+
 
 # Import memory system (with error handling)
 MEMORY_AVAILABLE = False
@@ -1636,6 +1643,155 @@ async def proxy_news_search(query: str):
     return await _do_proxy_news(query)
 
 
+def _sanitize_weather_location(location: str) -> str:
+    return re.sub(r"\s+", " ", (location or "").strip())
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_memory_location(memories: List[Dict[str, Any]]) -> Optional[str]:
+    if not memories:
+        return None
+    patterns = [
+        r"(?:i(?:\s|'| a)?m|i live|i am based|my location is|i'm in)\s+(?:in\s+)?([A-Za-z\s,'-]{2,80})",
+        r"([A-Za-z\s'-]{2,60},\s*(?:nsw|vic|qld|sa|wa|tas|nt|act))",
+        r"(\d{4})",
+    ]
+    for m in memories:
+        txt = (m.get("text") or "").strip()
+        if not txt:
+            continue
+        for pat in patterns:
+            mo = re.search(pat, txt, re.IGNORECASE)
+            if mo:
+                return _sanitize_weather_location(mo.group(1).strip(" .,"))
+    return None
+
+
+async def _resolve_weather_location(location: Optional[str], user_id: Optional[str], memory_manager: Any) -> Tuple[str, str]:
+    requested = _sanitize_weather_location(location or "")
+    if requested:
+        return requested, "request"
+    if memory_manager is not None and user_id:
+        try:
+            memories = await memory_manager.search_memories(
+                query=f"{user_id} location city suburb postcode", limit=8, similarity_threshold=0.3
+            )
+            inferred = _extract_memory_location(memories)
+            if inferred:
+                return inferred, "memory"
+        except Exception as e:
+            print(f"[WEATHER] Memory lookup failed: {e}")
+    raise HTTPException(status_code=400, detail="Location is required. Please provide a city/suburb/postcode.")
+
+
+async def _do_proxy_weather(location: Optional[str], detail: str = "summary", user_id: Optional[str] = None, memory_manager: Any = None) -> Dict[str, Any]:
+    resolved_location, source = await _resolve_weather_location(location, user_id, memory_manager)
+    detail = (detail or "summary").strip().lower()
+    parsed_base = urlparse(BOM_API_BASE_URL)
+    if not parsed_base.scheme.startswith("http"):
+        raise HTTPException(status_code=500, detail="Invalid BOM_API_BASE_URL configuration")
+    if not parsed_base.hostname or not parsed_base.hostname.endswith(BOM_ALLOWED_HOST_SUFFIX):
+        raise HTTPException(status_code=500, detail="BOM_API_BASE_URL host is not allowlisted")
+
+    search_url = f"{BOM_API_BASE_URL}/locations"
+    try:
+        async with httpx.AsyncClient(timeout=BOM_API_TIMEOUT_SECONDS) as client:
+            loc_resp = await client.get(search_url, params={"search": resolved_location}, headers={"Accept": "application/json"})
+            loc_resp.raise_for_status()
+            loc_json = loc_resp.json()
+            loc_items = loc_json.get("data") if isinstance(loc_json, dict) else []
+            if not isinstance(loc_items, list) or not loc_items:
+                raise HTTPException(status_code=404, detail=f"No BOM weather location found for '{resolved_location}'.")
+            loc = loc_items[0]
+            geohash = loc.get("geohash") or loc.get("id")
+            if not geohash:
+                raise HTTPException(status_code=502, detail="BOM response missing location geohash")
+
+            obs_task = client.get(f"{BOM_API_BASE_URL}/locations/{geohash}/observations", headers={"Accept": "application/json"})
+            forecast_task = client.get(f"{BOM_API_BASE_URL}/locations/{geohash}/forecasts/daily", headers={"Accept": "application/json"})
+            obs_resp, forecast_resp = await asyncio.gather(obs_task, forecast_task)
+            obs_resp.raise_for_status()
+            forecast_resp.raise_for_status()
+            obs_json = obs_resp.json()
+            forecast_json = forecast_resp.json()
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timed out contacting BOM weather service")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"BOM weather service returned status {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve weather data: {str(e)}")
+
+    observation = ((obs_json or {}).get("data") or {}).get("observations") or {}
+    if isinstance(observation, list):
+        observation = observation[0] if observation else {}
+    forecast_days = ((forecast_json or {}).get("data") or {}).get("daily") or []
+    if not isinstance(forecast_days, list):
+        forecast_days = []
+
+    current = {
+        "temperature_c": _safe_float(observation.get("temp") or observation.get("temperature")),
+        "feels_like_c": _safe_float(observation.get("temp_feels_like") or observation.get("feelsLike")),
+        "humidity_pct": _safe_float(observation.get("humidity")),
+        "wind_kph": _safe_float(observation.get("wind_speed_kilometre") or observation.get("wind_speed_kmh") or observation.get("windSpeedKmh")),
+        "condition": observation.get("icon_descriptor") or observation.get("condition") or "unknown",
+        "observation_time": observation.get("local_date_time_full") or observation.get("observation_time") or "",
+    }
+
+    forecast = []
+    for day in forecast_days[:7]:
+        forecast.append({
+            "date": day.get("date"),
+            "min_c": _safe_float(day.get("temp_min") or day.get("tempMin")),
+            "max_c": _safe_float(day.get("temp_max") or day.get("tempMax")),
+            "rain_chance_pct": _safe_float(day.get("rain_chance") or day.get("rainChance")),
+            "condition": day.get("icon_descriptor") or day.get("short_text") or day.get("condition"),
+        })
+
+    loc_name = loc.get("name") or resolved_location
+    summary = (
+        f"Weather for {loc_name}: {current.get('temperature_c', 'N/A')}°C, {current.get('condition', 'unknown')}"
+        f". Forecast entries: {len(forecast)}."
+    )
+
+    payload = {
+        "success": True,
+        "summary": summary,
+        "resolved_location": loc_name,
+        "location_source": source,
+        "current": current,
+        "forecast": forecast,
+        "detail": detail,
+        "source": "bom.gov.au",
+    }
+
+    if detail == "current":
+        payload["forecast"] = []
+    elif detail == "forecast":
+        payload["current"] = {}
+    return payload
+
+
+@app.get("/v1/proxy/weather")
+async def proxy_weather(
+    location: Optional[str] = None,
+    detail: str = "summary",
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Fetch parsed weather information from BOM. Auth required."""
+    user_id = current_user.get("username") if isinstance(current_user, dict) else None
+    return await _do_proxy_weather(location=location, detail=detail, user_id=user_id, memory_manager=memory_manager if MEMORY_AVAILABLE else None)
+
+
 # Shared AutoGen logic for route and Telegram tool runner
 async def _do_autogen(input_text: str) -> Dict[str, Any]:
     """Run AutoGen team with input_text. Returns dict with output/response/messages. Raises HTTPException on failure."""
@@ -2699,6 +2855,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 "do_search": _do_proxy_search,
                 "do_fetch": _do_proxy_fetch,
                 "do_news": _do_proxy_news,
+                "do_weather": _do_proxy_weather,
                 "do_autogen": _do_autogen,
                 "do_browser_agent": _do_browser_agent,
                 "do_deep_research": _do_deep_research,
@@ -3072,6 +3229,20 @@ async def get_all_available_tools() -> List[Dict]:
         print("[PHILOSOPHER] Added news_search tool")
     else:
         print("[PHILOSOPHER] NEWS_API_KEY not configured, skipping news_search tool")
+
+    all_tools.append({
+        "name": "weather_info",
+        "description": "Get weather information from BOM (bom.gov.au). Supports explicit location or memory-based location fallback.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City/suburb/postcode (optional if available in memory)"},
+                "detail": {"type": "string", "description": "summary, current, or forecast", "default": "summary"}
+            }
+        },
+        "server_id": "proxy_server"
+    })
+    print("[PHILOSOPHER] Added weather_info tool")
     
     # 4. File manipulation tools (scratch directory only; when file ops available)
     if FILE_OPS_AVAILABLE:
@@ -3374,6 +3545,20 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
         except Exception as e:
             return f"Error executing news_search: {str(e)}"
     
+    elif tool_name == "weather_info":
+        try:
+            result = await _do_proxy_weather(
+                location=parameters.get("location"),
+                detail=parameters.get("detail", "summary"),
+                user_id=parameters.get("user_id"),
+                memory_manager=memory_manager if MEMORY_AVAILABLE else None,
+            )
+            return json.dumps(result, ensure_ascii=False)
+        except HTTPException as e:
+            return f"Error executing weather_info: {e.detail}"
+        except Exception as e:
+            return f"Error executing weather_info: {str(e)}"
+
     # Handle file manipulation tools (scratch workspace)
     elif tool_name == "read_file":
         try:

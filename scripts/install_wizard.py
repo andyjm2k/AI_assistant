@@ -219,6 +219,9 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         content = _set_key_in_env_content(content, "BRAVE_API_KEY", brave)
     if news:
         content = _set_key_in_env_content(content, "NEWS_API_KEY", news)
+    # Weather tool defaults (BOM): no API key required; keep configurable base URL/timeout in .env
+    content = _set_key_in_env_content(content, "BOM_API_BASE_URL", "https://api.weather.bom.gov.au/v1")
+    content = _set_key_in_env_content(content, "BOM_API_TIMEOUT_SECONDS", "12")
     if use_telegram and telegram_token:
         content = _set_key_in_env_content(content, "TELEGRAM_BOT_TOKEN", telegram_token)
         content = _set_key_in_env_content(content, "TELEGRAM_ALLOW_ALL", telegram_allow_all)

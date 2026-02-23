@@ -160,7 +160,7 @@ async def execute_telegram_tool(
     context must include: conversation_id, and optionally:
     - todo_user_key: str (required for manageTodoList; uses persistent store only)
     - memory_cache_store: Dict[str, list]
-    - do_search, do_fetch, do_news, do_autogen, do_browser_agent, do_deep_research (async callables)
+    - do_search, do_fetch, do_news, do_weather, do_autogen, do_browser_agent, do_deep_research (async callables)
     - read_file_internal, write_file_internal, list_files_internal (callables)
     - upload_drive_internal (callable), memory_manager (object with store/search/list/delete)
     Returns a dict with success (bool), message (str), and optional data.
@@ -378,6 +378,21 @@ async def execute_telegram_tool(
             for r in results[:5]
         ]
         return {"success": True, "message": "Search results:\n" + "\n".join(lines) if lines else "No results.", "data": data}
+
+
+    # --- weatherInfo ---
+    if name == "weatherInfo":
+        do_weather = context.get("do_weather")
+        if not do_weather:
+            return {"success": False, "message": "Weather service is not available."}
+        location = (arguments.get("location") or "").strip()
+        detail = (arguments.get("requestType") or arguments.get("detail") or "summary").strip().lower() or "summary"
+        user_id = context.get("user_id")
+        try:
+            data = await do_weather(location=location or None, detail=detail, user_id=user_id, memory_manager=context.get("memory_manager"))
+            return {"success": True, "message": data.get("summary", "Weather data retrieved."), "data": data}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
 
     # --- fetchNews ---
     if name == "fetchNews":
