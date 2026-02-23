@@ -89,6 +89,7 @@ See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line i
 - **[File Operations](proxy_server.py)** — Read/write support for txt, docx, xlsx, pdf, and images
 - **[Web Search](proxy_server.py)** — Brave Search API with DuckDuckGo fallback
 - **[Weather Information (BOM)](src/servers/proxy_server.py)** — Secure weather tool for web + Telegram using bom.gov.au data
+- **[Codex CLI Tool](src/servers/proxy_server.py)** — Non-interactive Codex CLI runner for CATBot code changes and new tool capabilities
 - **[Telegram Integration](telegram_bot.py)** — Bot interface for Telegram messaging
 - **[Memory System](memory/)** — Vector-based memory storage and retrieval for conversation context
 
@@ -350,6 +351,15 @@ Key environment variables (see `config/mcp_config.env.example` for complete list
 - `BRAVE_API_KEY`: Brave Search API key
 - `NEWS_API_KEY`: News API key
 
+#### Codex CLI Tool (optional)
+- `CODEX_ENABLED`: Enable the Codex CLI tool endpoint (default true)
+- `CODEX_CLI_PATH`: Path to the `codex` executable (default `codex` on PATH)
+- `CODEX_SANDBOX_MODE`: Sandbox policy (`read-only`, `workspace-write`, `danger-full-access`)
+- `CODEX_APPROVAL_POLICY`: Approval policy (`untrusted`, `on-request`, `on-failure`, `never`)
+- `CODEX_DISABLE_ALT_SCREEN`: Disable alternate screen for clean output capture (default true)
+- `CODEX_ENABLE_SEARCH`: Enable Codex built-in web search (default true)
+- `CODEX_TIMEOUT_SECONDS`: Default timeout in seconds (default 1800)
+
 #### Telegram Bot Configuration
 
 **Required (bot process):**
@@ -505,6 +515,7 @@ All services are configured to accept connections from devices on your local net
 
 **AI & Chat:**
 - `POST /v1/proxy/autogen` - AutoGen team-based chat endpoint
+- `POST /v1/proxy/codex` - Codex CLI non-interactive runner (auth required; writes summary to scratch)
 - `POST /v1/telegram/chat` - Telegram bot chat endpoint
 - `DELETE /v1/telegram/chat/{conversation_id}` - Clear Telegram conversation history
 
@@ -609,7 +620,7 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 **Telegram tools (optional):**  
 Set `TELEGRAM_TOOLS_ENABLED=true` in the proxy environment to enable the same tool set as the web client. When enabled, the model can use tools (e.g. web search, read/write files in scratch, todo list, memory cache, workflows, news, calculate, store/search memories). The proxy parses `<tool>...</tool><parameters>...</parameters>` from the model reply, executes the tool server-side, and sends the result back to the model for a natural-language reply.
 
-- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). The same optional `urls` behaviour is supported in the web (HTML) client.
+- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), runCodexCli (Codex CLI for CATBot code changes), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). The same optional `urls` behaviour is supported in the web (HTML) client.
 - **Web-only in Telegram:** PDF to PowerPoint (`pdfToPowerPoint`) — the proxy returns a message directing the user to the CATBot web interface for this feature.
 - **Config:** `config/catbot_system_prompt_with_tools.txt` (included) defines the tool list and format; placeholders `{{MEMORY_CACHE}}` and `{{TODO_LIST}}` are filled per conversation. Max tool-loop iterations per message: `TELEGRAM_TOOLS_MAX_ITERATIONS` (default 5).
 

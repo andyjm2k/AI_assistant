@@ -177,8 +177,18 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     brave = _prompt("4) Brave Search API key (optional; press Enter to skip)", "", secret=True)
     news = _prompt("5) News API key (optional; press Enter to skip)", "", secret=True)
 
-    # 5. Telegram
-    use_telegram = _prompt_yes_no("6) Enable Telegram bot?", False)
+    # 5. Codex CLI tool
+    use_codex = _prompt_yes_no("6) Enable Codex CLI tool?", True)
+    codex_path = ""
+    codex_search = True
+    codex_timeout = "1800"
+    if use_codex:
+        codex_path = _prompt("   Codex CLI path (default: codex)", "codex")
+        codex_search = _prompt_yes_no("   Enable Codex web search?", True)
+        codex_timeout = _prompt("   Codex timeout seconds", "1800")
+
+    # 6. Telegram
+    use_telegram = _prompt_yes_no("7) Enable Telegram bot?", False)
     telegram_token = ""
     telegram_admins = ""
     telegram_allow_all = "false"
@@ -191,8 +201,8 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
             else:
                 telegram_admins = _prompt("   Admin Telegram user ID(s), comma-separated", "")
 
-    # 6. HTTPS certificate hostname (for LAN access; used by https_server and proxy_server)
-    https_hostname = _prompt("7) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
+    # 7. HTTPS certificate hostname (for LAN access; used by https_server and proxy_server)
+    https_hostname = _prompt("8) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
     if not https_hostname.strip():
         https_hostname = "anton.local"
     else:
@@ -219,6 +229,14 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         content = _set_key_in_env_content(content, "BRAVE_API_KEY", brave)
     if news:
         content = _set_key_in_env_content(content, "NEWS_API_KEY", news)
+    content = _set_key_in_env_content(content, "CODEX_ENABLED", "true" if use_codex else "false")
+    if use_codex:
+        content = _set_key_in_env_content(content, "CODEX_CLI_PATH", codex_path or "codex")
+        content = _set_key_in_env_content(content, "CODEX_ENABLE_SEARCH", "true" if codex_search else "false")
+        content = _set_key_in_env_content(content, "CODEX_TIMEOUT_SECONDS", codex_timeout or "1800")
+        content = _set_key_in_env_content(content, "CODEX_SANDBOX_MODE", "workspace-write")
+        content = _set_key_in_env_content(content, "CODEX_APPROVAL_POLICY", "never")
+        content = _set_key_in_env_content(content, "CODEX_DISABLE_ALT_SCREEN", "true")
     # Weather tool defaults (BOM): no API key required; keep configurable base URL/timeout in .env
     content = _set_key_in_env_content(content, "BOM_API_BASE_URL", "https://api.weather.bom.gov.au/v1")
     content = _set_key_in_env_content(content, "BOM_API_TIMEOUT_SECONDS", "12")

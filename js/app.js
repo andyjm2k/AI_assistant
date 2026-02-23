@@ -5143,6 +5143,27 @@ function saveWAVFile(wavBlob) {
             {
                 type: "function",
                 function: {
+                    name: "runCodexCli",
+                    description: "Runs Codex CLI non-interactively to make CATBot code changes or add new tool capabilities. Output is saved to a scratch summary file.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            prompt: {
+                                type: "string",
+                                description: "Clear instructions for Codex to execute in the CATBot project (e.g. 'add a new proxy tool and update docs')"
+                            },
+                            timeoutSeconds: {
+                                type: "number",
+                                description: "Optional timeout in seconds (default 1800, max 7200)"
+                            }
+                        },
+                        required: ["prompt"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
                     name: "webSearch",
                     description: "Searches the web for information about a topic and returns relevant results",
                     parameters: {
@@ -5530,6 +5551,9 @@ function saveWAVFile(wavBlob) {
                             hostname: args.hostname || window.location.hostname,
                             protocol: args.protocol || window.location.protocol
                         });
+                        break;
+                    case "runCodexCli":
+                        result = await handleCodexCli(args);
                         break;
                     case "llmQuery":
                         result = await handleLLMQuery(args, context);
@@ -6148,6 +6172,41 @@ function saveWAVFile(wavBlob) {
                 return { success: true, message: "The workflow has completed. Please review the output." };
             } catch (error) {
                 console.error('Workflow error:', error);
+                return { success: false, message: `Error: ${error.message}` };
+            }
+        }
+
+        async function handleCodexCli({ prompt, timeoutSeconds }) {
+            try {
+                const proxyUrl = `${PROXY_BASE_URL}/v1/proxy/codex`;
+                const response = await fetch(proxyUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify({
+                        prompt,
+                        timeoutSeconds
+                    })
+                });
+
+                if (!response.ok) {
+                    const errText = await response.text();
+                    throw new Error(`Codex CLI failed: ${response.status} ${response.statusText}${errText ? ' - ' + errText.slice(0, 120) : ''}`);
+                }
+
+                const data = await response.json();
+                const summaryFile = data.summaryFile ? `Summary file: ${data.summaryFile}` : 'Summary file not provided.';
+                const exitCode = data.exitCode !== undefined ? `exit_code=${data.exitCode}` : 'exit_code=unknown';
+                const timedOut = data.timedOut ? 'timed_out=true' : 'timed_out=false';
+                return {
+                    success: data.success !== false,
+                    message: `Codex CLI finished (${exitCode}, ${timedOut}). ${summaryFile}`
+                };
+            } catch (error) {
+                console.error('Codex CLI error:', error);
                 return { success: false, message: `Error: ${error.message}` };
             }
         }
@@ -6989,21 +7048,29 @@ Parameters:
     "contentPrompt": "string (the task to execute)"
 }
 
-7. scrapeWebsite
+7. runCodexCli
+Description: Runs Codex CLI non-interactively to make CATBot code changes or add new tool capabilities. Use this when the user asks to modify the CATBot codebase or implement new tools.
+Parameters:
+{
+    "prompt": "string (clear instructions for Codex to execute)",
+    "timeoutSeconds": "number (optional; default 1800, max 7200)"
+}
+
+8. scrapeWebsite
 Description: Fetches and summarizes content from a website
 Parameters:
 {
     "url": "string (must include http:// or https://)"
 }
 
-8. webSearch
+9. webSearch
 Description: Searches the web for information about a topic and returns relevant results
 Parameters:
 {
     "query": "string (the search query or keywords to look for)"
 }
 
-9. fetchNews
+10. fetchNews
 Description: Fetches news articles matching given keywords and saves them to a CSV file
 Parameters:
 {
@@ -7011,7 +7078,7 @@ Parameters:
     "filename": "string (CSV filename to save to)"
 }
 
-10. pdfToPowerPoint
+11. pdfToPowerPoint
 Description: Use this tool whenever the user wants to convert a PDF to PowerPoint, turn a PDF into a presentation, or create slides from a PDF. Always call the tool—do not reply in text. If the user provides a PDF URL, include pdfUrl; if they do not, omit pdfUrl and the user will be prompted to upload a file. Required: title, filename.
 Parameters:
 {
@@ -7022,7 +7089,7 @@ Parameters:
     "filename": "string (required; e.g. 'presentation.pptx')"
 }
 
-11. uploadToGoogleDrive
+12. uploadToGoogleDrive
 Description: Uploads a file from the scratch directory to Google Drive using service account authentication. Use the filename relative to the scratch directory.
 Parameters:
 {
@@ -7030,20 +7097,20 @@ Parameters:
     "fileName": "string (optional custom name for the file in Drive)"
 }
 
-12. readFile
+13. readFile
 Description: Reads a file from the scratch directory. Supports txt, docx, xlsx, pdf, png, py, js, and html formats.
 Parameters:
 {
     "filename": "string (name of the file to read from the scratch directory)"
 }
 
-13. listFiles
+14. listFiles
 Description: Lists all files currently available in the scratch directory. No parameters are required.
 Parameters:
 {
 }
 
-14. writeFile
+15. writeFile
 Description: Writes content to a file in the scratch directory. Supports txt, docx, xlsx, pdf, py, js, and html formats.
 Parameters:
 {

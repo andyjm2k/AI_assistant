@@ -259,6 +259,11 @@ class TodoResumeRequest(BaseModel):
     userMessage: str
 
 
+class CodexExecRequest(BaseModel):
+    prompt: str
+    timeoutSeconds: Optional[int] = None
+
+
 class TodoExecuteResponse(BaseModel):
     status: str
     message: str
@@ -528,6 +533,15 @@ OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID") or os.getenv("OPENAI_ORGANIZATION")
 OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")
 # Optional shared secret for bot-to-proxy auth; when set, requests must include X-Telegram-Secret or Authorization: Bearer <secret>
 TELEGRAM_SECRET = os.getenv("TELEGRAM_SECRET")
+
+# Codex CLI configuration
+CODEX_ENABLED = os.getenv("CODEX_ENABLED", "true").lower() == "true"
+CODEX_CLI_PATH = (os.getenv("CODEX_CLI_PATH") or "codex").strip() or "codex"
+CODEX_SANDBOX_MODE = (os.getenv("CODEX_SANDBOX_MODE") or "workspace-write").strip() or "workspace-write"
+CODEX_APPROVAL_POLICY = (os.getenv("CODEX_APPROVAL_POLICY") or "never").strip() or "never"
+CODEX_DISABLE_ALT_SCREEN = os.getenv("CODEX_DISABLE_ALT_SCREEN", "true").lower() == "true"
+CODEX_ENABLE_SEARCH = os.getenv("CODEX_ENABLE_SEARCH", "true").lower() == "true"
+CODEX_TIMEOUT_SECONDS = int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800"))
 
 # Auth configuration
 AUTH_USERS_FILE = _PROJECT_ROOT / "config" / "auth_users.json"
@@ -1864,6 +1878,124 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"AutoGen team execution failed: {str(e)}")
 
 
+def _write_codex_summary_to_scratch(
+    prompt: str,
+    command: List[str],
+    exit_code: Optional[int],
+    stdout: str,
+    stderr: str,
+    duration_ms: int,
+    timed_out: bool,
+) -> str:
+    """Write Codex execution summary to scratch and return filename."""
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().astimezone()
+    timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp_human = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    suffix = secrets.token_hex(4)
+    filename = f"codex_run_{timestamp_file}_{suffix}.txt"
+    filepath = SCRATCH_DIR / filename
+    lines = [
+        "Codex CLI execution summary",
+        f"Date-time: {timestamp_human}",
+        f"Duration (ms): {duration_ms}",
+        f"Timed out: {timed_out}",
+        f"Exit code: {exit_code if exit_code is not None else 'N/A'}",
+        "",
+        "Command:",
+        " ".join(command),
+        "",
+        "Prompt:",
+        prompt or "(empty)",
+        "",
+        "--- STDOUT ---",
+        stdout or "(empty)",
+        "",
+        "--- STDERR ---",
+        stderr or "(empty)",
+    ]
+    filepath.write_text("\n".join(lines), encoding="utf-8")
+    return filename
+
+
+async def _run_codex_cli(prompt: str, timeout_seconds: Optional[int] = None) -> Dict[str, Any]:
+    if not CODEX_ENABLED:
+        raise HTTPException(status_code=503, detail="Codex CLI tool is disabled.")
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt is required.")
+    timeout = CODEX_TIMEOUT_SECONDS if timeout_seconds is None else int(timeout_seconds)
+    if timeout <= 0:
+        raise HTTPException(status_code=400, detail="timeoutSeconds must be a positive integer.")
+    timeout = min(max(timeout, 60), 7200)
+
+    sandbox_mode = CODEX_SANDBOX_MODE if CODEX_SANDBOX_MODE in ("read-only", "workspace-write") else "workspace-write"
+    approval_policy = CODEX_APPROVAL_POLICY if CODEX_APPROVAL_POLICY in ("untrusted", "on-request", "on-failure", "never") else "never"
+
+    cmd: List[str] = [
+        CODEX_CLI_PATH,
+        "exec",
+        "-a",
+        approval_policy,
+        "--sandbox",
+        sandbox_mode,
+        "-C",
+        str(_PROJECT_ROOT),
+    ]
+    if CODEX_DISABLE_ALT_SCREEN:
+        cmd.append("--no-alt-screen")
+    if CODEX_ENABLE_SEARCH:
+        cmd.append("--search")
+    cmd.append(prompt)
+
+    start = time.time()
+    stdout_text = ""
+    stderr_text = ""
+    exit_code: Optional[int] = None
+    timed_out = False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(_PROJECT_ROOT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out_bytes, err_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            proc.kill()
+            out_bytes, err_bytes = await proc.communicate()
+        stdout_text = (out_bytes or b"").decode("utf-8", errors="replace")
+        stderr_text = (err_bytes or b"").decode("utf-8", errors="replace")
+        exit_code = proc.returncode
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="Codex CLI not found. Ensure it is installed and on PATH.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to execute Codex CLI: {str(e)}")
+    finally:
+        duration_ms = int((time.time() - start) * 1000)
+
+    summary_file = _write_codex_summary_to_scratch(
+        prompt=prompt,
+        command=cmd,
+        exit_code=exit_code,
+        stdout=stdout_text,
+        stderr=stderr_text,
+        duration_ms=duration_ms,
+        timed_out=timed_out,
+    )
+    return {
+        "success": exit_code == 0 and not timed_out,
+        "summaryFile": summary_file,
+        "exitCode": exit_code,
+        "timedOut": timed_out,
+        "durationMs": duration_ms,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+    }
+
+
 # AutoGen team chat endpoint (integrated directly)
 @app.post("/v1/proxy/autogen")
 async def autogen_chat(request: Request):
@@ -1882,6 +2014,16 @@ async def autogen_chat(request: Request):
         print(f"❌ AutoGen endpoint error: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to process AutoGen request: {str(e)}")
+
+
+@app.post("/v1/proxy/codex")
+async def proxy_codex_exec(
+    request: CodexExecRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Run Codex CLI non-interactively in sandboxed mode. Auth required."""
+    _ = current_user  # keep for auth enforcement
+    return await _run_codex_cli(request.prompt, timeout_seconds=request.timeoutSeconds)
 
 # Allowed keys when persisting MCP server config (never persist 'command')
 MCP_SERVER_SAFE_KEYS = {"id", "name", "preset_id", "apiKey", "model", "url", "wsUrl", "status", "enabled"}
@@ -2857,6 +2999,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 "do_news": _do_proxy_news,
                 "do_weather": _do_proxy_weather,
                 "do_autogen": _do_autogen,
+                "do_codex": _run_codex_cli,
                 "do_browser_agent": _do_browser_agent,
                 "do_deep_research": _do_deep_research,
                 "read_file_internal": _read_file_internal,
@@ -3333,6 +3476,31 @@ async def get_all_available_tools() -> List[Dict]:
         print("[PHILOSOPHER] Added runWorkflow tool")
     else:
         print("[PHILOSOPHER] AutoGen not available, skipping runWorkflow tool")
+
+    # 5b. runCodexCli (Codex CLI for CATBot code changes and tooling)
+    if CODEX_ENABLED:
+        all_tools.append({
+            "name": "runCodexCli",
+            "description": "Run Codex CLI in non-interactive mode to make CATBot code changes or add new capabilities. Always provide a clear prompt describing the change. Output is written to a scratch summary file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Task instructions for Codex (e.g. 'Add a new /v1/proxy/codex tool in the proxy server and update docs')",
+                    },
+                    "timeoutSeconds": {
+                        "type": "integer",
+                        "description": "Optional timeout in seconds (default 1800; max 7200)",
+                    },
+                },
+                "required": ["prompt"]
+            },
+            "server_id": "proxy_server"
+        })
+        print("[PHILOSOPHER] Added runCodexCli tool")
+    else:
+        print("[PHILOSOPHER] Codex CLI disabled, skipping runCodexCli tool")
     
     # 6. run_browser_agent (standalone browser-use HTTP server; not tied to mcp_servers)
     # Browser-use runs as a separate HTTP server (MCP_BROWSER_USE_HTTP_URL); add tool when URL is configured
@@ -3628,6 +3796,25 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             return f"Error executing runWorkflow: {e.detail}"
         except Exception as e:
             return f"Error executing runWorkflow: {str(e)}"
+
+    elif tool_name == "runCodexCli":
+        try:
+            codex_prompt = (parameters.get("prompt") or "").strip()
+            timeout_seconds = parameters.get("timeoutSeconds")
+            if not codex_prompt:
+                return "Error: 'prompt' is required for runCodexCli"
+            result = await _run_codex_cli(codex_prompt, timeout_seconds=timeout_seconds)
+            summary_file = result.get("summaryFile")
+            exit_code = result.get("exitCode")
+            timed_out = result.get("timedOut")
+            return (
+                f"Codex CLI finished (exit_code={exit_code}, timed_out={timed_out}). "
+                f"Summary file: {summary_file}"
+            )
+        except HTTPException as e:
+            return f"Error executing runCodexCli: {e.detail}"
+        except Exception as e:
+            return f"Error executing runCodexCli: {str(e)}"
     
     # Handle run_browser_agent (standalone browser-use HTTP server; no mcp_servers entry required)
     elif tool_name == "run_browser_agent":

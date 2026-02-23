@@ -12,6 +12,7 @@ Install these before running the installer (the installer will check and report 
 | **Node.js** | 16+ | [nodejs.org](https://nodejs.org/) |
 | **Git** | — | For clone and submodule; [git-scm.com](https://git-scm.com/) |
 | **uv** | — | For mcp-browser-use; `pip install uv` or [astral-sh/uv](https://github.com/astral-sh/uv) |
+| **Codex CLI** | — | Optional but recommended for `runCodexCli` tool; installed by the automated scripts (uses npm) |
 
 Optional: Chrome/Chromium for browser automation.
 
@@ -55,6 +56,14 @@ The Windows `start_all.py` script can start a sibling `whisper-api-server` if pr
 1. Create a bot with [BotFather](https://core.telegram.org/bots#botfather) and get the token.
 2. In `.env` set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ADMIN_IDS` (or `TELEGRAM_ALLOW_ALL=true`).
 3. Start the stack; the Telegram bot is started by `start_all.py` on Windows.
+
+## Optional: Codex CLI tool
+
+The installer attempts to install the Codex CLI automatically (via npm) if it is not already on your PATH. To configure:
+
+1. Ensure `codex` is available on PATH (or set `CODEX_CLI_PATH` in `.env`).
+2. Optional: tune `CODEX_SANDBOX_MODE`, `CODEX_APPROVAL_POLICY`, and `CODEX_TIMEOUT_SECONDS` in `.env`.
+3. The `runCodexCli` tool is available in both web and Telegram when tools are enabled. It runs in the CATBot project root and writes a summary file to `scratch/`.
 
 ## Verification
 

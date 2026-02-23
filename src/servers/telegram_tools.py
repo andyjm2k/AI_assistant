@@ -337,6 +337,22 @@ async def execute_telegram_tool(
         msg = result.get("output") or result.get("response") or result.get("detail", str(result))
         return {"success": True, "message": msg, "data": result}
 
+    # --- runCodexCli ---
+    if name == "runCodexCli":
+        do_codex = context.get("do_codex")
+        if not do_codex:
+            return {"success": False, "message": "Codex CLI is not available."}
+        prompt = (arguments.get("prompt") or "").strip()
+        if not prompt:
+            return {"success": False, "message": "prompt is required."}
+        timeout_seconds = arguments.get("timeoutSeconds")
+        result = await do_codex(prompt=prompt, timeout_seconds=timeout_seconds)
+        summary_file = result.get("summaryFile")
+        exit_code = result.get("exitCode")
+        timed_out = result.get("timedOut")
+        message = f"Codex CLI finished (exit_code={exit_code}, timed_out={timed_out}). Summary file: {summary_file}"
+        return {"success": True, "message": message, "data": result}
+
     # --- scrapeWebsite ---
     if name == "scrapeWebsite":
         do_fetch = context.get("do_fetch")

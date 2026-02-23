@@ -9,7 +9,7 @@ Set-Location $ProjectRoot
 Write-Host ('CATBot installer - project root: ' + $ProjectRoot) -ForegroundColor Cyan
 
 # 1. Prerequisites check
-Write-Host ([Environment]::NewLine + '[1/9] Checking prerequisites...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[1/10] Checking prerequisites...') -ForegroundColor Yellow
 & py scripts/check_prereqs.py
 if ($LASTEXITCODE -ne 0) {
     Write-Host 'Prerequisites check failed. Install missing tools and run install.ps1 again.' -ForegroundColor Red
@@ -17,7 +17,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 2. mcp-browser-use: init submodule if configured, else clone so directory is fully populated
-Write-Host ([Environment]::NewLine + '[2/9] Initializing mcp-browser-use...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[2/10] Initializing mcp-browser-use...') -ForegroundColor Yellow
 $mcpDir = Join-Path $ProjectRoot 'mcp-browser-use'
 $mcpRepoUrl = 'https://github.com/Saik0s/mcp-browser-use.git'
 $projectGitDir = Join-Path $ProjectRoot '.git'
@@ -47,7 +47,7 @@ if (-not (Test-Path $mcpDir)) {
 }
 
 # 3. Python venv and pip install
-Write-Host ([Environment]::NewLine + '[3/9] Creating venv and installing Python dependencies...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[3/10] Creating venv and installing Python dependencies...') -ForegroundColor Yellow
 $venvPath = Join-Path $ProjectRoot 'venv'
 $venvPython = Join-Path $venvPath 'Scripts\python.exe'
 $venvPip = Join-Path $venvPath 'Scripts\pip.exe'
@@ -61,17 +61,30 @@ if (-not (Test-Path $venvPython)) {
 if ($LASTEXITCODE -ne 0) { Write-Host 'pip install failed.' -ForegroundColor Red; exit 1 }
 
 # 4. Playwright (main venv)
-Write-Host ([Environment]::NewLine + '[4/9] Installing Playwright browsers...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[4/10] Installing Playwright browsers...') -ForegroundColor Yellow
 & $venvPython -m playwright install
 if ($LASTEXITCODE -ne 0) { Write-Host 'Playwright install failed.' -ForegroundColor Red; exit 1 }
 
 # 5. Node dependencies
-Write-Host ([Environment]::NewLine + '[5/9] Installing Node.js dependencies...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[5/10] Installing Node.js dependencies...') -ForegroundColor Yellow
 & npm install
 if ($LASTEXITCODE -ne 0) { Write-Host 'npm install failed.' -ForegroundColor Red; exit 1 }
 
-# 6. mcp-browser-use: uv sync and playwright
-Write-Host ([Environment]::NewLine + '[6/9] Setting up mcp-browser-use (uv sync + playwright)...') -ForegroundColor Yellow
+# 6. Codex CLI (optional)
+Write-Host ([Environment]::NewLine + '[6/10] Installing Codex CLI (optional)...') -ForegroundColor Yellow
+$codexCmd = Get-Command codex -ErrorAction SilentlyContinue
+if (-not $codexCmd) {
+    Write-Host 'Codex CLI not found; installing via npm...' -ForegroundColor Cyan
+    & npm install -g @openai/codex
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host 'Codex CLI install failed (optional). You can install it later and set CODEX_CLI_PATH.' -ForegroundColor Yellow
+    }
+} else {
+    Write-Host 'Codex CLI already installed.' -ForegroundColor Green
+}
+
+# 7. mcp-browser-use: uv sync and playwright
+Write-Host ([Environment]::NewLine + '[7/10] Setting up mcp-browser-use (uv sync + playwright)...') -ForegroundColor Yellow
 Push-Location $mcpDir
 try {
     & uv sync
@@ -82,18 +95,18 @@ try {
     Pop-Location
 }
 
-# 7. .env and directories
-Write-Host ([Environment]::NewLine + '[7/9] Creating .env and required directories...') -ForegroundColor Yellow
+# 8. .env and directories
+Write-Host ([Environment]::NewLine + '[8/10] Creating .env and required directories...') -ForegroundColor Yellow
 & $venvPython scripts/setup_env_and_dirs.py
 if ($LASTEXITCODE -ne 0) { Write-Host 'setup_env_and_dirs failed.' -ForegroundColor Red; exit 1 }
 
-# 8. Configuration wizard (interactive; collects API keys and writes .env)
-Write-Host ([Environment]::NewLine + '[8/9] Configuration wizard (API keys, Telegram, etc.)...') -ForegroundColor Yellow
+# 9. Configuration wizard (interactive; collects API keys and writes .env)
+Write-Host ([Environment]::NewLine + '[9/10] Configuration wizard (API keys, Telegram, etc.)...') -ForegroundColor Yellow
 & $venvPython scripts/install_wizard.py
 if ($LASTEXITCODE -ne 0) { Write-Host 'Wizard failed.' -ForegroundColor Red; exit 1 }
 
-# 9. Verification
-Write-Host ([Environment]::NewLine + '[9/9] Verifying installation...') -ForegroundColor Yellow
+# 10. Verification
+Write-Host ([Environment]::NewLine + '[10/10] Verifying installation...') -ForegroundColor Yellow
 $env:CATBOT_VERIFY_PYTHON = $venvPython
 & $venvPython scripts/verify_install.py
 if ($LASTEXITCODE -ne 0) {

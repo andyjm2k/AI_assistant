@@ -198,6 +198,21 @@ class TestExecuteTelegramTool:
         assert "Cancellation" in r.get("message", "") or "stop" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
+    async def test_run_codex_cli_calls_backend(self):
+        """runCodexCli uses do_codex and returns summary file info."""
+        async def mock_codex(prompt, timeout_seconds=None):
+            return {
+                "success": True,
+                "summaryFile": "codex_run_2026-01-01_00-00-00_abcd.txt",
+                "exitCode": 0,
+                "timedOut": False,
+            }
+        ctx = {"conversation_id": "c1", "todo_user_key": "u1", "do_codex": mock_codex}
+        r = await tg.execute_telegram_tool("runCodexCli", {"prompt": "do it"}, ctx)
+        assert r.get("success") is True
+        assert "Summary file" in r.get("message", "")
+
+    @pytest.mark.asyncio
     async def test_get_todo_execution_status_no_status_fn_returns_message(self):
         """getTodoExecutionStatus when task_execution_status not in context returns no status."""
         ctx = {"conversation_id": "c1", "todo_user_key": "u1"}

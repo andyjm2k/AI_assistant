@@ -98,6 +98,25 @@ def check_mcp_server_cli() -> tuple[bool, str]:
         return True, f"skipped ({e})"
 
 
+def check_codex_cli() -> tuple[bool, str]:
+    """Verify codex CLI is available (optional)."""
+    try:
+        result = subprocess.run(
+            ["codex", "--version"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return True, (result.stdout.strip() or "codex CLI OK")
+        return True, "skipped (codex CLI not available)"
+    except FileNotFoundError:
+        return True, "skipped (codex CLI not found)"
+    except Exception as e:
+        return True, f"skipped ({e})"
+
+
 def main() -> int:
     """Run all verification checks. Use venv Python if running from installer."""
     python_exe = os.environ.get("CATBOT_VERIFY_PYTHON") or sys.executable
@@ -107,6 +126,7 @@ def main() -> int:
         ("MCP", lambda: check_mcp(python_exe)),
         ("Playwright", lambda: check_playwright(python_exe)),
         ("mcp-server-browser-use CLI", check_mcp_server_cli),
+        ("Codex CLI (optional)", check_codex_cli),
     ]
     failed = []
     for name, check_fn in checks:
