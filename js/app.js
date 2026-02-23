@@ -959,6 +959,8 @@
         let vrmPositions = {}; // Persisted map of modelPath -> {scale, positionX, positionY, rotation}
         let currentVRMModelPath = '';
         // Removed fallback VRM; enforce valid user-provided .vrm only
+
+
         // Add these variables at the top of your script section
         let clipboardData = null;
         let clipboardType = null;
@@ -1048,6 +1050,8 @@
             }
         };
 
+
+
         // Add these variables at the top of your script section
         let webcamEnabled = false;
         const webcamToggle = document.getElementById('webcam-toggle');
@@ -1062,6 +1066,8 @@
         const VRM_SELECTED_KEY = 'vrmSelectedModelPath';
         const VRM_POSITIONS_KEY = 'vrmPositions'; // Map modelPath -> {scale, positionX, positionY, rotation}
 
+
+
         // Add these variables at the top of your script section
         let clipboardVisionEnabled = false;
         const clipboardToggle = document.getElementById('clipboard-toggle');
@@ -1069,6 +1075,8 @@
         // Add these variables near the top of your script section
         let isRecording = false;
         let spacebarPressed = false;
+
+
 
         // Add these variables at the top of your script section
         let availableModels = [];
@@ -5152,6 +5160,27 @@ function saveWAVFile(wavBlob) {
             {
                 type: "function",
                 function: {
+                    name: "weatherInfo",
+                    description: "Gets weather information for a location from BOM. Use for current conditions, forecast, rain chance, and general weather summaries. If location is omitted, backend may use saved memory location.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            location: {
+                                type: "string",
+                                description: "City/suburb/postcode (optional if user location is already known)"
+                            },
+                            requestType: {
+                                type: "string",
+                                enum: ["summary", "current", "forecast"],
+                                description: "Type of weather response to retrieve"
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
                     name: "saveToFile",
                     description: "Saves content to a file in the specified directory",
                     parameters: {
@@ -5478,6 +5507,9 @@ function saveWAVFile(wavBlob) {
                         break;
                     case "webSearch":
                         result = await handleWebSearch(args);
+                        break;
+                    case "weatherInfo":
+                        result = await handleWeatherInfo(args);
                         break;
                     case "manageMemoryCache":
                         result = await handleMemoryCache(args);
@@ -10446,6 +10478,39 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                     success: false,
                     message: `Error getting response: ${error.message}`
                 };
+            }
+        }
+
+
+
+        async function handleWeatherInfo({ location, requestType, detail }) {
+            try {
+                const selectedDetail = (requestType || detail || 'summary').toString().trim().toLowerCase();
+                const params = new URLSearchParams();
+                if (location && location.trim()) params.set('location', location.trim());
+                params.set('detail', selectedDetail || 'summary');
+                const headers = {};
+                if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+
+                const response = await fetch(`${PROXY_BASE_URL}/v1/proxy/weather?${params.toString()}`, {
+                    method: 'GET',
+                    headers
+                });
+
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}));
+                    return { success: false, message: err.detail || `Failed to fetch weather (${response.status})` };
+                }
+
+                const data = await response.json();
+                return {
+                    success: true,
+                    message: data.summary || `Weather data retrieved for ${data.resolved_location || (location || 'requested location')}.`,
+                    data
+                };
+            } catch (error) {
+                console.error('Weather tool error:', error);
+                return { success: false, message: `Error fetching weather: ${error.message}` };
             }
         }
 

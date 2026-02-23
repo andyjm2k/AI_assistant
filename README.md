@@ -88,6 +88,7 @@ See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line i
 - **[Model Context Protocol](https://modelcontextprotocol.io/)** — MCP integration for extensible tooling
 - **[File Operations](proxy_server.py)** — Read/write support for txt, docx, xlsx, pdf, and images
 - **[Web Search](proxy_server.py)** — Brave Search API with DuckDuckGo fallback
+- **[Weather Information (BOM)](src/servers/proxy_server.py)** — Secure weather tool for web + Telegram using bom.gov.au data
 - **[Telegram Integration](telegram_bot.py)** — Bot interface for Telegram messaging
 - **[Memory System](memory/)** — Vector-based memory storage and retrieval for conversation context
 
@@ -123,7 +124,12 @@ See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line i
    - Get your key: https://newsapi.org/
    - Can be configured in the application settings UI
 
-6. **Telegram Bot Token** (Optional)
+6. **BOM Weather API Access** (No key required)
+   - Data source: https://www.bom.gov.au/
+   - Environment variable: `BOM_API_BASE_URL` (defaults to `https://api.weather.bom.gov.au/v1`)
+   - Environment variable: `BOM_API_TIMEOUT_SECONDS` (optional request timeout)
+
+7. **Telegram Bot Token** (Optional)
    - Create a bot: https://core.telegram.org/bots#botfather
    - Environment variable: `TELEGRAM_BOT_TOKEN`
 
