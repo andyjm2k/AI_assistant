@@ -774,18 +774,26 @@ Install all Python dependencies with: `pip install -r requirements.txt`
    - For **Telegram tools**: set `TELEGRAM_TOOLS_ENABLED=true` on the proxy; ensure `config/catbot_system_prompt_with_tools.txt` exists. Tools need the same backend config as the web UI (e.g. `BRAVE_API_KEY`, `NEWS_API_KEY`).
    - Check bot logs for connection errors
 
-8. **MCP Browser Server Connection Issues**
+8. **runCodexCli Not Triggering or Failing (Telegram or Web UI)**
+   - Verify the tool-capable prompt is in use. For Telegram, `TELEGRAM_TOOLS_ENABLED=true` and do not override `system_prompt` with a non-tool prompt.
+   - Ensure `CODEX_ENABLED=true` on the proxy.
+   - Confirm the `codex` binary is installed and available on PATH (or set `CODEX_CLI_PATH`).
+   - Web UI only: confirm you are authenticated (JWT); `/v1/proxy/codex` requires auth.
+   - If the model returns tool calls inside fenced code blocks (```), Telegram will ignore them.
+   - Check proxy logs for `Codex CLI not found` or `Codex CLI tool is disabled`.
+
+9. **MCP Browser Server Connection Issues**
    - Verify MCP Browser-Use server is running
    - Check environment variables in `.env` file
    - Ensure `MCP_RESEARCH_TOOL_SAVE_DIR` directory exists
    - Review `start_mcp_browser_server.py` output for configuration errors
 
-9. **CORS Errors in Browser**
+10. **CORS Errors in Browser**
    - Proxy server includes CORS middleware - ensure it's running
    - Check that requests are going to the correct port (8002 for proxy, 5001 for MCP browser server)
    - Verify browser console for specific CORS error messages
 
-10. **Todo list not syncing / Task execution not starting**
+11. **Todo list not syncing / Task execution not starting**
    - **Todo:** Ensure you are signed in (JWT). Todo is stored per user in `todo_data/` (or `TODO_DATA_PATH`). For Telegram, use `config/telegram_user_links.json` to link your Telegram user ID to your app username so the same list appears in the web UI—see **config/TELEGRAM_TODO_LINK.md** for step-by-step instructions (get your Telegram ID with `/status` in the bot).
    - **Task execution:** All todo/execution endpoints require authentication (Bearer token). Only one execution can be active per user; complete or cancel the current one before starting another. Set `TASK_EXECUTION_MAX_ITERATIONS` in `.env` if you need a higher iteration limit (default 20).
 
