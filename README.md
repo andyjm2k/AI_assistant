@@ -501,6 +501,7 @@ All services are configured to accept connections from devices on your local net
 - `GET /v1/proxy/fetch` - Fetch web content from a URL (query param)
 - `POST /v1/proxy/fetch` - Fetch web content; body: `{"url": "..."}` or `{"urls": ["...", "..."]}`. When `urls` is provided, the server tries each URL in order until one succeeds (scrape-with-retry), e.g. after a web search.
 - `GET /v1/proxy/search` - Perform web search (Brave Search or DuckDuckGo fallback)
+- `GET /v1/proxy/weather` - Weather info (BOM: current, forecast, summary; supports memory fallback)
 
 **AI & Chat:**
 - `POST /v1/proxy/autogen` - AutoGen team-based chat endpoint
