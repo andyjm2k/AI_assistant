@@ -80,3 +80,29 @@ class TestTodoTaskExecutorCancel:
             status, message = await executor.run_loop()
         assert status == STATUS_AWAITING_CONFIRMATION
         assert "finished" in message.lower() or "task" in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_ensure_token_budget_summarizes_when_over_limit(monkeypatch):
+    monkeypatch.setenv("MAX_TOKEN_LIMIT", "50")
+    executor = TodoTaskExecutor(
+        api_key="test-key",
+        task_id=1,
+        task_description="Test",
+        get_tools_func=AsyncMock(return_value=[]),
+    )
+    long_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "x" * 500},
+        {"role": "assistant", "content": "y" * 500},
+        {"role": "user", "content": "z" * 500},
+    ]
+    summarized = [
+        {"role": "system", "content": "system"},
+        {"role": "system", "content": "Summary of previous context:\nsummary"},
+        {"role": "user", "content": "tail"},
+    ]
+    executor._summarize_messages_for_budget = AsyncMock(return_value=summarized)
+    result = await executor._ensure_token_budget(long_messages, max_tokens=2000)
+    assert result == summarized
+    assert executor._summarize_messages_for_budget.called

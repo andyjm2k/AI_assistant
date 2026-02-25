@@ -362,6 +362,20 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("weatherInfo", {"location": "Sydney"}, {})
         assert r.get("success") is False
         assert "not available" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_weather_info_invalid_request_type_defaults_summary(self):
+        """weatherInfo should normalize invalid requestType values safely."""
+        observed = {}
+
+        async def fake_weather(**kwargs):
+            observed.update(kwargs)
+            return {"summary": "Weather for Sydney: 22C", "resolved_location": "Sydney"}
+
+        ctx = {"do_weather": fake_weather, "user_id": "tg-user-1"}
+        r = await tg.execute_telegram_tool("weatherInfo", {"location": "Sydney", "requestType": 123}, ctx)
+        assert r.get("success") is True
+        assert observed.get("detail") == "summary"
     @pytest.mark.asyncio
     async def test_pdf_to_power_point_returns_web_only_message(self):
         """pdfToPowerPoint returns message directing user to web interface."""

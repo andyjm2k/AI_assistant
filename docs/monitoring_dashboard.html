@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CATBot Monitoring Dashboard</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #121924;
+      --panel-2: #0f1520;
+      --accent: #3dd6a5;
+      --accent-2: #5aa9ff;
+      --text: #e6edf3;
+      --muted: #93a4b8;
+      --warning: #ffb454;
+      --danger: #ff6b6b;
+      --grid: rgba(255, 255, 255, 0.06);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 800px at 10% -10%, #1b2636 0%, transparent 60%),
+                  radial-gradient(1200px 800px at 110% 0%, #1a1f2b 0%, transparent 55%),
+                  var(--bg);
+      color: var(--text);
+      font-family: "Space Grotesk", "Manrope", "Segoe UI", sans-serif;
+      min-height: 100vh;
+      letter-spacing: 0.2px;
+    }
+
+    header {
+      padding: 32px 40px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 24px;
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 28px;
+      font-weight: 600;
+    }
+
+    header .subtitle {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .pill {
+      background: rgba(61, 214, 165, 0.12);
+      border: 1px solid rgba(61, 214, 165, 0.35);
+      color: var(--accent);
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 20px;
+      padding: 12px 40px 40px;
+      grid-template-columns: repeat(12, 1fr);
+    }
+
+    .card {
+      background: linear-gradient(160deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.01) 100%), var(--panel);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 16px;
+      padding: 18px 20px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.25);
+    }
+
+    .card h2 {
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      margin: 0 0 12px 0;
+    }
+
+    .stat {
+      font-size: 22px;
+      font-weight: 600;
+      margin: 8px 0;
+    }
+
+    .stat-sub {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .status-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    }
+
+    .status-chip {
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--grid);
+      font-size: 13px;
+    }
+
+    .status-chip strong {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 4px;
+    }
+
+    .events-list,
+    .logs-list {
+      max-height: 360px;
+      overflow: auto;
+      background: rgba(9, 12, 18, 0.6);
+      border-radius: 12px;
+      border: 1px solid var(--grid);
+      padding: 12px;
+      font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .events-list .event {
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.04);
+      margin-bottom: 10px;
+    }
+
+    .event .meta {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+
+    .event .state {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .logs-list {
+      white-space: pre-wrap;
+    }
+
+    .log-line {
+      border-bottom: 1px dashed rgba(255,255,255,0.04);
+      padding: 4px 0;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(90, 169, 255, 0.12);
+      color: var(--accent-2);
+      font-size: 11px;
+      border: 1px solid rgba(90, 169, 255, 0.4);
+    }
+
+    .row-span-6 { grid-column: span 6; }
+    .row-span-4 { grid-column: span 4; }
+    .row-span-8 { grid-column: span 8; }
+    .row-span-12 { grid-column: span 12; }
+
+    @media (max-width: 1100px) {
+      .grid { grid-template-columns: repeat(6, 1fr); }
+      .row-span-6 { grid-column: span 6; }
+      .row-span-4 { grid-column: span 6; }
+      .row-span-8 { grid-column: span 6; }
+    }
+
+    @media (max-width: 720px) {
+      header { flex-direction: column; align-items: flex-start; }
+      .grid { grid-template-columns: repeat(2, 1fr); padding: 12px 20px 30px; }
+      .row-span-6, .row-span-4, .row-span-8, .row-span-12 { grid-column: span 2; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>CATBot System Monitor</h1>
+      <div class="subtitle">Live health, status events, and proxy output at a glance.</div>
+    </div>
+    <div class="pill" id="refresh-indicator">Refreshing…</div>
+  </header>
+
+  <section class="grid">
+    <div class="card row-span-4">
+      <h2>System Snapshot</h2>
+      <div class="stat" id="uptime">--</div>
+      <div class="stat-sub">Proxy uptime</div>
+      <div class="status-grid">
+        <div class="status-chip">
+          <strong>Memory</strong>
+          <span id="memory-status">--</span>
+        </div>
+        <div class="status-chip">
+          <strong>Telegram Tools</strong>
+          <span id="telegram-tools-status">--</span>
+        </div>
+        <div class="status-chip">
+          <strong>OpenAI Key</strong>
+          <span id="openai-key-status">--</span>
+        </div>
+        <div class="status-chip">
+          <strong>Active Sessions</strong>
+          <span id="active-sessions">--</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card row-span-8">
+      <h2>Recent Status Events</h2>
+      <div class="events-list" id="events-list">Loading events…</div>
+    </div>
+
+    <div class="card row-span-12">
+      <h2>Proxy Server Output</h2>
+      <div class="logs-list" id="logs-list">Waiting for logs…</div>
+      <div class="stat-sub" id="logs-hint">Configure PROXY_LOG_FILE to expose logs.</div>
+    </div>
+  </section>
+
+  <script>
+    const summaryEl = {
+      uptime: document.getElementById('uptime'),
+      memory: document.getElementById('memory-status'),
+      telegramTools: document.getElementById('telegram-tools-status'),
+      openaiKey: document.getElementById('openai-key-status'),
+      sessions: document.getElementById('active-sessions')
+    };
+    const eventsList = document.getElementById('events-list');
+    const logsList = document.getElementById('logs-list');
+    const logsHint = document.getElementById('logs-hint');
+    const refreshIndicator = document.getElementById('refresh-indicator');
+
+    function formatDuration(seconds) {
+      const hrs = Math.floor(seconds / 3600);
+      const mins = Math.floor((seconds % 3600) / 60);
+      const secs = Math.floor(seconds % 60);
+      return `${hrs}h ${mins}m ${secs}s`;
+    }
+
+    async function fetchSummary() {
+      const resp = await fetch('/monitor/summary');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      summaryEl.uptime.textContent = formatDuration(data.uptime_seconds || 0);
+      summaryEl.memory.textContent = data.memory_available ? 'Available' : 'Unavailable';
+      summaryEl.telegramTools.textContent = data.telegram_tools_enabled ? 'Enabled' : 'Disabled';
+      summaryEl.openaiKey.textContent = data.openai_api_key_configured ? 'Configured' : 'Missing';
+      summaryEl.sessions.textContent = data.status_sessions_active ?? 0;
+    }
+
+    function renderEvents(events) {
+      if (!events.length) {
+        eventsList.textContent = 'No status events yet.';
+        return;
+      }
+      eventsList.innerHTML = '';
+      events.slice().reverse().forEach(ev => {
+        const item = document.createElement('div');
+        item.className = 'event';
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        const iso = ev.iso || new Date((ev.ts || 0) * 1000).toISOString();
+        meta.textContent = `${iso} • ${ev.channel || 'unknown'} • ${ev.request_id || 'n/a'}`;
+        const state = document.createElement('div');
+        state.className = 'state';
+        state.textContent = ev.state || '(no state)';
+        item.appendChild(meta);
+        item.appendChild(state);
+        eventsList.appendChild(item);
+      });
+    }
+
+    async function fetchEvents() {
+      const resp = await fetch('/monitor/status?limit=50');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      renderEvents(Array.isArray(data.events) ? data.events : []);
+    }
+
+    async function fetchLogs() {
+      const resp = await fetch('/monitor/logs?limit=200');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!data.available) {
+        logsList.textContent = 'Proxy log file not configured.';
+        logsHint.style.display = 'block';
+        return;
+      }
+      logsHint.style.display = 'none';
+      logsList.innerHTML = '';
+      data.lines.forEach(line => {
+        const div = document.createElement('div');
+        div.className = 'log-line';
+        div.textContent = line;
+        logsList.appendChild(div);
+      });
+    }
+
+    async function refreshAll() {
+      refreshIndicator.textContent = 'Refreshing…';
+      await Promise.all([fetchSummary(), fetchEvents(), fetchLogs()]);
+      refreshIndicator.textContent = 'Live';
+    }
+
+    refreshAll();
+    setInterval(refreshAll, 15000);
+  </script>
+</body>
+</html>

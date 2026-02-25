@@ -5,6 +5,7 @@ clear_backend_history, _parse_admin_ids. Uses mocks; no real Telegram or API cal
 """
 
 import os
+import asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -184,3 +185,76 @@ class TestBackendHeaders:
         """_backend_headers includes X-Telegram-Secret when TELEGRAM_SECRET is set."""
         with patch.object(telegram_bot, "TELEGRAM_SECRET", "my-secret"):
             assert telegram_bot._backend_headers() == {"X-Telegram-Secret": "my-secret"}
+
+
+class TestStatusPoller:
+    """Tests for backend-driven status polling."""
+
+    @pytest.mark.asyncio
+    async def test_status_poller_sends_message_on_new_seq(self):
+        """Status poller forwards status when seq advances."""
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        stop_event = asyncio.Event()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "found": True,
+            "event": {"seq": 1, "state": "Working: test"},
+        }
+
+        with patch.object(telegram_bot, "STATUS_UPDATE_INTERVAL", 0.01):
+            with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
+                mock_client = AsyncMock()
+                mock_client.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
+                mock_client.__aexit__.return_value = None
+                mock_client_cls.return_value = mock_client
+
+                task = asyncio.create_task(
+                    telegram_bot._poll_status_updates(
+                        bot,
+                        chat_id=123,
+                        stop_event=stop_event,
+                        conversation_id="123",
+                        request_id="req-1",
+                    )
+                )
+                await asyncio.sleep(0.03)
+                stop_event.set()
+                await task
+
+        assert bot.send_message.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_status_poller_skips_when_not_found(self):
+        """Status poller does not send when backend returns found=false."""
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        stop_event = asyncio.Event()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"found": False}
+
+        with patch.object(telegram_bot, "STATUS_UPDATE_INTERVAL", 0.01):
+            with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
+                mock_client = AsyncMock()
+                mock_client.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
+                mock_client.__aexit__.return_value = None
+                mock_client_cls.return_value = mock_client
+
+                task = asyncio.create_task(
+                    telegram_bot._poll_status_updates(
+                        bot,
+                        chat_id=123,
+                        stop_event=stop_event,
+                        conversation_id="123",
+                        request_id="req-1",
+                    )
+                )
+                await asyncio.sleep(0.03)
+                stop_event.set()
+                await task
+
+        bot.send_message.assert_not_called()

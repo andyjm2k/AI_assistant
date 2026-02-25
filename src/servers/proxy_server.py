@@ -5,7 +5,9 @@ Provides the same functionality but in Python for better integration with the MC
 """
 
 import asyncio
+import collections
 import json
+import html
 import os
 import re
 import sys
@@ -20,16 +22,31 @@ from typing import Dict, List, Optional, Any, Set, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
+from dataclasses import dataclass
+from contextlib import suppress
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, ConfigDict
 import uvicorn
+
+from src.utils.token_budget import (
+    estimate_tokens_from_messages,
+    format_messages_for_summary,
+    get_max_token_limit,
+    is_context_limit_error,
+)
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BeautifulSoup = None
+    BS4_AVAILABLE = False
 
 # Import dotenv to load .env file
 try:
@@ -110,6 +127,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 PROXY_RELOAD = _env_bool("PROXY_RELOAD", default=False)
+PROXY_RESTART_ENABLED = _env_bool("PROXY_RESTART_ENABLED", default=True)
+try:
+    PROXY_RESTART_DELAY_SECONDS = max(0.2, float(os.environ.get("PROXY_RESTART_DELAY_SECONDS", "1.0")))
+except ValueError:
+    PROXY_RESTART_DELAY_SECONDS = 1.0
+
+_proxy_restart_scheduled = False
+PROXY_START_TIME = time.time()
 
 
 # Import memory system (with error handling)
@@ -286,6 +311,7 @@ class TelegramChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
     user_id: Optional[str] = None
+    request_id: Optional[str] = None
     history: Optional[List[TelegramChatMessage]] = None
     system_prompt: Optional[str] = None
     model: Optional[str] = None
@@ -297,6 +323,27 @@ class TelegramChatResponse(BaseModel):
     reply: str
     conversation_id: str
     usage: Optional[Dict[str, Any]] = None
+
+
+class StatusStartRequest(BaseModel):
+    conversation_id: str
+    request_id: str
+    channel: Optional[str] = "web"
+    state: Optional[str] = None
+
+
+class StatusUpdateRequest(BaseModel):
+    conversation_id: str
+    request_id: str
+    state: str
+    phase: Optional[str] = None
+
+
+class StatusFinishRequest(BaseModel):
+    conversation_id: str
+    request_id: str
+    final_state: Optional[str] = None
+    phase: Optional[str] = None
 
 # Pydantic models for memory operations
 class MemoryStoreRequest(BaseModel):
@@ -358,6 +405,9 @@ class ProxyFetchRequest(BaseModel):
     """Request body for POST /v1/proxy/fetch (avoids URL length limits on iOS Safari)."""
     url: Optional[str] = None
     urls: Optional[List[str]] = None  # Optional list: try each until one succeeds (scrape-with-retry)
+    crawl: bool = True
+    max_pages: int = 3
+    max_depth: int = 1
 
 
 # Project root (two levels up from src/servers/proxy_server.py)
@@ -399,8 +449,293 @@ telegram_memory_cache: Dict[str, List[str]] = {}
 CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE = _PROJECT_ROOT / "config" / "catbot_system_prompt_with_tools.txt"
 TELEGRAM_TOOLS_ENABLED = os.getenv("TELEGRAM_TOOLS_ENABLED", "false").lower() == "true"
 TELEGRAM_TOOLS_MAX_ITERATIONS = max(1, min(10, int(os.getenv("TELEGRAM_TOOLS_MAX_ITERATIONS", "5"))))
+# Automatic memory injection quality controls (Telegram/web auto-context paths)
+MEMORY_AUTO_SEARCH_MIN_SIMILARITY = max(
+    0.0, min(1.0, float(os.getenv("MEMORY_AUTO_SEARCH_MIN_SIMILARITY", "0.72")))
+)
+MEMORY_AUTO_SEARCH_CANDIDATE_THRESHOLD = max(
+    0.0, min(1.0, float(os.getenv("MEMORY_AUTO_SEARCH_CANDIDATE_THRESHOLD", "0.55")))
+)
+MEMORY_AUTO_SEARCH_LIMIT = max(1, min(10, int(os.getenv("MEMORY_AUTO_SEARCH_LIMIT", "3"))))
+MEMORY_AUTO_SEARCH_SCORE_WINDOW = max(
+    0.0, min(1.0, float(os.getenv("MEMORY_AUTO_SEARCH_SCORE_WINDOW", "0.12")))
+)
 # Optional: map Telegram user_id or conversation_id to app username for shared todo list
 TELEGRAM_USER_LINKS_FILE = _PROJECT_ROOT / "config" / "telegram_user_links.json"
+
+# ============================================================================
+# STATUS EVENTS (persistent progress updates)
+# ============================================================================
+
+STATUS_UPDATE_INTERVAL_SECONDS = max(5, int(os.environ.get("STATUS_UPDATE_INTERVAL_SECONDS", "60")))
+STATUS_DATA_DIR = _PROJECT_ROOT / "status_data"
+STATUS_EVENTS_FILE = STATUS_DATA_DIR / "status_events.jsonl"
+
+
+@dataclass
+class StatusSession:
+    conversation_id: str
+    request_id: str
+    channel: str
+    state: str
+    phase: str
+    seq: int = 0
+    started_at: float = 0.0
+    heartbeat_task: Optional[asyncio.Task] = None
+    done: bool = False
+
+
+status_sessions: Dict[Tuple[str, str], StatusSession] = {}
+status_latest_index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+status_write_lock = asyncio.Lock()
+
+
+def _ensure_status_storage() -> None:
+    STATUS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not STATUS_EVENTS_FILE.exists():
+        STATUS_EVENTS_FILE.write_text("", encoding="utf-8")
+
+
+def _tail_text_file(path: Path, max_lines: int = 200, max_bytes: int = 262144) -> str:
+    """Return the last max_lines from a text file, reading up to max_bytes from the end."""
+    if not path.exists():
+        return ""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_size = min(size, max_bytes)
+            f.seek(-read_size, os.SEEK_END)
+            data = f.read(read_size)
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        return "\n".join(lines[-max_lines:])
+    except Exception as exc:
+        print(f"[WARN] Failed to tail file {path}: {exc}")
+        return ""
+
+
+def _get_recent_status_events(limit: int = 50) -> List[Dict[str, Any]]:
+    """Read recent status events from the JSONL store."""
+    text = _tail_text_file(STATUS_EVENTS_FILE, max_lines=limit * 2)
+    events: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events[-limit:]
+
+
+def _load_status_index() -> None:
+    status_latest_index.clear()
+    if not STATUS_EVENTS_FILE.exists():
+        return
+    try:
+        with STATUS_EVENTS_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                conv = event.get("conversation_id")
+                req = event.get("request_id")
+                if not conv or not req:
+                    continue
+                status_latest_index[(conv, req)] = event
+    except Exception as exc:
+        print(f"[WARN] Failed to load status index: {exc}")
+
+
+def _init_status_store() -> None:
+    _ensure_status_storage()
+    _load_status_index()
+
+
+# Initialize status storage on module load
+_init_status_store()
+
+
+async def _record_status_event(event: Dict[str, Any]) -> None:
+    async with status_write_lock:
+        try:
+            with STATUS_EVENTS_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            conv = event.get("conversation_id")
+            req = event.get("request_id")
+            if conv and req:
+                status_latest_index[(conv, req)] = event
+        except Exception as exc:
+            print(f"[WARN] Failed to write status event: {exc}")
+
+
+async def _emit_status_event(
+    session: StatusSession,
+    state: Optional[str] = None,
+    phase: Optional[str] = None,
+    done: bool = False,
+    event_type: str = "heartbeat",
+) -> Dict[str, Any]:
+    if state is not None:
+        session.state = state
+    if phase is not None:
+        session.phase = phase
+    session.seq += 1
+    now = datetime.now(timezone.utc)
+    event = {
+        "ts": now.timestamp(),
+        "iso": now.isoformat(),
+        "conversation_id": session.conversation_id,
+        "request_id": session.request_id,
+        "channel": session.channel,
+        "seq": session.seq,
+        "state": session.state,
+        "phase": session.phase,
+        "done": done,
+        "type": event_type,
+    }
+    await _record_status_event(event)
+    return event
+
+
+async def _status_heartbeat(session: StatusSession) -> None:
+    while not session.done:
+        await asyncio.sleep(STATUS_UPDATE_INTERVAL_SECONDS)
+        if session.done:
+            break
+        await _emit_status_event(session, event_type="heartbeat")
+
+
+async def _start_status_session(
+    conversation_id: str,
+    request_id: str,
+    channel: str,
+    initial_state: str,
+    phase: str = "start",
+) -> StatusSession:
+    key = (conversation_id, request_id)
+    existing = status_sessions.get(key)
+    if existing and existing.heartbeat_task:
+        existing.done = True
+        with suppress(Exception):
+            existing.heartbeat_task.cancel()
+    session = StatusSession(
+        conversation_id=conversation_id,
+        request_id=request_id,
+        channel=channel,
+        state=initial_state,
+        phase=phase,
+        seq=0,
+        started_at=time.time(),
+        heartbeat_task=None,
+        done=False,
+    )
+    status_sessions[key] = session
+    await _emit_status_event(session, event_type="start")
+    session.heartbeat_task = asyncio.create_task(_status_heartbeat(session))
+    return session
+
+
+async def _update_status_session(
+    conversation_id: str,
+    request_id: str,
+    state: str,
+    phase: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    key = (conversation_id, request_id)
+    session = status_sessions.get(key)
+    if not session:
+        return None
+    return await _emit_status_event(session, state=state, phase=phase, event_type="update")
+
+
+async def _finish_status_session(
+    conversation_id: str,
+    request_id: str,
+    final_state: Optional[str] = None,
+    phase: str = "done",
+) -> Optional[Dict[str, Any]]:
+    key = (conversation_id, request_id)
+    session = status_sessions.get(key)
+    if not session:
+        return None
+    if final_state:
+        session.state = final_state
+    session.done = True
+    event = await _emit_status_event(session, phase=phase, done=True, event_type="finish")
+    if session.heartbeat_task:
+        with suppress(Exception):
+            session.heartbeat_task.cancel()
+    status_sessions.pop(key, None)
+    return event
+
+
+def _get_latest_status_event(
+    conversation_id: str,
+    request_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if request_id:
+        event = status_latest_index.get((conversation_id, request_id))
+        if event:
+            return event
+    # Fallback: scan file for latest event for conversation
+    if not STATUS_EVENTS_FILE.exists():
+        return None
+    latest = None
+    try:
+        with STATUS_EVENTS_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("conversation_id") != conversation_id:
+                    continue
+                if request_id and event.get("request_id") != request_id:
+                    continue
+                latest = event
+    except Exception as exc:
+        print(f"[WARN] Failed reading status events: {exc}")
+    return latest
+
+
+def _get_status_events_since(
+    conversation_id: str,
+    request_id: str,
+    since_seq: int,
+) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    if not STATUS_EVENTS_FILE.exists():
+        return events
+    try:
+        with STATUS_EVENTS_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("conversation_id") != conversation_id:
+                    continue
+                if event.get("request_id") != request_id:
+                    continue
+                seq = event.get("seq") or 0
+                if seq > since_seq:
+                    events.append(event)
+    except Exception as exc:
+        print(f"[WARN] Failed reading status events: {exc}")
+    return events
 
 
 def _resolve_todo_user_for_telegram(conversation_id: str, user_id: Optional[str]) -> str:
@@ -431,7 +766,7 @@ philosopher_mode_active: Dict[str, bool] = {}
 philosopher_mode_instances: Dict[str, Any] = {}
 
 # Task execution: max iterations per run (configurable via .env)
-TASK_EXECUTION_MAX_ITERATIONS = max(1, min(100, int(os.getenv("TASK_EXECUTION_MAX_ITERATIONS", "20"))))
+TASK_EXECUTION_MAX_ITERATIONS = max(1, min(200, int(os.getenv("TASK_EXECUTION_MAX_ITERATIONS", "200"))))
 # Per-user execution state: user_key -> { "task_id", "status", "executor" } (executor held for resume)
 task_execution_state: Dict[str, Dict[str, Any]] = {}
 
@@ -467,6 +802,108 @@ def _get_assistant_context_block() -> str:
         "When the user provides current facts, corrections, or information that differs from your training "
         '(e.g., "it\'s 2025 now", "that API changed"), accept them as authoritative and do not contradict them.\n\n'
     )
+
+
+def _normalize_chat_endpoint(endpoint: str) -> str:
+    if not endpoint:
+        return ""
+    if endpoint.endswith("/chat/completions"):
+        return endpoint
+    return endpoint.rstrip("/") + "/chat/completions"
+
+
+def _estimate_total_tokens(messages: List[Dict[str, Any]], max_tokens: int) -> int:
+    return estimate_tokens_from_messages(messages) + max_tokens
+
+
+def _get_max_tokens_from_payload(payload: Dict[str, Any]) -> int:
+    raw = payload.get("max_tokens")
+    try:
+        if raw is None:
+            return 0
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _call_chat_completion(
+    endpoint: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout_seconds: float = 120.0,
+) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        return await client.post(endpoint, json=payload, headers=headers)
+
+
+async def _summarize_messages_for_budget_proxy(
+    messages: List[Dict[str, Any]],
+    endpoint: str,
+    headers: Dict[str, str],
+    model_name: str,
+    max_tokens: int,
+    large_model: Optional[str] = None,
+    large_endpoint: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not messages:
+        return messages
+
+    system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+    remainder = messages[1:] if system_msg else messages[:]
+    if len(remainder) <= 4:
+        return messages
+
+    keep_tail_options = [8, 6, 4, 2]
+    for keep_tail in keep_tail_options:
+        if len(remainder) <= keep_tail:
+            continue
+        head = remainder[:-keep_tail]
+        tail = remainder[-keep_tail:]
+        summary_source_text = format_messages_for_summary(head, max_chars=40000)
+        if not summary_source_text.strip():
+            break
+
+        summary_prompt = (
+            "Summarize the prior conversation so the assistant can continue accurately. "
+            "Include key requirements, decisions, file paths, commands, tool outputs, errors, "
+            "and remaining TODOs. Keep it concise and structured."
+        )
+        summary_messages = [
+            {"role": "system", "content": "You are a summarization assistant. Summarize accurately and concisely."},
+            {"role": "user", "content": f"{summary_prompt}\n\nConversation:\n{summary_source_text}"},
+        ]
+
+        summary_model = large_model or model_name
+        summary_endpoint = _normalize_chat_endpoint(large_endpoint or endpoint)
+        summary_payload = {
+            "model": summary_model,
+            "messages": summary_messages,
+            "temperature": 0.2,
+            "max_tokens": 800,
+        }
+        try:
+            summary_response = await _call_chat_completion(summary_endpoint, headers, summary_payload, timeout_seconds=120.0)
+            if summary_response.status_code == 200:
+                data = summary_response.json()
+                summary_text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+            else:
+                summary_text = ""
+        except Exception:
+            summary_text = ""
+
+        if not summary_text:
+            summary_text = summary_source_text[-2000:] if summary_source_text else ""
+
+        new_messages: List[Dict[str, Any]] = []
+        if system_msg:
+            new_messages.append(system_msg)
+        new_messages.append({"role": "system", "content": f"Summary of previous context:\n{summary_text}"})
+        new_messages.extend(tail)
+
+        if _estimate_total_tokens(new_messages, max_tokens) <= get_max_token_limit():
+            return new_messages
+
+    return messages
 
 
 # Telegram/OpenAI configuration
@@ -540,6 +977,10 @@ OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID") or os.getenv("OPENAI_ORGANIZATION")
 OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")
 # Optional shared secret for bot-to-proxy auth; when set, requests must include X-Telegram-Secret or Authorization: Bearer <secret>
 TELEGRAM_SECRET = os.getenv("TELEGRAM_SECRET")
+
+# Large payload model fallback (optional)
+LARGE_PAYLOAD_MODEL = (os.getenv("LARGE_PAYLOAD_MODEL") or "").strip() or None
+LARGE_PAYLOAD_ENDPOINT = (os.getenv("LARGE_PAYLOAD_ENDPOINT") or "").strip() or None
 
 # Codex CLI configuration
 CODEX_ENABLED = os.getenv("CODEX_ENABLED", "true").lower() == "true"
@@ -964,6 +1405,7 @@ async def require_auth_for_v1_routes(request: Request, call_next):
     exempt_paths = {
         "/v1/auth/signup",
         "/v1/auth/login",
+        "/v1/tools/log",  # Tool invocation log sink for HTML UI tool calls
         "/v1/audio/transcriptions",  # Whisper endpoint - public for audio transcription
         "/v1/proxy/chat/completions",  # Chat completions proxy - public to avoid mixed content
         "/v1/proxy/models",  # Models list proxy - public to avoid mixed content
@@ -975,6 +1417,11 @@ async def require_auth_for_v1_routes(request: Request, call_next):
         "/v1/proxy/search",  # Search proxy - public
         "/v1/proxy/news",  # News proxy - public
         "/v1/proxy/fetch",  # Web fetch proxy - public
+        "/v1/status/start",
+        "/v1/status/update",
+        "/v1/status/finish",
+        "/v1/status/latest",
+        "/v1/status/events",
     }
     # Telegram bot endpoints are unauthenticated (bot uses TELEGRAM_SECRET when set)
     require_auth = (
@@ -1377,29 +1824,184 @@ def _is_dns_or_network_error(exc: BaseException) -> bool:
     return False
 
 
-async def _do_proxy_fetch(url: str) -> Dict[str, str]:
-    """Shared fetch logic: fetch URL and return dict with content or raise."""
+async def _do_proxy_fetch(
+    url: str,
+    crawl: bool = True,
+    max_pages: int = 3,
+    max_depth: int = 1,
+) -> Dict[str, Any]:
+    """Shared fetch logic: fetch URL(s), extract readable content, and optionally crawl."""
     if not url or not url.strip():
         raise HTTPException(status_code=400, detail="URL parameter is required")
-    # Normalize URL (allow without scheme for convenience)
-    url = url.strip()
+    return await _fetch_and_extract_content(
+        url=url,
+        crawl=bool(crawl),
+        max_pages=max_pages,
+        max_depth=max_depth,
+    )
+
+
+def _normalize_url(raw_url: str) -> str:
+    url = (raw_url or "").strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+    return url
+
+
+def _is_same_domain(base_url: str, candidate_url: str) -> bool:
+    try:
+        base_host = (urlparse(base_url).hostname or "").lower()
+        cand_host = (urlparse(candidate_url).hostname or "").lower()
+        return bool(base_host) and base_host == cand_host
+    except Exception:
+        return False
+
+
+def _extract_links_from_html(raw_html: str, base_url: str) -> List[str]:
+    if not raw_html:
+        return []
+    links: List[str] = []
+    seen: Set[str] = set()
+    for match in re.finditer(r"""<a\s+[^>]*href=["']([^"']+)["']""", raw_html, re.IGNORECASE):
+        href = (match.group(1) or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        # Normalize by dropping fragments only.
+        normalized = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        links.append(normalized)
+    return links
+
+
+def _extract_text_bs4(raw_html: str) -> Tuple[str, str]:
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe", "form"]):
+        tag.decompose()
+
+    main = (
+        soup.find("article")
+        or soup.find("main")
+        or soup.find(attrs={"role": "main"})
+        or soup.find("body")
+        or soup
+    )
+
+    for tag in main.find_all(["nav", "header", "footer", "aside"]):
+        tag.decompose()
+
+    title = (soup.title.get_text(" ", strip=True) if soup.title else "").strip()
+    text = main.get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text).strip()
+    return title, text
+
+
+def _extract_text_fallback(raw_html: str) -> Tuple[str, str]:
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw_html, re.IGNORECASE | re.DOTALL)
+    title = html.unescape(re.sub(r"<[^>]+>", " ", title_match.group(1))).strip() if title_match else ""
+
+    cleaned = re.sub(r"<!--.*?-->", " ", raw_html, flags=re.DOTALL)
+    cleaned = re.sub(r"<(script|style|noscript|svg|canvas|iframe|form)\b[^>]*>.*?</\1>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+    # Prefer content-heavy semantic containers before full body fallback.
+    for pattern in [
+        r"<article\b[^>]*>(.*?)</article>",
+        r"<main\b[^>]*>(.*?)</main>",
+        r"<body\b[^>]*>(.*?)</body>",
+    ]:
+        m = re.search(pattern, cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            cleaned = m.group(1)
+            break
+
+    cleaned = re.sub(r"<(nav|header|footer|aside)\b[^>]*>.*?</\1>", " ", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    text = html.unescape(cleaned)
+    text = re.sub(r"\s+", " ", text).strip()
+    return title, text
+
+
+def _extract_readable_content(raw_html: str) -> Tuple[str, str]:
+    if BS4_AVAILABLE and BeautifulSoup is not None:
+        try:
+            return _extract_text_bs4(raw_html)
+        except Exception:
+            pass
+    return _extract_text_fallback(raw_html)
+
+
+async def _fetch_and_extract_content(
+    url: str,
+    crawl: bool = True,
+    max_pages: int = 3,
+    max_depth: int = 1,
+) -> Dict[str, Any]:
+    normalized_start = _normalize_url(url)
+    max_pages = max(1, min(int(max_pages or 1), 10))
+    max_depth = max(0, min(int(max_depth or 0), 2))
+
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
     }
+
+    queue = collections.deque([(normalized_start, 0)])
+    visited: Set[str] = set()
+    pages: List[Dict[str, Any]] = []
+    last_raw_html = ""
+    last_error: Optional[BaseException] = None
+
     try:
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        return {"content": response.text}
-    except HTTPException:
-        raise
+            while queue and len(pages) < max_pages:
+                current_url, depth = queue.popleft()
+                if current_url in visited:
+                    continue
+                visited.add(current_url)
+
+                try:
+                    response = await client.get(current_url, headers=headers)
+                    response.raise_for_status()
+                    raw_html = response.text
+                    final_url = str(response.url)
+                    content_type = (response.headers.get("content-type") or "").lower()
+
+                    if "text/html" not in content_type and "<html" not in raw_html[:3000].lower():
+                        # Non-HTML content is still captured as plain text.
+                        extracted_title = ""
+                        extracted_text = raw_html.strip()
+                    else:
+                        extracted_title, extracted_text = _extract_readable_content(raw_html)
+
+                    if extracted_text:
+                        pages.append(
+                            {
+                                "url": final_url,
+                                "title": extracted_title,
+                                "content": extracted_text,
+                            }
+                        )
+                        last_raw_html = raw_html
+
+                    if crawl and depth < max_depth and len(pages) < max_pages:
+                        for link in _extract_links_from_html(raw_html, final_url):
+                            if link in visited:
+                                continue
+                            if not _is_same_domain(normalized_start, link):
+                                continue
+                            queue.append((link, depth + 1))
+                except Exception as page_error:
+                    last_error = page_error
+                    continue
     except Exception as e:
-        # DNS or network failure on the machine running the proxy (e.g. WSL, VPN, no outbound DNS)
         if _is_dns_or_network_error(e):
             raise HTTPException(
                 status_code=502,
@@ -1411,12 +2013,49 @@ async def _do_proxy_fetch(url: str) -> Dict[str, str]:
             )
         raise HTTPException(status_code=500, detail=f"Failed to fetch content: {str(e)}")
 
+    if not pages:
+        if last_error and _is_dns_or_network_error(last_error):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "The proxy server could not resolve the website's hostname (DNS lookup failed). "
+                    "This usually means the machine running the proxy has no internet or restricted DNS. "
+                    "Ensure the proxy runs on a machine with working internet and DNS (e.g. try pinging the host from that machine)."
+                ),
+            )
+        if last_error:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch content: {str(last_error)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch content: no pages returned")
+
+    combined_parts: List[str] = []
+    for i, page in enumerate(pages, start=1):
+        page_title = (page.get("title") or "").strip()
+        title_line = f"Title: {page_title}\n" if page_title else ""
+        combined_parts.append(f"[Page {i}] {page.get('url')}\n{title_line}{page.get('content', '')}")
+    combined_content = "\n\n".join(combined_parts).strip()
+
+    return {
+        "url": pages[0].get("url", normalized_start),
+        "content": combined_content,
+        "title": pages[0].get("title", ""),
+        "pages": pages,
+        "crawled": bool(crawl),
+        "page_count": len(pages),
+        "raw_html": last_raw_html,
+    }
+
 
 @app.get("/v1/proxy/fetch")
-async def proxy_fetch_get(url: str, request: Request):
+async def proxy_fetch_get(
+    url: str,
+    request: Request,
+    crawl: bool = True,
+    max_pages: int = 3,
+    max_depth: int = 1,
+):
     """Fetch web content via GET (query param). Use POST for long URLs (e.g. iOS Safari)."""
     try:
-        result = await _do_proxy_fetch(url)
+        result = await _do_proxy_fetch(url, crawl=crawl, max_pages=max_pages, max_depth=max_depth)
         cors = build_cors_headers(request)
         return JSONResponse(content=result, headers=cors)
     except HTTPException:
@@ -1440,7 +2079,12 @@ async def proxy_fetch_post(body: ProxyFetchRequest, request: Request):
     last_error: Optional[Exception] = None
     for one_url in to_try:
         try:
-            result = await _do_proxy_fetch(one_url)
+            result = await _do_proxy_fetch(
+                one_url,
+                crawl=body.crawl,
+                max_pages=body.max_pages,
+                max_depth=body.max_depth,
+            )
             cors = build_cors_headers(request)
             return JSONResponse(content=result, headers=cors)
         except HTTPException:
@@ -1666,7 +2310,27 @@ async def proxy_news_search(query: str):
 
 
 def _sanitize_weather_location(location: str) -> str:
-    return re.sub(r"\s+", " ", (location or "").strip())
+    if location is None:
+        return ""
+    if not isinstance(location, str):
+        location = str(location)
+    return re.sub(r"\s+", " ", location.strip())
+
+
+def _normalize_weather_detail(detail: Optional[str]) -> str:
+    """Normalize weather detail/request type to supported values."""
+    value = (detail or "summary")
+    if not isinstance(value, str):
+        value = str(value)
+    key = value.strip().lower()
+    aliases = {
+        "overview": "summary",
+        "all": "summary",
+        "rain": "forecast",
+        "wind": "current",
+        "alerts": "summary",
+    }
+    return aliases.get(key, key if key in {"summary", "current", "forecast"} else "summary")
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -1683,8 +2347,8 @@ def _extract_memory_location(memories: List[Dict[str, Any]]) -> Optional[str]:
         return None
     patterns = [
         r"(?:i(?:\s|'| a)?m|i live|i am based|my location is|i'm in)\s+(?:in\s+)?([A-Za-z\s,'-]{2,80})",
-        r"([A-Za-z\s'-]{2,60},\s*(?:nsw|vic|qld|sa|wa|tas|nt|act))",
-        r"(\d{4})",
+        r"\b([A-Za-z\s'-]{2,60},\s*(?:nsw|vic|qld|sa|wa|tas|nt|act))\b",
+        r"\b(\d{4})\b",
     ]
     for m in memories:
         txt = (m.get("text") or "").strip()
@@ -1716,7 +2380,7 @@ async def _resolve_weather_location(location: Optional[str], user_id: Optional[s
 
 async def _do_proxy_weather(location: Optional[str], detail: str = "summary", user_id: Optional[str] = None, memory_manager: Any = None) -> Dict[str, Any]:
     resolved_location, source = await _resolve_weather_location(location, user_id, memory_manager)
-    detail = (detail or "summary").strip().lower()
+    detail = _normalize_weather_detail(detail)
     parsed_base = urlparse(BOM_API_BASE_URL)
     if not parsed_base.scheme.startswith("http"):
         raise HTTPException(status_code=500, detail="Invalid BOM_API_BASE_URL configuration")
@@ -1728,11 +2392,31 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
         async with httpx.AsyncClient(timeout=BOM_API_TIMEOUT_SECONDS) as client:
             loc_resp = await client.get(search_url, params={"search": resolved_location}, headers={"Accept": "application/json"})
             loc_resp.raise_for_status()
-            loc_json = loc_resp.json()
+            try:
+                loc_json = loc_resp.json()
+            except ValueError as e:
+                raise HTTPException(status_code=502, detail=f"Invalid BOM location response payload: {str(e)}")
             loc_items = loc_json.get("data") if isinstance(loc_json, dict) else []
             if not isinstance(loc_items, list) or not loc_items:
                 raise HTTPException(status_code=404, detail=f"No BOM weather location found for '{resolved_location}'.")
-            loc = loc_items[0]
+            requested_lc = resolved_location.lower()
+            loc = next(
+                (
+                    item for item in loc_items
+                    if isinstance(item, dict) and str(item.get("name") or "").strip().lower() == requested_lc
+                ),
+                None,
+            )
+            if not loc:
+                loc = next(
+                    (
+                        item for item in loc_items
+                        if isinstance(item, dict) and str(item.get("name") or "").strip().lower().startswith(requested_lc)
+                    ),
+                    None,
+                )
+            if not loc:
+                loc = loc_items[0]
             geohash = loc.get("geohash") or loc.get("id")
             if not geohash:
                 raise HTTPException(status_code=502, detail="BOM response missing location geohash")
@@ -1742,8 +2426,11 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
             obs_resp, forecast_resp = await asyncio.gather(obs_task, forecast_task)
             obs_resp.raise_for_status()
             forecast_resp.raise_for_status()
-            obs_json = obs_resp.json()
-            forecast_json = forecast_resp.json()
+            try:
+                obs_json = obs_resp.json()
+                forecast_json = forecast_resp.json()
+            except ValueError as e:
+                raise HTTPException(status_code=502, detail=f"Invalid BOM weather payload: {str(e)}")
     except HTTPException:
         raise
     except httpx.TimeoutException:
@@ -1753,10 +2440,19 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve weather data: {str(e)}")
 
-    observation = ((obs_json or {}).get("data") or {}).get("observations") or {}
+    obs_data = (obs_json or {}).get("data") if isinstance(obs_json, dict) else {}
+    if not isinstance(obs_data, dict):
+        obs_data = {}
+    observation = obs_data.get("observations") or {}
     if isinstance(observation, list):
         observation = observation[0] if observation else {}
-    forecast_days = ((forecast_json or {}).get("data") or {}).get("daily") or []
+    forecast_data = (forecast_json or {}).get("data") if isinstance(forecast_json, dict) else {}
+    if isinstance(forecast_data, dict):
+        forecast_days = forecast_data.get("daily") or []
+    elif isinstance(forecast_data, list):
+        forecast_days = forecast_data
+    else:
+        forecast_days = []
     if not isinstance(forecast_days, list):
         forecast_days = []
 
@@ -1781,7 +2477,7 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
 
     loc_name = loc.get("name") or resolved_location
     summary = (
-        f"Weather for {loc_name}: {current.get('temperature_c', 'N/A')}°C, {current.get('condition', 'unknown')}"
+        f"Weather for {loc_name}: {current.get('temperature_c', 'N/A')}C, {current.get('condition', 'unknown')}"
         f". Forecast entries: {len(forecast)}."
     )
 
@@ -1807,11 +2503,13 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
 async def proxy_weather(
     location: Optional[str] = None,
     detail: str = "summary",
+    requestType: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Fetch parsed weather information from BOM. Auth required."""
     user_id = current_user.get("username") if isinstance(current_user, dict) else None
-    return await _do_proxy_weather(location=location, detail=detail, user_id=user_id, memory_manager=memory_manager if MEMORY_AVAILABLE else None)
+    final_detail = _normalize_weather_detail(requestType or detail)
+    return await _do_proxy_weather(location=location, detail=final_detail, user_id=user_id, memory_manager=memory_manager if MEMORY_AVAILABLE else None)
 
 
 # Shared AutoGen logic for route and Telegram tool runner
@@ -2140,6 +2838,13 @@ async def proxy_codex_exec(
     _ = current_user  # keep for auth enforcement
     return await _run_codex_cli(request.prompt)
 
+
+@app.post("/v1/proxy/restart")
+async def proxy_restart_server(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Schedule a proxy process restart. Auth required."""
+    username = current_user.get("username", "unknown")
+    return await _request_proxy_restart(trigger="web_api", requested_by=f"user:{username}")
+
 # Allowed keys when persisting MCP server config (never persist 'command')
 MCP_SERVER_SAFE_KEYS = {"id", "name", "preset_id", "apiKey", "model", "url", "wsUrl", "status", "enabled"}
 
@@ -2408,6 +3113,8 @@ async def _browser_use_http_call_tool(tool_name: str, parameters: Dict[str, Any]
     """Call a tool on the browser-use HTTP MCP server. Returns result with content list; raises on connection failure."""
     from fastmcp import Client
 
+    _log_tool_invocation("browser_use_http", tool_name, parameters)
+
     # Map proxy parameter names to server names (e.g. instruction -> task for run_browser_agent)
     args = dict(parameters)
     if tool_name == "run_browser_agent" and "instruction" in args and "task" not in args:
@@ -2440,6 +3147,37 @@ def _is_browser_use_server(server: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+def _log_tool_invocation(source: str, tool_name: str, parameters: Optional[Dict[str, Any]] = None) -> None:
+    """Unified console logging for all tool invocation entry points."""
+    try:
+        payload = parameters if isinstance(parameters, dict) else {}
+        args_text = json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        args_text = str(parameters)
+    print(f"[TOOL][{source}] name={tool_name} args={args_text}", flush=True)
+
+
+@app.post("/v1/tools/log")
+async def log_tool_invocation(request: Request):
+    """Record a tool invocation from clients that execute tool routing locally (e.g. HTML UI)."""
+    body: Dict[str, Any] = {}
+    try:
+        parsed = await request.json()
+        if isinstance(parsed, dict):
+            body = parsed
+    except Exception:
+        body = {}
+
+    tool_name = str(body.get("name") or "").strip()
+    if not tool_name:
+        raise HTTPException(status_code=400, detail="name is required")
+
+    source = str(body.get("source") or "client")
+    arguments = body.get("arguments")
+    _log_tool_invocation(source, tool_name, arguments if isinstance(arguments, dict) else {})
+    return {"success": True}
+
+
 # Browser automation tool endpoint (browser-use via HTTP; other servers via MCP client)
 @app.post("/v1/mcp/servers/{server_id}/tools/call")
 async def call_tool(server_id: str, request: ToolCallRequest):
@@ -2453,6 +3191,7 @@ async def call_tool(server_id: str, request: ToolCallRequest):
         server = mcp_servers.get(server_id)
         tool_name = request.toolName
         parameters = request.parameters or {}
+        _log_tool_invocation(f"mcp_call:{server_id}", tool_name, parameters)
         print(f"🔍 [TOOLS/CALL] Tool name: {tool_name}")
         print(f"🔍 [TOOLS/CALL] Parameters: {parameters}")
 
@@ -2932,6 +3671,141 @@ def _is_todo_list_query(message_text: str) -> bool:
     return any(p in lower for p in phrases)
 
 
+def _is_memory_context_question(message_text: str) -> bool:
+    """
+    Return True when a message is likely asking for opinions/knowledge where memory context helps.
+    Action/tool requests should return False to avoid noisy memory injection.
+    """
+    if not message_text:
+        return False
+
+    lower = message_text.lower().strip()
+    if len(lower) > 800:
+        return False
+
+    action_patterns = (
+        r"(search|find|look\s+up|get|fetch|retrieve)\s+(for|information\s+about|details\s+about)",
+        r"how\s+much\s+(does|do|is|are|cost)",
+        r"what'?s\s+the\s+(weather|price|cost|temperature|time)",
+        r"(show|display|list|give\s+me)\s+(information|data|details|results)",
+        r"(navigate|go\s+to|visit|open|browse)",
+        r"(read|write|save|load|upload|download)\s+(the\s+)?(file|document|data)",
+        r"(create|make|build|generate|produce)\s+(a|an|the)",
+        r"(run|execute|perform|do)\s+(a|an|the)",
+    )
+    if any(re.search(p, lower, re.IGNORECASE) for p in action_patterns):
+        return False
+
+    opinion_patterns = (
+        r"what\s+(do\s+you\s+)?think\s+(about|of)",
+        r"what'?s\s+(your\s+)?(opinion|view|perspective|take|thoughts?)\s+(on|about|of|regarding)",
+        r"what\s+(do\s+you\s+)?know\s+(about|of)",
+        r"how\s+do\s+you\s+(feel|see|view|perceive)\s+(about|on|regarding)",
+        r"tell\s+me\s+(what\s+you\s+)?(think|know|believe|feel)\s+(about|of|on)",
+        r"share\s+(your\s+)?(thoughts?|views?|opinions?|perspective)",
+        r"what\s+(do\s+you\s+)?(believe|understand|consider)\s+(about|of|regarding)",
+    )
+    if any(re.search(p, lower, re.IGNORECASE) for p in opinion_patterns):
+        return True
+
+    return bool(re.search(r"^what\s+(do\s+you|'?s\s+your)", lower, re.IGNORECASE))
+
+
+def _extract_memory_search_query(message_text: str) -> str:
+    """Extract likely topic phrase for memory search; falls back to full message."""
+    if not message_text:
+        return ""
+    match = re.search(
+        r"(?:think|opinion|view|know|thoughts?|beliefs?|feel|see|perceive|understand|consider|"
+        r"insights?|reflections?|contemplations?)\s+(?:about|of|on|regarding)\s+(.+?)(?:\?|$)",
+        message_text,
+        re.IGNORECASE,
+    )
+    topic = (match.group(1).strip() if match and match.group(1) else message_text.strip())
+    return topic[:500]
+
+
+def _filter_high_relevance_memories(memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Keep only high-confidence memory matches:
+    - top hit must pass minimum similarity
+    - keep matches in a score window close to top score
+    - cap final count
+    """
+    if not memories:
+        return []
+
+    sorted_memories = sorted(memories, key=lambda m: float(m.get("similarity", 0.0)), reverse=True)
+    top_score = float(sorted_memories[0].get("similarity", 0.0))
+    if top_score < MEMORY_AUTO_SEARCH_MIN_SIMILARITY:
+        return []
+
+    floor = max(MEMORY_AUTO_SEARCH_MIN_SIMILARITY, top_score - MEMORY_AUTO_SEARCH_SCORE_WINDOW)
+    filtered = [m for m in sorted_memories if float(m.get("similarity", 0.0)) >= floor]
+    return filtered[:MEMORY_AUTO_SEARCH_LIMIT]
+
+
+def _message_requests_proxy_restart(message_text: str) -> bool:
+    """
+    Return True for explicit restart command-style phrases.
+    This keeps restart deterministic for chat without relying on LLM tool selection.
+    """
+    if not message_text:
+        return False
+    normalized = re.sub(r"\s+", " ", message_text.strip().lower())
+    normalized = normalized.rstrip(" .!?,;:")
+    explicit_commands = {
+        "/restartproxy",
+        "/restart_proxy",
+        "restart proxy",
+        "restart proxy server",
+        "restart the proxy",
+        "restart the proxy server",
+    }
+    return normalized in explicit_commands
+
+
+async def _restart_proxy_after_delay(trigger: str, requested_by: str) -> None:
+    """Restart this proxy process after a short delay so current HTTP response can complete."""
+    global _proxy_restart_scheduled
+    await asyncio.sleep(PROXY_RESTART_DELAY_SECONDS)
+    print(
+        f"[RESTART] Restarting proxy server now (trigger={trigger}, requested_by={requested_by})",
+        flush=True,
+    )
+    # Restart using the canonical module entrypoint so startup behavior remains consistent.
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "src.servers.proxy_server"])
+    except Exception as exc:
+        _proxy_restart_scheduled = False
+        print(f"[RESTART] Failed to restart proxy server: {exc}", flush=True)
+
+
+async def _request_proxy_restart(trigger: str, requested_by: str) -> Dict[str, Any]:
+    """Schedule a process restart once; subsequent requests before restart are acknowledged idempotently."""
+    global _proxy_restart_scheduled
+    if not PROXY_RESTART_ENABLED:
+        return {
+            "success": False,
+            "scheduled": False,
+            "message": "Proxy restart is disabled by server configuration.",
+        }
+    if _proxy_restart_scheduled:
+        return {
+            "success": True,
+            "scheduled": True,
+            "alreadyScheduled": True,
+            "message": "Proxy restart is already scheduled and will start shortly.",
+        }
+    _proxy_restart_scheduled = True
+    asyncio.create_task(_restart_proxy_after_delay(trigger=trigger, requested_by=requested_by))
+    return {
+        "success": True,
+        "scheduled": True,
+        "message": "Proxy restart scheduled. Reconnect in a few seconds to load updated tools.",
+    }
+
+
 @app.post("/v1/telegram/chat", response_model=TelegramChatResponse)
 async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequest):
     """Process a Telegram chat message via OpenAI-compatible API."""
@@ -2941,15 +3815,50 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     if not message_text:
         raise HTTPException(status_code=400, detail="message is required")
 
+    conversation_id = request.conversation_id or request.user_id or "default"
+    request_id = request.request_id or f"telegram-{conversation_id}-{int(time.time() * 1000)}"
+
+    await _start_status_session(
+        conversation_id=conversation_id,
+        request_id=request_id,
+        channel="telegram",
+        initial_state="Working: contacting model",
+        phase="llm_request",
+    )
+
+    # Explicit command path for reliable Telegram-triggered proxy restarts (no LLM/tool-call required).
+    if _message_requests_proxy_restart(message_text):
+        restart_result = await _request_proxy_restart(
+            trigger="telegram_command",
+            requested_by=f"telegram:{request.user_id or conversation_id}",
+        )
+        reply_text = restart_result.get("message", "Proxy restart requested.")
+        await _finish_status_session(
+            conversation_id=conversation_id,
+            request_id=request_id,
+            final_state="Done: proxy restart scheduled",
+            phase="done",
+        )
+        history = telegram_conversations.setdefault(conversation_id, [])
+        history.append({"role": "user", "content": message_text})
+        history.append({"role": "assistant", "content": reply_text})
+        trim_telegram_history(history)
+        return TelegramChatResponse(reply=reply_text, conversation_id=conversation_id, usage=None)
+
     # Prefer OPENAI_API_KEY; fall back to MCP_LLM_OPENAI_API_KEY for single .env setups
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY")
     if not api_key:
+        await _finish_status_session(
+            conversation_id=conversation_id,
+            request_id=request_id,
+            final_state="Failed: server missing API key",
+            phase="error",
+        )
         raise HTTPException(
             status_code=503,
             detail="OPENAI_API_KEY or MCP_LLM_OPENAI_API_KEY is not configured on the server",
         )
 
-    conversation_id = request.conversation_id or request.user_id or "default"
     todo_user_key = _resolve_todo_user_for_telegram(conversation_id, request.user_id)
     history = telegram_conversations.setdefault(conversation_id, [])
 
@@ -2975,32 +3884,34 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     # Prepend assistant context (timezone + knowledge awareness)
     system_prompt = _get_assistant_context_block() + system_prompt
 
-    # Retrieve relevant memories if memory system is available (skip for todo-list queries so model uses manageTodoList tool)
+    # Retrieve relevant memories only for opinion/knowledge-style prompts.
     memory_context = ""
-    if MEMORY_AVAILABLE and memory_manager and not _is_todo_list_query(message_text):
+    if (
+        MEMORY_AVAILABLE
+        and memory_manager
+        and not _is_todo_list_query(message_text)
+        and _is_memory_context_question(message_text)
+    ):
         try:
-            # Search for relevant memories based on the current message
-            # Use a lower threshold (0.3) for automatic retrieval to catch more relevant memories
-            relevant_memories = await memory_manager.search_memories(
-                query=message_text,
-                limit=5,
-                similarity_threshold=0.3,  # Lower threshold for better recall
+            search_query = _extract_memory_search_query(message_text)
+            candidate_memories = await memory_manager.search_memories(
+                query=search_query,
+                limit=max(5, MEMORY_AUTO_SEARCH_LIMIT * 2),
+                similarity_threshold=MEMORY_AUTO_SEARCH_CANDIDATE_THRESHOLD,
             )
-            
-            # Log search results for debugging
+
+            relevant_memories = _filter_high_relevance_memories(candidate_memories)
             if relevant_memories:
-                print(f"Found {len(relevant_memories)} relevant memories for query: '{message_text[:50]}...'")
-                for mem in relevant_memories:
-                    print(f"  - {mem.get('text', '')} (similarity: {mem.get('similarity', 0):.3f})")
-            else:
-                print(f"No memories found for query: '{message_text[:50]}...' (threshold: 0.3)")
-            
-            # Build memory context if memories found
-            if relevant_memories:
+                print(
+                    f"Memory context: kept {len(relevant_memories)}/{len(candidate_memories)} "
+                    f"for query '{search_query[:50]}...'"
+                )
                 memory_context = "\n\nRelevant context from previous conversations:\n"
                 for i, mem in enumerate(relevant_memories, 1):
                     memory_context += f"{i}. {mem.get('text', '')}\n"
                 memory_context += "\nUse this context to provide more personalized and relevant responses."
+            else:
+                print(f"Memory context: no high-relevance matches for query '{search_query[:50]}...'")
         except Exception as e:
             print(f"Warning: Failed to retrieve memories: {e}")
             import traceback
@@ -3042,12 +3953,34 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         headers["OpenAI-Project"] = OPENAI_PROJECT_ID
 
     url = build_openai_url(TELEGRAM_OPENAI_CHAT_PATH)
+    url = _normalize_chat_endpoint(url)
+
+    max_tokens = _get_max_tokens_from_payload(payload)
+    summarized = False
+    if isinstance(payload.get("messages"), list):
+        estimated = _estimate_total_tokens(payload["messages"], max_tokens)
+        if estimated > get_max_token_limit():
+            payload["messages"] = await _summarize_messages_for_budget_proxy(
+                payload["messages"],
+                endpoint=url,
+                headers=headers,
+                model_name=model_name,
+                max_tokens=max_tokens,
+                large_model=LARGE_PAYLOAD_MODEL,
+                large_endpoint=LARGE_PAYLOAD_ENDPOINT,
+            )
+            summarized = True
 
     try:
-        async with httpx.AsyncClient(timeout=TELEGRAM_CHAT_TIMEOUT) as client:
-            response = await client.post(url, headers=headers, json=payload)
+        response = await _call_chat_completion(url, headers, payload, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
     except httpx.RequestError as exc:
         print(f"Telegram chat request error: {exc}")
+        await _finish_status_session(
+            conversation_id=conversation_id,
+            request_id=request_id,
+            final_state="Failed: could not contact model service",
+            phase="error",
+        )
         raise HTTPException(status_code=502, detail="Failed to contact language model service") from exc
 
     if response.status_code != 200:
@@ -3062,7 +3995,41 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             )
         except ValueError:
             pass
-        raise HTTPException(status_code=response.status_code, detail=detail)
+        if is_context_limit_error(response.status_code, detail):
+            if not summarized and isinstance(payload.get("messages"), list):
+                payload["messages"] = await _summarize_messages_for_budget_proxy(
+                    payload["messages"],
+                    endpoint=url,
+                    headers=headers,
+                    model_name=model_name,
+                    max_tokens=max_tokens,
+                    large_model=LARGE_PAYLOAD_MODEL,
+                    large_endpoint=LARGE_PAYLOAD_ENDPOINT,
+                )
+                summarized = True
+                response = await _call_chat_completion(url, headers, payload, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+            if response.status_code != 200 and LARGE_PAYLOAD_MODEL:
+                payload["model"] = LARGE_PAYLOAD_MODEL
+                large_url = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or url)
+                response = await _call_chat_completion(large_url, headers, payload, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+            if response.status_code == 200:
+                data = response.json()
+            else:
+                await _finish_status_session(
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    final_state="Failed: model returned error",
+                    phase="error",
+                )
+                raise HTTPException(status_code=response.status_code, detail=detail)
+        else:
+            await _finish_status_session(
+                conversation_id=conversation_id,
+                request_id=request_id,
+                final_state="Failed: model returned error",
+                phase="error",
+            )
+            raise HTTPException(status_code=response.status_code, detail=detail)
 
     data = response.json()
     reply = None
@@ -3091,6 +4058,13 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             if not parsed:
                 break
             tool_name = parsed.get("name")
+            if tool_name:
+                await _update_status_session(
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    state=f"Working: executing tool {tool_name}",
+                    phase=f"tool:{tool_name}",
+                )
             args_str = parsed.get("arguments", "{}")
             try:
                 tool_args = json.loads(args_str) if isinstance(args_str, str) else args_str
@@ -3115,6 +4089,10 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 "do_weather": _do_proxy_weather,
                 "do_autogen": _do_autogen,
                 "do_codex": _run_codex_cli,
+                "do_restart_proxy": lambda reason=None: _request_proxy_restart(
+                    trigger=f"telegram_tool:{(reason or '').strip() or 'requested'}",
+                    requested_by=f"telegram:{request.user_id or conversation_id}",
+                ),
                 "do_browser_agent": _do_browser_agent,
                 "do_deep_research": _do_deep_research,
                 "read_file_internal": _read_file_internal,
@@ -3137,16 +4115,54 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 payload_tool["temperature"] = request.temperature
             if request.max_output_tokens is not None:
                 payload_tool["max_tokens"] = request.max_output_tokens
+            max_tokens_tool = _get_max_tokens_from_payload(payload_tool)
+            summarized_tool = False
+            if isinstance(payload_tool.get("messages"), list):
+                estimated_tool = _estimate_total_tokens(payload_tool["messages"], max_tokens_tool)
+                if estimated_tool > get_max_token_limit():
+                    payload_tool["messages"] = await _summarize_messages_for_budget_proxy(
+                        payload_tool["messages"],
+                        endpoint=url,
+                        headers=headers,
+                        model_name=payload_tool.get("model", ""),
+                        max_tokens=max_tokens_tool,
+                        large_model=LARGE_PAYLOAD_MODEL,
+                        large_endpoint=LARGE_PAYLOAD_ENDPOINT,
+                    )
+                    summarized_tool = True
+            await _update_status_session(
+                conversation_id=conversation_id,
+                request_id=request_id,
+                state="Working: requesting final response",
+                phase="llm_followup",
+            )
             try:
-                async with httpx.AsyncClient(timeout=TELEGRAM_CHAT_TIMEOUT) as client:
-                    response_tool = await client.post(url, headers=headers, json=payload_tool)
+                response_tool = await _call_chat_completion(url, headers, payload_tool, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
             except httpx.RequestError as exc:
                 print(f"Telegram tool-loop request error: {exc}")
                 break
             if response_tool.status_code != 200:
                 print(f"Telegram tool follow-up returned status {response_tool.status_code}, using tool result as reply")
-                reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
-                break
+                if is_context_limit_error(response_tool.status_code, response_tool.text or ""):
+                    if not summarized_tool and isinstance(payload_tool.get("messages"), list):
+                        payload_tool["messages"] = await _summarize_messages_for_budget_proxy(
+                            payload_tool["messages"],
+                            endpoint=url,
+                            headers=headers,
+                            model_name=payload_tool.get("model", ""),
+                            max_tokens=max_tokens_tool,
+                            large_model=LARGE_PAYLOAD_MODEL,
+                            large_endpoint=LARGE_PAYLOAD_ENDPOINT,
+                        )
+                        summarized_tool = True
+                        response_tool = await _call_chat_completion(url, headers, payload_tool, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                    if response_tool.status_code != 200 and LARGE_PAYLOAD_MODEL:
+                        payload_tool["model"] = LARGE_PAYLOAD_MODEL
+                        large_url = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or url)
+                        response_tool = await _call_chat_completion(large_url, headers, payload_tool, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                if response_tool.status_code != 200:
+                    reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
+                    break
             data_tool = response_tool.json()
             choices_tool = data_tool.get("choices") or []
             if not choices_tool:
@@ -3193,6 +4209,13 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
 
     usage = data.get("usage") if isinstance(data, dict) else None
 
+    await _finish_status_session(
+        conversation_id=conversation_id,
+        request_id=request_id,
+        final_state="Done: response delivered",
+        phase="done",
+    )
+
     return TelegramChatResponse(
         reply=reply,
         conversation_id=conversation_id,
@@ -3207,6 +4230,68 @@ async def telegram_clear_conversation(request: Request, conversation_id: str):
 
     removed = telegram_conversations.pop(conversation_id, None) is not None
     return {"conversation_id": conversation_id, "cleared": removed}
+
+# ============================================================================
+# STATUS EVENTS ENDPOINTS
+# ============================================================================
+
+@app.post("/v1/status/start")
+async def status_start(request: StatusStartRequest):
+    """Start a status session for progress updates."""
+    state = (request.state or "Working: processing your request...").strip()
+    await _start_status_session(
+        conversation_id=request.conversation_id,
+        request_id=request.request_id,
+        channel=request.channel or "web",
+        initial_state=state,
+        phase="start",
+    )
+    return {"ok": True}
+
+
+@app.post("/v1/status/update")
+async def status_update(request: StatusUpdateRequest):
+    """Update the current status state for a session."""
+    event = await _update_status_session(
+        conversation_id=request.conversation_id,
+        request_id=request.request_id,
+        state=request.state,
+        phase=request.phase,
+    )
+    return {"ok": True, "event": event}
+
+
+@app.post("/v1/status/finish")
+async def status_finish(request: StatusFinishRequest):
+    """Finish a status session and stop heartbeat updates."""
+    event = await _finish_status_session(
+        conversation_id=request.conversation_id,
+        request_id=request.request_id,
+        final_state=request.final_state,
+        phase=request.phase or "done",
+    )
+    return {"ok": True, "event": event}
+
+
+@app.get("/v1/status/latest")
+async def status_latest(conversation_id: str, request_id: Optional[str] = None):
+    """Get the latest status event for a conversation (optionally by request_id)."""
+    event = _get_latest_status_event(conversation_id, request_id=request_id)
+    if not event:
+        return {"found": False}
+    key = (event.get("conversation_id"), event.get("request_id"))
+    active = key in status_sessions
+    return {"found": True, "active": active, "event": event}
+
+
+@app.get("/v1/status/events")
+async def status_events(conversation_id: str, request_id: str, since_seq: int = 0):
+    """Get status events since a sequence number for a given request."""
+    events = _get_status_events_since(conversation_id, request_id, since_seq)
+    latest = status_latest_index.get((conversation_id, request_id))
+    latest_seq = latest.get("seq") if latest else since_seq
+    active = (conversation_id, request_id) in status_sessions
+    return {"events": events, "latest_seq": latest_seq, "active": active}
 
 # ============================================================================
 # MEMORY SYSTEM ENDPOINTS
@@ -3451,14 +4536,29 @@ async def get_all_available_tools() -> List[Dict]:
     # 2. Web Scraper/Fetcher Tool
     all_tools.append({
         "name": "web_scraper",
-        "description": "Fetch and scrape content from a web URL. Returns the HTML content of the webpage.",
+        "description": "Fetch and scrape readable content from a web URL. Can optionally crawl a few same-domain pages and return extracted text content.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
                     "description": "The URL to fetch and scrape (must include http:// or https://)",
-                }
+                },
+                "crawl": {
+                    "type": "boolean",
+                    "description": "Whether to crawl linked pages on the same domain",
+                    "default": True,
+                },
+                "max_pages": {
+                    "type": "integer",
+                    "description": "Maximum pages to scrape including the start page",
+                    "default": 3,
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum link depth from the start page",
+                    "default": 1,
+                },
             },
             "required": ["url"]
         },
@@ -3513,7 +4613,11 @@ async def get_all_available_tools() -> List[Dict]:
                     "filename": {
                         "type": "string",
                         "description": "Name of the file to read (e.g. notes.txt)",
-                    }
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Optional max characters to return (default 12000).",
+                    },
                 },
                 "required": ["filename"]
             },
@@ -3733,7 +4837,7 @@ async def get_all_available_tools() -> List[Dict]:
 
 async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
     """Execute a tool for philosopher mode. Returns result as string."""
-    print(f"[PHILOSOPHER] Executing tool: {tool_name} with parameters: {parameters}")
+    _log_tool_invocation("philosopher", tool_name, parameters)
     
     # Handle built-in proxy server tools
     if tool_name == "web_search":
@@ -3772,17 +4876,24 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             url = parameters.get("url", "")
             if not url:
                 return "Error: 'url' parameter is required for web_scraper"
-            
-            # Call the proxy fetch endpoint
-            result = await _do_proxy_fetch(url)
-            
-            # Return the content (may be HTML)
+
+            crawl = bool(parameters.get("crawl", True))
+            max_pages = int(parameters.get("max_pages", 3) or 3)
+            max_depth = int(parameters.get("max_depth", 1) or 1)
+
+            # Call the proxy fetch endpoint with extraction + optional crawl
+            result = await _do_proxy_fetch(url, crawl=crawl, max_pages=max_pages, max_depth=max_depth)
+
             if result and "content" in result:
-                content = result["content"]
+                content = result["content"] or ""
+                page_count = result.get("page_count", 1)
                 # Truncate if too long (keep first 10000 characters)
                 if len(content) > 10000:
-                    return f"Web content from {url} (truncated):\n\n{content[:10000]}...\n\n[Content truncated to 10000 characters]"
-                return f"Web content from {url}:\n\n{content}"
+                    return (
+                        f"Scraped content from {url} (pages: {page_count}, truncated):\n\n"
+                        f"{content[:10000]}...\n\n[Content truncated to 10000 characters]"
+                    )
+                return f"Scraped content from {url} (pages: {page_count}):\n\n{content}"
             else:
                 return f"No content retrieved from URL: {url}"
         except HTTPException as e:
@@ -3849,6 +4960,24 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
                 return result.get("message", "Read failed")
             data = result.get("data", {})
             content = data.get("content", "")
+            content = content if isinstance(content, str) else str(content)
+            req_max_chars = parameters.get("max_chars")
+            if isinstance(req_max_chars, str) and req_max_chars.isdigit():
+                req_max_chars = int(req_max_chars)
+            if isinstance(req_max_chars, (int, float)):
+                max_chars = int(req_max_chars)
+            else:
+                max_chars = int(os.getenv("READ_FILE_MAX_CHARS", "12000") or 12000)
+            max_chars = max(2000, max_chars)
+            if content and len(content) > max_chars:
+                head = max_chars // 2
+                tail = max_chars - head
+                removed = len(content) - max_chars
+                return (
+                    f"{content[:head]}\n\n"
+                    f"...[truncated {removed} chars]...\n\n"
+                    f"{content[-tail:]}"
+                )
             return content if content else "(empty file)"
         except Exception as e:
             return f"Error executing read_file: {str(e)}"
@@ -4207,6 +5336,51 @@ async def test_endpoint():
     sys.stdout.flush()
     return {"message": "test successful", "timestamp": time.time()}
 
+# Monitoring dashboard (standalone)
+@app.get("/monitor")
+async def monitor_dashboard():
+    """Serve the monitoring dashboard HTML."""
+    dashboard_file = _PROJECT_ROOT / "docs" / "monitoring_dashboard.html"
+    if not dashboard_file.exists():
+        return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
+    return HTMLResponse(content=dashboard_file.read_text(encoding="utf-8"), status_code=200)
+
+
+@app.get("/monitor/summary")
+async def monitor_summary():
+    """Return high-level system status summary."""
+    uptime_seconds = max(0.0, time.time() - PROXY_START_TIME)
+    openai_key_present = bool(os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY"))
+    return {
+        "time": time.time(),
+        "uptime_seconds": uptime_seconds,
+        "memory_available": MEMORY_AVAILABLE,
+        "telegram_tools_enabled": TELEGRAM_TOOLS_ENABLED,
+        "status_sessions_active": len(status_sessions),
+        "openai_api_key_configured": openai_key_present,
+        "status_events_file": str(STATUS_EVENTS_FILE),
+    }
+
+
+@app.get("/monitor/status")
+async def monitor_status(limit: int = 50):
+    """Return recent status events for dashboard display."""
+    limit = max(1, min(200, limit))
+    return {"events": _get_recent_status_events(limit)}
+
+
+@app.get("/monitor/logs")
+async def monitor_logs(limit: int = 200):
+    """Return the last N lines from the proxy log file if configured."""
+    limit = max(1, min(1000, limit))
+    log_path_env = os.getenv("PROXY_LOG_FILE") or ""
+    log_path = Path(log_path_env) if log_path_env else None
+    if not log_path or not log_path.exists():
+        return {"available": False, "lines": []}
+    text = _tail_text_file(log_path, max_lines=limit)
+    lines = text.splitlines()
+    return {"available": True, "lines": lines[-limit:]}
+
 # Health check endpoint
 @app.get("/health")
 async def health_check():
@@ -4460,10 +5634,7 @@ async def proxy_chat_completions(request: Request):
         # If still no endpoint, use default from environment or localhost
         if not endpoint:
             endpoint = os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/chat/completions')
-        else:
-            # Ensure the endpoint includes the full path if not already present
-            if not endpoint.endswith('/chat/completions'):
-                endpoint = endpoint.rstrip('/') + '/chat/completions'
+        endpoint = _normalize_chat_endpoint(endpoint)
         
         # Remove internal endpoint parameter from body before forwarding
         body_clean = {k: v for k, v in body.items() if k != '_endpoint'}
@@ -4490,13 +5661,23 @@ async def proxy_chat_completions(request: Request):
         print(f"💬 Proxying chat completions request to: {endpoint}")
         print(f"   Model: {body_clean.get('model', 'unknown')}")
         
-        # Forward the request to the LLM service
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                endpoint,
-                json=body_clean,
-                headers=headers
-            )
+        max_tokens = _get_max_tokens_from_payload(body_clean)
+        summarized = False
+        if isinstance(body_clean.get("messages"), list):
+            estimated = _estimate_total_tokens(body_clean["messages"], max_tokens)
+            if estimated > get_max_token_limit():
+                body_clean["messages"] = await _summarize_messages_for_budget_proxy(
+                    body_clean["messages"],
+                    endpoint=endpoint,
+                    headers=headers,
+                    model_name=body_clean.get("model", ""),
+                    max_tokens=max_tokens,
+                    large_model=LARGE_PAYLOAD_MODEL,
+                    large_endpoint=LARGE_PAYLOAD_ENDPOINT,
+                )
+                summarized = True
+
+        response = await _call_chat_completion(endpoint, headers, body_clean, timeout_seconds=120.0)
         
         print(f"✅ Chat completions response status: {response.status_code}")
         
@@ -4504,6 +5685,33 @@ async def proxy_chat_completions(request: Request):
         if response.status_code != 200:
             print(f"❌ LLM service returned error: {response.status_code}")
             print(f"   Response text: {response.text[:500]}")
+            error_text = response.text or ""
+            if is_context_limit_error(response.status_code, error_text):
+                # Retry with summarization if we haven't yet.
+                if not summarized and isinstance(body_clean.get("messages"), list):
+                    body_clean["messages"] = await _summarize_messages_for_budget_proxy(
+                        body_clean["messages"],
+                        endpoint=endpoint,
+                        headers=headers,
+                        model_name=body_clean.get("model", ""),
+                        max_tokens=max_tokens,
+                        large_model=LARGE_PAYLOAD_MODEL,
+                        large_endpoint=LARGE_PAYLOAD_ENDPOINT,
+                    )
+                    summarized = True
+                    response = await _call_chat_completion(endpoint, headers, body_clean, timeout_seconds=120.0)
+                # Retry with large payload model if configured
+                if response.status_code != 200 and LARGE_PAYLOAD_MODEL:
+                    body_clean["model"] = LARGE_PAYLOAD_MODEL
+                    large_endpoint = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or endpoint)
+                    response = await _call_chat_completion(large_endpoint, headers, body_clean, timeout_seconds=120.0)
+                if response.status_code == 200:
+                    try:
+                        response_data = response.json()
+                        return JSONResponse(content=response_data, status_code=200)
+                    except Exception as json_error:
+                        print(f"❌ Failed to parse JSON response after retry: {json_error}")
+                        return JSONResponse(content={"error": "Invalid JSON response from LLM service"}, status_code=500)
             return JSONResponse(
                 content=response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text},
                 status_code=response.status_code

@@ -1061,6 +1061,17 @@
             margin-right: 20px;
         }
 
+        /* System/status message styling */
+        .message.system {
+            background-color: #10161f;
+            border: 1px dashed #2f3b4a;
+            color: #c8d4e0;
+            margin-left: auto;
+            margin-right: auto;
+            max-width: 90%;
+            text-align: center;
+        }
+
         /* Message sender name */
         .message-sender {
             font-weight: bold;
@@ -1083,10 +1094,19 @@
             color: #e65100;
         }
 
+        /* System sender name color */
+        .message.system .message-sender {
+            color: #9fb3c8;
+        }
+
         /* Message content */
         .message-content {
             color: #ffffff; /* Changed from gray (#333) to white for better readability */
             white-space: pre-wrap;
+        }
+
+        .message.system .message-content {
+            color: #c8d4e0;
         }
 
         /* Pulse effect on message history while awaiting API response */

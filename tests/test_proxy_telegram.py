@@ -242,6 +242,36 @@ class TestIsTodoListQuery:
         assert _is_todo_list_query("") is False
 
 
+class TestAutoMemorySearchHelpers:
+    """Tests for Telegram auto-memory relevance helper logic."""
+
+    def test_is_memory_context_question_true_for_opinion_prompt(self):
+        from src.servers.proxy_server import _is_memory_context_question
+        assert _is_memory_context_question("What do you think about Rust for backend APIs?") is True
+
+    def test_is_memory_context_question_false_for_action_prompt(self):
+        from src.servers.proxy_server import _is_memory_context_question
+        assert _is_memory_context_question("Search for information about Rust web frameworks") is False
+
+    def test_filter_high_relevance_memories_drops_low_confidence_set(self):
+        from src.servers.proxy_server import _filter_high_relevance_memories
+        memories = [
+            {"text": "A", "similarity": 0.60},
+            {"text": "B", "similarity": 0.58},
+        ]
+        assert _filter_high_relevance_memories(memories) == []
+
+    def test_filter_high_relevance_memories_keeps_close_top_hits(self):
+        from src.servers.proxy_server import _filter_high_relevance_memories
+        memories = [
+            {"text": "Top", "similarity": 0.83},
+            {"text": "Close", "similarity": 0.78},
+            {"text": "Far", "similarity": 0.62},
+        ]
+        out = _filter_high_relevance_memories(memories)
+        assert [m["text"] for m in out] == ["Top", "Close"]
+
+
 class TestResolveTodoUserForTelegram:
     """Tests for _resolve_todo_user_for_telegram (Telegram -> app username linking)."""
 
@@ -345,7 +375,7 @@ class TestProxyFetchUrls:
         client = _get_client()
         call_log = []
 
-        async def mock_fetch(url):
+        async def mock_fetch(url, **kwargs):
             call_log.append(url)
             if "fail" in url:
                 raise Exception("404 Not Found")

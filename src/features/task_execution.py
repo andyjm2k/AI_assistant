@@ -10,6 +10,14 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from src.utils.token_budget import (
+    estimate_tokens_from_messages,
+    format_messages_for_summary,
+    get_max_token_limit,
+    get_chars_per_token,
+    is_context_limit_error,
+)
+
 
 # Status values for execution state
 STATUS_EXECUTING = "executing"
@@ -62,7 +70,167 @@ class TodoTaskExecutor:
         self._available_tools: Optional[List[Dict]] = None
         # Flag set by request_cancel(); run_loop checks it each iteration to exit cleanly
         self._cancel_requested = False
+        self._max_token_limit = get_max_token_limit()
+        self.last_error: Optional[str] = None
         self._build_initial_messages()
+
+    def _estimate_total_tokens(self, messages: List[Dict[str, Any]], max_tokens: int) -> int:
+        return estimate_tokens_from_messages(messages) + max_tokens
+
+    async def _summarize_messages_for_budget(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+    ) -> List[Dict[str, Any]]:
+        if not messages:
+            return messages
+
+        system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+        remainder = messages[1:] if system_msg else messages[:]
+        if len(remainder) <= 4:
+            return messages
+
+        keep_tail_options = [8, 6, 4, 2]
+        summary_text = ""
+        summary_source = remainder
+
+        for keep_tail in keep_tail_options:
+            if len(remainder) <= keep_tail:
+                continue
+            head = remainder[:-keep_tail]
+            tail = remainder[-keep_tail:]
+
+            summary_source_text = format_messages_for_summary(head, max_chars=40000)
+            if not summary_source_text.strip():
+                break
+
+            summary_prompt = (
+                "Summarize the prior conversation so the task can continue with full context. "
+                "Include key requirements, decisions, file paths, commands run, tool outputs, errors, "
+                "and remaining TODOs. Keep it concise and structured."
+            )
+            summary_messages = [
+                {
+                    "role": "system",
+                    "content": "You are a summarization assistant. Summarize accurately and concisely.",
+                },
+                {
+                    "role": "user",
+                    "content": f"{summary_prompt}\n\nConversation:\n{summary_source_text}",
+                },
+            ]
+
+            try:
+                summary_response = await self._call_llm(
+                    summary_messages,
+                    tools=None,
+                    max_tokens=800,
+                    temperature=0.2,
+                    allow_summarize=False,
+                )
+                if summary_response and summary_response.get("content"):
+                    summary_text = summary_response.get("content").strip()
+            except Exception:
+                summary_text = ""
+
+            if not summary_text:
+                summary_text = summary_source_text[-2000:] if summary_source_text else ""
+
+            new_messages: List[Dict[str, Any]] = []
+            if system_msg:
+                new_messages.append(system_msg)
+            new_messages.append(
+                {
+                    "role": "system",
+                    "content": f"Summary of previous context:\n{summary_text}",
+                }
+            )
+            new_messages.extend(tail)
+
+            if self._estimate_total_tokens(new_messages, max_tokens) <= self._max_token_limit:
+                return new_messages
+
+        return messages
+
+    async def _ensure_token_budget(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+    ) -> List[Dict[str, Any]]:
+        if self._estimate_total_tokens(messages, max_tokens) <= self._max_token_limit:
+            return messages
+        summarized = await self._summarize_messages_for_budget(messages, max_tokens=max_tokens)
+        return summarized
+
+    def _truncate_middle(self, text: str, max_chars: int) -> str:
+        if not text or max_chars <= 0 or len(text) <= max_chars:
+            return text
+        keep_head = max_chars // 2
+        keep_tail = max_chars - keep_head
+        removed = len(text) - max_chars
+        return f"{text[:keep_head]}\n\n...[truncated {removed} chars]...\n\n{text[-keep_tail:]}"
+
+    def _force_trim_messages(self, messages: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, Any]]:
+        if not messages:
+            return messages
+        chars_per_token = get_chars_per_token()
+        max_total_chars = max(2000, (self._max_token_limit - max_tokens) * chars_per_token)
+        max_per_message = min(20000, max_total_chars)
+
+        trimmed: List[Dict[str, Any]] = []
+        for msg in messages:
+            new_msg = dict(msg)
+            content = new_msg.get("content")
+            if isinstance(content, list):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    content = str(content)
+            if isinstance(content, str) and len(content) > max_per_message:
+                new_msg["content"] = self._truncate_middle(content, max_per_message)
+            trimmed.append(new_msg)
+
+        def total_chars(msgs: List[Dict[str, Any]]) -> int:
+            total = 0
+            for m in msgs:
+                c = m.get("content")
+                if c is None:
+                    continue
+                if isinstance(c, list):
+                    try:
+                        c = json.dumps(c, ensure_ascii=False)
+                    except (TypeError, ValueError):
+                        c = str(c)
+                total += len(str(c))
+            return total
+
+        if total_chars(trimmed) <= max_total_chars:
+            return trimmed
+
+        system_msg = trimmed[0] if trimmed and trimmed[0].get("role") == "system" else None
+        tail_keep = 6
+        tail = trimmed[-tail_keep:] if len(trimmed) > tail_keep else trimmed[:]
+        head = []
+        if system_msg:
+            head.append(system_msg)
+        compact = head + tail if head else tail
+
+        for m in compact:
+            if m is system_msg:
+                continue
+            if m.get("content") is None:
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and len(content) > max_per_message:
+                m["content"] = self._truncate_middle(content, max_per_message)
+
+        if total_chars(compact) <= max_total_chars:
+            return compact
+
+        # Last resort: drop older messages (keep system + last 4)
+        tail_keep = 4
+        tail = trimmed[-tail_keep:] if len(trimmed) > tail_keep else trimmed[:]
+        return [system_msg] + tail if system_msg else tail
 
     def _build_initial_messages(self) -> None:
         goal = self.prompt_override or self.task_description
@@ -108,9 +276,22 @@ class TodoTaskExecutor:
             print(f"[TASK_EXEC] Error getting tools: {e}")
             return []
 
-    async def _call_llm(self, messages: List[Dict], tools: Optional[List[Dict]] = None) -> Optional[Dict]:
+    async def _call_llm(
+        self,
+        messages: List[Dict],
+        tools: Optional[List[Dict]] = None,
+        temperature: float = 0.6,
+        max_tokens: int = 2000,
+        allow_summarize: bool = True,
+        _retry_on_context_error: bool = True,
+    ) -> Optional[Dict]:
         url = f"{self.api_base}/chat/completions"
-        payload = {"model": self.model, "messages": messages, "temperature": 0.6, "max_tokens": 2000}
+        final_messages = messages
+        if allow_summarize:
+            final_messages = await self._ensure_token_budget(messages, max_tokens=max_tokens)
+            if messages is self.messages and final_messages is not messages:
+                self.messages = final_messages
+        payload = {"model": self.model, "messages": final_messages, "temperature": temperature, "max_tokens": max_tokens}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -122,7 +303,37 @@ class TodoTaskExecutor:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.post(url, headers=headers, json=payload)
             if r.status_code != 200:
-                print(f"[TASK_EXEC] LLM error {r.status_code}: {r.text[:200]}")
+                error_text = r.text[:500]
+                print(f"[TASK_EXEC] LLM error {r.status_code}: {error_text}")
+                self.last_error = f"LLM error {r.status_code}: {error_text}"
+                if allow_summarize and _retry_on_context_error and is_context_limit_error(r.status_code, error_text):
+                    summarized = await self._ensure_token_budget(messages, max_tokens=max_tokens)
+                    if summarized is not messages:
+                        if messages is self.messages:
+                            self.messages = summarized
+                        retry = await self._call_llm(
+                            summarized,
+                            tools=tools,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            allow_summarize=False,
+                            _retry_on_context_error=False,
+                        )
+                        if retry:
+                            return retry
+                    # Force-trim if summarization/estimation didn't reduce enough
+                    forced = self._force_trim_messages(summarized, max_tokens=max_tokens)
+                    if forced is not summarized:
+                        if messages is self.messages:
+                            self.messages = forced
+                        return await self._call_llm(
+                            forced,
+                            tools=tools,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            allow_summarize=False,
+                            _retry_on_context_error=False,
+                        )
                 return None
             data = r.json()
             choices = data.get("choices", [])
@@ -132,6 +343,7 @@ class TodoTaskExecutor:
             return {"content": msg.get("content"), "tool_calls": msg.get("tool_calls")}
         except Exception as e:
             print(f"[TASK_EXEC] LLM request failed: {e}")
+            self.last_error = f"LLM request failed: {e}"
             return None
 
     def _check_pause_or_done(self, content: str) -> Optional[str]:
@@ -162,7 +374,7 @@ class TodoTaskExecutor:
             self.iteration_count += 1
             llm_response = await self._call_llm(self.messages, tools=tools if tools else None)
             if not llm_response:
-                return (STATUS_AWAITING_CONFIRMATION, last_message or "Execution stopped (no response).")
+                return (STATUS_AWAITING_CONFIRMATION, last_message or self.last_error or "Execution stopped (no response).")
             content = (llm_response.get("content") or "").strip()
             tool_calls = llm_response.get("tool_calls")
             # Check content for done/pause even when there are tool_calls (model may say "I'm done" and still emit a final tool call)

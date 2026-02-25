@@ -305,6 +305,31 @@ class TestPhilosopherMode:
             assert result["cycle_count"] == 2
             assert len(result["contemplation_steps"]) == 2
 
+    @pytest.mark.asyncio
+    async def test_ensure_token_budget_summarizes_when_over_limit(self, mock_memory_manager, monkeypatch):
+        monkeypatch.setenv("MAX_TOKEN_LIMIT", "50")
+        philosopher = PhilosopherMode(
+            api_key="test_api_key",
+            api_base="https://api.test.com/v1",
+            model="test-model",
+            memory_manager=mock_memory_manager,
+        )
+        long_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "x" * 500},
+            {"role": "assistant", "content": "y" * 500},
+            {"role": "user", "content": "z" * 500},
+        ]
+        summarized = [
+            {"role": "system", "content": "system"},
+            {"role": "system", "content": "Summary of previous context:\nsummary"},
+            {"role": "user", "content": "tail"},
+        ]
+        philosopher._summarize_messages_for_budget = AsyncMock(return_value=summarized)
+        result = await philosopher._ensure_token_budget(long_messages, max_tokens=2000)
+        assert result == summarized
+        assert philosopher._summarize_messages_for_budget.called
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

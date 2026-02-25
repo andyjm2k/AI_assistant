@@ -240,6 +240,12 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     # Weather tool defaults (BOM): no API key required; keep configurable base URL/timeout in .env
     content = _set_key_in_env_content(content, "BOM_API_BASE_URL", "https://api.weather.bom.gov.au/v1")
     content = _set_key_in_env_content(content, "BOM_API_TIMEOUT_SECONDS", "12")
+    # Context window controls (defaults)
+    content = _set_key_in_env_content(content, "MAX_TOKEN_LIMIT", "256000")
+    content = _set_key_in_env_content(content, "TOKEN_ESTIMATE_CHARS_PER_TOKEN", "4")
+    # Large payload fallback (disabled by default)
+    content = _set_key_in_env_content(content, "LARGE_PAYLOAD_MODEL", "")
+    content = _set_key_in_env_content(content, "LARGE_PAYLOAD_ENDPOINT", "")
     if use_telegram and telegram_token:
         content = _set_key_in_env_content(content, "TELEGRAM_BOT_TOKEN", telegram_token)
         content = _set_key_in_env_content(content, "TELEGRAM_ALLOW_ALL", telegram_allow_all)

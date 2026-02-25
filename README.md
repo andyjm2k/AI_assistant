@@ -350,6 +350,14 @@ Key environment variables (see `config/mcp_config.env.example` for complete list
 - `TTS_ENDPOINT`: TTS service endpoint
 - `BRAVE_API_KEY`: Brave Search API key
 - `NEWS_API_KEY`: News API key
+ 
+#### Context Window Controls
+- `MAX_TOKEN_LIMIT`: Max total tokens (input + output) per LLM request. The proxy preflights, summarizes, and retries when exceeded.
+- `TOKEN_ESTIMATE_CHARS_PER_TOKEN`: Heuristic for token estimation when no tokenizer is available (default 4).
+ 
+#### Large Payload Fallback
+- `LARGE_PAYLOAD_MODEL`: Optional model to retry with when context window exhaustion occurs.
+- `LARGE_PAYLOAD_ENDPOINT`: Optional endpoint for the large payload model (OpenAI-compatible).
 
 #### Codex CLI Tool (optional)
 - `CODEX_ENABLED`: Enable the Codex CLI tool endpoint (default true)
@@ -515,6 +523,7 @@ All services are configured to accept connections from devices on your local net
 **AI & Chat:**
 - `POST /v1/proxy/autogen` - AutoGen team-based chat endpoint
 - `POST /v1/proxy/codex` - Codex CLI non-interactive runner (auth required; writes summary to scratch)
+- `POST /v1/proxy/restart` - Restart proxy server process to reload tool/code changes (auth required)
 - `POST /v1/telegram/chat` - Telegram bot chat endpoint
 - `DELETE /v1/telegram/chat/{conversation_id}` - Clear Telegram conversation history
 
@@ -619,7 +628,7 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 **Telegram tools (optional):**  
 Set `TELEGRAM_TOOLS_ENABLED=true` in the proxy environment to enable the same tool set as the web client. When enabled, the model can use tools (e.g. web search, read/write files in scratch, todo list, memory cache, workflows, news, calculate, store/search memories). The proxy parses `<tool>...</tool><parameters>...</parameters>` from the model reply, executes the tool server-side, and sends the result back to the model for a natural-language reply.
 
-- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), runCodexCli (Codex CLI for CATBot code changes), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). The same optional `urls` behaviour is supported in the web (HTML) client.
+- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), runCodexCli (Codex CLI for CATBot code changes), restartProxyServer (restart proxy to load new/updated tools), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). The same optional `urls` behaviour is supported in the web (HTML) client.
 - **Web-only in Telegram:** PDF to PowerPoint (`pdfToPowerPoint`) — the proxy returns a message directing the user to the CATBot web interface for this feature.
 - **Config:** `config/catbot_system_prompt_with_tools.txt` (included) defines the tool list and format; placeholders `{{MEMORY_CACHE}}` and `{{TODO_LIST}}` are filled per conversation. Max tool-loop iterations per message: `TELEGRAM_TOOLS_MAX_ITERATIONS` (default 5).
 

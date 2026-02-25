@@ -22,6 +22,15 @@ CALC_EXPR_MAX_LEN = 200
 CALC_ALLOWED_RE = re.compile(r"^[\d\s+\-*/().]+$")
 
 
+def _log_tool_invocation(name: str, arguments: Dict[str, Any], conversation_id: str) -> None:
+    """Print a consistent tool invocation log line from Telegram tool execution."""
+    try:
+        args_text = json.dumps(arguments if isinstance(arguments, dict) else {}, ensure_ascii=False, default=str)
+    except Exception:
+        args_text = str(arguments)
+    print(f"[TOOL][telegram:{conversation_id}] name={name} args={args_text}", flush=True)
+
+
 def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
     """
     Parse assistant content for a single tool call in the same format as the web client.
@@ -161,11 +170,13 @@ async def execute_telegram_tool(
     - todo_user_key: str (required for manageTodoList; uses persistent store only)
     - memory_cache_store: Dict[str, list]
     - do_search, do_fetch, do_news, do_weather, do_autogen, do_browser_agent, do_deep_research (async callables)
+    - do_restart_proxy (async callable that schedules proxy restart)
     - read_file_internal, write_file_internal, list_files_internal (callables)
     - upload_drive_internal (callable), memory_manager (object with store/search/list/delete)
     Returns a dict with success (bool), message (str), and optional data.
     """
     cid = context.get("conversation_id") or "default"
+    _log_tool_invocation(name, arguments, cid)
     memory_cache_store = context.get("memory_cache_store") or {}
     todo_user_key = context.get("todo_user_key")
 
@@ -357,6 +368,19 @@ async def execute_telegram_tool(
         )
         return {"success": True, "message": message, "data": result}
 
+    # --- restartProxyServer ---
+    if name == "restartProxyServer":
+        do_restart_proxy = context.get("do_restart_proxy")
+        if not do_restart_proxy:
+            return {"success": False, "message": "Proxy restart is not available."}
+        confirm = arguments.get("confirm")
+        if str(confirm).strip().lower() not in {"true", "1", "yes", "y"}:
+            return {"success": False, "message": "Set confirm=true to restart the proxy server."}
+        reason = (arguments.get("reason") or "").strip()
+        result = await do_restart_proxy(reason)
+        ok = bool(result.get("success", False))
+        return {"success": ok, "message": result.get("message", "Proxy restart requested."), "data": result}
+
     # --- scrapeWebsite ---
     if name == "scrapeWebsite":
         do_fetch = context.get("do_fetch")
@@ -405,8 +429,12 @@ async def execute_telegram_tool(
         do_weather = context.get("do_weather")
         if not do_weather:
             return {"success": False, "message": "Weather service is not available."}
-        location = (arguments.get("location") or "").strip()
-        detail = (arguments.get("requestType") or arguments.get("detail") or "summary").strip().lower() or "summary"
+        location_value = arguments.get("location")
+        location = location_value.strip() if isinstance(location_value, str) else (str(location_value).strip() if location_value else "")
+        detail_value = arguments.get("requestType") or arguments.get("detail") or "summary"
+        detail = detail_value.strip().lower() if isinstance(detail_value, str) else str(detail_value).strip().lower()
+        if detail not in {"summary", "current", "forecast"}:
+            detail = "summary"
         user_id = context.get("user_id")
         try:
             data = await do_weather(location=location or None, detail=detail, user_id=user_id, memory_manager=context.get("memory_manager"))

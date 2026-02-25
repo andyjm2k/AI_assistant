@@ -4,6 +4,7 @@ Handles automatic memory extraction and explicit memory storage.
 """
 
 import os
+import re
 from typing import List, Dict, Optional
 from datetime import datetime
 
@@ -66,6 +67,30 @@ class MemoryManager:
         # Pre-filter: skip extraction unless conversation has enough substance
         self.extract_min_user_messages = int(os.getenv("MEMORY_EXTRACT_MIN_USER_MESSAGES", "2"))
         self.extract_min_user_chars = int(os.getenv("MEMORY_EXTRACT_MIN_USER_CHARS", "80"))
+        self.extract_min_memory_words = int(os.getenv("MEMORY_EXTRACT_MIN_MEMORY_WORDS", "4"))
+        self.extract_min_memory_chars = int(os.getenv("MEMORY_EXTRACT_MIN_MEMORY_CHARS", "18"))
+        self.extract_dedup_similarity_threshold = float(
+            os.getenv("MEMORY_EXTRACT_DEDUP_SIMILARITY_THRESHOLD", "0.9")
+        )
+        confidence_csv = os.getenv("MEMORY_EXTRACT_ALLOWED_CONFIDENCE", "high")
+        self.extract_allowed_confidence = {
+            c.strip().lower() for c in confidence_csv.split(",") if c.strip()
+        } or {"high"}
+
+        self._durable_categories = {"preference", "habit", "fact", "need", "relationship"}
+        self._ephemeral_pattern = re.compile(
+            r"\b(today|tonight|yesterday|this morning|this afternoon|this evening|"
+            r"right now|currently|at the moment|just now)\b",
+            re.IGNORECASE,
+        )
+        self._smalltalk_pattern = re.compile(
+            r"^(thanks|thank you|ok|okay|sure|got it|sounds good)[.! ]*$",
+            re.IGNORECASE,
+        )
+        self._command_like_pattern = re.compile(
+            r"^(search|find|look up|open|run|execute|write|create|send|fetch)\b",
+            re.IGNORECASE,
+        )
 
     async def store_memory(
         self,
@@ -230,18 +255,84 @@ class MemoryManager:
             messages=messages,
             max_memories=max_memories,
         )
-        
+
         # Store each extracted memory
         memory_ids = []
+        seen_normalized = set()
         for mem in extracted:
-            # Only store high or medium confidence memories
-            if mem.get("confidence", "low") in ["high"]:
-                memory_id = await self.store_memory(
-                    text=mem.get("text", ""),
-                    category=mem.get("category", "general"),
-                    source=mem.get("source", "conversation"),
-                )
-                memory_ids.append(memory_id)
-        
+            confidence = (mem.get("confidence") or "").strip().lower()
+            if confidence not in self.extract_allowed_confidence:
+                continue
+
+            raw_text = (mem.get("text") or "").strip()
+            if not self._is_high_value_memory_text(raw_text):
+                continue
+
+            normalized = self._normalize_memory_text(raw_text)
+            if normalized in seen_normalized:
+                continue
+
+            category = (mem.get("category") or "").strip().lower()
+            if category not in self._durable_categories:
+                continue
+
+            if await self._memory_already_exists(raw_text):
+                continue
+
+            memory_id = await self.store_memory(
+                text=raw_text,
+                category=category,
+                source=mem.get("source", "conversation"),
+            )
+            memory_ids.append(memory_id)
+            seen_normalized.add(normalized)
+
         return memory_ids
+
+    def _normalize_memory_text(self, text: str) -> str:
+        """Normalize memory text for duplicate detection."""
+        return " ".join((text or "").strip().lower().split())
+
+    def _is_high_value_memory_text(self, text: str) -> bool:
+        """Heuristic quality gate to avoid storing low-value extraction output."""
+        if not text:
+            return False
+        if len(text) < self.extract_min_memory_chars:
+            return False
+        if len(text.split()) < self.extract_min_memory_words:
+            return False
+        if text.endswith("?"):
+            return False
+        if self._smalltalk_pattern.search(text):
+            return False
+        if self._ephemeral_pattern.search(text):
+            return False
+        if self._command_like_pattern.search(text):
+            return False
+        return True
+
+    async def _memory_already_exists(self, text: str) -> bool:
+        """Return True when memory text is already stored (exact or semantic duplicate)."""
+        normalized = self._normalize_memory_text(text)
+
+        # Fast exact normalized check against existing metadata.
+        for existing in self.vector_store.metadata.values():
+            existing_text = self._normalize_memory_text(existing.get("text", ""))
+            if existing_text == normalized:
+                return True
+
+        # Semantic near-duplicate check.
+        try:
+            near = await self.search_memories(
+                query=text,
+                limit=1,
+                similarity_threshold=self.extract_dedup_similarity_threshold,
+            )
+            if near:
+                return True
+        except Exception:
+            # Best-effort check only; never block extraction on duplicate check failures.
+            return False
+
+        return False
 

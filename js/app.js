@@ -502,11 +502,125 @@
         let philosopherModeStarting = false; // Flag to prevent race condition on start
         let philosopherModeContemplating = false; // Whether a contemplation is in progress
         let philosopherModeInterval = null; // Interval for contemplation loop
+
+        // Progress status updates (server-persisted, polled every 60s)
+        let statusPollTimer = null;
+        let statusRequestId = null;
+        let statusConversationId = null;
+        let statusSinceSeq = 0;
+
+        function generateRequestId() {
+            if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+                return window.crypto.randomUUID();
+            }
+            return `web-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        }
+
+        async function postStatusStart(stateText) {
+            if (!statusRequestId || !statusConversationId) return;
+            const payload = {
+                conversation_id: statusConversationId,
+                request_id: statusRequestId,
+                channel: 'web',
+                state: (stateText || 'Working: processing your request...').trim()
+            };
+            try {
+                await fetch(`${PROXY_BASE_URL}/v1/status/start`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            } catch (_) {}
+        }
+
+        async function postStatusUpdate(stateText) {
+            if (!statusRequestId || !statusConversationId) return;
+            if (!stateText || typeof stateText !== 'string') return;
+            const payload = {
+                conversation_id: statusConversationId,
+                request_id: statusRequestId,
+                state: stateText.trim()
+            };
+            try {
+                await fetch(`${PROXY_BASE_URL}/v1/status/update`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            } catch (_) {}
+        }
+
+        async function postStatusFinish(finalState) {
+            if (!statusRequestId || !statusConversationId) return;
+            const payload = {
+                conversation_id: statusConversationId,
+                request_id: statusRequestId,
+                final_state: finalState ? finalState.trim() : undefined
+            };
+            try {
+                await fetch(`${PROXY_BASE_URL}/v1/status/finish`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            } catch (_) {}
+        }
+
+        async function pollStatusEvents() {
+            if (!statusRequestId || !statusConversationId) return;
+            const params = new URLSearchParams({
+                conversation_id: statusConversationId,
+                request_id: statusRequestId,
+                since_seq: String(statusSinceSeq)
+            });
+            try {
+                const resp = await fetch(`${PROXY_BASE_URL}/v1/status/events?${params.toString()}`);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                const events = Array.isArray(data.events) ? data.events : [];
+                events.forEach(ev => {
+                    const state = (ev.state || '').trim();
+                    if (state) {
+                        addMessageToHistory('system', `⏳ ${state}`);
+                    }
+                });
+                if (typeof data.latest_seq === 'number') {
+                    statusSinceSeq = Math.max(statusSinceSeq, data.latest_seq);
+                }
+            } catch (_) {}
+        }
+
+        function startProgressUpdates(stateText) {
+            stopProgressUpdates();
+            statusRequestId = generateRequestId();
+            statusConversationId = activeConversationId || 'default';
+            statusSinceSeq = 0;
+            postStatusStart(stateText);
+            pollStatusEvents();
+            statusPollTimer = setInterval(pollStatusEvents, 60000);
+        }
+
+        function updateProgressState(stateText) {
+            if (typeof stateText === 'string' && stateText.trim()) {
+                postStatusUpdate(stateText);
+            }
+        }
+
+        function stopProgressUpdates() {
+            if (statusPollTimer) {
+                clearInterval(statusPollTimer);
+                statusPollTimer = null;
+            }
+            postStatusFinish('Done: response delivered');
+            statusRequestId = null;
+            statusConversationId = null;
+            statusSinceSeq = 0;
+        }
         
         // Function to add a message to the history display
         function addMessageToHistory(role, content) {
-            // Validate inputs - now supports 'user', 'assistant', and 'philosopher'
-            if (!role || (role !== 'user' && role !== 'assistant' && role !== 'philosopher')) {
+            // Validate inputs - now supports 'user', 'assistant', 'philosopher', and 'system'
+            if (!role || (role !== 'user' && role !== 'assistant' && role !== 'philosopher' && role !== 'system')) {
                 console.error('addMessageToHistory called with invalid role:', role);
                 return;
             }
@@ -526,12 +640,17 @@
             const userName = userNameInput.value.trim() || 'User';
             const assistantName = assistantNameInput.value.trim() || 'EVA';
             const philosopherName = assistantNameInput.value.trim() || 'EVA'; // Use assistant name for philosopher
+            const systemName = 'Status';
             
             // Create message object - ensure content is set correctly (not sender name)
             const message = {
                 role: role, // 'user', 'assistant', or 'philosopher'
                 content: content, // The actual message content, not the sender name
-                sender: role === 'user' ? userName : (role === 'philosopher' ? philosopherName + ' (Contemplating)' : assistantName),
+                sender: role === 'user'
+                    ? userName
+                    : (role === 'philosopher'
+                        ? philosopherName + ' (Contemplating)'
+                        : (role === 'system' ? systemName : assistantName)),
                 timestamp: new Date()
             };
             
@@ -543,13 +662,15 @@
                 displayedMessages.shift(); // Remove oldest message
             }
             
-            // Also add to chatHistory for API calls and persistence
-            // Create a simplified message object for chatHistory (without sender/timestamp for API compatibility)
-            const chatMessage = {
-                role: role,
-                content: content
-            };
-            chatHistory.push(chatMessage);
+            // Also add to chatHistory for API calls and persistence (skip system/status updates)
+            if (role !== 'system') {
+                // Create a simplified message object for chatHistory (without sender/timestamp for API compatibility)
+                const chatMessage = {
+                    role: role,
+                    content: content
+                };
+                chatHistory.push(chatMessage);
+            }
             
             // Update the display
             renderMessageHistory();
@@ -5164,6 +5285,27 @@ function saveWAVFile(wavBlob) {
             {
                 type: "function",
                 function: {
+                    name: "restartProxyServer",
+                    description: "Restarts the CATBot proxy server so newly added/updated tools become available. Use this after code/tool changes. Requires explicit confirmation.",
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            confirm: {
+                                type: "boolean",
+                                description: "Must be true to confirm restart."
+                            },
+                            reason: {
+                                type: "string",
+                                description: "Optional short reason for restart (for logs)."
+                            }
+                        },
+                        required: ["confirm"]
+                    }
+                }
+            },
+            {
+                type: "function",
+                function: {
                     name: "webSearch",
                     description: "Searches the web for information about a topic and returns relevant results",
                     parameters: {
@@ -5477,6 +5619,26 @@ function saveWAVFile(wavBlob) {
             }
         }
 
+        async function reportToolInvocationToProxy(name, args) {
+            try {
+                const payload = {
+                    source: 'html_ui',
+                    name: name,
+                    arguments: (args && typeof args === 'object') ? args : {}
+                };
+                const headers = { 'Content-Type': 'application/json' };
+                if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+                await fetch(`${PROXY_BASE_URL}/v1/tools/log`, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(payload)
+                });
+            } catch (error) {
+                // Logging failures should never block tool execution.
+                console.warn('Tool invocation logging failed:', error);
+            }
+        }
+
         // Update executeToolCall to include the new handler
         async function executeToolCall(toolCall, context) {
             console.log('executeToolCall - Input:', { toolCall, context });
@@ -5505,6 +5667,7 @@ function saveWAVFile(wavBlob) {
             try {
                 const args = typeof argsString === 'string' ? JSON.parse(argsString) : argsString;
                 console.log('executeToolCall - Parsed arguments:', args);
+                await reportToolInvocationToProxy(name, args);
 
                 let result;
                 switch (name) {
@@ -5554,6 +5717,9 @@ function saveWAVFile(wavBlob) {
                         break;
                     case "runCodexCli":
                         result = await handleCodexCli(args);
+                        break;
+                    case "restartProxyServer":
+                        result = await handleRestartProxyServer(args);
                         break;
                     case "llmQuery":
                         result = await handleLLMQuery(args, context);
@@ -5858,33 +6024,49 @@ function saveWAVFile(wavBlob) {
             }
         }
 
-        async function handleSearchMemories({ query, limit }) {
+        async function handleSearchMemories({ query, limit, similarity_threshold }) {
             try {
+                const threshold = (typeof similarity_threshold === 'number') ? similarity_threshold : 0.6;
                 const response = await fetch(`${PROXY_BASE_URL}/v1/memory/search`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         query: query,
                         limit: limit || 5,
-                        similarity_threshold: 0.5  // Lower threshold for better recall
+                        similarity_threshold: threshold
                     })
                 });
                 const data = await response.json();
                 if (data.success && data.data.memories) {
                     const memories = data.data.memories;
                     if (memories.length === 0) {
-                        return { success: true, message: "No relevant memories found." };
+                        return { success: true, message: "No relevant memories found.", data: { memories: [] } };
                     }
                     const memoryList = memories.map((mem, i) => 
                         `${i + 1}. ${mem.text} (similarity: ${(mem.similarity * 100).toFixed(1)}%)`
                     ).join('\n');
-                    return { success: true, message: `Found ${memories.length} relevant memories:\n${memoryList}` };
+                    return { success: true, message: `Found ${memories.length} relevant memories:\n${memoryList}`, data: { memories } };
                 } else {
                     return { success: false, message: data.message || "Failed to search memories" };
                 }
             } catch (error) {
                 return { success: false, message: `Error searching memories: ${error.message}` };
             }
+        }
+
+        function filterHighRelevanceMemories(memories, { minSimilarity = 0.72, scoreWindow = 0.12, maxResults = 3 } = {}) {
+            if (!Array.isArray(memories) || memories.length === 0) {
+                return [];
+            }
+            const sorted = [...memories].sort((a, b) => (Number(b.similarity) || 0) - (Number(a.similarity) || 0));
+            const topScore = Number(sorted[0]?.similarity) || 0;
+            if (topScore < minSimilarity) {
+                return [];
+            }
+            const floor = Math.max(minSimilarity, topScore - scoreWindow);
+            return sorted
+                .filter(mem => (Number(mem.similarity) || 0) >= floor)
+                .slice(0, maxResults);
         }
 
         // Detect if a question is asking for opinion/knowledge vs an action
@@ -5964,11 +6146,24 @@ function saveWAVFile(wavBlob) {
                 }
                 
                 // Search memories
-                const result = await handleSearchMemories({ query: searchQuery, limit: 5 });
-                
-                if (result.success && result.message && result.message !== "No relevant memories found.") {
-                    // Return the memory context string
-                    return result.message;
+                const result = await handleSearchMemories({
+                    query: searchQuery,
+                    limit: 6,
+                    similarity_threshold: 0.55
+                });
+
+                const rawMemories = result?.data?.memories || [];
+                const relevantMemories = filterHighRelevanceMemories(rawMemories, {
+                    minSimilarity: 0.72,
+                    scoreWindow: 0.12,
+                    maxResults: 3
+                });
+
+                if (result.success && relevantMemories.length > 0) {
+                    // Return compact context only (no debug labels/scores)
+                    return relevantMemories
+                        .map((mem, i) => `${i + 1}. ${mem.text}`)
+                        .join('\n');
                 }
                 
                 return null; // No memories found or error
@@ -6209,6 +6404,35 @@ function saveWAVFile(wavBlob) {
                 };
             } catch (error) {
                 console.error('Codex CLI error:', error);
+                return { success: false, message: `Error: ${error.message}` };
+            }
+        }
+
+        async function handleRestartProxyServer({ confirm, reason }) {
+            try {
+                if (confirm !== true) {
+                    return { success: false, message: "Restart not confirmed. Set confirm=true to restart the proxy server." };
+                }
+                const response = await fetch(`${PROXY_BASE_URL}/v1/proxy/restart`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                if (!response.ok) {
+                    const errText = await response.text();
+                    throw new Error(`Proxy restart failed: ${response.status} ${response.statusText}${errText ? ' - ' + errText.slice(0, 160) : ''}`);
+                }
+                const data = await response.json();
+                const note = reason ? ` Reason: ${reason}` : '';
+                return {
+                    success: data.success !== false,
+                    message: `${data.message || 'Proxy restart requested.'}${note}`
+                };
+            } catch (error) {
+                console.error('Proxy restart error:', error);
                 return { success: false, message: `Error: ${error.message}` };
             }
         }
@@ -6954,16 +7178,21 @@ function saveWAVFile(wavBlob) {
                 previousResults: []
             };
 
+            // Start periodic progress updates
+            startProgressUpdates('Analyzing request');
+
             // Check for tool chaining before proceeding with normal processing
             const hasChaining = promptText.toLowerCase().includes('then') || 
                                promptText.match(/first.*second|1st.*2nd|step.*step/i);
 
             if (hasChaining) {
                 console.log('Detected task chaining in prompt');
+                updateProgressState('Planning tool chain');
                 const tasks = await extractTasks(promptText);
                 
                 if (tasks.length > 1) {
                     console.log('Executing task chain:', tasks);
+                    updateProgressState('Executing tool chain');
                     const chainResult = await processToolChain(tasks);
                     
                     chatHistory.push({
@@ -6974,6 +7203,7 @@ function saveWAVFile(wavBlob) {
                     responseOutput.value = chainResult;
                     addMessageToHistory('assistant', chainResult); // Add to message history
                     textToSpeech(chainResult);
+                    stopProgressUpdates();
                     return;
                 }
             }
@@ -7058,21 +7288,29 @@ Parameters:
     "timeoutSeconds": "number (optional; default 1800, max 7200)"
 }
 
-8. scrapeWebsite
+8. restartProxyServer
+Description: Restarts the CATBot proxy server so new/updated tools are loaded. Use this after tool or code changes. Requires explicit confirmation.
+Parameters:
+{
+    "confirm": "boolean (must be true)",
+    "reason": "string (optional reason)"
+}
+
+9. scrapeWebsite
 Description: Fetches and summarizes content from a website
 Parameters:
 {
     "url": "string (must include http:// or https://)"
 }
 
-9. webSearch
+10. webSearch
 Description: Searches the web for information about a topic and returns relevant results
 Parameters:
 {
     "query": "string (the search query or keywords to look for)"
 }
 
-10. fetchNews
+11. fetchNews
 Description: Fetches news articles matching given keywords and saves them to a CSV file
 Parameters:
 {
@@ -7080,7 +7318,7 @@ Parameters:
     "filename": "string (CSV filename to save to)"
 }
 
-11. pdfToPowerPoint
+12. pdfToPowerPoint
 Description: Use this tool whenever the user wants to convert a PDF to PowerPoint, turn a PDF into a presentation, or create slides from a PDF. Always call the tool—do not reply in text. If the user provides a PDF URL, include pdfUrl; if they do not, omit pdfUrl and the user will be prompted to upload a file. Required: title, filename.
 Parameters:
 {
@@ -7356,6 +7594,7 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                 // Add pulsing effect to indicate we are waiting for the API
                 responseOutput.classList.add('responding');
                 messageHistory.classList.add('responding'); // Add pulsing effect to message history
+                updateProgressState('Contacting model');
                 console.log('Sending request:', {
                     endpoint,
                     model: getCurrentModel(),
@@ -7387,6 +7626,8 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
 
                             // Execute each tool call and push results
                             for (const tc of message.tool_calls) {
+                                const toolName = tc?.function?.name || tc?.name || 'tool';
+                                updateProgressState(`Executing tool: ${toolName}`);
                                 const toolResult = await executeToolCall(tc, context);
                                 
                                 // Format the tool result content properly
@@ -7409,6 +7650,7 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                             }
 
                             // Follow-up request to get the final assistant response after tool execution
+                            updateProgressState('Requesting final response');
                             const followupResponse = await fetch(endpoint, {
                                 method: 'POST',
                                 headers: {
@@ -7702,6 +7944,7 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                             // Remove pulsing effect after receiving the final response
                             responseOutput.classList.remove('responding');
                             messageHistory.classList.remove('responding'); // Remove pulsing effect from message history
+                            stopProgressUpdates();
                             return;
                         } catch (toolErr) {
                             console.error('Error handling tool calls via LM Studio/OpenAI format:', toolErr);
@@ -7717,6 +7960,8 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                         if (toolCall) {
                             console.log('Tool call detected:', toolCall);
                             try {
+                                const toolName = toolCall.function?.name || toolCall.name || 'tool';
+                                updateProgressState(`Executing tool: ${toolName}`);
                                 const result = await executeToolCall(toolCall, context);  // Pass the context here
                                 console.log('Tool execution result:', result);
                                 
@@ -7743,6 +7988,7 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                                         
                                         // Make a follow-up call to let the LLM respond based on the file content
                                         try {
+                                            updateProgressState('Requesting final response');
                                             const followupResponse = await fetch(endpoint, {
                                                 method: 'POST',
                                                 headers: {
@@ -8092,6 +8338,7 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
             } finally {
                 responseOutput.classList.remove('responding');
                 messageHistory.classList.remove('responding'); // Remove pulsing effect from message history
+                stopProgressUpdates();
             }
         }
 

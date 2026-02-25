@@ -25,6 +25,7 @@ class TestMemoryManager:
     def mock_vector_store(self):
         """Create a mock vector store."""
         store = MagicMock(spec=VectorStore)
+        store.metadata = {}
         store.add_embedding = MagicMock(return_value="mem_test123")
         store.search = MagicMock(return_value=[])
         store.get_memory = MagicMock(return_value=None)
@@ -86,7 +87,8 @@ class TestMemoryManager:
         # Verify vector store search was called
         mock_vector_store.search.assert_called_once()
         call_args = mock_vector_store.search.call_args
-        assert len(call_args[0][0]) == 5  # Query embedding
+        query_embedding = call_args[1]["query_embedding"]
+        assert len(query_embedding) == 5
         assert call_args[1]["limit"] == 5
         
         # Verify results
@@ -180,6 +182,54 @@ class TestMemoryManager:
         mock_extractor.extract_memories.assert_called_once()
         # Only high-confidence memories are stored
         assert len(memory_ids) == 1
+
+    @pytest.mark.asyncio
+    async def test_extract_memories_skips_low_value_and_duplicates(self, memory_manager):
+        """Extraction skips ephemeral/small-talk entries and duplicate durable memories."""
+        memory_manager.extract_min_user_messages = 2
+        memory_manager.extract_min_user_chars = 20
+        memory_manager.vector_store.metadata = {
+            "mem_existing": {
+                "id": "mem_existing",
+                "text": "User prefers dark mode for coding",
+                "embedding_index": 0,
+            }
+        }
+
+        mock_extractor = AsyncMock(spec=MemoryExtractor)
+        mock_extractor.extract_memories = AsyncMock(return_value=[
+            {
+                "text": "Thanks!",
+                "category": "fact",
+                "confidence": "high",
+                "source": "conversation",
+            },
+            {
+                "text": "User prefers dark mode for coding",
+                "category": "preference",
+                "confidence": "high",
+                "source": "conversation",
+            },
+            {
+                "text": "User currently needs this fixed right now",
+                "category": "need",
+                "confidence": "high",
+                "source": "conversation",
+            },
+        ])
+        memory_manager.memory_extractor = mock_extractor
+        memory_manager.store_memory = AsyncMock(return_value="mem_new")
+
+        messages = [
+            {"role": "user", "content": "I prefer dark mode for coding and terminal work."},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "Can you remember these details for next time?"},
+        ]
+        memory_ids = await memory_manager.extract_memories_from_conversation(messages=messages, max_memories=3)
+
+        # All extracted candidates were filtered out by quality/duplicate checks.
+        assert memory_ids == []
+        memory_manager.store_memory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_extract_memories_skipped_when_conversation_too_short(self, memory_manager):

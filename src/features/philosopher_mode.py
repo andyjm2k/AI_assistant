@@ -10,6 +10,12 @@ from typing import List, Dict, Optional, Any
 import httpx
 from datetime import datetime
 
+from src.utils.token_budget import (
+    estimate_tokens_from_messages,
+    format_messages_for_summary,
+    get_max_token_limit,
+    is_context_limit_error,
+)
 
 class PhilosopherMode:
     """
@@ -65,6 +71,7 @@ class PhilosopherMode:
         self.tool_executor = tool_executor
         self.get_tools_func = get_tools_func
         self._available_tools = None
+        self._max_token_limit = get_max_token_limit()
         
         # Philosopher mode system prompt
         self.philosopher_system_prompt = """You are in a state of contemplation where you explore what you are curious about.
@@ -190,6 +197,8 @@ When contemplating, you should use tools to gather information to inform your ow
         temperature: float = 0.7,
         max_tokens: int = 2000,
         tools: Optional[List[Dict]] = None,
+        allow_summarize: bool = True,
+        _retry_on_context_error: bool = True,
     ) -> Optional[Dict]:
         """
         Call the LLM API with given messages.
@@ -205,11 +214,15 @@ When contemplating, you should use tools to gather information to inform your ow
         """
         # Build API URL
         url = f"{self.api_base.rstrip('/')}/chat/completions"
-        
+
+        final_messages = messages
+        if allow_summarize:
+            final_messages = await self._ensure_token_budget(messages, max_tokens=max_tokens)
+
         # Build request payload
         payload = {
             "model": self.model,
-            "messages": messages,
+            "messages": final_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
@@ -251,6 +264,17 @@ When contemplating, you should use tools to gather information to inform your ow
                     error_message = error_data.get("error", {}).get("message", error_text)
                 except:
                     error_message = error_text
+                if allow_summarize and _retry_on_context_error and is_context_limit_error(response.status_code, error_text):
+                    summarized = await self._ensure_token_budget(messages, max_tokens=max_tokens)
+                    if summarized is not messages:
+                        return await self._call_llm(
+                            summarized,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                            allow_summarize=False,
+                            _retry_on_context_error=False,
+                        )
                 # Raise exception with more details for better error reporting
                 raise Exception(f"LLM API returned status {response.status_code}: {error_message}")
             
@@ -277,6 +301,92 @@ When contemplating, you should use tools to gather information to inform your ow
                 raise
             print(f"Error calling LLM: {e}")
             raise Exception(f"LLM API error: {str(e)}")
+
+    def _estimate_total_tokens(self, messages: List[Dict[str, str]], max_tokens: int) -> int:
+        return estimate_tokens_from_messages(messages) + max_tokens
+
+    async def _summarize_messages_for_budget(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> List[Dict[str, str]]:
+        if not messages:
+            return messages
+
+        system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+        remainder = messages[1:] if system_msg else messages[:]
+        if len(remainder) <= 4:
+            return messages
+
+        keep_tail_options = [6, 4, 2]
+        summary_text = ""
+
+        for keep_tail in keep_tail_options:
+            if len(remainder) <= keep_tail:
+                continue
+            head = remainder[:-keep_tail]
+            tail = remainder[-keep_tail:]
+
+            summary_source_text = format_messages_for_summary(head, max_chars=40000)
+            if not summary_source_text.strip():
+                break
+
+            summary_prompt = (
+                "Summarize the prior conversation so contemplation can continue. "
+                "Include the question, key reasoning, any tool results, and current stance. "
+                "Keep it concise."
+            )
+            summary_messages = [
+                {
+                    "role": "system",
+                    "content": "You are a summarization assistant. Summarize accurately and concisely.",
+                },
+                {
+                    "role": "user",
+                    "content": f"{summary_prompt}\n\nConversation:\n{summary_source_text}",
+                },
+            ]
+
+            try:
+                summary_response = await self._call_llm(
+                    summary_messages,
+                    temperature=0.2,
+                    max_tokens=600,
+                    tools=None,
+                    allow_summarize=False,
+                )
+                if summary_response and summary_response.get("content"):
+                    summary_text = summary_response.get("content").strip()
+            except Exception:
+                summary_text = ""
+
+            if not summary_text:
+                summary_text = summary_source_text[-2000:] if summary_source_text else ""
+
+            new_messages: List[Dict[str, str]] = []
+            if system_msg:
+                new_messages.append(system_msg)
+            new_messages.append(
+                {
+                    "role": "system",
+                    "content": f"Summary of previous context:\n{summary_text}",
+                }
+            )
+            new_messages.extend(tail)
+
+            if self._estimate_total_tokens(new_messages, max_tokens) <= self._max_token_limit:
+                return new_messages
+
+        return messages
+
+    async def _ensure_token_budget(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> List[Dict[str, str]]:
+        if self._estimate_total_tokens(messages, max_tokens) <= self._max_token_limit:
+            return messages
+        return await self._summarize_messages_for_budget(messages, max_tokens=max_tokens)
 
     async def _gather_information_if_needed(self, question: str, memory_context: str) -> str:
         """

@@ -42,6 +42,15 @@ In `.env` set at least:
 
 See `config/mcp_config.env.example` and the README Configuration section for the full list.
 
+### Context Window Controls (optional)
+
+If you work with large payloads (deep research, long reports, tool outputs), you can configure:
+
+- `MAX_TOKEN_LIMIT`: Max total tokens (input + output) allowed per LLM request. The proxy preflights, summarizes, and retries when exceeded.
+- `TOKEN_ESTIMATE_CHARS_PER_TOKEN`: Heuristic for token estimation when no tokenizer is available (default 4).
+- `LARGE_PAYLOAD_MODEL`: Optional model to retry with when context window exhaustion occurs.
+- `LARGE_PAYLOAD_ENDPOINT`: Optional endpoint for the large payload model (OpenAI-compatible).
+
 ## Optional: Whisper (speech-to-text)
 
 The default STT endpoint is `http://localhost:8001/v1/audio/transcriptions`. To use your own Whisper-compatible server:
