@@ -413,6 +413,8 @@ Key environment variables (see `.env.example` for complete list):
 - `TELEGRAM_CHAT_ENDPOINT`: Chat endpoint path (default: /v1/telegram/chat)
 - `TELEGRAM_CHAT_MODEL`: Model override for Telegram (default from OPENAI_MODEL or gpt-4o-mini)
 - `TELEGRAM_BACKEND_VERIFY_SSL`: Set to `"false"` to skip SSL verification for backend (e.g. self-signed certs)
+- `TELEGRAM_VOICE_NOTE_OPUS_BITRATE`: Opus bitrate for Telegram voice-note conversion (default: `32k`)
+- If `TELEGRAM_VOICE_OUT=true`, the bot attempts to transcode TTS output to Telegram-friendly `OGG/Opus` voice notes using `ffmpeg` when needed.
 
 **Optional (proxy):**
 - `TELEGRAM_SECRET`: Shared secret for bot-to-proxy auth when the proxy is reachable beyond localhost (set the same value on both bot and proxy)

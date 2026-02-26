@@ -11,6 +11,7 @@ Environment variables:
     TELEGRAM_TRANSCRIBE_MODEL: Transcription model field sent to backend (default: whisper-1)
     TELEGRAM_VOICE_IN: Set to "false" to disable incoming voice transcription
     TELEGRAM_VOICE_OUT: Set to "true" to enable voice responses
+    TELEGRAM_VOICE_NOTE_OPUS_BITRATE: Opus bitrate for Telegram voice notes (default: 32k)
     TELEGRAM_MAX_VOICE_SECONDS: Max accepted voice duration in seconds (default: 300)
     TELEGRAM_SEND_TRANSCRIPT: Set to "false" to suppress transcript echo message
     TELEGRAM_CHAT_TIMEOUT: Backend request timeout in seconds (default: 30)
@@ -26,6 +27,8 @@ import asyncio
 import io
 import logging
 import os
+import shutil
+import subprocess
 import uuid
 from contextlib import suppress
 from typing import Dict, Optional
@@ -61,6 +64,7 @@ TRANSCRIBE_MODEL = os.getenv("TELEGRAM_TRANSCRIBE_MODEL", "whisper-1")
 TTS_VOICE = os.getenv("TELEGRAM_TTS_VOICE", "alloy")
 TTS_MODEL = os.getenv("TELEGRAM_TTS_MODEL", "tts-1")
 TTS_RESPONSE_FORMAT = os.getenv("TELEGRAM_TTS_RESPONSE_FORMAT", "ogg")
+VOICE_NOTE_OPUS_BITRATE = (os.getenv("TELEGRAM_VOICE_NOTE_OPUS_BITRATE", "32k") or "32k").strip() or "32k"
 SYSTEM_PROMPT_OVERRIDE = os.getenv("TELEGRAM_BOT_SYSTEM_PROMPT")
 MODEL_OVERRIDE = os.getenv("TELEGRAM_CHAT_MODEL")
 TELEGRAM_SECRET = os.getenv("TELEGRAM_SECRET")
@@ -273,6 +277,59 @@ def _is_ogg_opus(content_type: str, audio_bytes: bytes) -> bool:
     return b"OpusHead" in header
 
 
+def _convert_to_ogg_opus_sync(audio_bytes: bytes) -> bytes:
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg is not available on PATH")
+    if not audio_bytes:
+        raise RuntimeError("No audio bytes to convert")
+
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        "pipe:0",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        VOICE_NOTE_OPUS_BITRATE,
+        "-vbr",
+        "on",
+        "-application",
+        "voip",
+        "-f",
+        "ogg",
+        "pipe:1",
+    ]
+    completed = subprocess.run(cmd, input=audio_bytes, capture_output=True, check=False)
+    if completed.returncode != 0 or not completed.stdout:
+        stderr = completed.stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(stderr or "ffmpeg conversion failed")
+    return completed.stdout
+
+
+async def _ensure_telegram_voice_note_audio(
+    audio_bytes: bytes,
+    content_type: str,
+) -> tuple[bytes, str, bool]:
+    if _is_ogg_opus(content_type, audio_bytes):
+        return audio_bytes, content_type, False
+    try:
+        converted = await asyncio.to_thread(_convert_to_ogg_opus_sync, audio_bytes)
+    except Exception as exc:
+        logger.warning("Could not convert TTS audio to OGG/Opus voice note: %s", exc)
+        return audio_bytes, content_type, False
+    return converted, "audio/ogg; codecs=opus", True
+
+
 async def call_backend_tts(text: str) -> tuple[bytes, str]:
     url = _build_backend_url("/v1/proxy/tts/speech")
     headers = _backend_headers()
@@ -389,15 +446,19 @@ async def _reply_with_backend_answer(
         try:
             await update.message.chat.send_action(action=ChatAction.RECORD_VOICE)
             audio_bytes, content_type = await call_backend_tts(reply)
+            audio_bytes, content_type, was_converted = await _ensure_telegram_voice_note_audio(
+                audio_bytes, content_type
+            )
             filename = _guess_audio_filename(content_type)
             audio_file = io.BytesIO(audio_bytes)
             audio_file.name = filename
             is_ogg_opus = _is_ogg_opus(content_type, audio_bytes)
             logger.info(
-                "TTS reply audio bytes=%s content-type=%s ogg_opus=%s",
+                "TTS reply audio bytes=%s content-type=%s ogg_opus=%s converted=%s",
                 len(audio_bytes or b""),
                 content_type,
                 is_ogg_opus,
+                was_converted,
             )
             if is_ogg_opus:
                 await update.message.reply_voice(voice=audio_file, filename=filename)
