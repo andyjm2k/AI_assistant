@@ -2100,6 +2100,70 @@
             return t; // Provide sanitized text
         }
 
+        // Split long TTS text into sentence-aware chunks for browser speech engines.
+        function splitTtsTextChunks(text, maxChars = 280) {
+            const cleaned = (text || '').trim();
+            if (!cleaned) return [];
+            if (cleaned.length <= maxChars) return [cleaned];
+
+            const segments = cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
+            const chunks = [];
+            let current = '';
+
+            const appendPiece = (piece) => {
+                const safePiece = (piece || '').trim();
+                if (!safePiece) return;
+                if (!current) {
+                    current = safePiece;
+                    return;
+                }
+                const candidate = `${current} ${safePiece}`;
+                if (candidate.length <= maxChars) {
+                    current = candidate;
+                } else {
+                    chunks.push(current);
+                    current = safePiece;
+                }
+            };
+
+            for (const segment of segments) {
+                if (segment.length <= maxChars) {
+                    appendPiece(segment);
+                    continue;
+                }
+                const words = segment.split(/\s+/).filter(Boolean);
+                let wordBuffer = '';
+                for (const word of words) {
+                    const candidate = wordBuffer ? `${wordBuffer} ${word}` : word;
+                    if (candidate.length <= maxChars) {
+                        wordBuffer = candidate;
+                        continue;
+                    }
+                    if (wordBuffer) appendPiece(wordBuffer);
+                    wordBuffer = '';
+                    if (word.length <= maxChars) {
+                        wordBuffer = word;
+                    } else {
+                        for (let i = 0; i < word.length; i += maxChars) {
+                            appendPiece(word.slice(i, i + maxChars));
+                        }
+                    }
+                }
+                if (wordBuffer) appendPiece(wordBuffer);
+            }
+
+            if (current) chunks.push(current);
+            return chunks.length > 0 ? chunks : [cleaned];
+        }
+
+        function getSelectedBrowserVoice() {
+            const selectedVoiceIndex = parseInt(voiceDropdown.value, 10);
+            if (voices.length > 0 && !Number.isNaN(selectedVoiceIndex) && voices[selectedVoiceIndex]) {
+                return voices[selectedVoiceIndex];
+            }
+            return null;
+        }
+
         // Update the textToSpeech function
         function textToSpeech(text) {
             if (!text) {
@@ -2903,17 +2967,36 @@
                     stream: false // Request a single binary audio response for broad browser compatibility
                 }; // End payload
 
-                // iOS Safari/Edge are more reliable with PCM than MP3/MPEG when using local Kitten TTS.
-                if (isIOSDevice) {
+                // Prefer PCM streaming for local/self-hosted TTS endpoints to reduce time-to-first-audio.
+                // Keep remote/unknown providers on binary MP3 defaults for compatibility.
+                const shouldPreferPcmStreaming = (() => {
+                    if (isIOSDevice) return true;
+                    try {
+                        const host = (new URL(baseUrl)).hostname.toLowerCase();
+                        const pageHost = (window.location.hostname || '').toLowerCase();
+                        const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+                        const isLocalDomain = host.endsWith('.local');
+                        const sameHost = !!pageHost && host === pageHost;
+                        const hasWebAudio = !!(window.AudioContext || window.webkitAudioContext);
+                        return hasWebAudio && (isLoopback || isLocalDomain || sameHost);
+                    } catch (_) {
+                        return false;
+                    }
+                })();
+
+                if (shouldPreferPcmStreaming) {
                     reqBody.response_format = 'pcm';
                     reqBody.sample_rate = 24000; // honored by some servers; ignored by others
                     reqBody.stream = true;
                 }
 
                 // Request binary audio by default; response parser still supports SSE when returned.
+                const wantsPcmResponse = reqBody.response_format === 'pcm';
                 const headers = {
                     'Content-Type': 'application/json', // JSON body content type
-                    'Accept': isIOSDevice ? 'audio/pcm, application/octet-stream, audio/wav;q=0.9, audio/mpeg;q=0.7' : 'audio/mpeg'
+                    'Accept': wantsPcmResponse
+                        ? 'audio/pcm, application/octet-stream, audio/wav;q=0.9, audio/mpeg;q=0.7'
+                        : 'audio/mpeg'
                 }; // End headers
 
 				// Prepare abort + generation token so interruptions cancel immediately and stale callbacks are ignored
@@ -3494,15 +3577,56 @@
             try { // Begin guard
                 // Sanitize text before creating utterance
                 text = sanitizeTTS(text); // Clean text for browser fallback speech
-                const utter = new SpeechSynthesisUtterance(text); // Build utterance instance
-                utter.onend = () => { // Ensure cleanup on browser TTS end
+                if (!text) return;
+                const selectedVoice = getSelectedBrowserVoice();
+                const chunkLimit = isIOSDevice ? 160 : 280;
+                const chunks = splitTtsTextChunks(text, chunkLimit);
+                let idx = 0;
+                let cancelled = false;
+                ttsCleanupFns.push(() => { cancelled = true; });
+
+                const finalize = () => {
+                    if (cancelled) return;
                     try { if (ttsLipSyncIntervalId) { clearInterval(ttsLipSyncIntervalId); ttsLipSyncIntervalId = null; } } catch(_){}
                     try { if (ttsRafId) { cancelAnimationFrame(ttsRafId); ttsRafId = 0; } } catch(_){}
                     try { ttsCleanupFns.forEach(fn => { try { fn(); } catch(_){} }); ttsCleanupFns = []; } catch(_){}
                     if (live2dModel) { live2dModel.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0); }
                     if (vrmModel && document.getElementById('vrm-mode').checked) { animateVRMLipSync(0); }
                 };
-                speechSynthesis.speak(utter); // Speak using browser engine
+
+                const speakNextChunk = () => {
+                    if (cancelled) return;
+                    if (idx >= chunks.length) {
+                        finalize();
+                        return;
+                    }
+                    const chunk = chunks[idx++];
+                    const utter = new SpeechSynthesisUtterance(chunk);
+                    if (selectedVoice) utter.voice = selectedVoice;
+                    utter.rate = 1.0;
+                    utter.pitch = 1.0;
+                    utter.onend = () => {
+                        if (cancelled) return;
+                        if (idx < chunks.length) {
+                            speakNextChunk();
+                        } else {
+                            finalize();
+                        }
+                    };
+                    utter.onerror = (event) => {
+                        if (cancelled) return;
+                        console.warn('Browser TTS fallback chunk error:', event);
+                        if (idx < chunks.length) {
+                            speakNextChunk();
+                        } else {
+                            finalize();
+                        }
+                    };
+                    speechSynthesis.speak(utter); // Speak using browser engine
+                };
+
+                try { speechSynthesis.cancel(); } catch(_) {}
+                speakNextChunk();
             } catch (e) { // Catch runtime issues
                 console.warn('Browser TTS fallback failed:', e); // Log warning for diagnostics
             } // End try/catch

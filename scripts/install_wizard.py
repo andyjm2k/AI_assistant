@@ -104,6 +104,18 @@ def _set_key_in_env_content(content: str, key: str, value: str) -> str:
     return content.rstrip() + "\n" + new_line
 
 
+def _has_key_in_env_content(content: str, key: str) -> bool:
+    """Return True if KEY= exists in .env-style content."""
+    return bool(re.search(r"^\s*" + re.escape(key) + r"\s*=", content, flags=re.MULTILINE))
+
+
+def _set_key_if_missing(content: str, key: str, value: str) -> str:
+    """Set KEY=value only if key is not present."""
+    if _has_key_in_env_content(content, key):
+        return content
+    return _set_key_in_env_content(content, key, value)
+
+
 def _load_template_with_path_substitution(project_root: Path) -> str:
     """Load .env.example or config/mcp_config.env.example and substitute project root in paths."""
     from scripts.setup_env_and_dirs import (
@@ -262,6 +274,12 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         content = _set_key_in_env_content(content, "TTS_MODEL", tts_model)
     if tts_voice:
         content = _set_key_in_env_content(content, "TTS_VOICE", tts_voice)
+    # Embedded/local TTS latency defaults (set only if missing to avoid overwriting custom tuning)
+    content = _set_key_if_missing(content, "EMBEDDED_KITTEN_SAMPLE_RATE", "24000")
+    content = _set_key_if_missing(content, "EMBEDDED_KITTEN_STREAM_CHUNK_BYTES", "4096")
+    content = _set_key_if_missing(content, "EMBEDDED_KITTEN_MAX_INPUT_CHARS", "220")
+    content = _set_key_if_missing(content, "EMBEDDED_KITTEN_CHUNK_SILENCE_MS", "80")
+    content = _set_key_if_missing(content, "TTS_PROXY_TIMEOUT_SECONDS", "180")
     # Always write HTTPS hostname so https_server and proxy_server use it for cert discovery
     content = _set_key_in_env_content(content, "HTTPS_CERT_HOSTNAME", https_hostname)
 

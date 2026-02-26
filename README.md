@@ -51,7 +51,7 @@ uv run playwright install
 cd ..
 
 # Configure environment variables
-cp config/mcp_config.env.example .env
+cp .env.example .env
 # Edit .env with your API keys
 
 # Start all services (run from project root)
@@ -130,6 +130,7 @@ See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line i
    - Data source: https://www.bom.gov.au/
    - Environment variable: `BOM_API_BASE_URL` (defaults to `https://api.weather.bom.gov.au/v1`)
    - Environment variable: `BOM_API_TIMEOUT_SECONDS` (optional request timeout)
+   - Environment variable: `BOM_API_TRUST_ENV` (`false` by default; set `true` only when you intentionally need HTTP(S)_PROXY)
 
 7. **Telegram Bot Token** (Optional)
    - Create a bot: https://core.telegram.org/bots#botfather
@@ -224,9 +225,9 @@ Create a `.env` file in the project root:
 
 ```bash
 # Copy example configuration
-cp config/mcp_config.env.example .env
+cp .env.example .env
 # Windows:
-copy config\mcp_config.env.example .env
+copy .env.example .env
 ```
 
 Edit `.env` with your configuration:
@@ -247,6 +248,11 @@ TTS_VOICE=alloy
 # EMBEDDED_KITTEN_TTS_ENABLED=true
 # EMBEDDED_KITTEN_MODEL=KittenML/kitten-tts-nano-0.2
 # EMBEDDED_KITTEN_DEFAULT_VOICE=expr-voice-2-f
+# EMBEDDED_KITTEN_SAMPLE_RATE=24000
+# EMBEDDED_KITTEN_STREAM_CHUNK_BYTES=4096
+# EMBEDDED_KITTEN_MAX_INPUT_CHARS=220
+# EMBEDDED_KITTEN_CHUNK_SILENCE_MS=80
+# TTS_PROXY_TIMEOUT_SECONDS=180
 # Then set TTS endpoint to this proxy:
 # TTS_ENDPOINT=http://localhost:8002
 
@@ -344,7 +350,7 @@ cd ..
 
 ### Environment Variables
 
-Key environment variables (see `config/mcp_config.env.example` for complete list):
+Key environment variables (see `.env.example` for complete list):
 
 #### LLM Configuration
 - `OPENAI_API_KEY`: OpenAI API key
@@ -370,6 +376,9 @@ Key environment variables (see `config/mcp_config.env.example` for complete list
 - `EMBEDDED_KITTEN_VOICES`: Comma-separated embedded voice ids exposed to UI
 - `EMBEDDED_KITTEN_SAMPLE_RATE`: Embedded output sample rate (default 24000)
 - `EMBEDDED_KITTEN_STREAM_CHUNK_BYTES`: Embedded stream chunk size in bytes
+- `EMBEDDED_KITTEN_MAX_INPUT_CHARS`: Max text chars per generation chunk for embedded Kitten streaming
+- `EMBEDDED_KITTEN_CHUNK_SILENCE_MS`: Silence inserted between generated chunks (milliseconds)
+- `TTS_PROXY_TIMEOUT_SECONDS`: Proxy timeout for forwarded TTS requests (seconds)
 - `BRAVE_API_KEY`: Brave Search API key
 - `NEWS_API_KEY`: News API key
  

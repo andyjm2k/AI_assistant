@@ -119,6 +119,8 @@ try:
     BOM_API_TIMEOUT_SECONDS = float(os.environ.get("BOM_API_TIMEOUT_SECONDS", "12"))
 except ValueError:
     BOM_API_TIMEOUT_SECONDS = 12.0
+BOM_API_TRUST_ENV = os.environ.get("BOM_API_TRUST_ENV", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+BOM_API_USER_AGENT = os.environ.get("BOM_API_USER_AGENT", "CATBot/1.0 (+bom-weather-tool)").strip() or "CATBot/1.0"
 BOM_ALLOWED_HOST_SUFFIX = "bom.gov.au"
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -163,6 +165,18 @@ try:
     EMBEDDED_KITTEN_STREAM_CHUNK_BYTES = max(512, int(os.environ.get("EMBEDDED_KITTEN_STREAM_CHUNK_BYTES", "8192")))
 except ValueError:
     EMBEDDED_KITTEN_STREAM_CHUNK_BYTES = 8192
+try:
+    EMBEDDED_KITTEN_MAX_INPUT_CHARS = max(120, int(os.environ.get("EMBEDDED_KITTEN_MAX_INPUT_CHARS", "320")))
+except ValueError:
+    EMBEDDED_KITTEN_MAX_INPUT_CHARS = 320
+try:
+    EMBEDDED_KITTEN_CHUNK_SILENCE_MS = max(0, int(os.environ.get("EMBEDDED_KITTEN_CHUNK_SILENCE_MS", "120")))
+except ValueError:
+    EMBEDDED_KITTEN_CHUNK_SILENCE_MS = 120
+try:
+    TTS_PROXY_TIMEOUT_SECONDS = max(30.0, float(os.environ.get("TTS_PROXY_TIMEOUT_SECONDS", "120")))
+except ValueError:
+    TTS_PROXY_TIMEOUT_SECONDS = 120.0
 
 _embedded_kitten_model_instance = None
 _embedded_kitten_model_lock = asyncio.Lock()
@@ -2473,15 +2487,28 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
         raise HTTPException(status_code=500, detail="BOM_API_BASE_URL host is not allowlisted")
 
     search_url = f"{BOM_API_BASE_URL}/locations"
+    bom_headers = {"Accept": "application/json", "User-Agent": BOM_API_USER_AGENT}
     try:
-        async with httpx.AsyncClient(timeout=BOM_API_TIMEOUT_SECONDS) as client:
-            loc_resp = await client.get(search_url, params={"search": resolved_location}, headers={"Accept": "application/json"})
+        async with httpx.AsyncClient(timeout=BOM_API_TIMEOUT_SECONDS, trust_env=BOM_API_TRUST_ENV, follow_redirects=True) as client:
+            loc_resp = await client.get(search_url, params={"search": resolved_location}, headers=bom_headers)
             loc_resp.raise_for_status()
             try:
                 loc_json = loc_resp.json()
             except ValueError as e:
                 raise HTTPException(status_code=502, detail=f"Invalid BOM location response payload: {str(e)}")
-            loc_items = loc_json.get("data") if isinstance(loc_json, dict) else []
+            loc_items = []
+            if isinstance(loc_json, dict):
+                candidate_lists = [
+                    loc_json.get("data"),
+                    loc_json.get("locations"),
+                    loc_json.get("results"),
+                ]
+                for candidate in candidate_lists:
+                    if isinstance(candidate, list):
+                        loc_items = candidate
+                        break
+            elif isinstance(loc_json, list):
+                loc_items = loc_json
             if not isinstance(loc_items, list) or not loc_items:
                 raise HTTPException(status_code=404, detail=f"No BOM weather location found for '{resolved_location}'.")
             requested_lc = resolved_location.lower()
@@ -2506,8 +2533,8 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
             if not geohash:
                 raise HTTPException(status_code=502, detail="BOM response missing location geohash")
 
-            obs_task = client.get(f"{BOM_API_BASE_URL}/locations/{geohash}/observations", headers={"Accept": "application/json"})
-            forecast_task = client.get(f"{BOM_API_BASE_URL}/locations/{geohash}/forecasts/daily", headers={"Accept": "application/json"})
+            obs_task = client.get(f"{BOM_API_BASE_URL}/locations/{geohash}/observations", headers=bom_headers)
+            forecast_task = client.get(f"{BOM_API_BASE_URL}/locations/{geohash}/forecasts/daily", headers=bom_headers)
             obs_resp, forecast_resp = await asyncio.gather(obs_task, forecast_task)
             obs_resp.raise_for_status()
             forecast_resp.raise_for_status()
@@ -2518,6 +2545,11 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
                 raise HTTPException(status_code=502, detail=f"Invalid BOM weather payload: {str(e)}")
     except HTTPException:
         raise
+    except httpx.ConnectError as e:
+        hint = ""
+        if not BOM_API_TRUST_ENV:
+            hint = " If you require an outbound proxy, set BOM_API_TRUST_ENV=true and configure HTTP(S)_PROXY."
+        raise HTTPException(status_code=502, detail=f"Could not connect to BOM weather service: {str(e)}.{hint}")
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Timed out contacting BOM weather service")
     except httpx.HTTPStatusError as e:
@@ -2533,7 +2565,7 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
         observation = observation[0] if observation else {}
     forecast_data = (forecast_json or {}).get("data") if isinstance(forecast_json, dict) else {}
     if isinstance(forecast_data, dict):
-        forecast_days = forecast_data.get("daily") or []
+        forecast_days = forecast_data.get("daily") or forecast_data.get("forecasts") or []
     elif isinstance(forecast_data, list):
         forecast_days = forecast_data
     else:
@@ -6189,12 +6221,87 @@ async def _get_embedded_kitten_model(model_name: Optional[str] = None) -> Tuple[
     return _embedded_kitten_model_instance, _embedded_kitten_voice_aliases
 
 
-async def _generate_embedded_kitten_pcm(
+def _split_embedded_kitten_text_chunks(raw_text: str, max_chars: int) -> List[str]:
+    collapsed = re.sub(r"\s+", " ", (raw_text or "").strip())
+    if not collapsed:
+        return []
+    if len(collapsed) <= max_chars:
+        return [collapsed]
+
+    chunks: List[str] = []
+    current = ""
+
+    def append_piece(piece: str) -> None:
+        nonlocal current
+        piece = piece.strip()
+        if not piece:
+            return
+        if not current:
+            current = piece
+            return
+        candidate = f"{current} {piece}"
+        if len(candidate) <= max_chars:
+            current = candidate
+            return
+        chunks.append(current)
+        current = piece
+
+    segments = re.split(r"(?<=[.!?])\s+", collapsed)
+    for segment in segments:
+        segment = segment.strip()
+        if not segment:
+            continue
+        if len(segment) <= max_chars:
+            append_piece(segment)
+            continue
+
+        words = segment.split(" ")
+        word_buffer = ""
+        for word in words:
+            word = word.strip()
+            if not word:
+                continue
+            candidate = f"{word_buffer} {word}".strip() if word_buffer else word
+            if len(candidate) <= max_chars:
+                word_buffer = candidate
+                continue
+            if word_buffer:
+                append_piece(word_buffer)
+                word_buffer = ""
+
+            if len(word) <= max_chars:
+                word_buffer = word
+                continue
+
+            for i in range(0, len(word), max_chars):
+                token = word[i:i + max_chars].strip()
+                if token:
+                    append_piece(token)
+
+        if word_buffer:
+            append_piece(word_buffer)
+
+    if current:
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk]
+
+
+def _build_embedded_kitten_pcm16_silence_bytes(target_sample_rate: int, milliseconds: int) -> bytes:
+    if milliseconds <= 0:
+        return b""
+    frame_count = max(0, int((target_sample_rate * milliseconds) / 1000))
+    if frame_count <= 0:
+        return b""
+    return b"\x00\x00" * frame_count
+
+
+async def _iter_embedded_kitten_pcm_chunks(
     text: str,
     voice: str,
     model_name: Optional[str] = None,
     speed: Optional[float] = None,
-) -> bytes:
+    sample_rate: Optional[int] = None,
+):
     model, alias_map = await _get_embedded_kitten_model(model_name=model_name)
     resolved_voice = _resolve_embedded_kitten_voice(
         requested_voice=voice,
@@ -6202,19 +6309,68 @@ async def _generate_embedded_kitten_pcm(
         alias_map=alias_map,
     )
 
-    kwargs: Dict[str, Any] = {"voice": resolved_voice}
-    if speed is not None:
-        kwargs["speed"] = speed
+    chunks = _split_embedded_kitten_text_chunks(text, EMBEDDED_KITTEN_MAX_INPUT_CHARS)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Input text is required.")
+    if len(chunks) > 1:
+        print(
+            f"[TTS] Chunking embedded Kitten request into {len(chunks)} segments "
+            f"(max {EMBEDDED_KITTEN_MAX_INPUT_CHARS} chars each)"
+        )
 
-    try:
-        generated = await asyncio.to_thread(model.generate, text, **kwargs)
-    except TypeError:
-        kwargs.pop("speed", None)
-        generated = await asyncio.to_thread(model.generate, text, **kwargs)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Embedded Kitten TTS rejected request: {exc}") from exc
+    target_sample_rate = max(8000, int(sample_rate or EMBEDDED_KITTEN_SAMPLE_RATE))
+    inter_chunk_silence = _build_embedded_kitten_pcm16_silence_bytes(
+        target_sample_rate, EMBEDDED_KITTEN_CHUNK_SILENCE_MS
+    )
+    speed_supported = speed is not None
 
-    pcm_bytes = _float_audio_to_pcm16_bytes(generated)
+    for index, chunk in enumerate(chunks):
+        kwargs: Dict[str, Any] = {"voice": resolved_voice}
+        if speed_supported and speed is not None:
+            kwargs["speed"] = speed
+
+        try:
+            generated = await asyncio.to_thread(model.generate, chunk, **kwargs)
+        except TypeError:
+            if "speed" in kwargs:
+                speed_supported = False
+                kwargs.pop("speed", None)
+                generated = await asyncio.to_thread(model.generate, chunk, **kwargs)
+            else:
+                raise
+        except ValueError as exc:
+            detail = (
+                f"Embedded Kitten TTS rejected request on chunk {index + 1}/{len(chunks)}: {exc}"
+                if len(chunks) > 1
+                else f"Embedded Kitten TTS rejected request: {exc}"
+            )
+            raise HTTPException(status_code=400, detail=detail) from exc
+
+        chunk_pcm = _float_audio_to_pcm16_bytes(generated)
+        if not chunk_pcm:
+            raise RuntimeError(f"Embedded Kitten TTS generated empty audio for chunk {index + 1}/{len(chunks)}.")
+        yield chunk_pcm
+        if inter_chunk_silence and index < len(chunks) - 1:
+            yield inter_chunk_silence
+
+
+async def _generate_embedded_kitten_pcm(
+    text: str,
+    voice: str,
+    model_name: Optional[str] = None,
+    speed: Optional[float] = None,
+    sample_rate: Optional[int] = None,
+) -> bytes:
+    pcm_parts: List[bytes] = []
+    async for piece in _iter_embedded_kitten_pcm_chunks(
+        text=text,
+        voice=voice,
+        model_name=model_name,
+        speed=speed,
+        sample_rate=sample_rate,
+    ):
+        pcm_parts.append(piece)
+    pcm_bytes = b"".join(pcm_parts)
     if not pcm_bytes:
         raise RuntimeError("Embedded Kitten TTS generated empty audio.")
     return pcm_bytes
@@ -6254,12 +6410,6 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
     response_format = (payload.response_format or "wav").strip().lower()
     stream_mode = bool(payload.stream)
 
-    pcm_bytes = await _generate_embedded_kitten_pcm(
-        text=text,
-        voice=requested_voice,
-        model_name=requested_model,
-        speed=payload.speed,
-    )
     headers = {
         "X-Audio-Sample-Rate": str(sample_rate),
         "X-Audio-Channels": str(channels),
@@ -6270,13 +6420,34 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
         media_type = "audio/pcm"
         if stream_mode:
             async def pcm_stream():
-                for i in range(0, len(pcm_bytes), EMBEDDED_KITTEN_STREAM_CHUNK_BYTES):
-                    yield pcm_bytes[i:i + EMBEDDED_KITTEN_STREAM_CHUNK_BYTES]
-                    await asyncio.sleep(0)
+                async for generated_chunk in _iter_embedded_kitten_pcm_chunks(
+                    text=text,
+                    voice=requested_voice,
+                    model_name=requested_model,
+                    speed=payload.speed,
+                    sample_rate=sample_rate,
+                ):
+                    for i in range(0, len(generated_chunk), EMBEDDED_KITTEN_STREAM_CHUNK_BYTES):
+                        yield generated_chunk[i:i + EMBEDDED_KITTEN_STREAM_CHUNK_BYTES]
+                        await asyncio.sleep(0)
 
             return StreamingResponse(pcm_stream(), media_type=media_type, headers=headers)
+        pcm_bytes = await _generate_embedded_kitten_pcm(
+            text=text,
+            voice=requested_voice,
+            model_name=requested_model,
+            speed=payload.speed,
+            sample_rate=sample_rate,
+        )
         return Response(content=pcm_bytes, media_type=media_type, headers=headers, status_code=200)
 
+    pcm_bytes = await _generate_embedded_kitten_pcm(
+        text=text,
+        voice=requested_voice,
+        model_name=requested_model,
+        speed=payload.speed,
+        sample_rate=sample_rate,
+    )
     wav_bytes = _build_wav_header(sample_rate=sample_rate, channels=channels, bits_per_sample=16, pcm_bytes_len=len(pcm_bytes)) + pcm_bytes
     if stream_mode:
         async def wav_stream():
@@ -6538,7 +6709,7 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
             print(f"[WARN] TTS speech proxy: TLS verification disabled for local endpoint: {base_url}")
 
         if buffer_response:
-            async with httpx.AsyncClient(timeout=60.0, verify=(not skip_tls_verify)) as client:
+            async with httpx.AsyncClient(timeout=TTS_PROXY_TIMEOUT_SECONDS, verify=(not skip_tls_verify)) as client:
                 response = await client.post(
                     speech_url,
                     json=request_body,
@@ -6563,7 +6734,7 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
         
         # Open upstream stream first so we can forward the *actual* content-type.
         # This avoids mislabeling MP3 as SSE, which breaks browser playback/parsing.
-        client = httpx.AsyncClient(timeout=60.0, verify=(not skip_tls_verify))
+        client = httpx.AsyncClient(timeout=TTS_PROXY_TIMEOUT_SECONDS, verify=(not skip_tls_verify))
         try:
             upstream_response = await client.send(
                 client.build_request(
