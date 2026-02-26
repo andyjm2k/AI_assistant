@@ -69,6 +69,15 @@ def check_playwright(python_exe: str | None = None) -> tuple[bool, str]:
     )
 
 
+def check_kitten_tts(python_exe: str | None = None) -> tuple[bool, str]:
+    """Verify embedded Kitten TTS runtime imports."""
+    return _run_python_check(
+        "KittenTTS",
+        "import kittentts, onnxruntime, misaki, phonemizer; print('KittenTTS OK')",
+        python_exe,
+    )
+
+
 def check_mcp_server_cli() -> tuple[bool, str]:
     """Verify mcp-server-browser-use CLI runs (via uv in mcp-browser-use). Non-blocking if submodule is incomplete."""
     if not MCP_BROWSER_USE_DIR.is_dir():
@@ -125,6 +134,7 @@ def main() -> int:
         ("AutoGen", lambda: check_autogen(python_exe)),
         ("MCP", lambda: check_mcp(python_exe)),
         ("Playwright", lambda: check_playwright(python_exe)),
+        ("KittenTTS runtime", lambda: check_kitten_tts(python_exe)),
         ("mcp-server-browser-use CLI", check_mcp_server_cli),
         ("Codex CLI (optional)", check_codex_cli),
     ]

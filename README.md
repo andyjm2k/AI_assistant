@@ -64,7 +64,8 @@ Full setup guide: [Installation Guide](#installation-guide). For one-command set
 
 On a **new machine** you can run the automated installer instead of following the Quick Start steps manually.
 
-**Prerequisites (install these first if missing):** Python 3.11+, Node.js 16+, Git, and [uv](https://github.com/astral-sh/uv) (e.g. `pip install uv`).
+**Prerequisites (install these first if missing):** Python 3.11+, Node.js 16+, Git, and [uv](https://github.com/astral-sh/uv) (e.g. `pip install uv`).  
+For embedded Kitten TTS, install `espeak-ng` on the host and ensure `espeak-ng` is on `PATH`.
 
 - **Windows:** From project root run:
   ```powershell
@@ -166,6 +167,9 @@ source venv/bin/activate
 # Install all Python dependencies from requirements.txt
 pip install -r requirements.txt
 
+# Note: requirements include KittenTTS from a GitHub wheel URL.
+# If embedded TTS is enabled, ensure espeak-ng is installed on the host.
+
 # Install Playwright browsers
 playwright install
 ```
@@ -234,7 +238,17 @@ OPENAI_API_BASE=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o-mini
 
 # TTS Configuration (OpenAI-Compatible)
-TTS_ENDPOINT=https://api.openai.com/v1/audio/speech
+# Use endpoint base URL (proxy app appends /v1/audio/speech internally)
+TTS_ENDPOINT=https://api.openai.com
+TTS_MODEL=tts-1
+TTS_VOICE=alloy
+
+# Optional: Embedded Kitten TTS served by proxy_server itself
+# EMBEDDED_KITTEN_TTS_ENABLED=true
+# EMBEDDED_KITTEN_MODEL=KittenML/kitten-tts-nano-0.2
+# EMBEDDED_KITTEN_DEFAULT_VOICE=expr-voice-2-f
+# Then set TTS endpoint to this proxy:
+# TTS_ENDPOINT=http://localhost:8002
 
 # STT Configuration (Whisper-Compatible)
 WHISPER_ENDPOINT=http://localhost:8001/v1/audio/transcriptions
@@ -347,7 +361,15 @@ Key environment variables (see `config/mcp_config.env.example` for complete list
 
 #### Service Endpoints
 - `WHISPER_ENDPOINT`: Whisper STT service endpoint
-- `TTS_ENDPOINT`: TTS service endpoint
+- `TTS_ENDPOINT`: TTS service endpoint base URL
+- `TTS_MODEL`: Default TTS model for the web UI (optional; also used as fallback if TTS voice list fetch fails)
+- `TTS_VOICE`: Default TTS voice for the web UI (optional; also used as fallback if TTS voice list fetch fails)
+- `EMBEDDED_KITTEN_TTS_ENABLED`: Enable embedded `/v1/audio/speech` + `/v1/audio/voices` in proxy_server
+- `EMBEDDED_KITTEN_MODEL`: Embedded Kitten model id
+- `EMBEDDED_KITTEN_DEFAULT_VOICE`: Default embedded Kitten voice id
+- `EMBEDDED_KITTEN_VOICES`: Comma-separated embedded voice ids exposed to UI
+- `EMBEDDED_KITTEN_SAMPLE_RATE`: Embedded output sample rate (default 24000)
+- `EMBEDDED_KITTEN_STREAM_CHUNK_BYTES`: Embedded stream chunk size in bytes
 - `BRAVE_API_KEY`: Brave Search API key
 - `NEWS_API_KEY`: News API key
  
@@ -529,8 +551,11 @@ All services are configured to accept connections from devices on your local net
 
 **Speech & Audio:**
 - `POST /v1/audio/transcriptions` - Whisper STT proxy endpoint
+- `GET /v1/audio/voices` - Embedded OpenAI-compatible TTS voices (when enabled)
+- `POST /v1/audio/speech` - Embedded OpenAI-compatible TTS speech (when enabled; PCM/WAV + stream)
 - `GET /v1/proxy/tts/voices` - Get available TTS voices
 - `POST /v1/proxy/tts/speech` - Generate TTS speech (supports streaming)
+- `GET /v1/client-config` - Expose non-secret UI defaults (e.g., TTS endpoint/model/voice)
 
 **MCP Server Management:**
 - `POST /v1/mcp/servers` - Add or update MCP server configuration
@@ -688,6 +713,7 @@ Key packages include (see [Installation Guide](#step-3-install-python-dependenci
 | `python-telegram-bot[rate-limiter]` | Telegram bot integration (polling) |
 | `python-dotenv` | Load `.env` configuration |
 | `flask`, `flask-cors` | MCP browser HTTP server |
+| `kittentts` | Embedded OpenAI-compatible TTS (`/v1/audio/speech`, `/v1/audio/voices`) |
 | `python-docx`, `openpyxl`, `PyPDF2`, `Pillow`, `reportlab` | File operations |
 
 Install all Python dependencies with: `pip install -r requirements.txt`

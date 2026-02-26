@@ -201,8 +201,13 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
             else:
                 telegram_admins = _prompt("   Admin Telegram user ID(s), comma-separated", "")
 
-    # 7. HTTPS certificate hostname (for LAN access; used by https_server and proxy_server)
-    https_hostname = _prompt("8) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
+    # 7. Web UI TTS defaults (optional)
+    tts_endpoint = _prompt("8) Default TTS endpoint for web UI (optional; press Enter to skip)", "")
+    tts_model = _prompt("9) Default TTS model for web UI (optional; used as UI fallback on voice-fetch failure)", "")
+    tts_voice = _prompt("10) Default TTS voice for web UI (optional; used as UI fallback on voice-fetch failure)", "")
+
+    # 8. HTTPS certificate hostname (for LAN access; used by https_server and proxy_server)
+    https_hostname = _prompt("11) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
     if not https_hostname.strip():
         https_hostname = "anton.local"
     else:
@@ -251,6 +256,12 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         content = _set_key_in_env_content(content, "TELEGRAM_ALLOW_ALL", telegram_allow_all)
         if telegram_admins:
             content = _set_key_in_env_content(content, "TELEGRAM_ADMIN_IDS", telegram_admins)
+    if tts_endpoint:
+        content = _set_key_in_env_content(content, "TTS_ENDPOINT", tts_endpoint)
+    if tts_model:
+        content = _set_key_in_env_content(content, "TTS_MODEL", tts_model)
+    if tts_voice:
+        content = _set_key_in_env_content(content, "TTS_VOICE", tts_voice)
     # Always write HTTPS hostname so https_server and proxy_server use it for cert discovery
     content = _set_key_in_env_content(content, "HTTPS_CERT_HOSTNAME", https_hostname)
 

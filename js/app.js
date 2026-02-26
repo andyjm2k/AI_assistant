@@ -273,6 +273,7 @@
         const authLogoutBtn = document.getElementById('auth-logout-btn');
         // Guard so post-auth initialization runs only once (e.g. from DOMContentLoaded or after login)
         let appInitialized = false;
+        let envToolDefaults = null;
 
         function showAuthOverlay(message = '') {
             if (authOverlay) authOverlay.style.display = 'flex';
@@ -373,6 +374,7 @@
                     memoryCache = [];
                 }
 
+                envToolDefaults = await fetchClientToolDefaults();
                 // Load persisted tool settings (User Name, Assistant Name, etc.)
                 loadToolSettings();
                 // Ensure VRM version is initialized (default to 1.0 if not set)
@@ -475,26 +477,85 @@
         }
 
         let voices = [];
-        let audioContextResumed = false; // Flag to track if audio context has been resumed after first user action
-        
-        // Resume audio context on first user action (required for autoplay policy and lip sync)
-        async function resumeAudioContextOnce() { // Function to resume audio context once after first user gesture
-            if (audioContextResumed) return; // Exit early if already resumed
-            audioContextResumed = true; // Mark as resumed
-            
-            try { // Guard resume operations
-                // Resume Opus decoder audio context if available
-                if (window.__opus?.audioCtx && window.__opus.audioCtx.state === 'suspended') { // Check if Opus decoder context is suspended
-                    await window.__opus.resume(); // Resume audio context to satisfy autoplay policy
-                    console.log('✅ Audio context resumed (Opus decoder)'); // Log successful resume
-                } // End Opus decoder resume check
-                
-                // Resume any other audio contexts that might be created for lip sync
-                // This ensures audio can play automatically after user gesture
-            } catch (e) { // Catch resume errors
-                console.warn('⚠️ Failed to resume audio context:', e); // Log resume failure (non-critical)
-            } // End resume try/catch
-        } // End resumeAudioContextOnce
+        let audioContextResumed = false; // True after at least one successful gesture-based audio unlock
+        let audioUnlockListenersInstalled = false; // Prevent duplicate global unlock listeners
+        const userAgent = navigator.userAgent || '';
+        const isIOSDevice = /iPad|iPhone|iPod/.test(userAgent) ||
+            (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+        // Safari/iOS may need a tiny rendered buffer after resume for stable playback/lip sync.
+        function primeAudioContext(context) {
+            try {
+                if (!context) return;
+                const buffer = context.createBuffer(1, 1, context.sampleRate || 44100);
+                const source = context.createBufferSource();
+                source.buffer = buffer;
+                source.connect(context.destination);
+                source.start(0);
+                source.stop(0);
+                source.disconnect();
+            } catch (_) {}
+        }
+
+        // Resume known audio contexts from a user gesture. Safe to call repeatedly.
+        async function resumeAudioContextOnce() {
+            let resumedAny = false;
+            try {
+                // Opus decoder context (used by streamed PCM path).
+                if (window.__opus?.audioCtx) {
+                    if (window.__opus.audioCtx.state === 'suspended' && typeof window.__opus.resume === 'function') {
+                        await window.__opus.resume();
+                    }
+                    if (window.__opus.audioCtx.state === 'running') {
+                        primeAudioContext(window.__opus.audioCtx);
+                        resumedAny = true;
+                    }
+                }
+
+                // Main WebAudio context used by recorder/lip sync paths.
+                if (audioContext && audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                if (audioContext && audioContext.state === 'running') {
+                    primeAudioContext(audioContext);
+                    resumedAny = true;
+                }
+            } catch (e) {
+                console.warn('Audio unlock attempt failed:', e);
+            }
+
+            if (resumedAny) {
+                audioContextResumed = true;
+                removeGlobalAudioUnlockListeners();
+            }
+        }
+
+        async function handleGlobalAudioUnlock() {
+            await resumeAudioContextOnce();
+        }
+
+        function installGlobalAudioUnlockListeners() {
+            if (audioUnlockListenersInstalled) return;
+            audioUnlockListenersInstalled = true;
+            const opts = { capture: true, passive: true };
+            document.addEventListener('pointerdown', handleGlobalAudioUnlock, opts);
+            document.addEventListener('touchstart', handleGlobalAudioUnlock, opts);
+            document.addEventListener('click', handleGlobalAudioUnlock, opts);
+            document.addEventListener('keydown', handleGlobalAudioUnlock, opts);
+        }
+
+        function removeGlobalAudioUnlockListeners() {
+            if (!audioUnlockListenersInstalled) return;
+            audioUnlockListenersInstalled = false;
+            const opts = { capture: true };
+            document.removeEventListener('pointerdown', handleGlobalAudioUnlock, opts);
+            document.removeEventListener('touchstart', handleGlobalAudioUnlock, opts);
+            document.removeEventListener('click', handleGlobalAudioUnlock, opts);
+            document.removeEventListener('keydown', handleGlobalAudioUnlock, opts);
+        }
+
+        // Install early so first tap/click/key can unlock audio on iOS Safari.
+        installGlobalAudioUnlockListeners();
         
         // Message history management
         let displayedMessages = []; // Array to store displayed messages (last 25)
@@ -1712,6 +1773,44 @@
             return baseModel;
         }
 
+        function applyEnvDefaultTtsVoiceOnFetchFailure() {
+            const envVoice = (envToolDefaults && typeof envToolDefaults.ttsVoice === 'string')
+                ? envToolDefaults.ttsVoice.trim()
+                : '';
+            if (!envVoice || !ttsVoiceDropdown) return false;
+
+            if (!Array.from(ttsVoiceDropdown.options).some(option => option.value === envVoice)) {
+                const option = document.createElement('option');
+                option.value = envVoice;
+                option.textContent = envVoice;
+                ttsVoiceDropdown.appendChild(option);
+            }
+
+            ttsVoiceDropdown.value = envVoice;
+            saveToolSettings();
+            console.warn('TTS voices fetch failed; applied .env default voice to tool settings:', envVoice);
+            return true;
+        }
+
+        function applyEnvDefaultTtsModelOnFetchFailure() {
+            const envModel = (envToolDefaults && typeof envToolDefaults.ttsModel === 'string')
+                ? envToolDefaults.ttsModel.trim()
+                : '';
+            if (!envModel || !ttsModelDropdown) return false;
+
+            if (!Array.from(ttsModelDropdown.options).some(option => option.value === envModel)) {
+                const option = document.createElement('option');
+                option.value = envModel;
+                option.textContent = envModel;
+                ttsModelDropdown.appendChild(option);
+            }
+
+            ttsModelDropdown.value = envModel;
+            saveToolSettings();
+            console.warn('TTS voices fetch failed; applied .env default model to tool settings:', envModel);
+            return true;
+        }
+
         // Fetch TTS voices from OpenAI-compatible endpoint (e.g., Chatterbox)
         async function fetchTtsVoices() {
             try {
@@ -1786,6 +1885,8 @@
                 // If all attempts failed, log error and return
                 if (!response || !response.ok || !responseData) {
                     console.error('Failed to fetch voices from all endpoints');
+                    applyEnvDefaultTtsModelOnFetchFailure();
+                    applyEnvDefaultTtsVoiceOnFetchFailure();
                     return;
                 }
                 
@@ -1853,6 +1954,8 @@
                 saveToolSettings(); // Save the updated voice list state
             } catch (error) {
                 console.error('Error fetching TTS voices:', error);
+                applyEnvDefaultTtsModelOnFetchFailure();
+                applyEnvDefaultTtsVoiceOnFetchFailure();
             }
         }
 
@@ -2695,6 +2798,67 @@
             
             console.log('🔊 Scheduled PCM16 chunk:', framesPerChannel, 'frames per channel (', totalSamples, 'total samples ),', sampleRate, 'Hz,', safeChannels, 'channels, duration:', buf.duration.toFixed(3), 's'); // Log playback info
         } // End playPcm16Delta
+
+        // Play raw PCM16 bytes (little-endian) using the same scheduler as playPcm16Delta
+        function playPcm16Bytes(u8, sampleRate = 24000, channels = 1) {
+            if (!(u8 instanceof Uint8Array) || u8.length < 2) {
+                return;
+            }
+            const sampleCount = Math.floor(u8.length / 2);
+            if (sampleCount <= 0) return;
+            const i16 = new Int16Array(sampleCount);
+            for (let i = 0, o = 0; i < sampleCount; i++, o += 2) {
+                const lo = u8[o];
+                const hi = u8[o + 1];
+                const val = (hi << 8) | lo;
+                i16[i] = (val & 0x8000) ? (val - 0x10000) : val;
+            }
+            const f32 = new Float32Array(sampleCount);
+            for (let i = 0; i < sampleCount; i++) {
+                f32[i] = Math.max(-1, Math.min(1, i16[i] / 32768));
+            }
+
+            const ctx = ensureChatterboxLipSyncGraph();
+            if (ctx.state === 'suspended') {
+                try { ctx.resume(); } catch (_) {}
+            }
+
+            const safeChannels = Math.max(1, channels | 0);
+            const framesPerChannel = Math.floor(sampleCount / safeChannels);
+            if (framesPerChannel <= 0) return;
+            const buf = ctx.createBuffer(safeChannels, framesPerChannel, sampleRate);
+            if (safeChannels === 1) {
+                buf.getChannelData(0).set(f32.subarray(0, framesPerChannel));
+            } else {
+                for (let ch = 0; ch < safeChannels; ch++) {
+                    const channelData = buf.getChannelData(ch);
+                    for (let i = 0; i < framesPerChannel; i++) {
+                        channelData[i] = f32[i * safeChannels + ch];
+                    }
+                }
+            }
+
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            if (ttsAnalyserNode) src.connect(ttsAnalyserNode);
+            else src.connect(ctx.destination);
+
+            ttsPcmActiveSources += 1;
+            const handleEnded = () => {
+                try { src.removeEventListener('ended', handleEnded); } catch (_) {}
+                if (ttsPcmActiveSources > 0) ttsPcmActiveSources -= 1;
+                if (ttsPcmActiveSources === 0) stopChatterboxLipSync(false);
+            };
+            src.addEventListener('ended', handleEnded, { once: true });
+            ttsCleanupFns.push(() => {
+                try { src.removeEventListener('ended', handleEnded); } catch (_) {}
+                try { src.stop(0); } catch (_) {}
+                try { src.disconnect(); } catch (_) {}
+            });
+            window.__opus.playhead = Math.max(ctx.currentTime, window.__opus.playhead || 0);
+            src.start(window.__opus.playhead);
+            window.__opus.playhead += buf.duration - 0.02;
+        }
         
         // Speak using Chatterbox TTS endpoint with streaming PCM16 decoding
 		async function speakWithOpenAITTS(text) { // Asynchronous function to fetch and play TTS audio via Chatterbox
@@ -2727,28 +2891,29 @@
                     baseUrl = match ? match[1] : ttsEndpointBase.replace(/\/v1$/, '');
                 }
                 
-                // Use proxy endpoint to handle CORS
+                // Use proxy endpoint to handle CORS.
                 const endpoint = `${PROXY_BASE_URL}/v1/proxy/tts/speech?endpoint=${encodeURIComponent(baseUrl)}`; // Use proxy endpoint for TTS speech
                 const modelId = (ttsModelDropdown && ttsModelDropdown.value) ? ttsModelDropdown.value : 'tts-1'; // Get model from dropdown or default
                 const voiceId = (ttsVoiceDropdown && ttsVoiceDropdown.value) ? ttsVoiceDropdown.value : 'alloy'; // Get voice from dropdown or default
 
-                const reqBody = { // Build request payload for Chatterbox SSE streaming with PCM16
+                const reqBody = { // Build request payload for OpenAI-compatible binary audio
                     model: modelId, // TTS model (optional for Chatterbox)
                     voice: voiceId, // Voice preset
                     input: text, // The text to speak (emojis already removed)
-                    stream: true, // Enable streaming
-                    stream_format: 'sse', // Use SSE format for browser-friendly streaming
-                    streaming_chunk_size: 150, // Request 10 byte chunks
-                    streaming_strategy: 'word', // Request word-based streaming strategy
-                    streaming_quality: 'fast', // Request fast quality streaming
-                    container: 'raw', // Request raw PCM format
-                    codec: 'pcm16' // Request PCM16 codec format
+                    stream: false // Request a single binary audio response for broad browser compatibility
                 }; // End payload
 
-                // Build headers for Chatterbox SSE streaming (no Authorization needed for local Chatterbox)
-                const headers = { // Set content headers for SSE streaming
+                // iOS Safari/Edge are more reliable with PCM than MP3/MPEG when using local Kitten TTS.
+                if (isIOSDevice) {
+                    reqBody.response_format = 'pcm';
+                    reqBody.sample_rate = 24000; // honored by some servers; ignored by others
+                    reqBody.stream = true;
+                }
+
+                // Request binary audio by default; response parser still supports SSE when returned.
+                const headers = {
                     'Content-Type': 'application/json', // JSON body content type
-                    'Accept': 'text/event-stream' // Request SSE format response
+                    'Accept': isIOSDevice ? 'audio/pcm, application/octet-stream, audio/wav;q=0.9, audio/mpeg;q=0.7' : 'audio/mpeg'
                 }; // End headers
 
 				// Prepare abort + generation token so interruptions cancel immediately and stale callbacks are ignored
@@ -2757,10 +2922,10 @@
 				ttsAbortController = localController; // Store in global variable
 				localGen = (++ttsGeneration); // Assign generation token for this request
 
-				// Use SSE streaming approach for lower latency through proxy
+				// Request TTS audio through proxy using a browser-compatible contract.
 				const res = await fetch(endpoint, { // Issue HTTP request for speech through proxy
                     method: 'POST', // Use POST method per API spec
-                    headers: headers, // Set headers for SSE streaming
+                    headers: headers, // Set request headers
 					body: JSON.stringify(reqBody), // Attach serialized JSON body
 					signal: localController.signal // Allow immediate cancellation on interrupt (use local reference)
                 }); // End fetch
@@ -2784,7 +2949,7 @@
                 // Detect response format: SSE (Chatterbox/PCM) or binary audio (VibeVoice/OpenAI-compatible)
                 const ct = (res.headers.get('content-type') || '').toLowerCase(); // Get content type from headers
                 const isSSE = ct.includes('text/event-stream'); // Check if response is SSE format (Chatterbox)
-                const isBinaryAudio = ct.includes('audio/'); // Check if response is binary audio (VibeVoice/OpenAI-compatible)
+                const isBinaryAudio = ct.includes('audio/') || ct.includes('application/octet-stream'); // Check if response is binary audio (VibeVoice/OpenAI-compatible)
                 
                 // Check if request was aborted before processing format (check local controller first)
                 if (localGen !== ttsGeneration || (localController && localController.signal.aborted)) {
@@ -2802,7 +2967,9 @@
                     try {
                         // Determine MIME type from content-type header
                         let mimeType = 'audio/mpeg'; // Default to MP3
-                        if (ct.includes('audio/wav') || ct.includes('audio/wave')) {
+                        if (ct.includes('audio/pcm') || ct.includes('audio/l16')) {
+                            mimeType = 'audio/pcm';
+                        } else if (ct.includes('audio/wav') || ct.includes('audio/wave')) {
                             mimeType = 'audio/wav';
                         } else if (ct.includes('audio/webm')) {
                             mimeType = 'audio/webm';
@@ -2810,8 +2977,123 @@
                             mimeType = 'audio/ogg';
                         } else if (ct.includes('audio/mp4') || ct.includes('audio/m4a')) {
                             mimeType = 'audio/mp4';
+                        } else if (ct.includes('audio/mp3') || ct.includes('audio/mpeg')) {
+                            // Normalize MP3 MIME for Safari/iOS compatibility.
+                            mimeType = 'audio/mpeg';
                         }
                         
+                        // Prefer WebAudio PCM playback on iOS for maximum compatibility and lip sync fidelity.
+                        const wantsPcm = reqBody.response_format === 'pcm';
+                        const looksLikePcm = mimeType === 'audio/pcm' || ct.includes('octet-stream');
+                        if (wantsPcm && looksLikePcm && reqBody.stream && res.body) {
+                            console.log('🎵 Using streaming WebAudio PCM16 path');
+                            stopChatterboxLipSync(true);
+                            const pcmCtx = ensureChatterboxLipSyncGraph();
+                            if (pcmCtx.state === 'suspended') {
+                                await pcmCtx.resume();
+                            }
+                            window.__opus.playhead = pcmCtx.currentTime;
+                            ttsStreamActive = true;
+                            startLipSyncFromAnalyserNode();
+
+                            const channels = Math.max(1, Number(res.headers.get('x-audio-channels') || res.headers.get('x-channels') || reqBody.channels || 1));
+                            const sampleRate = Math.max(8000, Number(res.headers.get('x-audio-sample-rate') || res.headers.get('x-sample-rate') || reqBody.sample_rate || 24000));
+                            const frameBytes = Math.max(2, channels * 2);
+                            let carry = new Uint8Array(0);
+                            const reader = res.body.getReader();
+                            while (true) {
+                                const { value, done } = await reader.read();
+                                if (done) break;
+                                if (!value || value.length === 0) continue;
+                                const joined = new Uint8Array(carry.length + value.length);
+                                joined.set(carry, 0);
+                                joined.set(value, carry.length);
+                                const alignedLen = joined.length - (joined.length % frameBytes);
+                                if (alignedLen > 0) {
+                                    playPcm16Bytes(joined.subarray(0, alignedLen), sampleRate, channels);
+                                }
+                                carry = joined.subarray(alignedLen);
+                            }
+                            ttsStreamActive = false;
+                            stopChatterboxLipSync(false);
+                            return;
+                        }
+
+                        if (wantsPcm && looksLikePcm) {
+                            console.log('🎵 Using WebAudio PCM16 playback path for iOS compatibility');
+                            const pcmBytes = await res.arrayBuffer();
+                            const header = new Uint8Array(pcmBytes.slice(0, 4));
+                            const looksLikeMp3 = (header[0] === 0x49 && header[1] === 0x44 && header[2] === 0x33) || (header[0] === 0xFF && (header[1] & 0xE0) === 0xE0);
+                            if (looksLikeMp3) {
+                                console.warn('⚠️ Upstream returned MP3 bytes while PCM was requested; falling back to blob playback');
+                                const mp3Blob = new Blob([pcmBytes], { type: 'audio/mpeg' });
+                                const audioUrl = URL.createObjectURL(mp3Blob);
+                                const audio = new Audio(audioUrl);
+                                audio.preload = 'auto';
+                                audio.crossOrigin = 'anonymous';
+                                audio.onended = () => {
+                                    URL.revokeObjectURL(audioUrl);
+                                    try { if (ttsLipSyncIntervalId) { clearInterval(ttsLipSyncIntervalId); ttsLipSyncIntervalId = null; } } catch(_){}
+                                    try { if (ttsRafId) { cancelAnimationFrame(ttsRafId); ttsRafId = 0; } } catch(_){}
+                                    try { ttsCleanupFns.forEach(fn => { try { fn(); } catch(_){} }); } catch(_){}
+                                    ttsCleanupFns = [];
+                                    if (live2dModel) { live2dModel.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0); }
+                                    if (vrmModel && document.getElementById('vrm-mode').checked) { animateVRMLipSync(0); }
+                                };
+                                startLipSyncFromAudioElement(audio);
+                                await audio.play();
+                                return;
+                            }
+                            const channels = Math.max(1, Number(res.headers.get('x-audio-channels') || res.headers.get('x-channels') || reqBody.channels || 1));
+                            const sampleRate = Math.max(8000, Number(res.headers.get('x-audio-sample-rate') || res.headers.get('x-sample-rate') || reqBody.sample_rate || 24000));
+                            const int16 = new Int16Array(pcmBytes);
+                            const framesPerChannel = Math.floor(int16.length / channels);
+                            if (!framesPerChannel) {
+                                throw new Error('PCM response did not include decodable audio frames');
+                            }
+
+                            stopChatterboxLipSync(true); // Reset any old state before starting PCM playback
+                            const pcmCtx = ensureChatterboxLipSyncGraph();
+                            if (pcmCtx.state === 'suspended') {
+                                await pcmCtx.resume();
+                            }
+                            startLipSyncFromAnalyserNode();
+
+                            const audioBuffer = pcmCtx.createBuffer(channels, framesPerChannel, sampleRate);
+                            for (let ch = 0; ch < channels; ch++) {
+                                const channelData = audioBuffer.getChannelData(ch);
+                                for (let i = 0; i < framesPerChannel; i++) {
+                                    channelData[i] = int16[(i * channels) + ch] / 32768;
+                                }
+                            }
+
+                            const src = pcmCtx.createBufferSource();
+                            src.buffer = audioBuffer;
+                            if (ttsAnalyserNode) {
+                                src.connect(ttsAnalyserNode);
+                            } else {
+                                src.connect(pcmCtx.destination);
+                            }
+
+                            ttsPcmActiveSources += 1;
+                            const handleEnded = () => {
+                                try { src.removeEventListener('ended', handleEnded); } catch (_) {}
+                                if (ttsPcmActiveSources > 0) ttsPcmActiveSources -= 1;
+                                if (ttsPcmActiveSources === 0) stopChatterboxLipSync(false);
+                            };
+                            src.addEventListener('ended', handleEnded, { once: true });
+
+                            ttsCleanupFns.push(() => {
+                                try { src.removeEventListener('ended', handleEnded); } catch (_) {}
+                                try { src.stop(0); } catch (_) {}
+                                try { src.disconnect(); } catch (_) {}
+                            });
+
+                            src.start();
+                            console.log('🎵 PCM16 playback started:', sampleRate, 'Hz, channels:', channels, 'frames:', framesPerChannel);
+                            return;
+                        }
+
                         // Check if MediaSource supports this format for streaming
                         // Note: MP3 is not well-supported by MediaSource API in most browsers
                         // For MP3, we'll use blob mode instead
@@ -2852,14 +3134,8 @@
                                                     audioStarted = true; // Mark as started
                                                     audio.play().then(() => { // When audio starts playing
                                                         console.log('🎵 Audio playback started (streaming, low latency)'); // Log playback start
-                                                        // Start lip sync using audio element
-                                                        const audioContext = new (window.AudioContext || window.webkitAudioContext)(); // Create audio context
-                                                        const source = audioContext.createMediaElementSource(audio); // Create source from audio element
-                                                        const analyser = audioContext.createAnalyser(); // Create analyser for lip sync
-                                                        analyser.fftSize = 256; // Set FFT size for analysis
-                                                        source.connect(analyser); // Connect source to analyser
-                                                        analyser.connect(audioContext.destination); // Connect analyser to output
-                                                        startLipSyncFromAnalyserNode(); // Start analyser-driven lip sync updates
+                                                        // Start lip sync for binary audio path
+                                                        startLipSyncFromAudioElement(audio); // Hook up lip sync to this audio element
                                                     }).catch(e => { // Catch play errors
                                                         console.error('Audio play error:', e); // Log error
                                                     }); // End play promise chain
@@ -2942,7 +3218,12 @@
                             // MediaSource not supported for this format, fall back to blob playback
                             console.warn('⚠️ MediaSource not supported for', mimeType, '- using blob playback'); // Log fallback
                             const audioBlob = await res.blob(); // Get audio data as blob
-                            const audioUrl = URL.createObjectURL(audioBlob); // Create object URL for blob
+                            // Re-wrap with normalized MIME because some TTS services return audio/mp3
+                            // which is less reliable on iOS Safari than audio/mpeg.
+                            const normalizedBlob = (audioBlob.type && audioBlob.type !== mimeType)
+                                ? new Blob([audioBlob], { type: mimeType })
+                                : audioBlob;
+                            const audioUrl = URL.createObjectURL(normalizedBlob); // Create object URL for blob
                             
                             // Create audio element and play
                             const audio = new Audio(audioUrl); // Create audio element
@@ -2962,16 +3243,8 @@
                                 if (vrmModel && document.getElementById('vrm-mode').checked) { animateVRMLipSync(0); }
                             }; // End onended handler
                             
-                            // Start basic lip sync using audio amplitude
-                            const audioContext = new (window.AudioContext || window.webkitAudioContext)(); // Create audio context
-                            const source = audioContext.createMediaElementSource(audio); // Create source from audio element
-                            const analyser = audioContext.createAnalyser(); // Create analyser for lip sync
-                            analyser.fftSize = 256; // Set FFT size for analysis
-                            source.connect(analyser); // Connect source to analyser
-                            analyser.connect(audioContext.destination); // Connect analyser to output
-                            
-                            // Start lip sync animation
-                            startLipSyncFromAnalyserNode(); // Start analyser-driven lip sync updates
+                            // Start lip sync for binary audio path
+                            startLipSyncFromAudioElement(audio); // Hook up lip sync to this audio element
                             
                             // Play the audio
                             await audio.play(); // Start playback
@@ -3299,6 +3572,18 @@
                     } // End continuation check
                 }; // End update function
 
+                const startLoop = () => { // Start analyser loop only once per playback
+                    if (rafId) return; // Avoid duplicate RAF loops
+                    update(); // Kick off mouth animation updates
+                };
+
+                const onPlay = () => { // Ensure loop starts even when hook is created before play()
+                    if (audioContext && audioContext.state === 'suspended') {
+                        audioContext.resume().catch(() => {});
+                    }
+                    startLoop();
+                };
+
                 const onEnded = () => { // Define cleanup on audio end
                     if (rafId) cancelAnimationFrame(rafId); // Cancel RAF loop
                     ttsRafId = 0; // Clear global raf id
@@ -3310,13 +3595,16 @@
                     try { analyser.disconnect(); } catch (_) {} // Detach analyser from graph
                     try { gain.disconnect(); } catch (_) {} // Detach gain from graph
                     try { URL.revokeObjectURL(audioEl.src); } catch (_) {} // Revoke object URL
+                    audioEl.removeEventListener('play', onPlay); // Remove play handler
                     audioEl.removeEventListener('ended', onEnded); // Remove event handler
                 }; // End onEnded
 
+                audioEl.addEventListener('play', onPlay); // Start analyser loop when playback begins
                 audioEl.addEventListener('ended', onEnded); // Wire cleanup on end
                 // Register cleanup for external cancellations
                 ttsCleanupFns.push(() => {
                     try { audioEl.pause(); } catch(_){}
+                    try { audioEl.removeEventListener('play', onPlay); } catch(_){}
                     try { audioEl.removeEventListener('ended', onEnded); } catch(_){}
                     try { source.disconnect(); } catch(_){}
                     try { analyser.disconnect(); } catch(_){}
@@ -3324,7 +3612,9 @@
                     try { if (rafId) cancelAnimationFrame(rafId); } catch(_){}
                     try { URL.revokeObjectURL(audioEl.src); } catch(_){}
                 });
-                update(); // Kick off the animation loop
+                if (!audioEl.paused && !audioEl.ended) { // Start immediately when already playing
+                    startLoop();
+                }
             } catch (e) { // Catch runtime issues constructing graph
                 console.warn('startLipSyncFromAudioElement failed:', e); // Log warning to console
             } // End try/catch
@@ -3401,6 +3691,51 @@
             }
         }
 
+        function hasMeaningfulValue(value) {
+            if (value == null) return false;
+            if (typeof value === 'string') return value.trim().length > 0;
+            return true;
+        }
+
+        function mergeTtsDefaults(settings, defaults) {
+            if (!defaults || typeof defaults !== 'object') return { settings, applied: false };
+            const merged = (settings && typeof settings === 'object') ? { ...settings } : {};
+            let applied = false;
+            if (!hasMeaningfulValue(merged.ttsEndpoint) && hasMeaningfulValue(defaults.ttsEndpoint)) {
+                merged.ttsEndpoint = defaults.ttsEndpoint;
+                applied = true;
+            }
+            if (!hasMeaningfulValue(merged.ttsModel) && hasMeaningfulValue(defaults.ttsModel)) {
+                merged.ttsModel = defaults.ttsModel;
+                applied = true;
+            }
+            if (!hasMeaningfulValue(merged.ttsVoice) && hasMeaningfulValue(defaults.ttsVoice)) {
+                merged.ttsVoice = defaults.ttsVoice;
+                applied = true;
+            }
+            return { settings: merged, applied };
+        }
+
+        async function fetchClientToolDefaults() {
+            try {
+                const res = await fetch(`${PROXY_BASE_URL}/v1/client-config`, {
+                    headers: { 'Authorization': `Bearer ${authToken}` }
+                });
+                if (!res.ok) return null;
+                const data = await res.json();
+                if (!data || typeof data !== 'object') return null;
+                const defaults = {
+                    ttsEndpoint: data.ttsEndpoint || '',
+                    ttsModel: data.ttsModel || '',
+                    ttsVoice: data.ttsVoice || ''
+                };
+                return defaults;
+            } catch (error) {
+                console.warn('Error fetching client config:', error);
+                return null;
+            }
+        }
+
         // Apply a settings object to DOM and globals; optionally re-initialize avatar if mode/model changed
         function applyToolSettingsToDOM(settings) {
             if (!settings || typeof settings !== 'object') return;
@@ -3439,7 +3774,15 @@
                 else ttsServiceMicrosoft.checked = true;
             }
             if (settings.ttsEndpoint !== undefined && ttsEndpointInput) ttsEndpointInput.value = settings.ttsEndpoint;
-            if (settings.ttsModel !== undefined && ttsModelDropdown) ttsModelDropdown.value = settings.ttsModel;
+            if (settings.ttsModel !== undefined && ttsModelDropdown) {
+                if (settings.ttsModel && !Array.from(ttsModelDropdown.options).some(o => o.value === settings.ttsModel)) {
+                    const opt = document.createElement('option');
+                    opt.value = settings.ttsModel;
+                    opt.textContent = settings.ttsModel;
+                    ttsModelDropdown.appendChild(opt);
+                }
+                ttsModelDropdown.value = settings.ttsModel;
+            }
             if (settings.ttsVoice !== undefined && ttsVoiceDropdown) ttsVoiceDropdown.value = settings.ttsVoice;
             const vrmVersionDropdown = document.getElementById('vrm-version-dropdown');
             if (settings.vrmVersion !== undefined && vrmVersionDropdown) {
@@ -3559,12 +3902,25 @@
         // Function to load tool settings from localStorage or from a provided settings object (e.g. companion)
         function loadToolSettings(optionalSettings) {
             try {
-                const settings = optionalSettings != null
+                let settings = optionalSettings != null
                     ? optionalSettings
                     : (() => { const s = localStorage.getItem('toolSettings'); return s ? JSON.parse(s) : null; })();
+                let appliedDefaults = false;
+                if (optionalSettings == null) {
+                    const merged = mergeTtsDefaults(settings, envToolDefaults);
+                    settings = merged.settings;
+                    appliedDefaults = merged.applied;
+                }
                 if (settings) {
                     applyToolSettingsToDOM(settings);
+                    if (appliedDefaults) saveToolSettings();
                     if (optionalSettings == null) console.log('Tool settings loaded from localStorage');
+                } else if (optionalSettings == null && envToolDefaults) {
+                    const merged = mergeTtsDefaults(null, envToolDefaults);
+                    if (merged.settings) {
+                        applyToolSettingsToDOM(merged.settings);
+                        if (merged.applied) saveToolSettings();
+                    }
                 }
             } catch (error) {
                 console.warn('Error loading tool settings:', error);

@@ -46,6 +46,17 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# Ensure embedded Kitten TTS package is present (fallback if direct URL in requirements was blocked)
+"$VENV_PYTHON" -c "import kittentts" >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  echo "Installing embedded Kitten TTS package (fallback)..."
+  "$VENV_PIP" install "https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentts-0.1.0-py3-none-any.whl"
+  if [ $? -ne 0 ]; then
+    echo "Kitten TTS install failed." >&2
+    exit 1
+  fi
+fi
+
 # 4. Playwright (main venv)
 echo ""
 echo "[4/10] Installing Playwright browsers..."

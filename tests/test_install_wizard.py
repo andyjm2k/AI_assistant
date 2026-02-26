@@ -84,8 +84,8 @@ def test_run_wizard_writes_https_cert_hostname():
     tmp_path = Path(tempfile.mkdtemp(prefix="test_wizard_", dir=str(Path(__file__).resolve().parent.parent)))
     try:
         env_path = tmp_path / ".env"
-        # Mock input: 1=ollama, default model, blank endpoint, blank brave, blank news, n=no telegram, custom hostname
-        with patch("builtins.input", side_effect=["1", "", "", "", "", "n", "mylan.local"]):
+        # Mock input: provider/model/endpoint/search/news/codex/telegram + TTS defaults + HTTPS hostname
+        with patch("builtins.input", side_effect=["1", "", "", "", "", "n", "n", "", "", "", "mylan.local"]):
             run_wizard(Path(tmp_path), env_path)
         content = env_path.read_text(encoding="utf-8")
         assert "HTTPS_CERT_HOSTNAME=mylan.local" in content
@@ -102,7 +102,7 @@ def test_run_wizard_uses_default_https_hostname_when_empty():
     tmp_path = Path(tempfile.mkdtemp(prefix="test_wizard_", dir=str(Path(__file__).resolve().parent.parent)))
     try:
         env_path = tmp_path / ".env"
-        with patch("builtins.input", side_effect=["1", "", "", "", "", "n", ""]):
+        with patch("builtins.input", side_effect=["1", "", "", "", "", "n", "n", "", "", "", ""]):
             run_wizard(Path(tmp_path), env_path)
         content = env_path.read_text(encoding="utf-8")
         assert "HTTPS_CERT_HOSTNAME=anton.local" in content

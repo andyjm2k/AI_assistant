@@ -60,6 +60,14 @@ if (-not (Test-Path $venvPython)) {
 & $venvPip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { Write-Host 'pip install failed.' -ForegroundColor Red; exit 1 }
 
+# Ensure embedded Kitten TTS package is present (fallback if direct URL in requirements was blocked)
+$kittenImport = & $venvPython -c "import kittentts; print('ok')" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'Installing embedded Kitten TTS package (fallback)...' -ForegroundColor Yellow
+    & $venvPip install "https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentts-0.1.0-py3-none-any.whl"
+    if ($LASTEXITCODE -ne 0) { Write-Host 'Kitten TTS install failed.' -ForegroundColor Red; exit 1 }
+}
+
 # 4. Playwright (main venv)
 Write-Host ([Environment]::NewLine + '[4/10] Installing Playwright browsers...') -ForegroundColor Yellow
 & $venvPython -m playwright install

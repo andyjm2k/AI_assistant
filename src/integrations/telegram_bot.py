@@ -23,6 +23,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import uuid
@@ -57,6 +58,9 @@ BACKEND_BASE_URL = os.getenv("TELEGRAM_BACKEND_URL", os.getenv("BACKEND_URL", "h
 CHAT_ENDPOINT = os.getenv("TELEGRAM_CHAT_ENDPOINT", "/v1/telegram/chat")
 TRANSCRIBE_ENDPOINT = os.getenv("TELEGRAM_TRANSCRIBE_ENDPOINT", "/v1/audio/transcriptions")
 TRANSCRIBE_MODEL = os.getenv("TELEGRAM_TRANSCRIBE_MODEL", "whisper-1")
+TTS_VOICE = os.getenv("TELEGRAM_TTS_VOICE", "alloy")
+TTS_MODEL = os.getenv("TELEGRAM_TTS_MODEL", "tts-1")
+TTS_RESPONSE_FORMAT = os.getenv("TELEGRAM_TTS_RESPONSE_FORMAT", "ogg")
 SYSTEM_PROMPT_OVERRIDE = os.getenv("TELEGRAM_BOT_SYSTEM_PROMPT")
 MODEL_OVERRIDE = os.getenv("TELEGRAM_CHAT_MODEL")
 TELEGRAM_SECRET = os.getenv("TELEGRAM_SECRET")
@@ -248,6 +252,57 @@ async def call_backend_transcription(
     return transcript
 
 
+def _guess_audio_filename(content_type: str) -> str:
+    lowered = (content_type or "").lower()
+    if "ogg" in lowered:
+        return "reply.ogg"
+    if "wav" in lowered:
+        return "reply.wav"
+    if "mpeg" in lowered or "mp3" in lowered:
+        return "reply.mp3"
+    return "reply.audio"
+
+
+def _is_ogg_opus(content_type: str, audio_bytes: bytes) -> bool:
+    lowered = (content_type or "").lower()
+    if "opus" in lowered:
+        return True
+    if "ogg" not in lowered:
+        return False
+    header = audio_bytes[:128] if audio_bytes else b""
+    return b"OpusHead" in header
+
+
+async def call_backend_tts(text: str) -> tuple[bytes, str]:
+    url = _build_backend_url("/v1/proxy/tts/speech")
+    headers = _backend_headers()
+    payload = {
+        "model": TTS_MODEL,
+        "input": text,
+        "voice": TTS_VOICE,
+        "response_format": TTS_RESPONSE_FORMAT,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=CHAT_TIMEOUT, verify=BACKEND_VERIFY_SSL) as client:
+            response = await client.post(
+                url,
+                params={"buffer": "true"},
+                json=payload,
+                headers=headers,
+                timeout=CHAT_TIMEOUT,
+            )
+    except httpx.RequestError as exc:
+        raise RuntimeError("Failed to reach TTS endpoint.") from exc
+
+    if response.status_code != 200:
+        logger.error("TTS backend error %s: %s", response.status_code, response.text)
+        raise RuntimeError("Backend returned an unexpected TTS error.")
+
+    content_type = response.headers.get("content-type", "audio/mpeg")
+    return response.content, content_type
+
+
 async def clear_backend_history(user_id: int) -> bool:
     delete_url = _build_backend_url(CHAT_ENDPOINT).rstrip("/") + f"/{user_id}"
     headers = _backend_headers()
@@ -329,6 +384,27 @@ async def _reply_with_backend_answer(
     with suppress(Exception):
         await status_task
     await update.message.reply_text(reply)
+
+    if VOICE_OUT_ENABLED:
+        try:
+            await update.message.chat.send_action(action=ChatAction.RECORD_VOICE)
+            audio_bytes, content_type = await call_backend_tts(reply)
+            filename = _guess_audio_filename(content_type)
+            audio_file = io.BytesIO(audio_bytes)
+            audio_file.name = filename
+            is_ogg_opus = _is_ogg_opus(content_type, audio_bytes)
+            logger.info(
+                "TTS reply audio bytes=%s content-type=%s ogg_opus=%s",
+                len(audio_bytes or b""),
+                content_type,
+                is_ogg_opus,
+            )
+            if is_ogg_opus:
+                await update.message.reply_voice(voice=audio_file, filename=filename)
+            else:
+                await update.message.reply_audio(audio=audio_file, filename=filename)
+        except Exception as exc:
+            logger.error("Voice reply failed: %s", exc, exc_info=True)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

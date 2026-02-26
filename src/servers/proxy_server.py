@@ -18,6 +18,7 @@ import hashlib
 import secrets
 import glob
 import socket
+import struct
 from typing import Dict, List, Optional, Any, Set, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, ConfigDict
 import uvicorn
@@ -126,6 +127,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
+def _env_str(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
 PROXY_RELOAD = _env_bool("PROXY_RELOAD", default=False)
 PROXY_RESTART_ENABLED = _env_bool("PROXY_RESTART_ENABLED", default=True)
 try:
@@ -135,6 +144,50 @@ except ValueError:
 
 _proxy_restart_scheduled = False
 PROXY_START_TIME = time.time()
+
+# Embedded Kitten TTS settings (disabled by default; set EMBEDDED_KITTEN_TTS_ENABLED=true)
+EMBEDDED_KITTEN_TTS_ENABLED = _env_bool("EMBEDDED_KITTEN_TTS_ENABLED", default=False)
+EMBEDDED_KITTEN_MODEL = os.environ.get("EMBEDDED_KITTEN_MODEL", "KittenML/kitten-tts-nano-0.2").strip()
+EMBEDDED_KITTEN_DEFAULT_VOICE = os.environ.get("EMBEDDED_KITTEN_DEFAULT_VOICE", "expr-voice-2-f").strip() or "expr-voice-2-f"
+EMBEDDED_KITTEN_VOICES = [
+    v.strip() for v in os.environ.get(
+        "EMBEDDED_KITTEN_VOICES",
+        "expr-voice-2-f,expr-voice-3-f,expr-voice-4-m,expr-voice-5-m,expr-voice-2-m,expr-voice-5-f",
+    ).split(",") if v.strip()
+]
+try:
+    EMBEDDED_KITTEN_SAMPLE_RATE = max(8000, int(os.environ.get("EMBEDDED_KITTEN_SAMPLE_RATE", "24000")))
+except ValueError:
+    EMBEDDED_KITTEN_SAMPLE_RATE = 24000
+try:
+    EMBEDDED_KITTEN_STREAM_CHUNK_BYTES = max(512, int(os.environ.get("EMBEDDED_KITTEN_STREAM_CHUNK_BYTES", "8192")))
+except ValueError:
+    EMBEDDED_KITTEN_STREAM_CHUNK_BYTES = 8192
+
+_embedded_kitten_model_instance = None
+_embedded_kitten_model_lock = asyncio.Lock()
+_embedded_kitten_model_repo_id: Optional[str] = None
+_embedded_kitten_voice_aliases: Dict[str, str] = {}
+
+EMBEDDED_KITTEN_COMPAT_VOICE_ALIASES: Dict[str, str] = {
+    # OpenAI-style names
+    "alloy": "expr-voice-5-m",
+    "echo": "expr-voice-2-m",
+    "fable": "expr-voice-3-f",
+    "onyx": "expr-voice-4-m",
+    "nova": "expr-voice-5-f",
+    "shimmer": "expr-voice-2-f",
+    # Kitten mini aliases and project-specific names seen in configs
+    "bella": "expr-voice-2-f",
+    "jasper": "expr-voice-2-m",
+    "luna": "expr-voice-3-f",
+    "bruno": "expr-voice-3-m",
+    "rosie": "expr-voice-4-f",
+    "hugo": "expr-voice-4-m",
+    "kiki": "expr-voice-5-f",
+    "leo": "expr-voice-5-m",
+    "empress": "expr-voice-4-f",
+}
 
 
 # Import memory system (with error handling)
@@ -179,6 +232,25 @@ except Exception as e:
     PHILOSOPHER_MODE_AVAILABLE = False
     PhilosopherMode = None
 
+# Optional embedded Kitten TTS (OpenAI-compatible /v1/audio/speech + /v1/audio/voices)
+try:
+    from kittentts import KittenTTS as EmbeddedKittenTTS
+    EMBEDDED_KITTEN_IMPORT_AVAILABLE = True
+except Exception as e:
+    EmbeddedKittenTTS = None
+    EMBEDDED_KITTEN_IMPORT_AVAILABLE = False
+    print(f"[WARN] Embedded Kitten TTS import not available: {e}")
+
+try:
+    from huggingface_hub import hf_hub_download as _hf_hub_download
+    from kittentts.onnx_model import KittenTTS_1_Onnx as _EmbeddedKittenOnnxModel
+    EMBEDDED_KITTEN_FALLBACK_LOADER_AVAILABLE = True
+except Exception as e:
+    _hf_hub_download = None
+    _EmbeddedKittenOnnxModel = None
+    EMBEDDED_KITTEN_FALLBACK_LOADER_AVAILABLE = False
+    print(f"[WARN] Embedded Kitten fallback loader unavailable: {e}")
+
 # Telegram tool parsing and execution (for Telegram tools parity with web client)
 try:
     from src.servers import telegram_tools as _telegram_tools
@@ -203,10 +275,10 @@ if DOTENV_AVAILABLE:
         load_dotenv(env_path)
         print(f"✅ Loaded environment variables from {env_path}")
     else:
-        print(f"⚠️  No .env file found. Using system environment variables.")
+        print(f"âš ï¸  No .env file found. Using system environment variables.")
         print(f"   Looked in: {env_path}")
 else:
-    print("⚠️  python-dotenv not available. Using system environment variables only.")
+    print("âš ï¸  python-dotenv not available. Using system environment variables only.")
 
 # Primary hostname for SSL cert discovery (same as https_server; configurable via HTTPS_CERT_HOSTNAME in .env)
 _SSL_CERT_HOSTNAME = (os.environ.get("HTTPS_CERT_HOSTNAME") or "anton.local").strip()
@@ -323,6 +395,17 @@ class TelegramChatResponse(BaseModel):
     reply: str
     conversation_id: str
     usage: Optional[Dict[str, Any]] = None
+
+
+class EmbeddedTtsSpeechRequest(BaseModel):
+    model: Optional[str] = None
+    voice: Optional[str] = None
+    input: str
+    response_format: Optional[str] = "wav"
+    stream: Optional[bool] = False
+    sample_rate: Optional[int] = None
+    channels: Optional[int] = 1
+    speed: Optional[float] = None
 
 
 class StatusStartRequest(BaseModel):
@@ -1047,7 +1130,7 @@ def load_users_db() -> None:
     try:
         users_db = json.loads(AUTH_USERS_FILE.read_text(encoding="utf-8"))
     except Exception as e:
-        print(f"⚠️ Failed to load users database: {e}")
+        print(f"âš ï¸ Failed to load users database: {e}")
         users_db = {}
 
 
@@ -1199,11 +1282,11 @@ if MEMORY_AVAILABLE:
             memory_manager = MemoryManager()
             print(f"✅ Memory system initialized with {memory_manager.count()} existing memories")
         else:
-            print("⚠️  Memory system disabled via MEMORY_ENABLED=false")
+            print("âš ï¸  Memory system disabled via MEMORY_ENABLED=false")
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        print(f"⚠️  Failed to initialize memory system: {e}")
+        print(f"âš ï¸  Failed to initialize memory system: {e}")
         print(f"   Full traceback:\n{error_trace}")
         memory_manager = None
 
@@ -1268,7 +1351,7 @@ class MCPClientManager:
             env.setdefault("BROWSER_USE_HEADLESS", "true")
             env.setdefault("BROWSER_USE_DISABLE_SECURITY", "false")
 
-            print(f"🔐 Environment variables for MCP server: {list(env.keys())}")
+            print(f"ðŸ” Environment variables for MCP server: {list(env.keys())}")
 
             server_params = StdioServerParameters(command=command, args=args, env=env)
 
@@ -1333,7 +1416,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             path = getattr(request.url, 'path', 'unknown') if hasattr(request, 'url') else 'unknown'
             query = getattr(request.url, 'query', '') if hasattr(request, 'url') and hasattr(request.url, 'query') else ''
             origin = request.headers.get('origin', 'none') if hasattr(request, 'headers') else 'none'
-            print(f"🌐 [{method}] {path}?{query}", flush=True)
+            print(f"ðŸŒ [{method}] {path}?{query}", flush=True)
             sys.stdout.flush()
             print(f"   Origin: {origin}", flush=True)
             sys.stdout.flush()
@@ -1342,7 +1425,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 sys.stdout.flush()
         except Exception as log_error:
             # If logging fails, continue anyway - don't break the request
-            print(f"⚠️ Error logging request: {log_error}", flush=True)
+            print(f"âš ï¸ Error logging request: {log_error}", flush=True)
             sys.stdout.flush()
             import traceback
             print(traceback.format_exc(), flush=True)
@@ -1359,7 +1442,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 print(f"✅ [{method}] {path} -> {status}", flush=True)
                 sys.stdout.flush()
             except Exception as log_err:
-                print(f"⚠️ Error logging response: {log_err}", flush=True)
+                print(f"âš ï¸ Error logging response: {log_err}", flush=True)
                 sys.stdout.flush()
             return response
         except Exception as e:
@@ -1367,13 +1450,13 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             try:
                 method = getattr(request, 'method', 'UNKNOWN')
                 path = getattr(request.url, 'path', 'unknown') if hasattr(request, 'url') else 'unknown'
-                print(f"❌ [{method}] {path} -> Exception: {e}", flush=True)
+                print(f"âŒ [{method}] {path} -> Exception: {e}", flush=True)
                 sys.stdout.flush()
                 import traceback
                 print(traceback.format_exc(), flush=True)
                 sys.stdout.flush()
             except Exception:
-                print("❌ Error in exception logging", flush=True)
+                print("âŒ Error in exception logging", flush=True)
                 sys.stdout.flush()
             # Re-raise the exception so it can be handled by exception handlers
             raise
@@ -1407,6 +1490,8 @@ async def require_auth_for_v1_routes(request: Request, call_next):
         "/v1/auth/login",
         "/v1/tools/log",  # Tool invocation log sink for HTML UI tool calls
         "/v1/audio/transcriptions",  # Whisper endpoint - public for audio transcription
+        "/v1/audio/speech",  # Embedded OpenAI-compatible TTS speech endpoint
+        "/v1/audio/voices",  # Embedded OpenAI-compatible TTS voices endpoint
         "/v1/proxy/chat/completions",  # Chat completions proxy - public to avoid mixed content
         "/v1/proxy/models",  # Models list proxy - public to avoid mixed content
         "/v1/proxy/autogen",  # AutoGen workflow proxy - public to avoid mixed content
@@ -1509,7 +1594,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     try:
         cors_headers = build_cors_headers(request)
     except Exception as header_error:
-        print(f"⚠️ Error building CORS headers in HTTPException handler: {header_error}")
+        print(f"âš ï¸ Error building CORS headers in HTTPException handler: {header_error}")
         # Use minimal safe headers if build_cors_headers fails
         cors_headers = {
             "Access-Control-Allow-Origin": "*",
@@ -1530,7 +1615,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     try:
         cors_headers = build_cors_headers(request)
     except Exception as header_error:
-        print(f"⚠️ Error building CORS headers in ValidationException handler: {header_error}")
+        print(f"âš ï¸ Error building CORS headers in ValidationException handler: {header_error}")
         # Use minimal safe headers if build_cors_headers fails
         cors_headers = {
             "Access-Control-Allow-Origin": "*",
@@ -1550,7 +1635,7 @@ async def general_exception_handler(request: Request, exc: Exception):
     import sys
     import traceback
     error_trace = traceback.format_exc()
-    print(f"❌ Unhandled exception in general_exception_handler: {exc}", flush=True)
+    print(f"âŒ Unhandled exception in general_exception_handler: {exc}", flush=True)
     sys.stdout.flush()
     print(error_trace, flush=True)
     sys.stdout.flush()
@@ -1559,7 +1644,7 @@ async def general_exception_handler(request: Request, exc: Exception):
     try:
         cors_headers = build_cors_headers(request)
     except Exception as header_error:
-        print(f"⚠️ Error building CORS headers: {header_error}", flush=True)
+        print(f"âš ï¸ Error building CORS headers: {header_error}", flush=True)
         sys.stdout.flush()
         import traceback
         print(traceback.format_exc(), flush=True)
@@ -1581,7 +1666,7 @@ async def general_exception_handler(request: Request, exc: Exception):
         sys.stdout.flush()
         return response
     except Exception as response_error:
-        print(f"❌ Error creating error response: {response_error}", flush=True)
+        print(f"âŒ Error creating error response: {response_error}", flush=True)
         sys.stdout.flush()
         import traceback
         print(traceback.format_exc(), flush=True)
@@ -1674,12 +1759,12 @@ def load_autogen_team():
     global autogen_team
     
     if not AUTOGEN_AVAILABLE:
-        print("⚠️  AutoGen not available, skipping team load")
+        print("âš ï¸  AutoGen not available, skipping team load")
         return None
     
     try:
         if not TEAM_CONFIG_FILE.exists():
-            print(f"⚠️  Team config file not found: {TEAM_CONFIG_FILE}")
+            print(f"âš ï¸  Team config file not found: {TEAM_CONFIG_FILE}")
             return None
             
         print(f"📂 Loading AutoGen team from {TEAM_CONFIG_FILE}...")
@@ -1723,7 +1808,7 @@ def load_autogen_team():
         
     except Exception as e:
         import traceback
-        print(f"❌ Error loading AutoGen team: {e}")
+        print(f"âŒ Error loading AutoGen team: {e}")
         print(traceback.format_exc())
         return None
 
@@ -1740,7 +1825,7 @@ async def _start_code_executors(team: Any) -> None:
             try:
                 await executor.start()
             except Exception as e:
-                print(f"⚠️ Code executor start warning: {e}")
+                print(f"âš ï¸ Code executor start warning: {e}")
         # AssistantAgent workbench tools may have .executor (e.g. PythonCodeExecutionTool)
         wb = getattr(agent, "workbench", getattr(agent, "_workbench", None))
         if wb is not None:
@@ -1754,7 +1839,7 @@ async def _start_code_executors(team: Any) -> None:
                             try:
                                 await ex.start()
                             except Exception as e:
-                                print(f"⚠️ Tool executor start warning: {e}")
+                                print(f"âš ï¸ Tool executor start warning: {e}")
 
 
 async def _stop_code_executors(team: Any) -> None:
@@ -1768,7 +1853,7 @@ async def _stop_code_executors(team: Any) -> None:
             try:
                 await executor.stop()
             except Exception as e:
-                print(f"⚠️ Code executor stop warning: {e}")
+                print(f"âš ï¸ Code executor stop warning: {e}")
         wb = getattr(agent, "workbench", getattr(agent, "_workbench", None))
         if wb is not None:
             wb_list = wb if isinstance(wb, list) else [wb]
@@ -1781,7 +1866,7 @@ async def _stop_code_executors(team: Any) -> None:
                             try:
                                 await ex.stop()
                             except Exception as e:
-                                print(f"⚠️ Tool executor stop warning: {e}")
+                                print(f"âš ï¸ Tool executor stop warning: {e}")
 
 
 # Load servers on startup (with error handling to prevent startup failures)
@@ -1790,7 +1875,7 @@ try:
     print(f"✅ Loaded {len(mcp_servers)} MCP servers from disk")
 except Exception as e:
     import traceback
-    print(f"⚠️ Warning: Could not load servers on startup: {e}")
+    print(f"âš ï¸ Warning: Could not load servers on startup: {e}")
     print(traceback.format_exc())
     # Continue anyway - server should still work without pre-loaded servers
 
@@ -1801,7 +1886,7 @@ try:
         print("✅ AutoGen team loaded successfully on startup")
 except Exception as e:
     import traceback
-    print(f"⚠️ Warning: Could not load AutoGen team on startup: {e}")
+    print(f"âš ï¸ Warning: Could not load AutoGen team on startup: {e}")
     print(traceback.format_exc())
     # Continue anyway - server should still work without AutoGen team
     autogen_team = None
@@ -2104,10 +2189,10 @@ async def _do_proxy_search(query: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Search query is required")
     brave_api_key = os.getenv('BRAVE_API_KEY')
     if not brave_api_key:
-        print("⚠️  BRAVE_API_KEY not configured. Falling back to DuckDuckGo.")
+        print("âš ï¸  BRAVE_API_KEY not configured. Falling back to DuckDuckGo.")
     else:
         try:
-            print(f"🔍 Using Brave Search API for query: {query[:50]}...")
+            print(f"ðŸ” Using Brave Search API for query: {query[:50]}...")
             async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.get(
                     'https://api.search.brave.com/res/v1/web/search',
@@ -2143,17 +2228,17 @@ async def _do_proxy_search(query: str) -> Dict[str, Any]:
                     print(f"✅ Brave Search returned {len(results)} results")
                     return {"results": results[:5], "source": "brave"}
                 else:
-                    print(f"⚠️  Brave Search returned no results in response")
+                    print(f"âš ï¸  Brave Search returned no results in response")
             elif response.status_code == 401:
-                print(f"❌ Brave Search API authentication failed (401). Check your BRAVE_API_KEY.")
+                print(f"âŒ Brave Search API authentication failed (401). Check your BRAVE_API_KEY.")
                 raise HTTPException(
                     status_code=500,
                     detail="Brave Search API authentication failed. Please check your BRAVE_API_KEY configuration."
                 )
             elif response.status_code == 429:
-                print(f"⚠️  Brave Search API rate limit exceeded (429). Falling back to DuckDuckGo.")
+                print(f"âš ï¸  Brave Search API rate limit exceeded (429). Falling back to DuckDuckGo.")
             else:
-                print(f"⚠️  Brave Search API returned status {response.status_code}. Falling back to DuckDuckGo.")
+                print(f"âš ï¸  Brave Search API returned status {response.status_code}. Falling back to DuckDuckGo.")
                 try:
                     error_data = response.json()
                     print(f"   Error details: {error_data}")
@@ -2162,16 +2247,16 @@ async def _do_proxy_search(query: str) -> Dict[str, Any]:
 
         except httpx.RequestError as e:
             error_msg = str(e) if str(e) else f"Network error: {type(e).__name__}"
-            print(f"❌ Brave Search network error: {error_msg}")
+            print(f"âŒ Brave Search network error: {error_msg}")
             print("   Falling back to DuckDuckGo...")
         except httpx.HTTPStatusError as e:
-            print(f"❌ Brave Search HTTP error: {e.response.status_code if e.response else 'Unknown'}")
+            print(f"âŒ Brave Search HTTP error: {e.response.status_code if e.response else 'Unknown'}")
             print("   Falling back to DuckDuckGo...")
         except HTTPException:
             raise
         except Exception as e:
             error_msg = str(e) if str(e) else f"Unknown error: {type(e).__name__}"
-            print(f"❌ Brave Search failed: {error_msg}")
+            print(f"âŒ Brave Search failed: {error_msg}")
             print("   Falling back to DuckDuckGo...")
             import traceback
             print(traceback.format_exc())
@@ -2221,7 +2306,7 @@ async def _do_proxy_search(query: str) -> Dict[str, Any]:
             if len(results) >= 5:
                 break
         if len(results) == 0:
-            print(f"⚠️  DuckDuckGo search: No results found with regex patterns. HTML preview: {html[:1000]}")
+            print(f"âš ï¸  DuckDuckGo search: No results found with regex patterns. HTML preview: {html[:1000]}")
             return {"results": [], "source": "duckduckgo", "message": "No results found. DuckDuckGo HTML structure may have changed."}
         print(f"✅ DuckDuckGo returned {len(results)} results")
         return {"results": results, "source": "duckduckgo"}
@@ -2543,7 +2628,7 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
                 if hasattr(autogen_team, '_executors_started'):
                     delattr(autogen_team, '_executors_started')
     except Exception as e:
-        print(f"⚠️  Error checking team config modification time: {e}")
+        print(f"âš ï¸  Error checking team config modification time: {e}")
     if not getattr(autogen_team, '_executors_started', False):
         await _start_code_executors(autogen_team)
         try:
@@ -2583,7 +2668,7 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
         }
     except Exception as e:
         import traceback
-        print(f"❌ AutoGen team execution error: {e}")
+        print(f"âŒ AutoGen team execution error: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"AutoGen team execution failed: {str(e)}")
 
@@ -2824,7 +2909,7 @@ async def autogen_chat(request: Request):
         raise
     except Exception as e:
         import traceback
-        print(f"❌ AutoGen endpoint error: {e}")
+        print(f"âŒ AutoGen endpoint error: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to process AutoGen request: {str(e)}")
 
@@ -3192,8 +3277,8 @@ async def call_tool(server_id: str, request: ToolCallRequest):
         tool_name = request.toolName
         parameters = request.parameters or {}
         _log_tool_invocation(f"mcp_call:{server_id}", tool_name, parameters)
-        print(f"🔍 [TOOLS/CALL] Tool name: {tool_name}")
-        print(f"🔍 [TOOLS/CALL] Parameters: {parameters}")
+        print(f"ðŸ” [TOOLS/CALL] Tool name: {tool_name}")
+        print(f"ðŸ” [TOOLS/CALL] Parameters: {parameters}")
 
         # Browser-use preset: use HTTP client (no mcp_clients entry)
         if server and _is_browser_use_server(server):
@@ -3201,7 +3286,7 @@ async def call_tool(server_id: str, request: ToolCallRequest):
                 result = await _browser_use_http_call_tool(tool_name, parameters)
                 return {"result": result}
             except Exception as e:
-                print(f"❌ [TOOLS/CALL] Browser-use HTTP error: {e}")
+                print(f"âŒ [TOOLS/CALL] Browser-use HTTP error: {e}")
                 raise HTTPException(
                     status_code=503,
                     detail=BROWSER_USE_HTTP_UNAVAILABLE_MSG + " " + str(e),
@@ -3209,11 +3294,11 @@ async def call_tool(server_id: str, request: ToolCallRequest):
 
         client = mcp_clients.get(server_id)
         if not client:
-            print(f"❌ [TOOLS/CALL] Server {server_id} not found or not connected")
+            print(f"âŒ [TOOLS/CALL] Server {server_id} not found or not connected")
             raise HTTPException(status_code=404, detail="Server is not connected")
 
         if not tool_name:
-            print("❌ [TOOLS/CALL] toolName is required but missing")
+            print("âŒ [TOOLS/CALL] toolName is required but missing")
             raise HTTPException(status_code=400, detail="toolName is required")
 
         result = await client.request(
@@ -3235,7 +3320,7 @@ async def list_tools(server_id: str):
         raise HTTPException(status_code=503, detail="MCP SDK not available")
 
     try:
-        print(f"🔍 [TOOLS/LIST] Server: {server_id}")
+        print(f"ðŸ” [TOOLS/LIST] Server: {server_id}")
 
         server = mcp_servers.get(server_id)
         # Browser-use preset: list tools from HTTP server
@@ -3244,7 +3329,7 @@ async def list_tools(server_id: str):
                 result = await _browser_use_http_list_tools()
                 return {"result": result}
             except Exception as e:
-                print(f"❌ [TOOLS/LIST] Browser-use HTTP error: {e}")
+                print(f"âŒ [TOOLS/LIST] Browser-use HTTP error: {e}")
                 raise HTTPException(
                     status_code=503,
                     detail=BROWSER_USE_HTTP_UNAVAILABLE_MSG + " " + str(e),
@@ -3253,7 +3338,7 @@ async def list_tools(server_id: str):
         global mcp_clients
         client = mcp_clients.get(server_id)
         if not client:
-            print(f"❌ [TOOLS/LIST] Server {server_id} not found or not connected")
+            print(f"âŒ [TOOLS/LIST] Server {server_id} not found or not connected")
             raise HTTPException(status_code=404, detail="Server is not connected")
 
         result = await client.request(
@@ -3265,28 +3350,28 @@ async def list_tools(server_id: str):
 
         # Validate response structure
         if not result:
-            print("❌ [TOOLS/LIST] No result returned from MCP server")
+            print("âŒ [TOOLS/LIST] No result returned from MCP server")
         elif 'tools' not in result:
-            print(f"❌ [TOOLS/LIST] Missing 'tools' field in response: {list(result.keys())}")
+            print(f"âŒ [TOOLS/LIST] Missing 'tools' field in response: {list(result.keys())}")
         elif not isinstance(result['tools'], list):
-            print(f"❌ [TOOLS/LIST] 'tools' field is not an array: {type(result['tools'])}")
+            print(f"âŒ [TOOLS/LIST] 'tools' field is not an array: {type(result['tools'])}")
         else:
             print(f"✅ [TOOLS/LIST] Found {len(result['tools'])} tools in response")
             for i, tool in enumerate(result['tools']):
                 print(f"  Tool {i}: {tool.get('name', 'unnamed')}")
                 if 'name' not in tool:
-                    print(f"    ❌ Missing name for tool {i}")
+                    print(f"    âŒ Missing name for tool {i}")
                 if 'description' not in tool:
-                    print(f"    ⚠️  Missing description for tool {i}")
+                    print(f"    âš ï¸  Missing description for tool {i}")
                 if 'inputSchema' not in tool:
-                    print(f"    ⚠️  Missing inputSchema for tool {i}")
+                    print(f"    âš ï¸  Missing inputSchema for tool {i}")
                 else:
                     schema = tool['inputSchema']
                     print(f"    ✅ inputSchema type: {schema.get('type')}")
                     if 'properties' in schema:
                         print(f"    ✅ Has {len(schema['properties'])} properties")
                     else:
-                        print("    ⚠️  No properties in inputSchema")
+                        print("    âš ï¸  No properties in inputSchema")
 
         return {"result": result}
 
@@ -5387,19 +5472,31 @@ async def health_check():
     """Health check endpoint."""
     # Add explicit logging to debug
     import sys
-    print("🏥 Health check endpoint called", flush=True)
+    print("ðŸ¥ Health check endpoint called", flush=True)
     sys.stdout.flush()
     try:
         result = {"status": "healthy", "timestamp": time.time()}
-        print(f"🏥 Health check returning: {result}", flush=True)
+        print(f"ðŸ¥ Health check returning: {result}", flush=True)
         sys.stdout.flush()
         return result
     except Exception as e:
         import traceback
-        print(f"❌ Health check error: {e}", flush=True)
+        print(f"âŒ Health check error: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
         sys.stdout.flush()
         raise
+
+
+@app.get("/v1/client-config")
+async def client_config():
+    """Expose safe client defaults from .env (no secrets)."""
+    tts_model = _env_str("TTS_MODEL") or _env_str("TELEGRAM_TTS_MODEL")
+    tts_voice = _env_str("TTS_VOICE") or _env_str("TELEGRAM_TTS_VOICE")
+    return {
+        "ttsEndpoint": _env_str("TTS_ENDPOINT"),
+        "ttsModel": tts_model,
+        "ttsVoice": tts_voice,
+    }
 
 # Models list proxy endpoint to handle CORS and mixed content
 @app.get("/v1/proxy/models")
@@ -5451,7 +5548,7 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
         
         # Check if the response is successful
         if response.status_code != 200:
-            print(f"❌ LLM service returned error: {response.status_code}")
+            print(f"âŒ LLM service returned error: {response.status_code}")
             print(f"   Response text: {response.text[:500]}")
             return JSONResponse(
                 content=response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text},
@@ -5463,20 +5560,20 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
             response_data = response.json()
             return JSONResponse(content=response_data, status_code=200)
         except Exception as json_error:
-            print(f"❌ Failed to parse JSON response: {json_error}")
+            print(f"âŒ Failed to parse JSON response: {json_error}")
             return JSONResponse(
                 content={"error": "Invalid JSON response from LLM service"},
                 status_code=500
             )
     
     except httpx.ConnectError as e:
-        print(f"❌ Connection error: Could not connect to LLM service")
+        print(f"âŒ Connection error: Could not connect to LLM service")
         raise HTTPException(
             status_code=503,
             detail=f"Could not connect to LLM service. Please check the endpoint configuration."
         )
     except Exception as e:
-        print(f"❌ Models list proxy error: {e}")
+        print(f"âŒ Models list proxy error: {e}")
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy models list request: {str(e)}")
@@ -5499,7 +5596,7 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
     else:
         print(f"   Using configured MCP_BROWSER_SERVER_URL: {mcp_browser_url}")
     endpoint = f"{mcp_browser_url.rstrip('/')}/api/browser-agent"
-    print(f"🌐 Proxying browser-agent request to: {endpoint}")
+    print(f"ðŸŒ Proxying browser-agent request to: {endpoint}")
     health_endpoint = f"{mcp_browser_url.rstrip('/')}/api/health"
     health_check_passed = False
     try:
@@ -5508,7 +5605,7 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
             if health_response.status_code == 200:
                 health_check_passed = True
     except Exception as health_err:
-        print(f"   ⚠️  MCP browser server health check failed: {health_err}")
+        print(f"   âš ï¸  MCP browser server health check failed: {health_err}")
         if not mcp_browser_url.startswith("http://127.0.0.1"):
             mcp_browser_url = "http://127.0.0.1:5001"
             endpoint = f"{mcp_browser_url.rstrip('/')}/api/browser-agent"
@@ -5520,13 +5617,13 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
     if not health_check_passed:
-        print(f"   ⚠️  Warning: Health check failed, but continuing with request")
+        print(f"   âš ï¸  Warning: Health check failed, but continuing with request")
     timeout = httpx.Timeout(connect=10.0, read=10800.0, write=10.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         try:
             response = await client.post(endpoint, json=body, headers={'Content-Type': 'application/json'})
         except httpx.ConnectError as conn_err:
-            print(f"❌ Connection error to MCP browser server: {conn_err}")
+            print(f"âŒ Connection error to MCP browser server: {conn_err}")
             raise HTTPException(
                 status_code=503,
                 detail="Could not connect to MCP browser server. Please ensure it's running on port 5001."
@@ -5581,13 +5678,13 @@ async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
         try:
             response = await client.post(endpoint, json=body, headers={'Content-Type': 'application/json'})
         except httpx.ConnectError as conn_err:
-            print(f"❌ Connection error to MCP browser server: {conn_err}")
+            print(f"âŒ Connection error to MCP browser server: {conn_err}")
             raise HTTPException(
                 status_code=503,
                 detail="Could not connect to MCP browser server. Please ensure it's running on port 5001."
             )
         except httpx.ReadTimeout as timeout_err:
-            print(f"❌ Read timeout from MCP browser server: {timeout_err}")
+            print(f"âŒ Read timeout from MCP browser server: {timeout_err}")
             raise HTTPException(
                 status_code=504,
                 detail="Deep research task timed out. Please try again or check the MCP browser server logs."
@@ -5609,7 +5706,7 @@ async def proxy_deep_research(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Deep-research proxy error: {e}")
+        print(f"âŒ Deep-research proxy error: {e}")
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy deep-research request: {str(e)}")
@@ -5683,7 +5780,7 @@ async def proxy_chat_completions(request: Request):
         
         # Check if the response is successful
         if response.status_code != 200:
-            print(f"❌ LLM service returned error: {response.status_code}")
+            print(f"âŒ LLM service returned error: {response.status_code}")
             print(f"   Response text: {response.text[:500]}")
             error_text = response.text or ""
             if is_context_limit_error(response.status_code, error_text):
@@ -5710,7 +5807,7 @@ async def proxy_chat_completions(request: Request):
                         response_data = response.json()
                         return JSONResponse(content=response_data, status_code=200)
                     except Exception as json_error:
-                        print(f"❌ Failed to parse JSON response after retry: {json_error}")
+                        print(f"âŒ Failed to parse JSON response after retry: {json_error}")
                         return JSONResponse(content={"error": "Invalid JSON response from LLM service"}, status_code=500)
             return JSONResponse(
                 content=response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text},
@@ -5722,20 +5819,20 @@ async def proxy_chat_completions(request: Request):
             response_data = response.json()
             return JSONResponse(content=response_data, status_code=200)
         except Exception as json_error:
-            print(f"❌ Failed to parse JSON response: {json_error}")
+            print(f"âŒ Failed to parse JSON response: {json_error}")
             return JSONResponse(
                 content={"error": "Invalid JSON response from LLM service"},
                 status_code=500
             )
     
     except httpx.ConnectError as e:
-        print(f"❌ Connection error: Could not connect to LLM service")
+        print(f"âŒ Connection error: Could not connect to LLM service")
         raise HTTPException(
             status_code=503,
             detail=f"Could not connect to LLM service. Please check the endpoint configuration."
         )
     except Exception as e:
-        print(f"❌ Chat completions proxy error: {e}")
+        print(f"âŒ Chat completions proxy error: {e}")
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy chat completions request: {str(e)}")
@@ -5766,7 +5863,7 @@ async def proxy_whisper(request: Request):
         # Get the Whisper endpoint (defaulting to localhost:8001)
         whisper_endpoint = os.getenv('WHISPER_ENDPOINT', 'http://localhost:8001/v1/audio/transcriptions')
         
-        print(f"📝 Proxying Whisper request to: {whisper_endpoint}")
+        print(f"ðŸ“ Proxying Whisper request to: {whisper_endpoint}")
         
         # Outgoing auth to Whisper/OpenAI uses only WHISPER_API_KEY (client Authorization is for proxy auth, not forwarded)
         forward_headers = {}
@@ -5802,7 +5899,7 @@ async def proxy_whisper(request: Request):
         
         # Check if the response is successful
         if response.status_code != 200:
-            print(f"❌ Whisper service returned error: {response.status_code}")
+            print(f"âŒ Whisper service returned error: {response.status_code}")
             print(f"   Response text: {response.text}")
             return JSONResponse(
                 content={"error": f"Whisper service error: {response.text}"},
@@ -5815,7 +5912,7 @@ async def proxy_whisper(request: Request):
             print(f"✅ Parsed JSON response: {response_data}")
             return JSONResponse(content=response_data, status_code=200)
         except Exception as json_error:
-            print(f"❌ Failed to parse JSON response: {json_error}")
+            print(f"âŒ Failed to parse JSON response: {json_error}")
             print(f"   Raw response text: {response.text[:200]}")
             # Return the raw text if JSON parsing fails
             return JSONResponse(
@@ -5824,19 +5921,390 @@ async def proxy_whisper(request: Request):
             )
     
     except httpx.ConnectError as e:
-        print(f"❌ Connection error: Could not connect to Whisper service at {whisper_endpoint}")
+        print(f"âŒ Connection error: Could not connect to Whisper service at {whisper_endpoint}")
         print(f"   Make sure the Whisper service is running on port 8001")
         raise HTTPException(
             status_code=503,
             detail=f"Could not connect to Whisper service. Make sure it's running on port 8001."
         )
     except Exception as e:
-        print(f"❌ Whisper proxy error: {e}")
+        print(f"âŒ Whisper proxy error: {e}")
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy Whisper request: {str(e)}")
 
+def _build_wav_header(sample_rate: int, channels: int, bits_per_sample: int, pcm_bytes_len: int) -> bytes:
+    channels = max(1, int(channels))
+    sample_rate = max(8000, int(sample_rate))
+    bits_per_sample = max(8, int(bits_per_sample))
+    block_align = channels * (bits_per_sample // 8)
+    byte_rate = sample_rate * block_align
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36 + pcm_bytes_len)
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", 16)
+        + struct.pack("<H", 1)
+        + struct.pack("<H", channels)
+        + struct.pack("<I", sample_rate)
+        + struct.pack("<I", byte_rate)
+        + struct.pack("<H", block_align)
+        + struct.pack("<H", bits_per_sample)
+        + b"data"
+        + struct.pack("<I", pcm_bytes_len)
+    )
+
+
+def _float_audio_to_pcm16_bytes(audio: Any) -> bytes:
+    try:
+        import numpy as np  # type: ignore
+
+        arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+        arr = np.clip(arr, -1.0, 1.0)
+        return (arr * 32767.0).astype(np.int16).tobytes()
+    except Exception:
+        pass
+
+    out = bytearray()
+    try:
+        for value in (audio or []):
+            f = float(value)
+            if f > 1.0:
+                f = 1.0
+            elif f < -1.0:
+                f = -1.0
+            out.extend(struct.pack("<h", int(f * 32767.0)))
+    except Exception as exc:
+        raise RuntimeError(f"Could not convert generated audio to PCM16: {exc}") from exc
+    return bytes(out)
+
+
+def _normalize_embedded_kitten_repo_id(model_name: Optional[str]) -> str:
+    raw = (model_name or EMBEDDED_KITTEN_MODEL or "").strip()
+    if not raw:
+        raw = "KittenML/kitten-tts-nano-0.2"
+    if "/" not in raw:
+        return f"KittenML/{raw}"
+    return raw
+
+
+def _get_embedded_kitten_available_voices(model: Any) -> List[str]:
+    available = getattr(model, "available_voices", None)
+    if not available:
+        return []
+    if isinstance(available, (list, tuple, set)):
+        return [str(v).strip() for v in available if str(v).strip()]
+    return []
+
+
+def _fetch_embedded_kitten_config(repo_id: str) -> Dict[str, Any]:
+    if _hf_hub_download is None:
+        return {}
+    try:
+        config_path = _hf_hub_download(repo_id=repo_id, filename="config.json")
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _extract_embedded_kitten_voice_aliases(config: Dict[str, Any]) -> Dict[str, str]:
+    aliases: Dict[str, str] = {}
+    raw_aliases = config.get("voice_aliases")
+    if isinstance(raw_aliases, dict):
+        for alias, target in raw_aliases.items():
+            alias_key = str(alias).strip().lower()
+            target_value = str(target).strip()
+            if alias_key and target_value:
+                aliases[alias_key] = target_value
+    return aliases
+
+
+def _coerce_embedded_kitten_style_embeddings(model: Any) -> bool:
+    """Normalize legacy voice embeddings to match ONNX style tensor shape."""
+    session = getattr(model, "session", None)
+    voices_obj = getattr(model, "voices", None)
+    if session is None or voices_obj is None:
+        return False
+
+    try:
+        style_input = next((inp for inp in session.get_inputs() if inp.name == "style"), None)
+    except Exception:
+        return False
+    if style_input is None:
+        return False
+
+    shape = list(getattr(style_input, "shape", []) or [])
+    expected_batch = shape[0] if len(shape) >= 1 else None
+    expected_width = shape[1] if len(shape) >= 2 else None
+
+    keys: List[str] = []
+    if isinstance(voices_obj, dict):
+        keys = [str(k) for k in voices_obj.keys()]
+    elif hasattr(voices_obj, "files"):
+        keys = [str(k) for k in getattr(voices_obj, "files", [])]
+    if not keys:
+        return False
+
+    patched: Dict[str, Any] = {}
+    changed = False
+    for key in keys:
+        try:
+            style_embedding = voices_obj[key]
+        except Exception:
+            continue
+
+        embedding_shape = tuple(getattr(style_embedding, "shape", ()) or ())
+        normalized = style_embedding
+
+        if expected_batch == 1:
+            if len(embedding_shape) == 1:
+                if expected_width is None or embedding_shape[0] == expected_width:
+                    try:
+                        normalized = style_embedding.reshape((1, embedding_shape[0]))
+                        changed = True
+                    except Exception:
+                        normalized = style_embedding
+            elif len(embedding_shape) >= 2 and embedding_shape[0] != 1:
+                if expected_width is None or embedding_shape[-1] == expected_width:
+                    normalized = style_embedding[:1]
+                    changed = True
+
+        patched[key] = normalized
+
+    if not changed:
+        return False
+
+    model.voices = patched
+    if hasattr(model, "available_voices"):
+        available = [k for k in keys if k in patched]
+        if available:
+            model.available_voices = available
+    print("Normalized embedded KittenTTS voice embeddings for ONNX style input compatibility")
+    return True
+
+
+def _load_embedded_kitten_model_sync(repo_id: str) -> Tuple[Any, Dict[str, str]]:
+    if not EMBEDDED_KITTEN_IMPORT_AVAILABLE or EmbeddedKittenTTS is None:
+        raise RuntimeError("Embedded Kitten TTS import unavailable.")
+
+    config = _fetch_embedded_kitten_config(repo_id)
+    alias_map = _extract_embedded_kitten_voice_aliases(config)
+
+    try:
+        model = EmbeddedKittenTTS(repo_id)
+        _coerce_embedded_kitten_style_embeddings(model)
+        return model, alias_map
+    except ValueError as exc:
+        if "Unsupported model type" not in str(exc):
+            raise
+        if not EMBEDDED_KITTEN_FALLBACK_LOADER_AVAILABLE or _hf_hub_download is None or _EmbeddedKittenOnnxModel is None:
+            raise RuntimeError(
+                f"Model {repo_id} is unsupported by installed kittentts and fallback loader is unavailable."
+            ) from exc
+
+        config = config or _fetch_embedded_kitten_config(repo_id)
+        model_type = str(config.get("type", "")).strip().upper()
+        model_file = str(config.get("model_file", "")).strip()
+        voices_file = str(config.get("voices", "")).strip()
+        if model_type not in {"ONNX1", "ONNX2"} or not model_file or not voices_file:
+            raise RuntimeError(
+                f"Model {repo_id} uses unsupported type '{model_type or 'unknown'}'."
+            ) from exc
+
+        model_path = _hf_hub_download(repo_id=repo_id, filename=model_file)
+        voices_path = _hf_hub_download(repo_id=repo_id, filename=voices_file)
+        alias_map = alias_map or _extract_embedded_kitten_voice_aliases(config)
+        model = _EmbeddedKittenOnnxModel(model_path=model_path, voices_path=voices_path)
+        _coerce_embedded_kitten_style_embeddings(model)
+        return model, alias_map
+
+
+def _resolve_embedded_kitten_voice(
+    requested_voice: str,
+    available_voices: List[str],
+    alias_map: Dict[str, str],
+) -> str:
+    requested = (requested_voice or "").strip()
+    if not requested:
+        return available_voices[0] if available_voices else EMBEDDED_KITTEN_DEFAULT_VOICE
+
+    available_lookup = {voice.lower(): voice for voice in available_voices}
+    if requested in available_voices:
+        return requested
+    if requested.lower() in available_lookup:
+        return available_lookup[requested.lower()]
+
+    alias_target = alias_map.get(requested.lower()) or EMBEDDED_KITTEN_COMPAT_VOICE_ALIASES.get(requested.lower())
+    if alias_target:
+        mapped = available_lookup.get(alias_target.lower())
+        if mapped:
+            return mapped
+        if alias_target in available_voices:
+            return alias_target
+
+    if available_voices:
+        available_preview = ", ".join(available_voices)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported voice '{requested}'. Available voices: {available_preview}",
+        )
+    return requested
+
+
+async def _get_embedded_kitten_model(model_name: Optional[str] = None) -> Tuple[Any, Dict[str, str]]:
+    global _embedded_kitten_model_instance, _embedded_kitten_model_repo_id, _embedded_kitten_voice_aliases
+
+    if not EMBEDDED_KITTEN_TTS_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedded Kitten TTS is disabled. Set EMBEDDED_KITTEN_TTS_ENABLED=true.",
+        )
+
+    if not EMBEDDED_KITTEN_IMPORT_AVAILABLE or EmbeddedKittenTTS is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedded Kitten TTS is unavailable. Install kitten-tts support dependencies.",
+        )
+
+    target_repo_id = _normalize_embedded_kitten_repo_id(model_name)
+
+    async with _embedded_kitten_model_lock:
+        if _embedded_kitten_model_instance is None or _embedded_kitten_model_repo_id != target_repo_id:
+            try:
+                print(f"Loading embedded KittenTTS model: {target_repo_id}")
+                model, alias_map = await asyncio.to_thread(_load_embedded_kitten_model_sync, target_repo_id)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Failed to load embedded Kitten TTS model '{target_repo_id}': {exc}",
+                ) from exc
+
+            _embedded_kitten_model_instance = model
+            _embedded_kitten_model_repo_id = target_repo_id
+            _embedded_kitten_voice_aliases = alias_map
+            print("Embedded KittenTTS model loaded")
+
+    return _embedded_kitten_model_instance, _embedded_kitten_voice_aliases
+
+
+async def _generate_embedded_kitten_pcm(
+    text: str,
+    voice: str,
+    model_name: Optional[str] = None,
+    speed: Optional[float] = None,
+) -> bytes:
+    model, alias_map = await _get_embedded_kitten_model(model_name=model_name)
+    resolved_voice = _resolve_embedded_kitten_voice(
+        requested_voice=voice,
+        available_voices=_get_embedded_kitten_available_voices(model),
+        alias_map=alias_map,
+    )
+
+    kwargs: Dict[str, Any] = {"voice": resolved_voice}
+    if speed is not None:
+        kwargs["speed"] = speed
+
+    try:
+        generated = await asyncio.to_thread(model.generate, text, **kwargs)
+    except TypeError:
+        kwargs.pop("speed", None)
+        generated = await asyncio.to_thread(model.generate, text, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Embedded Kitten TTS rejected request: {exc}") from exc
+
+    pcm_bytes = _float_audio_to_pcm16_bytes(generated)
+    if not pcm_bytes:
+        raise RuntimeError("Embedded Kitten TTS generated empty audio.")
+    return pcm_bytes
+
+@app.get("/v1/audio/voices")
+async def embedded_audio_voices():
+    """OpenAI-compatible voices endpoint served directly by proxy_server (embedded KittenTTS)."""
+    if not EMBEDDED_KITTEN_TTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Embedded Kitten TTS endpoint is disabled.")
+    voices = EMBEDDED_KITTEN_VOICES or [EMBEDDED_KITTEN_DEFAULT_VOICE]
+    return JSONResponse(
+        content={
+            "object": "list",
+            "data": [
+                {"id": voice_id, "object": "voice", "name": voice_id}
+                for voice_id in voices
+            ],
+        },
+        status_code=200,
+    )
+
+
+@app.post("/v1/audio/speech")
+async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
+    """OpenAI-compatible TTS speech endpoint served directly by proxy_server (embedded KittenTTS)."""
+    if not EMBEDDED_KITTEN_TTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Embedded Kitten TTS endpoint is disabled.")
+
+    text = (payload.input or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Input text is required.")
+
+    requested_model = (payload.model or EMBEDDED_KITTEN_MODEL or "").strip() or EMBEDDED_KITTEN_MODEL
+    requested_voice = (payload.voice or EMBEDDED_KITTEN_DEFAULT_VOICE or "").strip() or EMBEDDED_KITTEN_DEFAULT_VOICE
+    sample_rate = max(8000, int(payload.sample_rate or EMBEDDED_KITTEN_SAMPLE_RATE))
+    channels = max(1, int(payload.channels or 1))
+    response_format = (payload.response_format or "wav").strip().lower()
+    stream_mode = bool(payload.stream)
+
+    pcm_bytes = await _generate_embedded_kitten_pcm(
+        text=text,
+        voice=requested_voice,
+        model_name=requested_model,
+        speed=payload.speed,
+    )
+    headers = {
+        "X-Audio-Sample-Rate": str(sample_rate),
+        "X-Audio-Channels": str(channels),
+        "Cache-Control": "no-store",
+    }
+
+    if response_format in {"pcm", "l16", "s16le"}:
+        media_type = "audio/pcm"
+        if stream_mode:
+            async def pcm_stream():
+                for i in range(0, len(pcm_bytes), EMBEDDED_KITTEN_STREAM_CHUNK_BYTES):
+                    yield pcm_bytes[i:i + EMBEDDED_KITTEN_STREAM_CHUNK_BYTES]
+                    await asyncio.sleep(0)
+
+            return StreamingResponse(pcm_stream(), media_type=media_type, headers=headers)
+        return Response(content=pcm_bytes, media_type=media_type, headers=headers, status_code=200)
+
+    wav_bytes = _build_wav_header(sample_rate=sample_rate, channels=channels, bits_per_sample=16, pcm_bytes_len=len(pcm_bytes)) + pcm_bytes
+    if stream_mode:
+        async def wav_stream():
+            yield wav_bytes[:44]
+            await asyncio.sleep(0)
+            payload_bytes = wav_bytes[44:]
+            for i in range(0, len(payload_bytes), EMBEDDED_KITTEN_STREAM_CHUNK_BYTES):
+                yield payload_bytes[i:i + EMBEDDED_KITTEN_STREAM_CHUNK_BYTES]
+                await asyncio.sleep(0)
+
+        return StreamingResponse(wav_stream(), media_type="audio/wav", headers=headers)
+    return Response(content=wav_bytes, media_type="audio/wav", headers=headers, status_code=200)
+
 # TTS voices proxy endpoint to handle CORS
+def _should_skip_tts_tls_verify(base_url: str) -> bool:
+    """Return True for local HTTPS TTS endpoints where self-signed certs are common."""
+    try:
+        parsed = urlparse(base_url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https":
+            return False
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        return host.endswith(".local")
+    except Exception:
+        return False
+
+
 @app.get("/v1/proxy/tts/voices")
 async def proxy_tts_voices(endpoint: str):
     """Proxy TTS voices requests to handle CORS. Tries /voices first, then /v1/audio/voices."""
@@ -5869,6 +6337,10 @@ async def proxy_tts_voices(endpoint: str):
                 if not base_url.startswith('http'):
                     base_url = f"http://{base_url}"
         
+        skip_tls_verify = _should_skip_tts_tls_verify(base_url)
+        if skip_tls_verify:
+            print(f"[WARN] TTS voices proxy: TLS verification disabled for local endpoint: {base_url}")
+
         # Try /voices first (Chatterbox style)
         voices_url_primary = f"{base_url}/voices"
         print(f"🎤 Trying primary TTS voices endpoint: {voices_url_primary}")
@@ -5876,7 +6348,7 @@ async def proxy_tts_voices(endpoint: str):
         response = None
         response_data = None
         
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=(not skip_tls_verify)) as client:
             try:
                 # Try the primary endpoint first
                 response = await client.get(
@@ -5896,7 +6368,7 @@ async def proxy_tts_voices(endpoint: str):
                         print(f"✅ Parsed TTS voices JSON response from primary endpoint")
                         return JSONResponse(content=response_data, status_code=200)
                     except Exception as json_error:
-                        print(f"❌ Failed to parse JSON response: {json_error}")
+                        print(f"âŒ Failed to parse JSON response: {json_error}")
                         print(f"   Raw response text: {response.text[:200]}")
                         # Return the raw text if JSON parsing fails
                         return JSONResponse(
@@ -5905,7 +6377,7 @@ async def proxy_tts_voices(endpoint: str):
                         )
             except (httpx.ConnectError, httpx.HTTPStatusError) as e:
                 # Primary endpoint failed, try fallback
-                print(f"⚠️ Primary endpoint failed: {e}")
+                print(f"âš ï¸ Primary endpoint failed: {e}")
                 response = None
             
             # If primary failed, try /v1/audio/voices (OpenAI-compatible style)
@@ -5931,7 +6403,7 @@ async def proxy_tts_voices(endpoint: str):
                             print(f"✅ Parsed TTS voices JSON response from fallback endpoint")
                             return JSONResponse(content=response_data, status_code=200)
                         except Exception as json_error:
-                            print(f"❌ Failed to parse JSON response: {json_error}")
+                            print(f"âŒ Failed to parse JSON response: {json_error}")
                             print(f"   Raw response text: {response.text[:200]}")
                             # Return the raw text if JSON parsing fails
                             return JSONResponse(
@@ -5940,20 +6412,20 @@ async def proxy_tts_voices(endpoint: str):
                             )
                     else:
                         # Fallback also failed
-                        print(f"❌ Fallback TTS service returned error: {response.status_code}")
+                        print(f"âŒ Fallback TTS service returned error: {response.status_code}")
                         print(f"   Response text: {response.text[:200]}")
                         raise HTTPException(
                             status_code=response.status_code,
                             detail=f"TTS service error: {response.text[:200]}"
                         )
                 except httpx.ConnectError as e:
-                    print(f"❌ Connection error: Could not connect to TTS service at {voices_url_fallback}")
+                    print(f"âŒ Connection error: Could not connect to TTS service at {voices_url_fallback}")
                     raise HTTPException(
                         status_code=503,
                         detail=f"Could not connect to TTS service. Tried {voices_url_primary} and {voices_url_fallback}"
                     )
                 except httpx.HTTPStatusError as e:
-                    print(f"❌ HTTP error from fallback TTS service: {e.response.status_code}")
+                    print(f"âŒ HTTP error from fallback TTS service: {e.response.status_code}")
                     raise HTTPException(
                         status_code=e.response.status_code,
                         detail=f"TTS service returned error: {str(e)}"
@@ -5975,19 +6447,19 @@ async def proxy_tts_voices(endpoint: str):
         # Re-raise HTTP exceptions as-is
         raise
     except httpx.ConnectError as e:
-        print(f"❌ Connection error: Could not connect to TTS service at {endpoint}")
+        print(f"âŒ Connection error: Could not connect to TTS service at {endpoint}")
         raise HTTPException(
             status_code=503,
             detail=f"Could not connect to TTS service at {endpoint}"
         )
     except httpx.HTTPStatusError as e:
-        print(f"❌ HTTP error from TTS service: {e.response.status_code}")
+        print(f"âŒ HTTP error from TTS service: {e.response.status_code}")
         raise HTTPException(
             status_code=e.response.status_code,
             detail=f"TTS service returned error: {str(e)}"
         )
     except Exception as e:
-        print(f"❌ TTS voices proxy error: {e}")
+        print(f"âŒ TTS voices proxy error: {e}")
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy TTS voices request: {str(e)}")
@@ -5997,6 +6469,7 @@ async def proxy_tts_voices(endpoint: str):
 async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
     """Proxy TTS speech requests to handle CORS. Supports streaming responses."""
     try:
+        buffer_response = request.query_params.get("buffer", "").lower() in {"1", "true", "yes", "on"}
         # Get endpoint from query parameter or try to extract from request
         if not endpoint:
             # Try to get from query params
@@ -6059,94 +6532,90 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
         auth_header = request.headers.get('Authorization')
         if auth_header:
             forward_headers['Authorization'] = auth_header
+
+        skip_tls_verify = _should_skip_tts_tls_verify(base_url)
+        if skip_tls_verify:
+            print(f"[WARN] TTS speech proxy: TLS verification disabled for local endpoint: {base_url}")
+
+        if buffer_response:
+            async with httpx.AsyncClient(timeout=60.0, verify=(not skip_tls_verify)) as client:
+                response = await client.post(
+                    speech_url,
+                    json=request_body,
+                    headers=forward_headers,
+                )
+            content_type = response.headers.get('content-type', 'audio/mpeg')
+            # Safari/iOS can fail to decode blobs labeled as audio/mp3; normalize to audio/mpeg.
+            if isinstance(content_type, str) and content_type.lower().startswith('audio/mp3'):
+                content_type = 'audio/mpeg'
+            if response.status_code != 200:
+                print(f"âŒ TTS service returned error (buffered): {response.status_code}")
+                return Response(
+                    content=response.content,
+                    media_type=content_type,
+                    status_code=response.status_code,
+                )
+            return Response(
+                content=response.content,
+                media_type=content_type,
+                status_code=200,
+            )
         
-        # Create a streaming response generator
-        # We need to peek at the response to get the actual content-type
-        # Since we can't change media_type after StreamingResponse is created,
-        # we'll use a wrapper that can handle both SSE and binary audio
-        
-        class TTSStreamWrapper:
-            """Wrapper to handle both SSE and binary audio responses."""
-            def __init__(self):
-                self.content_type = None
-                self.first_chunk = True
-                
-            async def __aiter__(self):
-                try:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
-                        async with client.stream(
-                            'POST',
-                            speech_url,
-                            json=request_body,
-                            headers=forward_headers
-                        ) as response:
-                            print(f"✅ TTS speech response status: {response.status_code}")
-                            
-                            # Log request details for debugging
-                            print(f"📤 TTS request body: {json.dumps(request_body, indent=2)[:500]}")
-                            print(f"📤 TTS request headers: {forward_headers}")
-                            
-                            # Capture the actual content type from the TTS service
-                            self.content_type = response.headers.get('content-type', 'audio/mpeg')
-                            print(f"📦 TTS response content-type: {self.content_type}")
-                            
-                            # Check if the response is successful
-                            if response.status_code != 200:
-                                error_text = await response.aread()
-                                print(f"❌ TTS service returned error: {response.status_code}")
-                                print(f"   Response text: {error_text[:200]}")
-                                # Yield error as bytes
-                                if isinstance(error_text, bytes):
-                                    yield error_text
-                                else:
-                                    yield str(error_text).encode('utf-8')
-                                return
-                            
-                            # Stream the response chunk by chunk as bytes
-                            # This preserves binary audio data (MP3, WAV, etc.) or SSE text
-                            async for chunk in response.aiter_bytes():
-                                if chunk:
-                                    yield chunk
-                                    
-                except httpx.ConnectError as e:
-                    print(f"❌ Connection error: Could not connect to TTS service at {speech_url}")
-                    error_msg = f"Error: Could not connect to TTS service at {speech_url}"
-                    yield error_msg.encode('utf-8')
-                except Exception as e:
-                    print(f"❌ TTS speech proxy error: {e}")
-                    import traceback
-                    print(traceback.format_exc())
-                    error_msg = f"Error: Failed to proxy TTS speech request: {str(e)}"
-                    yield error_msg.encode('utf-8')
-        
-        stream_wrapper = TTSStreamWrapper()
-        
-        # Determine initial content-type based on Accept header
-        # If client requests SSE, use that; otherwise default to audio/mpeg
-        # The actual content-type will be in the response headers
-        initial_content_type = 'audio/mpeg'  # Default
-        if accept_header and 'text/event-stream' in accept_header:
-            initial_content_type = 'text/event-stream'  # Use SSE if requested
-        
-        # Use StreamingResponse with the initial content-type
-        # The actual content-type from the TTS service will be in the response headers
-        # JavaScript will check res.headers.get('content-type') to get the actual type
-        # Note: FastAPI's StreamingResponse sets Content-Type based on media_type parameter,
-        # but the actual response from the TTS service should have its own content-type header
-        # that JavaScript can read. However, if Chatterbox is returning audio/mpeg instead of
-        # text/event-stream, that means Chatterbox itself is not respecting the stream_format: 'sse'
-        # parameter or the Accept header.
-        
-        response_obj = StreamingResponse(
-            stream_wrapper,
-            media_type=initial_content_type,  # Initial guess based on Accept header
-            status_code=200
+        # Open upstream stream first so we can forward the *actual* content-type.
+        # This avoids mislabeling MP3 as SSE, which breaks browser playback/parsing.
+        client = httpx.AsyncClient(timeout=60.0, verify=(not skip_tls_verify))
+        try:
+            upstream_response = await client.send(
+                client.build_request(
+                    "POST",
+                    speech_url,
+                    json=request_body,
+                    headers=forward_headers,
+                ),
+                stream=True,
+            )
+        except Exception:
+            await client.aclose()
+            raise
+
+        print(f"✅ TTS speech response status: {upstream_response.status_code}")
+        print(f"📤 TTS request body: {json.dumps(request_body, indent=2)[:500]}")
+        print(f"📤 TTS request headers: {forward_headers}")
+        upstream_content_type = upstream_response.headers.get("content-type", "audio/mpeg")
+        # Normalize non-standard MP3 MIME type for better iOS Safari compatibility.
+        if isinstance(upstream_content_type, str) and upstream_content_type.lower().startswith("audio/mp3"):
+            upstream_content_type = "audio/mpeg"
+        print(f"📦 TTS response content-type: {upstream_content_type}")
+
+        if upstream_response.status_code != 200:
+            error_body = await upstream_response.aread()
+            print(f"âŒ TTS service returned error: {upstream_response.status_code}")
+            print(f"   Response text: {error_body[:200]}")
+            await upstream_response.aclose()
+            await client.aclose()
+            return Response(
+                content=error_body,
+                status_code=upstream_response.status_code,
+                headers={"Content-Type": upstream_content_type},
+            )
+
+        async def stream_upstream():
+            try:
+                async for chunk in upstream_response.aiter_bytes():
+                    if chunk:
+                        yield chunk
+            finally:
+                await upstream_response.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            stream_upstream(),
+            status_code=200,
+            headers={"Content-Type": upstream_content_type},
         )
-        
-        return response_obj
     
     except Exception as e:
-        print(f"❌ TTS speech proxy error: {e}")
+        print(f"âŒ TTS speech proxy error: {e}")
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy TTS speech request: {str(e)}")
@@ -7054,7 +7523,7 @@ async def upload_to_drive(request: Request, current_user: Dict[str, Any] = Depen
         user_sub = current_user.get("sub") if current_user else "unknown"
         print(f"[AUDIT] upload-to-drive user={user_sub} folder_id={folder_id or 'n/a'} success=false error={str(e)}")
         # Handle any other errors
-        print(f"❌ Google Drive upload error: {e}")
+        print(f"âŒ Google Drive upload error: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to upload file to Google Drive: {str(e)}"
