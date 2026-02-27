@@ -8,6 +8,7 @@ import ast
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 # Optional persistent todo store (used when todo_user_key is in context)
@@ -188,38 +189,152 @@ async def execute_telegram_tool(
         action = (arguments.get("action") or "").strip().lower()
         task_id = arguments.get("taskId")
         task_description = (arguments.get("taskDescription") or "").strip()
+        scheduled_for = (arguments.get("scheduledFor") or arguments.get("scheduled_for") or "").strip() or None
+        clear_schedule = bool(arguments.get("clearSchedule") or arguments.get("clear_schedule"))
+        clear_recurrence = bool(arguments.get("clearRecurrence") or arguments.get("clear_recurrence"))
+
+        recurrence: Optional[Dict[str, Any]] = None
+        recurrence_arg = arguments.get("recurrence")
+        if isinstance(recurrence_arg, dict):
+            freq = str(recurrence_arg.get("frequency", "")).strip().lower()
+            interval = recurrence_arg.get("interval", 1)
+            if freq:
+                try:
+                    recurrence = {"frequency": freq, "interval": int(interval)}
+                except (TypeError, ValueError):
+                    return {"success": False, "message": "recurrence.interval must be a number."}
+        else:
+            repeat_frequency = str(arguments.get("repeatFrequency") or arguments.get("repeat_frequency") or "").strip().lower()
+            repeat_interval = arguments.get("repeatInterval", arguments.get("repeat_interval", 1))
+            if repeat_frequency:
+                try:
+                    recurrence = {"frequency": repeat_frequency, "interval": int(repeat_interval)}
+                except (TypeError, ValueError):
+                    return {"success": False, "message": "repeatInterval must be a number."}
+
         use_persistent = todo_user_key and _todo_store_module is not None
         if not use_persistent:
             return {
                 "success": False,
                 "message": "Todo list is not available (persistent store not configured). Please use the web app with sign-in or ensure the server has todo storage enabled.",
             }
-        tasks = _todo_store_module.load_tasks(todo_user_key)
+
+        def _parse_task_id(value: Any) -> Optional[int]:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed
+
+        def _load_meta() -> Dict[str, Any]:
+            meta_loader = getattr(_todo_store_module, "load_tasks_with_meta", None)
+            if callable(meta_loader):
+                loaded = meta_loader(todo_user_key)
+                if isinstance(loaded, dict):
+                    tasks_out = loaded.get("tasks")
+                    task_items_out = loaded.get("task_items")
+                    if not isinstance(tasks_out, list):
+                        tasks_out = []
+                    if not isinstance(task_items_out, list):
+                        task_items_out = []
+                    return {"tasks": tasks_out, "task_items": task_items_out}
+            fallback = _todo_store_module.load_tasks(todo_user_key)
+            fallback = fallback if isinstance(fallback, list) else []
+            return {"tasks": [str(t) for t in fallback], "task_items": []}
+
+        meta = _load_meta()
+        tasks = meta["tasks"]
+        task_items = meta["task_items"]
+
         if action == "list":
             if not tasks:
                 return {"success": True, "message": "Your todo list is empty."}
-            lines = [f"{i + 1}. {t}" for i, t in enumerate(tasks)]
-            return {"success": True, "message": "Here are your current tasks:\n" + "\n".join(lines)}
+            if not task_items:
+                task_items = [{"description": t} for t in tasks]
+
+            now_utc = datetime.now(timezone.utc)
+            lines = []
+            for i, item in enumerate(task_items):
+                description = str(item.get("description") or (tasks[i] if i < len(tasks) else "")).strip()
+                next_run = item.get("next_run_at")
+                recurrence_item = item.get("recurrence")
+                suffix_parts = []
+                if next_run:
+                    due_marker = ""
+                    try:
+                        next_run_text = str(next_run)
+                        if next_run_text.endswith("Z"):
+                            next_run_text = next_run_text[:-1] + "+00:00"
+                        parsed_next = datetime.fromisoformat(next_run_text)
+                        if parsed_next.tzinfo is None:
+                            parsed_next = parsed_next.replace(tzinfo=timezone.utc)
+                        if parsed_next.astimezone(timezone.utc) <= now_utc:
+                            due_marker = ", due now"
+                    except ValueError:
+                        pass
+                    suffix_parts.append(f"next: {next_run}{due_marker}")
+                if isinstance(recurrence_item, dict):
+                    freq = str(recurrence_item.get("frequency", "")).strip().lower()
+                    interval = recurrence_item.get("interval", 1)
+                    if freq:
+                        try:
+                            interval_value = int(interval)
+                        except (TypeError, ValueError):
+                            interval_value = 1
+                        unit = freq if interval_value == 1 else f"{freq}s"
+                        suffix_parts.append(f"repeats every {interval_value} {unit}")
+                suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
+                lines.append(f"{i + 1}. {description}{suffix}")
+            return {"success": True, "message": "Here are your current tasks:\n" + "\n".join(lines), "data": meta}
+
         if action == "add":
             if not task_description:
                 return {"success": False, "message": "Task description is required."}
-            _todo_store_module.add_task(todo_user_key, task_description)
+            try:
+                _todo_store_module.add_task(
+                    todo_user_key,
+                    task_description,
+                    scheduled_for=scheduled_for,
+                    recurrence=recurrence,
+                )
+            except ValueError as e:
+                return {"success": False, "message": str(e)}
             return {"success": True, "message": f"Added task: {task_description}"}
+
         if action == "update":
-            if task_id is None or not task_description:
-                return {"success": False, "message": "Both task ID and new description are required."}
-            idx = int(task_id) if isinstance(task_id, (int, float)) else None
+            idx = _parse_task_id(task_id)
             if idx is None or idx < 1 or idx > len(tasks):
                 return {"success": False, "message": "Invalid task ID."}
+            description_for_update = task_description if task_description else None
+            if (
+                description_for_update is None
+                and scheduled_for is None
+                and recurrence is None
+                and not clear_schedule
+                and not clear_recurrence
+            ):
+                return {
+                    "success": False,
+                    "message": "Provide at least one update field (taskDescription, scheduledFor, recurrence, clearSchedule, clearRecurrence).",
+                }
             try:
-                _todo_store_module.update_task(todo_user_key, idx, task_description)
+                _todo_store_module.update_task(
+                    todo_user_key,
+                    idx,
+                    description_for_update,
+                    scheduled_for=scheduled_for,
+                    recurrence=recurrence,
+                    clear_schedule=clear_schedule,
+                    clear_recurrence=clear_recurrence,
+                )
             except ValueError:
                 return {"success": False, "message": "Invalid task ID."}
-            return {"success": True, "message": f'Updated task {idx} to "{task_description}"'}
+            return {"success": True, "message": f"Updated task {idx}."}
+
         if action == "delete":
             if task_id is None:
                 return {"success": False, "message": "Task ID is required."}
-            idx = int(task_id) if isinstance(task_id, (int, float)) else None
+            idx = _parse_task_id(task_id)
             if idx is None or idx < 1 or idx > len(tasks):
                 return {"success": False, "message": "Invalid task ID."}
             try:
@@ -227,6 +342,29 @@ async def execute_telegram_tool(
             except ValueError:
                 return {"success": False, "message": "Invalid task ID."}
             return {"success": True, "message": f"Deleted task {idx}."}
+
+        if action == "complete":
+            if task_id is None:
+                return {"success": False, "message": "Task ID is required."}
+            idx = _parse_task_id(task_id)
+            if idx is None or idx < 1 or idx > len(tasks):
+                return {"success": False, "message": "Invalid task ID."}
+            try:
+                complete_fn = getattr(_todo_store_module, "complete_task", None)
+                if callable(complete_fn):
+                    result = complete_fn(todo_user_key, idx)
+                    if isinstance(result, dict) and result.get("rescheduled"):
+                        next_run_at = result.get("next_run_at") or "the next scheduled run"
+                        return {
+                            "success": True,
+                            "message": f"Completed task {idx}. This repeating task was rescheduled for {next_run_at}.",
+                        }
+                else:
+                    _todo_store_module.delete_task(todo_user_key, idx)
+            except ValueError:
+                return {"success": False, "message": "Invalid task ID."}
+            return {"success": True, "message": f"Completed task {idx}."}
+
         if action == "clear":
             _todo_store_module.clear_tasks(todo_user_key)
             return {"success": True, "message": "Todo list has been cleared."}

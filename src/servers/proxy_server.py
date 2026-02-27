@@ -33,7 +33,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import uvicorn
 
 from src.utils.token_budget import (
@@ -114,14 +114,21 @@ MCP_BROWSER_USE_HTTP_URL = os.environ.get("MCP_BROWSER_USE_HTTP_URL", "http://12
 BROWSER_USE_HTTP_UNAVAILABLE_MSG = (
     "Browser-use HTTP server not available. Start it with: uv run mcp-server-browser-use server (in mcp-browser-use directory)."
 )
-BOM_API_BASE_URL = os.environ.get("BOM_API_BASE_URL", "https://api.weather.bom.gov.au/v1").strip().rstrip("/")
+OPEN_METEO_FORECAST_BASE_URL = os.environ.get("OPEN_METEO_FORECAST_BASE_URL", "https://api.open-meteo.com/v1/forecast").strip().rstrip("/")
+OPEN_METEO_GEOCODING_BASE_URL = os.environ.get("OPEN_METEO_GEOCODING_BASE_URL", "https://geocoding-api.open-meteo.com/v1/search").strip().rstrip("/")
+_open_meteo_timeout_value = os.environ.get("OPEN_METEO_TIMEOUT_SECONDS", os.environ.get("BOM_API_TIMEOUT_SECONDS", "12"))
 try:
-    BOM_API_TIMEOUT_SECONDS = float(os.environ.get("BOM_API_TIMEOUT_SECONDS", "12"))
+    OPEN_METEO_TIMEOUT_SECONDS = float(_open_meteo_timeout_value)
 except ValueError:
-    BOM_API_TIMEOUT_SECONDS = 12.0
-BOM_API_TRUST_ENV = os.environ.get("BOM_API_TRUST_ENV", "").strip().lower() in {"1", "true", "yes", "y", "on"}
-BOM_API_USER_AGENT = os.environ.get("BOM_API_USER_AGENT", "CATBot/1.0 (+bom-weather-tool)").strip() or "CATBot/1.0"
-BOM_ALLOWED_HOST_SUFFIX = "bom.gov.au"
+    OPEN_METEO_TIMEOUT_SECONDS = 12.0
+_open_meteo_trust_env_value = os.environ.get("OPEN_METEO_TRUST_ENV", os.environ.get("BOM_API_TRUST_ENV", ""))
+OPEN_METEO_TRUST_ENV = str(_open_meteo_trust_env_value).strip().lower() in {"1", "true", "yes", "y", "on"}
+OPEN_METEO_USER_AGENT = (
+    os.environ.get("OPEN_METEO_USER_AGENT")
+    or os.environ.get("BOM_API_USER_AGENT")
+    or "CATBot/1.0 (+open-meteo-weather-tool)"
+).strip() or "CATBot/1.0"
+OPEN_METEO_ALLOWED_HOST_SUFFIX = "open-meteo.com"
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name, "")
@@ -356,16 +363,40 @@ class AuthUserResponse(BaseModel):
 
 
 # Todo REST API request/response models (all endpoints require auth)
+class TodoRecurrenceRequest(BaseModel):
+    frequency: str
+    interval: int = Field(default=1, ge=1, le=10000)
+
+
 class TodoAddRequest(BaseModel):
     taskDescription: str
+    scheduledFor: Optional[str] = None
+    recurrence: Optional[TodoRecurrenceRequest] = None
 
 
 class TodoUpdateRequest(BaseModel):
+    taskDescription: Optional[str] = None
+    scheduledFor: Optional[str] = None
+    recurrence: Optional[TodoRecurrenceRequest] = None
+    clearSchedule: bool = False
+    clearRecurrence: bool = False
+
+
+class TodoTaskItemResponse(BaseModel):
+    taskId: int
     taskDescription: str
+    scheduledFor: Optional[str] = None
+    nextRunAt: Optional[str] = None
+    recurrence: Optional[Dict[str, Any]] = None
+    lastCompletedAt: Optional[str] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    isDue: bool = False
 
 
 class TodoListResponse(BaseModel):
     tasks: List[str]
+    taskItems: List[TodoTaskItemResponse] = []
     updated_at: Optional[str] = None
 
 
@@ -2441,6 +2472,47 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _open_meteo_weather_code_to_text(code: Any) -> str:
+    code_int: Optional[int]
+    try:
+        code_int = int(float(code))
+    except (TypeError, ValueError):
+        code_int = None
+    mapping = {
+        0: "clear sky",
+        1: "mainly clear",
+        2: "partly cloudy",
+        3: "overcast",
+        45: "fog",
+        48: "depositing rime fog",
+        51: "light drizzle",
+        53: "moderate drizzle",
+        55: "dense drizzle",
+        56: "light freezing drizzle",
+        57: "dense freezing drizzle",
+        61: "slight rain",
+        63: "moderate rain",
+        65: "heavy rain",
+        66: "light freezing rain",
+        67: "heavy freezing rain",
+        71: "slight snow fall",
+        73: "moderate snow fall",
+        75: "heavy snow fall",
+        77: "snow grains",
+        80: "slight rain showers",
+        81: "moderate rain showers",
+        82: "violent rain showers",
+        85: "slight snow showers",
+        86: "heavy snow showers",
+        95: "thunderstorm",
+        96: "thunderstorm with slight hail",
+        99: "thunderstorm with heavy hail",
+    }
+    if code_int is None:
+        return "unknown"
+    return mapping.get(code_int, f"weather code {code_int}")
+
+
 def _extract_memory_location(memories: List[Dict[str, Any]]) -> Optional[str]:
     if not memories:
         return None
@@ -2480,37 +2552,33 @@ async def _resolve_weather_location(location: Optional[str], user_id: Optional[s
 async def _do_proxy_weather(location: Optional[str], detail: str = "summary", user_id: Optional[str] = None, memory_manager: Any = None) -> Dict[str, Any]:
     resolved_location, source = await _resolve_weather_location(location, user_id, memory_manager)
     detail = _normalize_weather_detail(detail)
-    parsed_base = urlparse(BOM_API_BASE_URL)
-    if not parsed_base.scheme.startswith("http"):
-        raise HTTPException(status_code=500, detail="Invalid BOM_API_BASE_URL configuration")
-    if not parsed_base.hostname or not parsed_base.hostname.endswith(BOM_ALLOWED_HOST_SUFFIX):
-        raise HTTPException(status_code=500, detail="BOM_API_BASE_URL host is not allowlisted")
+    parsed_geocoding_base = urlparse(OPEN_METEO_GEOCODING_BASE_URL)
+    if not parsed_geocoding_base.scheme.startswith("http"):
+        raise HTTPException(status_code=500, detail="Invalid OPEN_METEO_GEOCODING_BASE_URL configuration")
+    if not parsed_geocoding_base.hostname or not parsed_geocoding_base.hostname.endswith(OPEN_METEO_ALLOWED_HOST_SUFFIX):
+        raise HTTPException(status_code=500, detail="OPEN_METEO_GEOCODING_BASE_URL host is not allowlisted")
+    parsed_forecast_base = urlparse(OPEN_METEO_FORECAST_BASE_URL)
+    if not parsed_forecast_base.scheme.startswith("http"):
+        raise HTTPException(status_code=500, detail="Invalid OPEN_METEO_FORECAST_BASE_URL configuration")
+    if not parsed_forecast_base.hostname or not parsed_forecast_base.hostname.endswith(OPEN_METEO_ALLOWED_HOST_SUFFIX):
+        raise HTTPException(status_code=500, detail="OPEN_METEO_FORECAST_BASE_URL host is not allowlisted")
 
-    search_url = f"{BOM_API_BASE_URL}/locations"
-    bom_headers = {"Accept": "application/json", "User-Agent": BOM_API_USER_AGENT}
+    weather_headers = {"Accept": "application/json", "User-Agent": OPEN_METEO_USER_AGENT}
     try:
-        async with httpx.AsyncClient(timeout=BOM_API_TIMEOUT_SECONDS, trust_env=BOM_API_TRUST_ENV, follow_redirects=True) as client:
-            loc_resp = await client.get(search_url, params={"search": resolved_location}, headers=bom_headers)
+        async with httpx.AsyncClient(timeout=OPEN_METEO_TIMEOUT_SECONDS, trust_env=OPEN_METEO_TRUST_ENV, follow_redirects=True) as client:
+            loc_resp = await client.get(
+                OPEN_METEO_GEOCODING_BASE_URL,
+                params={"name": resolved_location, "count": 10, "language": "en", "format": "json"},
+                headers=weather_headers,
+            )
             loc_resp.raise_for_status()
             try:
                 loc_json = loc_resp.json()
             except ValueError as e:
-                raise HTTPException(status_code=502, detail=f"Invalid BOM location response payload: {str(e)}")
-            loc_items = []
-            if isinstance(loc_json, dict):
-                candidate_lists = [
-                    loc_json.get("data"),
-                    loc_json.get("locations"),
-                    loc_json.get("results"),
-                ]
-                for candidate in candidate_lists:
-                    if isinstance(candidate, list):
-                        loc_items = candidate
-                        break
-            elif isinstance(loc_json, list):
-                loc_items = loc_json
+                raise HTTPException(status_code=502, detail=f"Invalid Open-Meteo geocoding payload: {str(e)}")
+            loc_items = loc_json.get("results") if isinstance(loc_json, dict) else []
             if not isinstance(loc_items, list) or not loc_items:
-                raise HTTPException(status_code=404, detail=f"No BOM weather location found for '{resolved_location}'.")
+                raise HTTPException(status_code=404, detail=f"No Open-Meteo location found for '{resolved_location}'.")
             requested_lc = resolved_location.lower()
             loc = next(
                 (
@@ -2524,77 +2592,102 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
                     (
                         item for item in loc_items
                         if isinstance(item, dict) and str(item.get("name") or "").strip().lower().startswith(requested_lc)
+                ),
+                None,
+            )
+            if not loc:
+                loc = next(
+                    (
+                        item for item in loc_items
+                        if isinstance(item, dict) and requested_lc in " ".join(
+                            str(item.get(part) or "").strip().lower()
+                            for part in ("name", "admin1", "country", "country_code")
+                        )
                     ),
                     None,
                 )
             if not loc:
-                loc = loc_items[0]
-            geohash = loc.get("geohash") or loc.get("id")
-            if not geohash:
-                raise HTTPException(status_code=502, detail="BOM response missing location geohash")
+                loc = loc_items[0] if isinstance(loc_items[0], dict) else {}
 
-            obs_task = client.get(f"{BOM_API_BASE_URL}/locations/{geohash}/observations", headers=bom_headers)
-            forecast_task = client.get(f"{BOM_API_BASE_URL}/locations/{geohash}/forecasts/daily", headers=bom_headers)
-            obs_resp, forecast_resp = await asyncio.gather(obs_task, forecast_task)
-            obs_resp.raise_for_status()
+            latitude = _safe_float(loc.get("latitude"))
+            longitude = _safe_float(loc.get("longitude"))
+            if latitude is None or longitude is None:
+                raise HTTPException(status_code=502, detail="Open-Meteo geocoding response missing coordinates")
+
+            forecast_resp = await client.get(
+                OPEN_METEO_FORECAST_BASE_URL,
+                params={
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code",
+                    "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                    "forecast_days": 7,
+                    "timezone": "auto",
+                },
+                headers=weather_headers,
+            )
             forecast_resp.raise_for_status()
             try:
-                obs_json = obs_resp.json()
                 forecast_json = forecast_resp.json()
             except ValueError as e:
-                raise HTTPException(status_code=502, detail=f"Invalid BOM weather payload: {str(e)}")
+                raise HTTPException(status_code=502, detail=f"Invalid Open-Meteo weather payload: {str(e)}")
     except HTTPException:
         raise
     except httpx.ConnectError as e:
         hint = ""
-        if not BOM_API_TRUST_ENV:
-            hint = " If you require an outbound proxy, set BOM_API_TRUST_ENV=true and configure HTTP(S)_PROXY."
-        raise HTTPException(status_code=502, detail=f"Could not connect to BOM weather service: {str(e)}.{hint}")
+        if not OPEN_METEO_TRUST_ENV:
+            hint = " If you require an outbound proxy, set OPEN_METEO_TRUST_ENV=true and configure HTTP(S)_PROXY."
+        raise HTTPException(status_code=502, detail=f"Could not connect to Open-Meteo service: {str(e)}.{hint}")
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Timed out contacting BOM weather service")
+        raise HTTPException(status_code=504, detail="Timed out contacting Open-Meteo weather service")
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"BOM weather service returned status {e.response.status_code}")
+        raise HTTPException(status_code=502, detail=f"Open-Meteo weather service returned status {e.response.status_code}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve weather data: {str(e)}")
 
-    obs_data = (obs_json or {}).get("data") if isinstance(obs_json, dict) else {}
-    if not isinstance(obs_data, dict):
-        obs_data = {}
-    observation = obs_data.get("observations") or {}
-    if isinstance(observation, list):
-        observation = observation[0] if observation else {}
-    forecast_data = (forecast_json or {}).get("data") if isinstance(forecast_json, dict) else {}
-    if isinstance(forecast_data, dict):
-        forecast_days = forecast_data.get("daily") or forecast_data.get("forecasts") or []
-    elif isinstance(forecast_data, list):
-        forecast_days = forecast_data
-    else:
-        forecast_days = []
-    if not isinstance(forecast_days, list):
-        forecast_days = []
+    current_data = (forecast_json or {}).get("current") if isinstance(forecast_json, dict) else {}
+    if not isinstance(current_data, dict):
+        current_data = {}
+    daily_data = (forecast_json or {}).get("daily") if isinstance(forecast_json, dict) else {}
+    if not isinstance(daily_data, dict):
+        daily_data = {}
+
+    daily_dates = daily_data.get("time") if isinstance(daily_data.get("time"), list) else []
+    daily_mins = daily_data.get("temperature_2m_min") if isinstance(daily_data.get("temperature_2m_min"), list) else []
+    daily_maxs = daily_data.get("temperature_2m_max") if isinstance(daily_data.get("temperature_2m_max"), list) else []
+    daily_rain = daily_data.get("precipitation_probability_max") if isinstance(daily_data.get("precipitation_probability_max"), list) else []
+    daily_codes = daily_data.get("weather_code") if isinstance(daily_data.get("weather_code"), list) else []
+
+    def _daily_value(values: Any, index: int) -> Any:
+        if isinstance(values, list) and index < len(values):
+            return values[index]
+        return None
 
     current = {
-        "temperature_c": _safe_float(observation.get("temp") or observation.get("temperature")),
-        "feels_like_c": _safe_float(observation.get("temp_feels_like") or observation.get("feelsLike")),
-        "humidity_pct": _safe_float(observation.get("humidity")),
-        "wind_kph": _safe_float(observation.get("wind_speed_kilometre") or observation.get("wind_speed_kmh") or observation.get("windSpeedKmh")),
-        "condition": observation.get("icon_descriptor") or observation.get("condition") or "unknown",
-        "observation_time": observation.get("local_date_time_full") or observation.get("observation_time") or "",
+        "temperature_c": _safe_float(current_data.get("temperature_2m")),
+        "feels_like_c": _safe_float(current_data.get("apparent_temperature")),
+        "humidity_pct": _safe_float(current_data.get("relative_humidity_2m")),
+        "wind_kph": _safe_float(current_data.get("wind_speed_10m")),
+        "condition": _open_meteo_weather_code_to_text(current_data.get("weather_code")),
+        "observation_time": current_data.get("time") or "",
     }
 
     forecast = []
-    for day in forecast_days[:7]:
+    for idx, day_date in enumerate(daily_dates[:7]):
+        day_code = _daily_value(daily_codes, idx)
         forecast.append({
-            "date": day.get("date"),
-            "min_c": _safe_float(day.get("temp_min") or day.get("tempMin")),
-            "max_c": _safe_float(day.get("temp_max") or day.get("tempMax")),
-            "rain_chance_pct": _safe_float(day.get("rain_chance") or day.get("rainChance")),
-            "condition": day.get("icon_descriptor") or day.get("short_text") or day.get("condition"),
+            "date": day_date,
+            "min_c": _safe_float(_daily_value(daily_mins, idx)),
+            "max_c": _safe_float(_daily_value(daily_maxs, idx)),
+            "rain_chance_pct": _safe_float(_daily_value(daily_rain, idx)),
+            "condition": _open_meteo_weather_code_to_text(day_code),
         })
 
     loc_name = loc.get("name") or resolved_location
+    current_temp = current.get("temperature_c")
+    current_temp_text = f"{current_temp}C" if current_temp is not None else "N/A"
     summary = (
-        f"Weather for {loc_name}: {current.get('temperature_c', 'N/A')}C, {current.get('condition', 'unknown')}"
+        f"Weather for {loc_name}: {current_temp_text}, {current.get('condition', 'unknown')}"
         f". Forecast entries: {len(forecast)}."
     )
 
@@ -2606,7 +2699,7 @@ async def _do_proxy_weather(location: Optional[str], detail: str = "summary", us
         "current": current,
         "forecast": forecast,
         "detail": detail,
-        "source": "bom.gov.au",
+        "source": "open-meteo.com",
     }
 
     if detail == "current":
@@ -2623,7 +2716,7 @@ async def proxy_weather(
     requestType: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Fetch parsed weather information from BOM. Auth required."""
+    """Fetch parsed weather information from Open-Meteo. Auth required."""
     user_id = current_user.get("username") if isinstance(current_user, dict) else None
     final_detail = _normalize_weather_detail(requestType or detail)
     return await _do_proxy_weather(location=location, detail=final_detail, user_id=user_id, memory_manager=memory_manager if MEMORY_AVAILABLE else None)
@@ -3479,14 +3572,99 @@ async def auth_me(current_user: Dict[str, Any] = Depends(get_current_user)):
 # TODO REST API (all endpoints require authentication)
 # ============================================================================
 
+def _todo_recurrence_to_dict(recurrence: Optional[TodoRecurrenceRequest]) -> Optional[Dict[str, Any]]:
+    if not recurrence:
+        return None
+    return {
+        "frequency": str(recurrence.frequency).strip().lower(),
+        "interval": int(recurrence.interval),
+    }
+
+
+def _parse_todo_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _build_todo_list_response(meta: Dict[str, Any], due_only: bool = False) -> TodoListResponse:
+    now = datetime.now(timezone.utc)
+    raw_items = meta.get("task_items") if isinstance(meta, dict) else []
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    task_items: List[TodoTaskItemResponse] = []
+    tasks: List[str] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        description = str(item.get("description") or "").strip()
+        if not description:
+            continue
+        next_run = _parse_todo_datetime(item.get("next_run_at"))
+        is_due = bool(next_run and next_run <= now)
+        if due_only and not is_due:
+            continue
+        tasks.append(description)
+        task_items.append(
+            TodoTaskItemResponse(
+                taskId=len(tasks),
+                taskDescription=description,
+                scheduledFor=item.get("scheduled_for"),
+                nextRunAt=item.get("next_run_at"),
+                recurrence=item.get("recurrence"),
+                lastCompletedAt=item.get("last_completed_at"),
+                createdAt=item.get("created_at"),
+                updatedAt=item.get("updated_at"),
+                isDue=is_due,
+            )
+        )
+
+    # Backward compatibility with old store schema that only had "tasks": ["..."].
+    if not task_items and not due_only:
+        raw_legacy_tasks = meta.get("tasks") if isinstance(meta, dict) else []
+        if isinstance(raw_legacy_tasks, list):
+            tasks = [str(t) for t in raw_legacy_tasks]
+            task_items = [
+                TodoTaskItemResponse(taskId=i + 1, taskDescription=desc)
+                for i, desc in enumerate(tasks)
+            ]
+
+    return TodoListResponse(tasks=tasks, taskItems=task_items, updated_at=meta.get("updated_at"))
+
+
 @app.get("/v1/todo", response_model=TodoListResponse)
-async def todo_list(current_user: Dict[str, Any] = Depends(get_current_user)):
+async def todo_list(
+    due_only: bool = False,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Return the authenticated user's todo list. Requires JWT."""
     if not TODO_STORE_AVAILABLE or not _todo_store:
         raise HTTPException(status_code=503, detail="Todo store is not available.")
     user_key = current_user["username"]
     meta = _todo_store.load_tasks_with_meta(user_key)
-    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+    return _build_todo_list_response(meta, due_only=due_only)
+
+
+@app.get("/v1/todo/due", response_model=TodoListResponse)
+async def todo_due_list(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Return due scheduled tasks (next_run_at <= now) for the authenticated user."""
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        raise HTTPException(status_code=503, detail="Todo store is not available.")
+    user_key = current_user["username"]
+    meta = _todo_store.load_tasks_with_meta(user_key)
+    return _build_todo_list_response(meta, due_only=True)
 
 
 @app.post("/v1/todo", response_model=TodoListResponse)
@@ -3501,9 +3679,18 @@ async def todo_add(
     desc = (request.taskDescription or "").strip()
     if not desc:
         raise HTTPException(status_code=400, detail="taskDescription is required.")
-    tasks = _todo_store.add_task(user_key, desc)
+    recurrence = _todo_recurrence_to_dict(request.recurrence)
+    try:
+        _todo_store.add_task(
+            user_key,
+            desc,
+            scheduled_for=request.scheduledFor,
+            recurrence=recurrence,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     meta = _todo_store.load_tasks_with_meta(user_key)
-    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+    return _build_todo_list_response(meta)
 
 
 @app.patch("/v1/todo/{task_id}", response_model=TodoListResponse)
@@ -3516,15 +3703,33 @@ async def todo_update(
     if not TODO_STORE_AVAILABLE or not _todo_store:
         raise HTTPException(status_code=503, detail="Todo store is not available.")
     user_key = current_user["username"]
-    desc = (request.taskDescription or "").strip()
-    if not desc:
-        raise HTTPException(status_code=400, detail="taskDescription is required.")
+    desc = request.taskDescription
+    if desc is not None:
+        desc = desc.strip()
+        if not desc:
+            raise HTTPException(status_code=400, detail="taskDescription is required.")
+    if (
+        desc is None
+        and request.scheduledFor is None
+        and request.recurrence is None
+        and not request.clearSchedule
+        and not request.clearRecurrence
+    ):
+        raise HTTPException(status_code=400, detail="No update fields provided.")
     try:
-        _todo_store.update_task(user_key, task_id, desc)
+        _todo_store.update_task(
+            user_key,
+            task_id,
+            desc,
+            scheduled_for=request.scheduledFor,
+            recurrence=_todo_recurrence_to_dict(request.recurrence),
+            clear_schedule=bool(request.clearSchedule),
+            clear_recurrence=bool(request.clearRecurrence),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     meta = _todo_store.load_tasks_with_meta(user_key)
-    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+    return _build_todo_list_response(meta)
 
 
 @app.delete("/v1/todo/{task_id}", response_model=TodoListResponse)
@@ -3541,7 +3746,7 @@ async def todo_delete(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     meta = _todo_store.load_tasks_with_meta(user_key)
-    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+    return _build_todo_list_response(meta)
 
 
 @app.delete("/v1/todo", response_model=TodoListResponse)
@@ -3551,7 +3756,7 @@ async def todo_clear(current_user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=503, detail="Todo store is not available.")
     user_key = current_user["username"]
     _todo_store.clear_tasks(user_key)
-    return TodoListResponse(tasks=[], updated_at=None)
+    return TodoListResponse(tasks=[], taskItems=[], updated_at=None)
 
 
 # ============================================================================
@@ -3718,17 +3923,21 @@ async def todo_task_complete(
     task_id: int,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Human verification: mark task as complete and remove from list. Requires JWT."""
+    """Human verification: complete a task. Repeating tasks are rescheduled; one-time tasks are removed."""
     if not TODO_STORE_AVAILABLE or not _todo_store:
         raise HTTPException(status_code=503, detail="Todo store is not available.")
     user_key = current_user["username"]
     task_execution_state.pop(user_key, None)
     try:
-        _todo_store.delete_task(user_key, task_id)
+        result = _todo_store.complete_task(user_key, task_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    meta = _todo_store.load_tasks_with_meta(user_key)
-    return TodoListResponse(tasks=meta["tasks"], updated_at=meta.get("updated_at"))
+    meta = {
+        "tasks": result.get("tasks", []),
+        "task_items": result.get("task_items", []),
+        "updated_at": result.get("updated_at"),
+    }
+    return _build_todo_list_response(meta)
 
 
 def _task_execute_cancel(user_key: str) -> tuple:
@@ -4707,7 +4916,7 @@ async def get_all_available_tools() -> List[Dict]:
 
     all_tools.append({
         "name": "weather_info",
-        "description": "Get weather information from BOM (bom.gov.au). Supports explicit location or memory-based location fallback.",
+        "description": "Get weather information from Open-Meteo (api.open-meteo.com). Supports explicit location or memory-based location fallback.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -4965,6 +4965,7 @@ function saveWAVFile(wavBlob) {
                 } catch (e) {
                     todoList = [];
                 }
+                todoTaskItems = [];
                 return;
             }
             try {
@@ -4974,12 +4975,15 @@ function saveWAVFile(wavBlob) {
                 if (res.ok) {
                     const data = await res.json();
                     todoList = Array.isArray(data.tasks) ? data.tasks : [];
+                    todoTaskItems = Array.isArray(data.taskItems) ? data.taskItems : [];
                 } else {
                     todoList = [];
+                    todoTaskItems = [];
                 }
             } catch (err) {
                 console.warn('Failed to fetch todo list from server:', err);
                 todoList = [];
+                todoTaskItems = [];
             }
         }
 
@@ -4989,6 +4993,7 @@ function saveWAVFile(wavBlob) {
 
         // Initialize variables
         let todoList = [];
+        let todoTaskItems = [];
         let memoryCache = [];
         let isToolRequest = false;
         let chatHistory = [];  // Single declaration of chatHistory
@@ -5397,22 +5402,57 @@ function saveWAVFile(wavBlob) {
                     type: "function",
                     function: {
                         name: "manageTodoList",
-                        description: "Manages a persistent todo list with various operations (list, add, update, delete tasks)",
+                        description: "Manages a persistent todo list with scheduling and repeating-task support (list, add, update, complete, delete, clear).",
                         parameters: {
                             type: "object",
                             properties: {
                                 action: {
                                     type: "string",
-                                    enum: ["list", "add", "update", "delete", "clear"],
+                                    enum: ["list", "add", "update", "complete", "delete", "clear"],
                                     description: "The action to perform on the todo list"
                                 },
                                 taskId: {
                                     type: "number",
-                                    description: "The ID of the task (required for update and delete actions)"
+                                    description: "The 1-based task index (required for update, complete, and delete actions)"
                                 },
                                 taskDescription: {
                                     type: "string",
                                     description: "The description of the task (required for add and update actions)"
+                                },
+                                scheduledFor: {
+                                    type: "string",
+                                    description: "Optional scheduled datetime in ISO-8601 format (e.g. 2026-03-01T09:00:00-05:00)"
+                                },
+                                recurrence: {
+                                    type: "object",
+                                    description: "Optional recurrence rule for repeating tasks",
+                                    properties: {
+                                        frequency: {
+                                            type: "string",
+                                            enum: ["hourly", "daily", "weekly", "monthly", "yearly"]
+                                        },
+                                        interval: {
+                                            type: "number",
+                                            description: "Repeat every N frequency units (default 1)"
+                                        }
+                                    }
+                                },
+                                repeatFrequency: {
+                                    type: "string",
+                                    enum: ["hourly", "daily", "weekly", "monthly", "yearly"],
+                                    description: "Alias for recurrence.frequency"
+                                },
+                                repeatInterval: {
+                                    type: "number",
+                                    description: "Alias for recurrence.interval"
+                                },
+                                clearSchedule: {
+                                    type: "boolean",
+                                    description: "When true (update action), remove existing schedule."
+                                },
+                                clearRecurrence: {
+                                    type: "boolean",
+                                    description: "When true (update action), remove recurrence."
                                 }
                             },
                             required: ["action"]
@@ -5452,7 +5492,7 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "completeTodoTask",
-                    description: "Mark a todo task as complete and remove it from the list (human-in-the-loop). Call when executeTodoTask returned status 'awaiting_confirmation' and the user confirms they want to mark the task done.",
+                    description: "Mark a todo task as complete (human-in-the-loop). One-time tasks are removed; repeating tasks are rescheduled. Call when executeTodoTask returned status 'awaiting_confirmation' and the user confirms they want to mark the task done.",
                     parameters: {
                         type: "object",
                         properties: {
@@ -5804,7 +5844,7 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "weatherInfo",
-                    description: "Gets weather information for a location from BOM. Use for current conditions, forecast, rain chance, and general weather summaries. If location is omitted, backend may use saved memory location.",
+                    description: "Gets weather information for a location from Open-Meteo. Use for current conditions, forecast, rain chance, and general weather summaries. If location is omitted, backend may use saved memory location.",
                     parameters: {
                         type: "object",
                         properties: {
@@ -6265,22 +6305,68 @@ function saveWAVFile(wavBlob) {
 
 
         // Individual tool handlers (todo uses REST API when authenticated, else local + localStorage)
-        async function handleTodoList({ action, taskId, taskDescription }) {
+        function normalizeTodoRecurrenceInput({ recurrence, repeatFrequency, repeatInterval }) {
+            if (recurrence && typeof recurrence === 'object') {
+                const freq = String(recurrence.frequency || '').trim().toLowerCase();
+                const intervalRaw = recurrence.interval ?? 1;
+                const interval = Number(intervalRaw);
+                if (!freq) return null;
+                return { frequency: freq, interval: Number.isFinite(interval) && interval > 0 ? Math.floor(interval) : 1 };
+            }
+            const freqAlias = String(repeatFrequency || '').trim().toLowerCase();
+            if (!freqAlias) return null;
+            const intervalAlias = Number(repeatInterval ?? 1);
+            return {
+                frequency: freqAlias,
+                interval: Number.isFinite(intervalAlias) && intervalAlias > 0 ? Math.floor(intervalAlias) : 1
+            };
+        }
+
+        function formatTodoTaskLine(task, index) {
+            if (typeof task === 'string') return `${index + 1}. ${task}`;
+            const description = task?.taskDescription || task?.description || '(No description)';
+            const suffix = [];
+            const nextRun = task?.nextRunAt || task?.next_run_at || task?.scheduledFor || task?.scheduled_for;
+            if (nextRun) {
+                suffix.push(`next: ${nextRun}${task?.isDue ? ', due now' : ''}`);
+            }
+            const recurrence = task?.recurrence;
+            if (recurrence && recurrence.frequency) {
+                const interval = Number(recurrence.interval ?? 1);
+                const safeInterval = Number.isFinite(interval) && interval > 0 ? Math.floor(interval) : 1;
+                const freq = String(recurrence.frequency).toLowerCase();
+                const unit = safeInterval === 1 ? freq : `${freq}s`;
+                suffix.push(`repeats every ${safeInterval} ${unit}`);
+            }
+            return suffix.length
+                ? `${index + 1}. ${description} (${suffix.join('; ')})`
+                : `${index + 1}. ${description}`;
+        }
+
+        async function handleTodoList({ action, taskId, taskDescription, scheduledFor, recurrence, repeatFrequency, repeatInterval, clearSchedule, clearRecurrence }) {
             const headers = { 'Content-Type': 'application/json' };
             if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
             try {
                 if (authToken) {
+                    const recurrencePayload = normalizeTodoRecurrenceInput({ recurrence, repeatFrequency, repeatInterval });
                     switch (action) {
                         case "list":
                             await fetchTodoListFromServer();
                             if (todoList.length === 0) return { success: true, message: "Your todo list is empty." };
-                            const taskList = todoList.map((task, index) => `${index + 1}. ${task}`).join('\n');
+                            const sourceItems = (Array.isArray(todoTaskItems) && todoTaskItems.length > 0)
+                                ? todoTaskItems
+                                : todoList;
+                            const taskList = sourceItems.map((task, index) => formatTodoTaskLine(task, index)).join('\n');
                             return { success: true, message: "Here are your current tasks:\n" + taskList };
                         case "add":
                             if (!taskDescription) return { success: false, message: "Task description is required." };
+                            const addPayload = { taskDescription: taskDescription.trim() };
+                            const scheduledText = typeof scheduledFor === 'string' ? scheduledFor.trim() : '';
+                            if (scheduledText) addPayload.scheduledFor = scheduledText;
+                            if (recurrencePayload) addPayload.recurrence = recurrencePayload;
                             const addRes = await fetch(`${PROXY_BASE_URL}/v1/todo`, {
                                 method: 'POST', headers,
-                                body: JSON.stringify({ taskDescription: taskDescription.trim() })
+                                body: JSON.stringify(addPayload)
                             });
                             if (!addRes.ok) {
                                 const err = await addRes.json().catch(() => ({}));
@@ -6288,12 +6374,27 @@ function saveWAVFile(wavBlob) {
                             }
                             const addData = await addRes.json();
                             todoList = addData.tasks || [];
+                            todoTaskItems = addData.taskItems || [];
                             return { success: true, message: `Added task: ${taskDescription}` };
                         case "update":
-                            if (!taskId || !taskDescription) return { success: false, message: "Both task ID and new description are required." };
+                            if (!taskId) return { success: false, message: "Task ID is required." };
+                            const updatePayload = {};
+                            if (taskDescription !== undefined && taskDescription !== null) {
+                                const nextDesc = String(taskDescription).trim();
+                                if (!nextDesc) return { success: false, message: "taskDescription cannot be empty." };
+                                updatePayload.taskDescription = nextDesc;
+                            }
+                            const updateScheduledText = typeof scheduledFor === 'string' ? scheduledFor.trim() : '';
+                            if (updateScheduledText) updatePayload.scheduledFor = updateScheduledText;
+                            if (recurrencePayload) updatePayload.recurrence = recurrencePayload;
+                            if (clearSchedule) updatePayload.clearSchedule = true;
+                            if (clearRecurrence) updatePayload.clearRecurrence = true;
+                            if (Object.keys(updatePayload).length === 0) {
+                                return { success: false, message: "Provide at least one field to update." };
+                            }
                             const updRes = await fetch(`${PROXY_BASE_URL}/v1/todo/${taskId}`, {
                                 method: 'PATCH', headers,
-                                body: JSON.stringify({ taskDescription: taskDescription.trim() })
+                                body: JSON.stringify(updatePayload)
                             });
                             if (!updRes.ok) {
                                 const err = await updRes.json().catch(() => ({}));
@@ -6301,7 +6402,21 @@ function saveWAVFile(wavBlob) {
                             }
                             const updData = await updRes.json();
                             todoList = updData.tasks || [];
-                            return { success: true, message: `Updated task ${taskId} to "${taskDescription}"` };
+                            todoTaskItems = updData.taskItems || [];
+                            return { success: true, message: `Updated task ${taskId}.` };
+                        case "complete":
+                            if (!taskId) return { success: false, message: "Task ID is required." };
+                            const completeRes = await fetch(`${PROXY_BASE_URL}/v1/todo/${taskId}/complete`, {
+                                method: 'POST', headers
+                            });
+                            if (!completeRes.ok) {
+                                const err = await completeRes.json().catch(() => ({}));
+                                return { success: false, message: err.detail || completeRes.statusText };
+                            }
+                            const completeData = await completeRes.json();
+                            todoList = completeData.tasks || [];
+                            todoTaskItems = completeData.taskItems || [];
+                            return { success: true, message: `Completed task ${taskId}.` };
                         case "delete":
                             if (!taskId) return { success: false, message: "Task ID is required." };
                             const delRes = await fetch(`${PROXY_BASE_URL}/v1/todo/${taskId}`, { method: 'DELETE', headers });
@@ -6311,6 +6426,7 @@ function saveWAVFile(wavBlob) {
                             }
                             const delData = await delRes.json();
                             todoList = delData.tasks || [];
+                            todoTaskItems = delData.taskItems || [];
                             return { success: true, message: "Task deleted." };
                         case "clear":
                             const clearRes = await fetch(`${PROXY_BASE_URL}/v1/todo`, { method: 'DELETE', headers });
@@ -6319,6 +6435,7 @@ function saveWAVFile(wavBlob) {
                                 return { success: false, message: err.detail || clearRes.statusText };
                             }
                             todoList = [];
+                            todoTaskItems = [];
                             return { success: true, message: "Todo list has been cleared." };
                         default:
                             return { success: false, message: "Invalid action." };
@@ -6400,7 +6517,9 @@ function saveWAVFile(wavBlob) {
                         : (typeof detail === 'string' ? detail : (detail ? JSON.stringify(detail) : res.statusText));
                     return { success: false, message: message };
                 }
-                return { success: true, message: "Task marked complete and removed from the list.", tasks: data.tasks };
+                todoList = Array.isArray(data.tasks) ? data.tasks : [];
+                todoTaskItems = Array.isArray(data.taskItems) ? data.taskItems : [];
+                return { success: true, message: "Task completion recorded.", tasks: todoList };
             } catch (err) {
                 return { success: false, message: err.message || "Complete failed." };
             }
@@ -7221,6 +7340,7 @@ function saveWAVFile(wavBlob) {
                 patterns: [
                     /(add|create|make|new) (?:a )?(?:new )?(?:todo|task|item|reminder|note)(?: (?:to|in|into) (?:the )?(?:todo )?list)?(?: saying| with)? ["']?([^"']+)["']?/i,
                     /(update|change|modify|edit) (?:the )?(?:todo|task|item|reminder|note) (?:number )?(\d+)(?: (?:to|with) ["']?([^"']+)["']?)?/i,
+                    /(complete|done|finish|mark complete|check off) (?:the )?(?:todo|task|item|reminder|note) (?:number )?(\d+)/i,
                     /(delete|remove|clear) (?:the )?(?:todo|task|item|reminder|note)(?: number )?(\d+)?/i,
                     /(show|list|display|get) (?:all )?(?:my )?(?:todo|task|item|reminder|note)s?(?:list)?/i
                 ],
@@ -7236,6 +7356,11 @@ function saveWAVFile(wavBlob) {
                             action: 'update',
                             taskId: parseInt(match[2]),
                             taskDescription: match[3] || ''
+                        };
+                    } else if (action.match(/complete|done|finish|mark complete|check off/i)) {
+                        return {
+                            action: 'complete',
+                            taskId: parseInt(match[2])
                         };
                     } else if (action.match(/delete|remove/i)) {
                         return {

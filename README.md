@@ -89,7 +89,7 @@ See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line i
 - **[Model Context Protocol](https://modelcontextprotocol.io/)** — MCP integration for extensible tooling
 - **[File Operations](proxy_server.py)** — Read/write support for txt, docx, xlsx, pdf, and images
 - **[Web Search](proxy_server.py)** — Brave Search API with DuckDuckGo fallback
-- **[Weather Information (BOM)](src/servers/proxy_server.py)** — Secure weather tool for web + Telegram using bom.gov.au data
+- **[Weather Information (Open-Meteo)](src/servers/proxy_server.py)** — Secure weather tool for web + Telegram using api.open-meteo.com data
 - **[Codex CLI Tool](src/servers/proxy_server.py)** — Non-interactive Codex CLI runner for CATBot code changes and new tool capabilities
 - **[Telegram Integration](telegram_bot.py)** — Bot interface for Telegram messaging
 - **[Memory System](memory/)** — Vector-based memory storage and retrieval for conversation context
@@ -126,11 +126,13 @@ See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line i
    - Get your key: https://newsapi.org/
    - Can be configured in the application settings UI
 
-6. **BOM Weather API Access** (No key required)
-   - Data source: https://www.bom.gov.au/
-   - Environment variable: `BOM_API_BASE_URL` (defaults to `https://api.weather.bom.gov.au/v1`)
-   - Environment variable: `BOM_API_TIMEOUT_SECONDS` (optional request timeout)
-   - Environment variable: `BOM_API_TRUST_ENV` (`false` by default; set `true` only when you intentionally need HTTP(S)_PROXY)
+6. **Open-Meteo Weather API Access** (No key required)
+   - Forecast data source: https://api.open-meteo.com/v1/forecast
+   - Geocoding data source: https://geocoding-api.open-meteo.com/v1/search
+   - Environment variable: `OPEN_METEO_FORECAST_BASE_URL` (optional override)
+   - Environment variable: `OPEN_METEO_GEOCODING_BASE_URL` (optional override)
+   - Environment variable: `OPEN_METEO_TIMEOUT_SECONDS` (optional request timeout)
+   - Environment variable: `OPEN_METEO_TRUST_ENV` (`false` by default; set `true` only when you intentionally need HTTP(S)_PROXY)
 
 7. **Telegram Bot Token** (Optional)
    - Create a bot: https://core.telegram.org/bots#botfather
@@ -551,7 +553,7 @@ All services are configured to accept connections from devices on your local net
 - `GET /v1/proxy/fetch` - Fetch web content from a URL (query param)
 - `POST /v1/proxy/fetch` - Fetch web content; body: `{"url": "..."}` or `{"urls": ["...", "..."]}`. When `urls` is provided, the server tries each URL in order until one succeeds (scrape-with-retry), e.g. after a web search.
 - `GET /v1/proxy/search` - Perform web search (Brave Search or DuckDuckGo fallback)
-- `GET /v1/proxy/weather` - Weather info (BOM: current, forecast, summary; supports memory fallback)
+- `GET /v1/proxy/weather` - Weather info (Open-Meteo: current, forecast, summary; supports memory fallback)
 
 **AI & Chat:**
 - `POST /v1/proxy/autogen` - AutoGen team-based chat endpoint
