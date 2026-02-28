@@ -5,6 +5,7 @@ Covers load/save, add/update/delete/clear, sanitize_user_key, and atomic write.
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -95,3 +96,48 @@ class TestTodoStore:
         path = temp_dir / f"{safe}.json"
         assert path.exists()
         assert ts.load_tasks("user/with/slash") == ["one"]
+
+    def test_scheduled_tasks_are_chronological(self, temp_dir):
+        now = datetime.now(timezone.utc)
+        ts.add_task("sched1", "unscheduled")
+        ts.add_task("sched1", "later", scheduled_for=(now + timedelta(days=2)).isoformat())
+        ts.add_task("sched1", "sooner", scheduled_for=(now + timedelta(days=1)).isoformat())
+        meta = ts.load_tasks_with_meta("sched1")
+        assert meta["tasks"][0] == "sooner"
+        assert meta["tasks"][1] == "later"
+        assert meta["tasks"][2] == "unscheduled"
+
+    def test_complete_repeating_task_reschedules(self, temp_dir):
+        start = datetime.now(timezone.utc) - timedelta(days=3)
+        ts.add_task(
+            "repeat1",
+            "daily report",
+            scheduled_for=start.isoformat(),
+            recurrence={"frequency": "daily", "interval": 1},
+        )
+        result = ts.complete_task("repeat1", 1)
+        assert result["rescheduled"] is True
+        meta = ts.load_tasks_with_meta("repeat1")
+        assert len(meta["tasks"]) == 1
+        item = meta["task_items"][0]
+        assert item["description"] == "daily report"
+        assert item["next_run_at"] is not None
+        next_run = datetime.fromisoformat(item["next_run_at"])
+        if next_run.tzinfo is None:
+            next_run = next_run.replace(tzinfo=timezone.utc)
+        assert next_run.astimezone(timezone.utc) > datetime.now(timezone.utc)
+
+    def test_complete_one_time_task_removes_task(self, temp_dir):
+        ts.add_task("complete_once", "one-time")
+        result = ts.complete_task("complete_once", 1)
+        assert result["rescheduled"] is False
+        assert ts.load_tasks("complete_once") == []
+
+    def test_list_due_task_items_only_returns_due_scheduled(self, temp_dir):
+        now = datetime.now(timezone.utc)
+        ts.add_task("due1", "due task", scheduled_for=(now - timedelta(hours=1)).isoformat())
+        ts.add_task("due1", "future task", scheduled_for=(now + timedelta(hours=3)).isoformat())
+        ts.add_task("due1", "plain unscheduled")
+        due_items = ts.list_due_task_items("due1")
+        assert len(due_items) == 1
+        assert due_items[0]["description"] == "due task"

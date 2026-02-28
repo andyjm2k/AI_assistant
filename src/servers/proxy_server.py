@@ -394,10 +394,17 @@ class TodoTaskItemResponse(BaseModel):
     isDue: bool = False
 
 
+class TodoCompletionMetaResponse(BaseModel):
+    taskId: int
+    rescheduled: bool = False
+    nextRunAt: Optional[str] = None
+
+
 class TodoListResponse(BaseModel):
     tasks: List[str]
     taskItems: List[TodoTaskItemResponse] = []
     updated_at: Optional[str] = None
+    completion: Optional[TodoCompletionMetaResponse] = None
 
 
 class TodoExecuteRequest(BaseModel):
@@ -590,6 +597,7 @@ MEMORY_AUTO_SEARCH_SCORE_WINDOW = max(
 )
 # Optional: map Telegram user_id or conversation_id to app username for shared todo list
 TELEGRAM_USER_LINKS_FILE = _PROJECT_ROOT / "config" / "telegram_user_links.json"
+_TELEGRAM_CHAT_ID_RE = re.compile(r"^-?\d+$")
 
 # ============================================================================
 # STATUS EVENTS (persistent progress updates)
@@ -866,20 +874,32 @@ def _get_status_events_since(
     return events
 
 
+def _load_telegram_user_links() -> Dict[str, str]:
+    """Load Telegram user-link mappings from config/telegram_user_links.json."""
+    mapping: Dict[str, str] = {}
+    if not TELEGRAM_USER_LINKS_FILE.exists():
+        return mapping
+    try:
+        raw = TELEGRAM_USER_LINKS_FILE.read_text(encoding="utf-8")
+        loaded = json.loads(raw)
+        if not isinstance(loaded, dict):
+            return mapping
+        for key, value in loaded.items():
+            key_text = str(key or "").strip()
+            value_text = str(value or "").strip()
+            if key_text and value_text:
+                mapping[key_text] = value_text
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return mapping
+
+
 def _resolve_todo_user_for_telegram(conversation_id: str, user_id: Optional[str]) -> str:
     """
     Resolve the todo user key for Telegram: if telegram_user_links.json maps this conversation
     or user to an app username, return that; else return conversation_id (or user_id) for persistent per-chat todo.
     """
-    mapping = {}
-    if TELEGRAM_USER_LINKS_FILE.exists():
-        try:
-            raw = TELEGRAM_USER_LINKS_FILE.read_text(encoding="utf-8")
-            mapping = json.loads(raw)
-            if not isinstance(mapping, dict):
-                mapping = {}
-        except (json.JSONDecodeError, OSError):
-            pass
+    mapping = _load_telegram_user_links()
     # Normalize to string (API may send user_id as number)
     uid = str(user_id or "").strip()
     cid = str(conversation_id or "").strip() or "default"
@@ -888,6 +908,124 @@ def _resolve_todo_user_for_telegram(conversation_id: str, user_id: Optional[str]
     if cid in mapping:
         return str(mapping[cid]).strip() or cid
     return cid
+
+
+def _resolve_telegram_chat_ids_for_todo_user(user_key: str) -> List[str]:
+    """
+    Resolve Telegram chat IDs that should receive task-execution notifications for a todo user key.
+
+    Supports:
+    - direct numeric user_key values (Telegram chat/user IDs)
+    - reverse lookup in telegram_user_links.json where value == user_key
+    """
+    key = str(user_key or "").strip()
+    if not key:
+        return []
+    chat_ids: List[str] = []
+    if _TELEGRAM_CHAT_ID_RE.match(key):
+        chat_ids.append(key)
+    mapping = _load_telegram_user_links()
+    for tg_id, mapped_user in mapping.items():
+        if mapped_user != key:
+            continue
+        tg_id_text = str(tg_id or "").strip()
+        if tg_id_text and _TELEGRAM_CHAT_ID_RE.match(tg_id_text):
+            chat_ids.append(tg_id_text)
+    return list(dict.fromkeys(chat_ids))
+
+
+def _task_execution_register_telegram_target(user_key: str, chat_id: Optional[Any]) -> bool:
+    """Attach a Telegram chat ID to an in-flight task execution so completion can notify the user."""
+    state = task_execution_state.get(user_key)
+    if not state:
+        return False
+    chat_id_text = str(chat_id or "").strip()
+    if not chat_id_text or not _TELEGRAM_CHAT_ID_RE.match(chat_id_text):
+        return False
+    existing = state.get("telegram_chat_ids")
+    if not isinstance(existing, list):
+        existing = []
+        state["telegram_chat_ids"] = existing
+    if chat_id_text not in existing:
+        existing.append(chat_id_text)
+    return True
+
+
+def _build_task_execution_telegram_message(
+    *,
+    task_id: Optional[int],
+    task_description: str,
+    status: str,
+    result_message: str,
+) -> str:
+    now_utc = datetime.now(timezone.utc).isoformat()
+    body = (result_message or "").strip()
+    if len(body) > 1800:
+        body = body[:1800].rstrip() + "\n...[truncated]"
+    lines = [
+        "Scheduled task execution completed.",
+        f"Task ID: {task_id if task_id is not None else 'unknown'}",
+        f"Task: {task_description or '(no description)'}",
+        f"Status: {status or 'unknown'}",
+        f"Completed at (UTC): {now_utc}",
+    ]
+    if body:
+        lines.append("")
+        lines.append("Result:")
+        lines.append(body)
+    return "\n".join(lines)
+
+
+async def _send_telegram_bot_message(chat_id: str, text: str) -> bool:
+    """Send a direct Telegram message via Bot API. Returns True when sent successfully."""
+    token = str(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id_text = str(chat_id or "").strip()
+    message_text = (text or "").strip()
+    if not token or not chat_id_text or not message_text:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id_text, "text": message_text}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(url, json=payload)
+        if response.status_code != 200:
+            print(f"[WARN] Telegram sendMessage failed ({response.status_code}) for chat_id={chat_id_text}", flush=True)
+            return False
+        data = response.json()
+        ok = bool(data.get("ok"))
+        if not ok:
+            print(f"[WARN] Telegram sendMessage returned ok=false for chat_id={chat_id_text}", flush=True)
+        return ok
+    except Exception as exc:
+        print(f"[WARN] Telegram sendMessage error for chat_id={chat_id_text}: {exc}", flush=True)
+        return False
+
+
+async def _maybe_notify_telegram_task_completion(
+    user_key: str,
+    state: Dict[str, Any],
+    status: str,
+    message: str,
+) -> None:
+    """
+    Send Telegram notification when a scheduled task execution reaches completion state.
+    No-op when task is not scheduled or no resolvable Telegram chat IDs are available.
+    """
+    if status != STATUS_AWAITING_CONFIRMATION:
+        return
+    if not bool(state.get("is_scheduled")):
+        return
+    chat_ids = state.get("telegram_chat_ids")
+    if not isinstance(chat_ids, list) or not chat_ids:
+        return
+    text = _build_task_execution_telegram_message(
+        task_id=state.get("task_id"),
+        task_description=str(state.get("task_description") or ""),
+        status=status,
+        result_message=message or "",
+    )
+    for chat_id in chat_ids:
+        await _send_telegram_bot_message(str(chat_id), text)
 
 # Philosopher mode state storage (per conversation)
 philosopher_mode_active: Dict[str, bool] = {}
@@ -3598,7 +3736,11 @@ def _parse_todo_datetime(value: Optional[str]) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-def _build_todo_list_response(meta: Dict[str, Any], due_only: bool = False) -> TodoListResponse:
+def _build_todo_list_response(
+    meta: Dict[str, Any],
+    due_only: bool = False,
+    completion: Optional[Dict[str, Any]] = None,
+) -> TodoListResponse:
     now = datetime.now(timezone.utc)
     raw_items = meta.get("task_items") if isinstance(meta, dict) else []
     if not isinstance(raw_items, list):
@@ -3606,7 +3748,7 @@ def _build_todo_list_response(meta: Dict[str, Any], due_only: bool = False) -> T
 
     task_items: List[TodoTaskItemResponse] = []
     tasks: List[str] = []
-    for item in raw_items:
+    for task_index, item in enumerate(raw_items, start=1):
         if not isinstance(item, dict):
             continue
         description = str(item.get("description") or "").strip()
@@ -3619,7 +3761,7 @@ def _build_todo_list_response(meta: Dict[str, Any], due_only: bool = False) -> T
         tasks.append(description)
         task_items.append(
             TodoTaskItemResponse(
-                taskId=len(tasks),
+                taskId=task_index,
                 taskDescription=description,
                 scheduledFor=item.get("scheduled_for"),
                 nextRunAt=item.get("next_run_at"),
@@ -3641,7 +3783,23 @@ def _build_todo_list_response(meta: Dict[str, Any], due_only: bool = False) -> T
                 for i, desc in enumerate(tasks)
             ]
 
-    return TodoListResponse(tasks=tasks, taskItems=task_items, updated_at=meta.get("updated_at"))
+    completion_payload: Optional[TodoCompletionMetaResponse] = None
+    if isinstance(completion, dict):
+        try:
+            completion_payload = TodoCompletionMetaResponse(
+                taskId=int(completion.get("taskId")),
+                rescheduled=bool(completion.get("rescheduled", False)),
+                nextRunAt=completion.get("nextRunAt"),
+            )
+        except (TypeError, ValueError):
+            completion_payload = None
+
+    return TodoListResponse(
+        tasks=tasks,
+        taskItems=task_items,
+        updated_at=meta.get("updated_at"),
+        completion=completion_payload,
+    )
 
 
 @app.get("/v1/todo", response_model=TodoListResponse)
@@ -3834,6 +3992,7 @@ async def _run_task_loop_background(user_key: str, executor: Any) -> None:
             state["message"] = message or ""
             # Always capture agent response to scratch with timestamp (paused, awaiting, cancelled, done)
             _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
+            await _maybe_notify_telegram_task_completion(user_key, state, status, message or "")
             # Clear state on cancel so user can start a new execution
             if status == STATUS_CANCELLED:
                 task_execution_state.pop(user_key, None)
@@ -3851,6 +4010,25 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
     if task_id < 1 or task_id > len(tasks):
         raise HTTPException(status_code=400, detail="Invalid task ID.")
     task_description = tasks[task_id - 1]
+    task_is_scheduled = False
+    try:
+        meta = _todo_store.load_tasks_with_meta(user_key)
+        task_items = meta.get("task_items") if isinstance(meta, dict) else None
+        if isinstance(task_items, list) and task_id >= 1 and task_id <= len(task_items):
+            task_item = task_items[task_id - 1]
+            if isinstance(task_item, dict):
+                item_desc = str(task_item.get("description") or "").strip()
+                if item_desc:
+                    task_description = item_desc
+                task_is_scheduled = bool(
+                    task_item.get("scheduled_for")
+                    or task_item.get("next_run_at")
+                    or task_item.get("recurrence")
+                )
+    except Exception:
+        # Keep execution available even if metadata parsing fails.
+        task_is_scheduled = False
+    telegram_chat_ids = _resolve_telegram_chat_ids_for_todo_user(user_key)
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured.")
@@ -3864,7 +4042,15 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
         get_tools_func=get_all_available_tools,
     )
     # Set state to 'executing' before starting so cancel/status work and we never leave state stuck
-    task_execution_state[user_key] = {"task_id": task_id, "status": STATUS_EXECUTING, "executor": executor, "message": None}
+    task_execution_state[user_key] = {
+        "task_id": task_id,
+        "status": STATUS_EXECUTING,
+        "executor": executor,
+        "message": None,
+        "task_description": task_description,
+        "is_scheduled": task_is_scheduled,
+        "telegram_chat_ids": telegram_chat_ids,
+    }
     asyncio.create_task(_run_task_loop_background(user_key, executor))
     return (STATUS_EXECUTING, "Task execution started. Ask me for status or to cancel.")
 
@@ -3887,6 +4073,7 @@ async def _task_execute_resume(user_key: str, user_message: str) -> tuple:
         state["message"] = message or ""
         # Capture agent response to scratch (paused or awaiting confirmation after resume)
         _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
+        await _maybe_notify_telegram_task_completion(user_key, state, status, message or "")
         return (status, message or "Resumed.")
     except Exception as e:
         state["status"] = STATUS_AWAITING_CONFIRMATION
@@ -3937,7 +4124,12 @@ async def todo_task_complete(
         "task_items": result.get("task_items", []),
         "updated_at": result.get("updated_at"),
     }
-    return _build_todo_list_response(meta)
+    completion = {
+        "taskId": task_id,
+        "rescheduled": bool(result.get("rescheduled", False)),
+        "nextRunAt": result.get("next_run_at"),
+    }
+    return _build_todo_list_response(meta, completion=completion)
 
 
 def _task_execute_cancel(user_key: str) -> tuple:
@@ -3993,6 +4185,13 @@ def _is_todo_list_query(message_text: str) -> bool:
         "whats on my list",
         "my tasks",
         "my todos",
+        "what is due",
+        "what's due",
+        "whats due",
+        "show due tasks",
+        "list due tasks",
+        "show overdue tasks",
+        "list overdue tasks",
     )
     return any(p in lower for p in phrases)
 
@@ -4407,6 +4606,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 "task_execute_resume": _task_execute_resume,
                 "task_execute_cancel": _task_execute_cancel,
                 "task_execution_status": _task_execution_status,
+                "task_execution_register_telegram_target": _task_execution_register_telegram_target,
                 "todo_store": telegram_todo,
                 "memory_cache_store": telegram_memory_cache,
                 "do_search": _do_proxy_search,

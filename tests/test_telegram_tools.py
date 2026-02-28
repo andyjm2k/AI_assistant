@@ -152,13 +152,71 @@ class TestExecuteTelegramTool:
             )
         assert r1.get("success") is True
         assert "Added task" in r1.get("message", "")
-        mock_store.add_task.assert_called_once_with("user1", "Buy milk")
+        mock_store.add_task.assert_called_once()
+        add_call_args, add_call_kwargs = mock_store.add_task.call_args
+        assert add_call_args[:2] == ("user1", "Buy milk")
+        assert add_call_kwargs == {"scheduled_for": None, "recurrence": None}
         # List: load_tasks returns the task
         mock_store.load_tasks.return_value = ["Buy milk"]
         with patch.object(tg, "_todo_store_module", mock_store):
             r2 = await tg.execute_telegram_tool("manageTodoList", {"action": "list"}, ctx)
         assert r2.get("success") is True
         assert "Buy milk" in r2.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_manage_todo_list_add_with_schedule_and_recurrence(self):
+        """manageTodoList add passes scheduledFor and recurrence to todo_store."""
+        mock_store = MagicMock()
+        mock_store.load_tasks.return_value = []
+        ctx = {"conversation_id": "cid1", "todo_user_key": "user1", "memory_cache_store": {}}
+        args = {
+            "action": "add",
+            "taskDescription": "Water plants",
+            "scheduledFor": "2026-03-01T09:00:00+00:00",
+            "recurrence": {"frequency": "weekly", "interval": 1},
+        }
+        with patch.object(tg, "_todo_store_module", mock_store):
+            out = await tg.execute_telegram_tool("manageTodoList", args, ctx)
+        assert out.get("success") is True
+        mock_store.add_task.assert_called_once_with(
+            "user1",
+            "Water plants",
+            scheduled_for="2026-03-01T09:00:00+00:00",
+            recurrence={"frequency": "weekly", "interval": 1},
+        )
+
+    @pytest.mark.asyncio
+    async def test_manage_todo_list_due_uses_due_loader_and_keeps_task_number(self):
+        """manageTodoList action=due should use due loader and preserve original task numbering."""
+        mock_store = MagicMock()
+        mock_store.load_tasks_with_meta.return_value = {
+            "tasks": ["Task A", "Task B"],
+            "task_items": [
+                {"id": "a", "description": "Task A"},
+                {"id": "b", "description": "Task B", "next_run_at": "2026-03-01T09:00:00+00:00"},
+            ],
+        }
+        mock_store.list_due_task_items.return_value = [
+            {"id": "b", "description": "Task B", "next_run_at": "2026-03-01T09:00:00+00:00"}
+        ]
+        ctx = {"conversation_id": "cid1", "todo_user_key": "user1", "memory_cache_store": {}}
+        with patch.object(tg, "_todo_store_module", mock_store):
+            out = await tg.execute_telegram_tool("manageTodoList", {"action": "due"}, ctx)
+        assert out.get("success") is True
+        assert "due tasks" in out.get("message", "").lower()
+        assert "2. Task B" in out.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_manage_todo_list_complete_rescheduled_message(self):
+        """manageTodoList complete reports reschedule when complete_task returns rescheduled=True."""
+        mock_store = MagicMock()
+        mock_store.load_tasks.return_value = ["Pay rent"]
+        mock_store.complete_task.return_value = {"rescheduled": True, "next_run_at": "2026-03-01T09:00:00+00:00"}
+        ctx = {"conversation_id": "cid1", "todo_user_key": "user1", "memory_cache_store": {}}
+        with patch.object(tg, "_todo_store_module", mock_store):
+            out = await tg.execute_telegram_tool("manageTodoList", {"action": "complete", "taskId": 1}, ctx)
+        assert out.get("success") is True
+        assert "rescheduled" in out.get("message", "").lower()
 
     @pytest.mark.asyncio
     async def test_execute_todo_task_requires_task_id(self):
@@ -178,6 +236,23 @@ class TestExecuteTelegramTool:
         assert r.get("success") is True
         assert r.get("status") == "executing"
         assert "started" in r.get("message", "").lower() or "status" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_todo_task_registers_telegram_target_when_callback_present(self):
+        """executeTodoTask calls task_execution_register_telegram_target when provided in context."""
+        async def mock_start(user_key, task_id, prompt_override):
+            return ("executing", "Task execution started.")
+        mock_register = MagicMock(return_value=True)
+        ctx = {
+            "conversation_id": "c1",
+            "user_id": "123456789",
+            "todo_user_key": "u1",
+            "task_execute_start": mock_start,
+            "task_execution_register_telegram_target": mock_register,
+        }
+        r = await tg.execute_telegram_tool("executeTodoTask", {"taskId": 1}, ctx)
+        assert r.get("success") is True
+        mock_register.assert_called_once_with("u1", "123456789")
 
     @pytest.mark.asyncio
     async def test_cancel_todo_execution_no_cancel_fn_returns_unavailable(self):

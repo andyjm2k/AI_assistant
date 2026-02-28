@@ -585,16 +585,17 @@ All services are configured to accept connections from devices on your local net
 - `DELETE /v1/files/delete/{filename}` - Delete a file from scratch directory
 
 **Todo list (all require authentication: `Authorization: Bearer <JWT>`):**
-- `GET /v1/todo` - List current user's tasks
-- `POST /v1/todo` - Add task (body: `{"taskDescription": "..."}`)
-- `PATCH /v1/todo/{task_id}` - Update task (body: `{"taskDescription": "..."}`)
+- `GET /v1/todo` - List current user's tasks (`?due_only=true` optional)
+- `GET /v1/todo/due` - List only due scheduled tasks (`nextRunAt <= now`)
+- `POST /v1/todo` - Add task (body supports `taskDescription`, optional `scheduledFor`, optional `recurrence`)
+- `PATCH /v1/todo/{task_id}` - Update task (body supports `taskDescription`, `scheduledFor`, `recurrence`, `clearSchedule`, `clearRecurrence`)
 - `DELETE /v1/todo/{task_id}` - Delete task
 - `DELETE /v1/todo` - Clear all tasks
 
 **Task Execution (all require authentication):**
 - `POST /v1/todo/execute` - Start execution for a task (body: `{"taskId": 1, "promptOverride": "optional"}`)
 - `POST /v1/todo/execute/resume` - Resume paused execution (body: `{"userMessage": "..."}`)
-- `POST /v1/todo/{task_id}/complete` - Human verification: mark task complete and remove from list
+- `POST /v1/todo/{task_id}/complete` - Human verification: mark task complete (one-time tasks removed, repeating tasks rescheduled)
 - `POST /v1/todo/execute/cancel` - Cancel current execution (task remains in list)
 
 **Utility:**

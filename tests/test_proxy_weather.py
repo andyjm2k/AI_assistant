@@ -21,32 +21,40 @@ def test_weather_requires_auth():
     assert response.status_code in (401, 403)
 
 
-def test_weather_endpoint_success_with_mocked_bom():
+def test_weather_endpoint_success_with_mocked_open_meteo():
     client = _client()
 
     location_resp = MagicMock()
     location_resp.raise_for_status = MagicMock()
     location_resp.json.return_value = {
-        "data": [{"name": "Sydney", "geohash": "r3gx2f"}]
-    }
-
-    obs_resp = MagicMock()
-    obs_resp.raise_for_status = MagicMock()
-    obs_resp.json.return_value = {
-        "data": {"observations": {"temp": 22.2, "humidity": 66, "icon_descriptor": "sunny"}}
+        "results": [{"name": "Sydney", "latitude": -33.86, "longitude": 151.2}]
     }
 
     forecast_resp = MagicMock()
     forecast_resp.raise_for_status = MagicMock()
     forecast_resp.json.return_value = {
-        "data": {"daily": [{"date": "2026-01-01", "temp_min": 18, "temp_max": 27, "rain_chance": 20}]}
+        "current": {
+            "temperature_2m": 22.2,
+            "apparent_temperature": 23.1,
+            "relative_humidity_2m": 66,
+            "wind_speed_10m": 15.0,
+            "weather_code": 1,
+            "time": "2026-01-01T10:00",
+        },
+        "daily": {
+            "time": ["2026-01-01"],
+            "temperature_2m_min": [18],
+            "temperature_2m_max": [27],
+            "precipitation_probability_max": [20],
+            "weather_code": [3],
+        },
     }
 
     with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_client_cls:
         client_instance = MagicMock()
         client_instance.__aenter__ = AsyncMock(return_value=client_instance)
         client_instance.__aexit__ = AsyncMock(return_value=None)
-        client_instance.get = AsyncMock(side_effect=[location_resp, obs_resp, forecast_resp])
+        client_instance.get = AsyncMock(side_effect=[location_resp, forecast_resp])
         mock_client_cls.return_value = client_instance
 
         response = client.get("/v1/proxy/weather?location=Sydney&detail=summary", headers=_auth_headers())
@@ -55,6 +63,7 @@ def test_weather_endpoint_success_with_mocked_bom():
     body = response.json()
     assert body["success"] is True
     assert body["resolved_location"] == "Sydney"
+    assert body["source"] == "open-meteo.com"
     assert "current" in body
     assert "forecast" in body
 
@@ -62,9 +71,15 @@ def test_weather_endpoint_success_with_mocked_bom():
 def test_weather_endpoint_memory_fallback_when_no_location():
     client = _client()
 
-    location_resp = MagicMock(); location_resp.raise_for_status = MagicMock(); location_resp.json.return_value = {"data": [{"name": "Melbourne", "geohash": "r1r0q"}]}
-    obs_resp = MagicMock(); obs_resp.raise_for_status = MagicMock(); obs_resp.json.return_value = {"data": {"observations": {"temp": 19}}}
-    forecast_resp = MagicMock(); forecast_resp.raise_for_status = MagicMock(); forecast_resp.json.return_value = {"data": {"daily": []}}
+    location_resp = MagicMock()
+    location_resp.raise_for_status = MagicMock()
+    location_resp.json.return_value = {"results": [{"name": "Melbourne", "latitude": -37.81, "longitude": 144.96}]}
+    forecast_resp = MagicMock()
+    forecast_resp.raise_for_status = MagicMock()
+    forecast_resp.json.return_value = {
+        "current": {"temperature_2m": 19, "weather_code": 2, "time": "2026-01-01T09:00"},
+        "daily": {"time": []},
+    }
 
     memory_manager = MagicMock()
     memory_manager.search_memories = AsyncMock(return_value=[{"text": "I live in Melbourne VIC"}])
@@ -75,7 +90,7 @@ def test_weather_endpoint_memory_fallback_when_no_location():
         client_instance = MagicMock()
         client_instance.__aenter__ = AsyncMock(return_value=client_instance)
         client_instance.__aexit__ = AsyncMock(return_value=None)
-        client_instance.get = AsyncMock(side_effect=[location_resp, obs_resp, forecast_resp])
+        client_instance.get = AsyncMock(side_effect=[location_resp, forecast_resp])
         mock_client_cls.return_value = client_instance
 
         response = client.get("/v1/proxy/weather", headers=_auth_headers())
@@ -90,26 +105,32 @@ def test_weather_endpoint_accepts_request_type_alias():
     location_resp = MagicMock()
     location_resp.raise_for_status = MagicMock()
     location_resp.json.return_value = {
-        "data": [{"name": "Sydney", "geohash": "r3gx2f"}]
-    }
-
-    obs_resp = MagicMock()
-    obs_resp.raise_for_status = MagicMock()
-    obs_resp.json.return_value = {
-        "data": {"observations": {"temp": 22.2, "humidity": 66, "icon_descriptor": "sunny"}}
+        "results": [{"name": "Sydney", "latitude": -33.86, "longitude": 151.2}]
     }
 
     forecast_resp = MagicMock()
     forecast_resp.raise_for_status = MagicMock()
     forecast_resp.json.return_value = {
-        "data": {"daily": [{"date": "2026-01-01", "temp_min": 18, "temp_max": 27, "rain_chance": 20}]}
+        "current": {
+            "temperature_2m": 22.2,
+            "relative_humidity_2m": 66,
+            "weather_code": 1,
+            "time": "2026-01-01T10:00",
+        },
+        "daily": {
+            "time": ["2026-01-01"],
+            "temperature_2m_min": [18],
+            "temperature_2m_max": [27],
+            "precipitation_probability_max": [20],
+            "weather_code": [3],
+        },
     }
 
     with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_client_cls:
         client_instance = MagicMock()
         client_instance.__aenter__ = AsyncMock(return_value=client_instance)
         client_instance.__aexit__ = AsyncMock(return_value=None)
-        client_instance.get = AsyncMock(side_effect=[location_resp, obs_resp, forecast_resp])
+        client_instance.get = AsyncMock(side_effect=[location_resp, forecast_resp])
         mock_client_cls.return_value = client_instance
 
         response = client.get("/v1/proxy/weather?location=Sydney&requestType=current", headers=_auth_headers())

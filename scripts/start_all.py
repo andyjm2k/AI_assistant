@@ -18,6 +18,7 @@ if not VENV_PYTHON.exists():
 commands = [
     f'start cmd /k "cd /d {PROJECT_ROOT} && {VENV_PYTHON} -m src.servers.https_server"',
     f'start cmd /k "cd /d {PROJECT_ROOT} && {VENV_PYTHON} -m src.servers.proxy_server"',
+    f'start cmd /k "cd /d {PROJECT_ROOT} && {VENV_PYTHON} -m src.servers.scheduled_task_poller"',
     f'start cmd /k "cd /d {PROJECT_ROOT} && %venv% && autogenstudio serve --team config/team-config.json --host 0.0.0.0 --port 8084"',
     f'start cmd /k "cd /d {PROJECT_ROOT} && {VENV_PYTHON} scripts/start_mcp_browser_use_http_server.py"',
     f'start cmd /k "cd /d {PROJECT_ROOT} && {VENV_PYTHON} scripts/start_mcp_browser_server.py"',

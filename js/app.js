@@ -5402,13 +5402,13 @@ function saveWAVFile(wavBlob) {
                     type: "function",
                     function: {
                         name: "manageTodoList",
-                        description: "Manages a persistent todo list with scheduling and repeating-task support (list, add, update, complete, delete, clear).",
+                        description: "Manages a persistent todo list with scheduling and repeating-task support (list, due, add, update, complete, delete, clear).",
                         parameters: {
                             type: "object",
                             properties: {
                                 action: {
                                     type: "string",
-                                    enum: ["list", "add", "update", "complete", "delete", "clear"],
+                                    enum: ["list", "due", "add", "update", "complete", "delete", "clear"],
                                     description: "The action to perform on the todo list"
                                 },
                                 taskId: {
@@ -6325,6 +6325,8 @@ function saveWAVFile(wavBlob) {
         function formatTodoTaskLine(task, index) {
             if (typeof task === 'string') return `${index + 1}. ${task}`;
             const description = task?.taskDescription || task?.description || '(No description)';
+            const parsedTaskId = Number(task?.taskId);
+            const lineNumber = Number.isFinite(parsedTaskId) && parsedTaskId > 0 ? Math.floor(parsedTaskId) : (index + 1);
             const suffix = [];
             const nextRun = task?.nextRunAt || task?.next_run_at || task?.scheduledFor || task?.scheduled_for;
             if (nextRun) {
@@ -6339,17 +6341,19 @@ function saveWAVFile(wavBlob) {
                 suffix.push(`repeats every ${safeInterval} ${unit}`);
             }
             return suffix.length
-                ? `${index + 1}. ${description} (${suffix.join('; ')})`
-                : `${index + 1}. ${description}`;
+                ? `${lineNumber}. ${description} (${suffix.join('; ')})`
+                : `${lineNumber}. ${description}`;
         }
 
         async function handleTodoList({ action, taskId, taskDescription, scheduledFor, recurrence, repeatFrequency, repeatInterval, clearSchedule, clearRecurrence }) {
             const headers = { 'Content-Type': 'application/json' };
             if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+            const normalizedAction = String(action || '').trim().toLowerCase();
+            const resolvedAction = (normalizedAction === 'list_due' || normalizedAction === 'listdue') ? 'due' : normalizedAction;
             try {
                 if (authToken) {
                     const recurrencePayload = normalizeTodoRecurrenceInput({ recurrence, repeatFrequency, repeatInterval });
-                    switch (action) {
+                    switch (resolvedAction) {
                         case "list":
                             await fetchTodoListFromServer();
                             if (todoList.length === 0) return { success: true, message: "Your todo list is empty." };
@@ -6358,6 +6362,21 @@ function saveWAVFile(wavBlob) {
                                 : todoList;
                             const taskList = sourceItems.map((task, index) => formatTodoTaskLine(task, index)).join('\n');
                             return { success: true, message: "Here are your current tasks:\n" + taskList };
+                        case "due":
+                            const dueRes = await fetch(`${PROXY_BASE_URL}/v1/todo/due`, { method: 'GET', headers });
+                            if (!dueRes.ok) {
+                                const err = await dueRes.json().catch(() => ({}));
+                                return { success: false, message: err.detail || dueRes.statusText };
+                            }
+                            const dueData = await dueRes.json();
+                            const dueTasks = Array.isArray(dueData.tasks) ? dueData.tasks : [];
+                            const dueTaskItems = Array.isArray(dueData.taskItems) ? dueData.taskItems : [];
+                            if (dueTasks.length === 0) {
+                                return { success: true, message: "You have no due scheduled tasks right now." };
+                            }
+                            const dueSourceItems = dueTaskItems.length > 0 ? dueTaskItems : dueTasks;
+                            const dueTaskList = dueSourceItems.map((task, index) => formatTodoTaskLine(task, index)).join('\n');
+                            return { success: true, message: "Here are your due tasks:\n" + dueTaskList, tasks: dueTasks, taskItems: dueTaskItems };
                         case "add":
                             if (!taskDescription) return { success: false, message: "Task description is required." };
                             const addPayload = { taskDescription: taskDescription.trim() };
@@ -7342,9 +7361,14 @@ function saveWAVFile(wavBlob) {
                     /(update|change|modify|edit) (?:the )?(?:todo|task|item|reminder|note) (?:number )?(\d+)(?: (?:to|with) ["']?([^"']+)["']?)?/i,
                     /(complete|done|finish|mark complete|check off) (?:the )?(?:todo|task|item|reminder|note) (?:number )?(\d+)/i,
                     /(delete|remove|clear) (?:the )?(?:todo|task|item|reminder|note)(?: number )?(\d+)?/i,
+                    /(show|list|get|display) (?:my )?(?:due|overdue|scheduled due) (?:todo|task|item|reminder|note)s?/i,
                     /(show|list|display|get) (?:all )?(?:my )?(?:todo|task|item|reminder|note)s?(?:list)?/i
                 ],
                 extractArgs: (match) => {
+                    const rawText = String(match[0] || '').toLowerCase();
+                    if (/\bdue\b|\boverdue\b/.test(rawText)) {
+                        return { action: 'due' };
+                    }
                     const action = match[1].toLowerCase();
                     if (action.match(/add|create|make|new/i)) {
                         return { 
@@ -7840,12 +7864,16 @@ IMPORTANT: Always use the XML-style format shown above. Never return raw JSON or
 Available tools:
 
 1. manageTodoList
-Description: Manages a todo list
+Description: Manages a todo list with scheduler support
 Parameters:
 {
-    "action": "list|add|update|delete|clear",
-    "taskId": "number (for update/delete)",
-    "taskDescription": "string (for add/update)"
+    "action": "list|due|add|update|complete|delete|clear",
+    "taskId": "number (for update/complete/delete)",
+    "taskDescription": "string (for add/update)",
+    "scheduledFor": "string (optional ISO-8601 datetime)",
+    "recurrence": {"frequency": "hourly|daily|weekly|monthly|yearly", "interval": "number >= 1"},
+    "clearSchedule": "boolean (update only)",
+    "clearRecurrence": "boolean (update only)"
 }
 
 2. manageMemoryCache

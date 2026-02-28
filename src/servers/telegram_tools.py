@@ -245,17 +245,63 @@ async def execute_telegram_tool(
         meta = _load_meta()
         tasks = meta["tasks"]
         task_items = meta["task_items"]
+        task_id_by_uid: Dict[str, int] = {}
+        for idx, item in enumerate(task_items, start=1):
+            if isinstance(item, dict):
+                item_uid = item.get("id")
+                if item_uid is not None:
+                    task_id_by_uid[str(item_uid)] = idx
 
-        if action == "list":
-            if not tasks:
-                return {"success": True, "message": "Your todo list is empty."}
-            if not task_items:
-                task_items = [{"description": t} for t in tasks]
-
+        if action in {"list", "due", "list_due", "listdue"}:
+            due_only = action in {"due", "list_due", "listdue"}
+            items_for_render = task_items
+            tasks_for_render = tasks
             now_utc = datetime.now(timezone.utc)
+
+            if due_only:
+                due_loader = getattr(_todo_store_module, "list_due_task_items", None)
+                if callable(due_loader):
+                    due_items = due_loader(todo_user_key)
+                    if isinstance(due_items, list):
+                        items_for_render = [item for item in due_items if isinstance(item, dict)]
+                else:
+                    filtered: List[Dict[str, Any]] = []
+                    for item in task_items:
+                        if not isinstance(item, dict):
+                            continue
+                        next_run = item.get("next_run_at")
+                        if not next_run:
+                            continue
+                        try:
+                            next_run_text = str(next_run)
+                            if next_run_text.endswith("Z"):
+                                next_run_text = next_run_text[:-1] + "+00:00"
+                            parsed_next = datetime.fromisoformat(next_run_text)
+                            if parsed_next.tzinfo is None:
+                                parsed_next = parsed_next.replace(tzinfo=timezone.utc)
+                            if parsed_next.astimezone(timezone.utc) <= now_utc:
+                                filtered.append(item)
+                        except ValueError:
+                            continue
+                    items_for_render = filtered
+                tasks_for_render = [
+                    str(item.get("description") or "").strip()
+                    for item in items_for_render
+                    if isinstance(item, dict) and str(item.get("description") or "").strip()
+                ]
+
+            if not tasks_for_render and not items_for_render:
+                if due_only:
+                    return {"success": True, "message": "You have no due scheduled tasks right now.", "data": {"tasks": [], "task_items": []}}
+                return {"success": True, "message": "Your todo list is empty."}
+            if not items_for_render:
+                items_for_render = [{"description": t} for t in tasks_for_render]
+
             lines = []
-            for i, item in enumerate(task_items):
-                description = str(item.get("description") or (tasks[i] if i < len(tasks) else "")).strip()
+            for i, item in enumerate(items_for_render):
+                description = str(item.get("description") or (tasks_for_render[i] if i < len(tasks_for_render) else "")).strip()
+                item_uid = item.get("id")
+                line_number = task_id_by_uid.get(str(item_uid), i + 1) if item_uid is not None else (i + 1)
                 next_run = item.get("next_run_at")
                 recurrence_item = item.get("recurrence")
                 suffix_parts = []
@@ -284,8 +330,13 @@ async def execute_telegram_tool(
                         unit = freq if interval_value == 1 else f"{freq}s"
                         suffix_parts.append(f"repeats every {interval_value} {unit}")
                 suffix = f" ({'; '.join(suffix_parts)})" if suffix_parts else ""
-                lines.append(f"{i + 1}. {description}{suffix}")
-            return {"success": True, "message": "Here are your current tasks:\n" + "\n".join(lines), "data": meta}
+                lines.append(f"{line_number}. {description}{suffix}")
+            intro = "Here are your due tasks:\n" if due_only else "Here are your current tasks:\n"
+            return {
+                "success": True,
+                "message": intro + "\n".join(lines),
+                "data": {"tasks": tasks_for_render, "task_items": items_for_render},
+            }
 
         if action == "add":
             if not task_description:
@@ -386,6 +437,13 @@ async def execute_telegram_tool(
         user_key = context.get("todo_user_key") or cid
         try:
             status, message = await start_fn(user_key, tid, (prompt_override or "").strip() or None)
+            register_target_fn = context.get("task_execution_register_telegram_target")
+            chat_id = context.get("user_id") or context.get("conversation_id")
+            if callable(register_target_fn):
+                try:
+                    register_target_fn(user_key, chat_id)
+                except Exception:
+                    pass
             return {"success": True, "message": message, "status": status}
         except Exception as e:
             msg = str(e)

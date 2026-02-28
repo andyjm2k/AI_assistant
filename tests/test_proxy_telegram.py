@@ -233,6 +233,8 @@ class TestIsTodoListQuery:
         assert _is_todo_list_query("list my tasks") is True
         assert _is_todo_list_query("my todo list") is True
         assert _is_todo_list_query("what are my tasks") is True
+        assert _is_todo_list_query("what is due today?") is True
+        assert _is_todo_list_query("show overdue tasks") is True
 
     def test_unrelated_queries_return_false(self):
         """Unrelated messages return False."""
@@ -303,6 +305,60 @@ class TestResolveTodoUserForTelegram:
             # Simulate Pydantic/JSON giving int
             out = ps._resolve_todo_user_for_telegram("6644154165", 6644154165)
         assert out == "andyjm2k"
+
+
+class TestTelegramTaskExecutionNotifications:
+    """Tests for Telegram notification helpers used by task execution completion flow."""
+
+    def test_resolve_telegram_chat_ids_for_todo_user_reverses_links(self):
+        from src.servers import proxy_server as ps
+        links_content = '{"6644154165": "andyjm2k", "-100123": "andyjm2k", "group_alpha": "andyjm2k"}'
+        with patch.object(ps, "TELEGRAM_USER_LINKS_FILE") as mock_path:
+            mock_path.exists.return_value = True
+            mock_path.read_text.return_value = links_content
+            out = ps._resolve_telegram_chat_ids_for_todo_user("andyjm2k")
+        assert out == ["6644154165", "-100123"]
+
+    def test_task_execution_register_telegram_target_adds_chat_id_once(self):
+        from src.servers import proxy_server as ps
+        user_key = "notify-user-1"
+        ps.task_execution_state[user_key] = {"status": "executing", "telegram_chat_ids": ["111"]}
+        try:
+            ok1 = ps._task_execution_register_telegram_target(user_key, "222")
+            ok2 = ps._task_execution_register_telegram_target(user_key, "222")
+            assert ok1 is True
+            assert ok2 is True
+            assert ps.task_execution_state[user_key]["telegram_chat_ids"] == ["111", "222"]
+        finally:
+            ps.task_execution_state.pop(user_key, None)
+
+    @pytest.mark.asyncio
+    async def test_run_task_loop_background_notifies_on_scheduled_completion(self):
+        from src.servers import proxy_server as ps
+
+        class _Executor:
+            async def run_loop(self):
+                return (ps.STATUS_AWAITING_CONFIRMATION, "Execution complete.")
+
+        user_key = "notify-user-2"
+        ps.task_execution_state[user_key] = {
+            "task_id": 3,
+            "status": ps.STATUS_EXECUTING,
+            "executor": _Executor(),
+            "message": None,
+            "task_description": "Scheduled task demo",
+            "is_scheduled": True,
+            "telegram_chat_ids": ["6644154165"],
+        }
+        try:
+            with patch.object(ps, "_write_task_exec_response_to_scratch") as mock_write:
+                with patch.object(ps, "_send_telegram_bot_message", new=AsyncMock(return_value=True)) as mock_send:
+                    await ps._run_task_loop_background(user_key, _Executor())
+            assert ps.task_execution_state[user_key]["status"] == ps.STATUS_AWAITING_CONFIRMATION
+            mock_write.assert_called_once()
+            mock_send.assert_awaited_once()
+        finally:
+            ps.task_execution_state.pop(user_key, None)
 
 
 class TestPhilosopherFileTools:
