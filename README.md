@@ -387,6 +387,7 @@ Key environment variables (see `.env.example` for complete list):
 #### Context Window Controls
 - `MAX_TOKEN_LIMIT`: Max total tokens (input + output) per LLM request. The proxy preflights, summarizes, and retries when exceeded.
 - `TOKEN_ESTIMATE_CHARS_PER_TOKEN`: Heuristic for token estimation when no tokenizer is available (default 4).
+- `LIST_FILES_TOOL_MAX_ENTRIES`: Max number of rows returned by LLM-facing file-list tools (`listFiles`/`list_files`, default 60). Use this to keep large scratch directory listings from inflating tool-loop context.
  
 #### Large Payload Fallback
 - `LARGE_PAYLOAD_MODEL`: Optional model to retry with when context window exhaustion occurs.
@@ -427,6 +428,7 @@ Key environment variables (see `.env.example` for complete list):
 **Telegram tools (optional, proxy only):**
 - `TELEGRAM_TOOLS_ENABLED`: Set to `"true"` to enable tools in Telegram (search, files, todo, memory, workflows, etc.). When enabled, the proxy uses `config/catbot_system_prompt_with_tools.txt` and runs a tool loop.
 - `TELEGRAM_TOOLS_MAX_ITERATIONS`: Max tool-loop iterations per message (default: 5)
+- `LIST_FILES_TOOL_MAX_ENTRIES`: Caps `listFiles` output rows sent back to the model (default: 60) so large scratch directories do not bloat chat context.
 - When tools are enabled, the following are used by specific tools if set (same as web UI): `BRAVE_API_KEY` (webSearch; else DuckDuckGo), `NEWS_API_KEY` (fetchNews), `GOOGLE_DRIVE_*` (uploadToGoogleDrive), memory/vector-store settings for store/search/list/delete memories. File tools use the proxy scratch directory; runWorkflow uses AutoGen/team-config.
 
 **Todo list (persistent, per user):** The todo list is stored in backend file storage (`todo_data/` by default, or `TODO_DATA_PATH`) per authenticated user. The web UI requires sign-in to load/save todo; tools (manageTodoList, executeTodoTask) call the proxy REST API. Telegram uses the same backend; optional **Telegram account linking** via `config/telegram_user_links.json` (mapping Telegram user ID or conversation ID to app username) lets the same todo list be shared between browser and Telegram. Without linking, Telegram uses a persistent per-chat list keyed by conversation ID.

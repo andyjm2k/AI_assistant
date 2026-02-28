@@ -7,6 +7,7 @@ Todo list uses persistent todo_store when context provides todo_user_key.
 import ast
 import asyncio
 import json
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,29 @@ except ImportError:
 CALC_EXPR_MAX_LEN = 200
 # Allowed characters for safe calculate (numbers, spaces, + - * / ( ) .)
 CALC_ALLOWED_RE = re.compile(r"^[\d\s+\-*/().]+$")
+
+
+def _get_list_files_tool_max_entries() -> int:
+    """Return max entries rendered in list-files replies."""
+    raw = (os.getenv("LIST_FILES_TOOL_MAX_ENTRIES", "60") or "60").strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        parsed = 60
+    return max(1, parsed)
+
+
+def _format_list_files_message(files: List[Dict[str, Any]]) -> str:
+    """Render a bounded file list to reduce token pressure in chat loops."""
+    if not files:
+        return "No files."
+    limit = _get_list_files_tool_max_entries()
+    shown = files[:limit]
+    lines = [f"- {f.get('name', '')}" for f in shown]
+    remaining = max(0, len(files) - len(shown))
+    if remaining > 0:
+        lines.append(f"- ... and {remaining} more files.")
+    return "Files:\n" + "\n".join(lines)
 
 
 def _log_tool_invocation(name: str, arguments: Dict[str, Any], conversation_id: str) -> None:
@@ -702,8 +726,7 @@ async def execute_telegram_tool(
         if isinstance(out, dict) and not out.get("success"):
             return {"success": False, "message": out.get("message", "List failed.")}
         files = out.get("files") or []
-        lines = [f"- {f.get('name', '')}" for f in files]
-        return {"success": True, "message": "Files:\n" + "\n".join(lines) if lines else "No files.", "data": out}
+        return {"success": True, "message": _format_list_files_message(files), "data": out}
 
     # --- saveToFile (map to writeFile) ---
     if name == "saveToFile":

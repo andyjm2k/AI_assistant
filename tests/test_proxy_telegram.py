@@ -385,6 +385,31 @@ class TestPhilosopherFileTools:
         assert "scratch" in result.lower() or "empty" in result.lower() or "Files" in result
 
     @pytest.mark.asyncio
+    async def test_execute_list_files_truncates_when_limit_set(self, monkeypatch):
+        """execute_tool_for_philosopher list_files should cap rendered rows for large directories."""
+        from src.servers import proxy_server as ps
+        monkeypatch.setenv("LIST_FILES_TOOL_MAX_ENTRIES", "3")
+
+        fake_result = {
+            "success": True,
+            "files": [
+                {"name": "a.txt", "size": 1},
+                {"name": "b.txt", "size": 2},
+                {"name": "c.txt", "size": 3},
+                {"name": "d.txt", "size": 4},
+            ],
+        }
+
+        with patch.object(ps, "_list_files_internal", new=AsyncMock(return_value=fake_result)):
+            result = await ps.execute_tool_for_philosopher("list_files", {})
+        assert isinstance(result, str)
+        assert "a.txt (1 bytes)" in result
+        assert "b.txt (2 bytes)" in result
+        assert "c.txt (3 bytes)" in result
+        assert "... and 1 more files." in result
+        assert "d.txt (4 bytes)" not in result
+
+    @pytest.mark.asyncio
     async def test_run_workflow_tool_included_when_autogen_available(self):
         """When AUTOGEN_AVAILABLE is True, get_all_available_tools includes runWorkflow."""
         from src.servers import proxy_server as ps

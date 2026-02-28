@@ -5531,8 +5531,7 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             files = result.get("files", [])
             if not files:
                 return f"Scratch workspace is empty. (Directory: {result.get('scratch_dir', 'scratch')})"
-            lines = [f"{f.get('name', '?')} ({f.get('size', 0)} bytes)" for f in files]
-            return "Files in scratch workspace:\n" + "\n".join(lines)
+            return _format_list_files_for_tool_output(files, include_sizes=True)
         except Exception as e:
             return f"Error executing list_files: {str(e)}"
     
@@ -7518,6 +7517,34 @@ async def _list_files_internal() -> Dict[str, Any]:
         return {"success": True, "files": files, "count": len(files), "scratch_dir": str(SCRATCH_DIR)}
     except Exception as e:
         return {"success": False, "message": str(e), "files": []}
+
+
+def _get_list_files_tool_max_entries() -> int:
+    """Return max entries rendered in list-files tool replies."""
+    raw = (os.getenv("LIST_FILES_TOOL_MAX_ENTRIES", "60") or "60").strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        parsed = 60
+    return max(1, parsed)
+
+
+def _format_list_files_for_tool_output(files: List[Dict[str, Any]], include_sizes: bool = False) -> str:
+    """Format scratch files for LLM-facing tool output with a bounded number of rows."""
+    if not files:
+        return "Scratch workspace is empty."
+    limit = _get_list_files_tool_max_entries()
+    shown = files[:limit]
+    if include_sizes:
+        lines = [f"{f.get('name', '?')} ({f.get('size', 0)} bytes)" for f in shown]
+    else:
+        lines = [f.get("name", "?") for f in shown]
+    remaining = max(0, len(files) - len(shown))
+    header = "Files in scratch workspace:"
+    if remaining > 0:
+        header += f" (showing {len(shown)} of {len(files)})"
+        lines.append(f"... and {remaining} more files.")
+    return header + "\n" + "\n".join(lines)
 
 
 async def _delete_file_internal(filename: str) -> Dict[str, Any]:

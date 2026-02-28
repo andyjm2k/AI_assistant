@@ -27,6 +27,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -330,12 +331,40 @@ async def _ensure_telegram_voice_note_audio(
     return converted, "audio/ogg; codecs=opus", True
 
 
+_BRACKET_CONTENT_PATTERN = re.compile(r"\([^()]*\)|\[[^\[\]]*\]")
+_TTS_ALLOWED_PUNCTUATION = set(".,!?;:'\"-")
+
+
+def _sanitize_tts_text(text: str) -> str:
+    cleaned = text or ""
+
+    # Remove content in parentheses and square brackets (supports nested by repeated passes).
+    while True:
+        updated = _BRACKET_CONTENT_PATTERN.sub(" ", cleaned)
+        if updated == cleaned:
+            break
+        cleaned = updated
+
+    # Keep only letters/digits, whitespace, and TTS-friendly punctuation.
+    filtered_chars = [
+        ch
+        for ch in cleaned
+        if ch.isalnum() or ch.isspace() or ch in _TTS_ALLOWED_PUNCTUATION
+    ]
+    normalized = "".join(filtered_chars)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 async def call_backend_tts(text: str) -> tuple[bytes, str]:
     url = _build_backend_url("/v1/proxy/tts/speech")
     headers = _backend_headers()
+    sanitized_text = _sanitize_tts_text(text)
+    if not sanitized_text:
+        raise RuntimeError("TTS input was empty after sanitization.")
+
     payload = {
         "model": TTS_MODEL,
-        "input": text,
+        "input": sanitized_text,
         "voice": TTS_VOICE,
         "response_format": TTS_RESPONSE_FORMAT,
     }

@@ -419,6 +419,45 @@ class TestExecuteTelegramTool:
         assert r.get("success") is False
         assert "not available" in r.get("message", "").lower()
 
+    @pytest.mark.asyncio
+    async def test_list_files_limits_output_rows(self, monkeypatch):
+        """listFiles should cap rendered rows and append an overflow indicator."""
+        monkeypatch.setenv("LIST_FILES_TOOL_MAX_ENTRIES", "3")
+
+        async def fake_list_internal():
+            return {
+                "success": True,
+                "files": [
+                    {"name": "a.txt"},
+                    {"name": "b.txt"},
+                    {"name": "c.txt"},
+                    {"name": "d.txt"},
+                    {"name": "e.txt"},
+                ],
+            }
+
+        ctx = {"conversation_id": "cid1", "list_files_internal": fake_list_internal}
+        r = await tg.execute_telegram_tool("listFiles", {}, ctx)
+        assert r.get("success") is True
+        message = r.get("message", "")
+        assert "- a.txt" in message
+        assert "- b.txt" in message
+        assert "- c.txt" in message
+        assert "- ... and 2 more files." in message
+        assert "- d.txt" not in message
+        assert "- e.txt" not in message
+
+    @pytest.mark.asyncio
+    async def test_list_files_returns_no_files_when_empty(self):
+        """listFiles returns 'No files.' when no files are present."""
+        async def fake_list_internal():
+            return {"success": True, "files": []}
+
+        ctx = {"conversation_id": "cid1", "list_files_internal": fake_list_internal}
+        r = await tg.execute_telegram_tool("listFiles", {}, ctx)
+        assert r.get("success") is True
+        assert r.get("message") == "No files."
+
 
     @pytest.mark.asyncio
     async def test_weather_info_calls_do_weather(self):
