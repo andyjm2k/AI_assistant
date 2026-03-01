@@ -204,6 +204,8 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     telegram_token = ""
     telegram_admins = ""
     telegram_allow_all = "false"
+    telegram_tools_enabled = "false"
+    telegram_secret = ""
     if use_telegram:
         telegram_token = _prompt("   Telegram bot token (from BotFather)", "", secret=True)
         if telegram_token:
@@ -212,6 +214,16 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
                 telegram_allow_all = "true"
             else:
                 telegram_admins = _prompt("   Admin Telegram user ID(s), comma-separated", "")
+            enable_tools = _prompt_yes_no("   Enable Telegram tools on proxy?", False)
+            telegram_tools_enabled = "true" if enable_tools else "false"
+            if enable_tools:
+                print("   Telegram file attachments (sendTelegramFile) require authenticated proxy requests.")
+            set_secret = _prompt_yes_no(
+                "   Set TELEGRAM_SECRET for bot-to-proxy authentication (recommended)?",
+                True,
+            )
+            if set_secret:
+                telegram_secret = _prompt("   TELEGRAM_SECRET value (same on bot and proxy)", "", secret=True)
 
     # 7. Web UI TTS defaults (optional)
     tts_endpoint = _prompt("8) Default TTS endpoint for web UI (optional; press Enter to skip)", "")
@@ -268,6 +280,9 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         content = _set_key_in_env_content(content, "TELEGRAM_ALLOW_ALL", telegram_allow_all)
         if telegram_admins:
             content = _set_key_in_env_content(content, "TELEGRAM_ADMIN_IDS", telegram_admins)
+        content = _set_key_in_env_content(content, "TELEGRAM_TOOLS_ENABLED", telegram_tools_enabled)
+        if telegram_secret:
+            content = _set_key_in_env_content(content, "TELEGRAM_SECRET", telegram_secret)
     if tts_endpoint:
         content = _set_key_in_env_content(content, "TTS_ENDPOINT", tts_endpoint)
     if tts_model:

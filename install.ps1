@@ -125,5 +125,6 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ([Environment]::NewLine + 'CATBot install complete.') -ForegroundColor Green
 Write-Host 'Next steps:' -ForegroundColor Cyan
 Write-Host '  If you skipped the wizard or need to change settings: edit .env'
+Write-Host '  If using Telegram tools/file attachments, set TELEGRAM_SECRET on both bot and proxy.'
 Write-Host '  Start CATBot: .\start.bat  or  .\venv\Scripts\python.exe scripts/start_all.py'
 Write-Host ''

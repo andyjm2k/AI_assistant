@@ -67,6 +67,47 @@ class TestTelegramChatEndpoint:
         assert data.get("reply") == "Hello from CATBot"
         assert data.get("conversation_id") == "test-conv"
 
+    def test_valid_request_handles_structured_content_reply(self):
+        """POST should coerce list/dict content parts into plain text reply."""
+        client = _get_client()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Hello from CATBot"},
+                            {"type": "text", "text": "Second line"},
+                        ]
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+        def getenv(k, d=None):
+            if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"):
+                return "test-key"
+            return os.environ.get(k, d) if d is not None else os.environ.get(k)
+
+        with patch("src.servers.proxy_server.os.getenv", side_effect=getenv):
+            with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                mock_client_instance = MagicMock()
+                mock_client_instance.post = AsyncMock(return_value=mock_response)
+                mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                mock_aclient.return_value = mock_client_instance
+
+                resp = client.post(
+                    "/v1/telegram/chat",
+                    json={"message": "Hi", "conversation_id": "structured-conv"},
+                )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("reply") == "Hello from CATBot\nSecond line"
+        assert data.get("conversation_id") == "structured-conv"
+
     def test_no_api_key_returns_503(self):
         """POST when neither OPENAI_API_KEY nor MCP_LLM_OPENAI_API_KEY is set returns 503."""
         client = _get_client()
@@ -221,6 +262,123 @@ class TestTelegramToolsLoop:
         assert data.get("reply") == final_response
         assert data.get("conversation_id") == "tools-test"
 
+    def test_tool_loop_handles_structured_followup_content(self):
+        """Tool-loop follow-up content parts should be normalized to text instead of failing response validation."""
+        client = _get_client()
+        tool_response = '<tool>webSearch</tool>\n<parameters>{"query": "test query"}</parameters>'
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [{"message": {"content": tool_response}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Here are the search results."},
+                            {"type": "text", "text": "Summary line 2."},
+                        ]
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 10},
+        }
+        post_calls = [mock_first, mock_second]
+
+        def next_response(*args, **kwargs):
+            return post_calls.pop(0) if post_calls else mock_second
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            try:
+                from src.servers import proxy_server as ps
+                if getattr(ps, "_telegram_tools", None) is None:
+                    pytest.skip("telegram_tools module not available")
+            except ImportError:
+                pytest.skip("telegram_tools not importable")
+            with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search:
+                mock_search.return_value = {"results": [{"title": "Test", "snippet": "Snippet"}]}
+                with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                    m_getenv.side_effect = lambda k, d=None: (
+                        "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                    )
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(side_effect=next_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={"message": "Search for test", "conversation_id": "tools-structured-test"},
+                        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("reply") == "Here are the search results.\nSummary line 2."
+        assert data.get("conversation_id") == "tools-structured-test"
+
+    def test_tool_loop_keeps_mixed_final_reply_instead_of_error_fallback(self):
+        """
+        When follow-up text includes user-facing content plus incidental tool XML,
+        the final reply should be delivered (with XML stripped), not replaced by
+        the generic tool-error fallback.
+        """
+        client = _get_client()
+        tool_response = '<tool>webSearch</tool>\n<parameters>{"query": "test query"}</parameters>'
+        mixed_final = (
+            "Here are the search results summary.\n"
+            '<tool>webSearch</tool>\n<parameters>{"query":"next query"}</parameters>'
+        )
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [{"message": {"content": tool_response}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [{"message": {"content": mixed_final}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 10},
+        }
+        post_calls = [mock_first, mock_second]
+
+        def next_response(*args, **kwargs):
+            return post_calls.pop(0) if post_calls else mock_second
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            try:
+                from src.servers import proxy_server as ps
+                if getattr(ps, "_telegram_tools", None) is None:
+                    pytest.skip("telegram_tools module not available")
+            except ImportError:
+                pytest.skip("telegram_tools not importable")
+            with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search:
+                mock_search.return_value = {"results": [{"title": "Test", "snippet": "Snippet"}]}
+                with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                    m_getenv.side_effect = lambda k, d=None: (
+                        "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                    )
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(side_effect=next_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={"message": "Search for test", "conversation_id": "tools-mixed-final"},
+                        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("reply") == "Here are the search results summary."
+        assert data.get("reply") != "I wasn't able to get that information just now. Please try again or rephrase your question."
+
 
 class TestIsTodoListQuery:
     """Tests for _is_todo_list_query (skip memory injection for todo-list requests)."""
@@ -353,12 +511,35 @@ class TestTelegramTaskExecutionNotifications:
         try:
             with patch.object(ps, "_write_task_exec_response_to_scratch") as mock_write:
                 with patch.object(ps, "_send_telegram_bot_message", new=AsyncMock(return_value=True)) as mock_send:
-                    await ps._run_task_loop_background(user_key, _Executor())
-            assert ps.task_execution_state[user_key]["status"] == ps.STATUS_AWAITING_CONFIRMATION
+                    with patch.object(ps, "_todo_store") as mock_store:
+                        mock_store.complete_task.return_value = {
+                            "rescheduled": True,
+                            "next_run_at": "2026-03-02T09:00:00+00:00",
+                        }
+                        await ps._run_task_loop_background(user_key, _Executor())
+            assert user_key not in ps.task_execution_state
+            mock_store.complete_task.assert_called_once_with(user_key, 3)
             mock_write.assert_called_once()
             mock_send.assert_awaited_once()
         finally:
             ps.task_execution_state.pop(user_key, None)
+
+
+class TestTelegramFileSendSecurity:
+    """Tests for Telegram scratch-file sending preconditions."""
+
+    @pytest.mark.asyncio
+    async def test_send_telegram_file_internal_does_not_require_proxy_auth(self, monkeypatch):
+        """send file helper should proceed without proxy auth checks and validate next requirements."""
+        from src.servers import proxy_server as ps
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+        out = await ps._send_telegram_file_internal(
+            chat_id="123456",
+            filename="report.txt",
+        )
+        assert out.get("success") is False
+        assert "telegram_bot_token is not configured" in out.get("message", "").lower()
 
 
 class TestPhilosopherFileTools:

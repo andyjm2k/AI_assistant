@@ -30,8 +30,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from contextlib import suppress
+from pathlib import Path
 from typing import Dict, Optional
 
 import httpx
@@ -74,6 +76,8 @@ SEND_TRANSCRIPT = os.getenv("TELEGRAM_SEND_TRANSCRIPT", "true").lower() != "fals
 VOICE_IN_ENABLED = os.getenv("TELEGRAM_VOICE_IN", "true").lower() != "false"
 VOICE_OUT_ENABLED = os.getenv("TELEGRAM_VOICE_OUT", "false").lower() == "true"
 STATUS_UPDATE_INTERVAL = 60.0
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RESTART_WORKER_SCRIPT = PROJECT_ROOT / "scripts" / "restart_all.py"
 
 
 def _parse_admin_ids() -> set[int]:
@@ -521,7 +525,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start - initialize chat\n"
         "/help - show this message\n"
         "/status - backend status and usage\n"
-        "/clear - clear conversation history\n\n"
+        "/clear - clear conversation history\n"
+        "/restart - restart all CATBot services\n\n"
         "You can send text, voice notes, or audio files.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -566,6 +571,83 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Conversation history cleared.")
     else:
         await update.message.reply_text("Backend did not confirm history clear. Try again shortly.")
+
+
+def _spawn_restart_worker(chat_id: int, requested_by: int) -> None:
+    if not RESTART_WORKER_SCRIPT.exists():
+        raise RuntimeError(f"Restart worker script not found: {RESTART_WORKER_SCRIPT}")
+
+    # On Windows, launch through a short-lived PowerShell trampoline so the
+    # restart worker is not a direct child of the telegram bot process.
+    # This prevents stop_all.py (taskkill /T) from killing the restart worker.
+    if os.name == "nt":
+        python_executable = str(Path(sys.executable).resolve())
+        script_path = str(RESTART_WORKER_SCRIPT.resolve())
+
+        def _ps_single_quote(value: str) -> str:
+            return value.replace("'", "''")
+
+        ps_script = (
+            f"$python = '{_ps_single_quote(python_executable)}'; "
+            f"$script = '{_ps_single_quote(script_path)}'; "
+            f"$args = @($script, '--chat-id', '{chat_id}', '--requested-by', '{requested_by}'); "
+            "Start-Process -FilePath $python -ArgumentList $args -WindowStyle Hidden"
+        )
+
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            cwd=str(PROJECT_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            creationflags=create_no_window,
+        )
+        return
+
+    cmd = [
+        sys.executable,
+        str(RESTART_WORKER_SCRIPT),
+        "--chat-id",
+        str(chat_id),
+        "--requested-by",
+        str(requested_by),
+    ]
+    popen_kwargs = {
+        "cwd": str(PROJECT_ROOT),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        detached = getattr(subprocess, "DETACHED_PROCESS", 0)
+        new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        popen_kwargs["creationflags"] = detached | new_group
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    subprocess.Popen(cmd, **popen_kwargs)
+
+
+async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    user_id = await _authorize_or_reject(update)
+    if user_id is None:
+        return
+
+    chat_id = update.effective_chat.id
+    try:
+        _spawn_restart_worker(chat_id=chat_id, requested_by=user_id)
+    except Exception as exc:
+        logger.error("Failed to launch restart worker: %s", exc, exc_info=True)
+        await update.message.reply_text("Failed to start restart workflow. Check server logs.")
+        return
+
+    await update.message.reply_text(
+        "Restart workflow started. I will post a follow-up message in this chat when services are back."
+    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -674,6 +756,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("restart", restart_bot_command))
+    app.add_handler(CommandHandler("restart_bot", restart_bot_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_voice))
     app.add_error_handler(error_handler)

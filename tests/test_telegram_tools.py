@@ -99,6 +99,30 @@ class TestReplyLooksLikeToolCall:
         """Content with only <parameters> (no <tool>) returns False."""
         assert tg.reply_looks_like_tool_call('<parameters>{"q": "x"}</parameters>') is False
 
+    def test_mixed_text_and_tool_xml_returns_false(self):
+        """Mixed natural language + tool XML should not be treated as raw tool call."""
+        content = (
+            "Final answer: done.\n\n"
+            '<tool>webSearch</tool>\n<parameters>{"query":"x"}</parameters>'
+        )
+        assert tg.reply_looks_like_tool_call(content) is False
+
+
+class TestStripToolCallMarkup:
+    """Tests for stripping embedded tool XML from mixed replies."""
+
+    def test_strip_tool_call_markup_preserves_user_text(self):
+        content = (
+            "Here is the final response.\n"
+            '<tool>webSearch</tool>\n<parameters>{"query":"x"}</parameters>\n'
+            "Anything else?"
+        )
+        out = tg.strip_tool_call_markup(content)
+        assert "<tool>" not in out
+        assert "<parameters>" not in out
+        assert "Here is the final response." in out
+        assert "Anything else?" in out
+
 
 class TestToolResultLooksLikeError:
     """Tests for tool_result_looks_like_error (friendly fallback when tool fails)."""
@@ -457,6 +481,56 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("listFiles", {}, ctx)
         assert r.get("success") is True
         assert r.get("message") == "No files."
+
+    @pytest.mark.asyncio
+    async def test_send_telegram_file_requires_sender_callback(self):
+        """sendTelegramFile fails when backend sender is unavailable."""
+        ctx = {"conversation_id": "cid1"}
+        r = await tg.execute_telegram_tool("sendTelegramFile", {"filename": "report.txt"}, ctx)
+        assert r.get("success") is False
+        assert "not available" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_send_telegram_file_requires_filename(self):
+        """sendTelegramFile requires filename parameter."""
+        async def fake_sender(filename, caption=None):
+            return {"success": True, "message": f"Sent {filename}"}
+
+        ctx = {"conversation_id": "cid1", "send_telegram_file_internal": fake_sender}
+        r = await tg.execute_telegram_tool("sendTelegramFile", {}, ctx)
+        assert r.get("success") is False
+        assert "filename is required" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_send_telegram_file_calls_sender(self):
+        """sendTelegramFile passes filename and caption to backend sender and returns success."""
+        observed = {}
+
+        async def fake_sender(filename, caption=None):
+            observed["filename"] = filename
+            observed["caption"] = caption
+            return {"success": True, "message": "Sent summary.docx to Telegram."}
+
+        ctx = {"conversation_id": "cid1", "send_telegram_file_internal": fake_sender}
+        r = await tg.execute_telegram_tool(
+            "sendTelegramFile",
+            {"filename": "summary.docx", "caption": "Here is your file"},
+            ctx,
+        )
+        assert r.get("success") is True
+        assert observed == {"filename": "summary.docx", "caption": "Here is your file"}
+        assert "sent" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_send_telegram_file_propagates_sender_failure(self):
+        """sendTelegramFile returns sender failure message when backend send fails."""
+        async def fake_sender(filename, caption=None):
+            return {"success": False, "message": "File not found: missing.txt"}
+
+        ctx = {"conversation_id": "cid1", "send_telegram_file_internal": fake_sender}
+        r = await tg.execute_telegram_tool("sendTelegramFile", {"filename": "missing.txt"}, ctx)
+        assert r.get("success") is False
+        assert "file not found" in r.get("message", "").lower()
 
 
     @pytest.mark.asyncio

@@ -126,6 +126,31 @@ def check_codex_cli() -> tuple[bool, str]:
         return True, f"skipped ({e})"
 
 
+def check_telegram_security_env() -> tuple[bool, str]:
+    """Best-effort security sanity check for Telegram tools configuration."""
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return True, "skipped (.env not found)"
+    try:
+        raw = env_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return True, f"skipped ({e})"
+
+    values: dict[str, str] = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        values[key.strip()] = value.strip()
+
+    tools_enabled = values.get("TELEGRAM_TOOLS_ENABLED", "").lower() in {"1", "true", "yes", "y", "on"}
+    has_secret = bool(values.get("TELEGRAM_SECRET", "").strip())
+    if tools_enabled and not has_secret:
+        return True, "WARN: TELEGRAM_TOOLS_ENABLED=true but TELEGRAM_SECRET is empty (recommended for authenticated Telegram file attachments)."
+    return True, "Telegram security env OK"
+
+
 def main() -> int:
     """Run all verification checks. Use venv Python if running from installer."""
     python_exe = os.environ.get("CATBOT_VERIFY_PYTHON") or sys.executable
@@ -137,6 +162,7 @@ def main() -> int:
         ("KittenTTS runtime", lambda: check_kitten_tts(python_exe)),
         ("mcp-server-browser-use CLI", check_mcp_server_cli),
         ("Codex CLI (optional)", check_codex_cli),
+        ("Telegram security env (optional)", check_telegram_security_env),
     ]
     failed = []
     for name, check_fn in checks:

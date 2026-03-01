@@ -420,7 +420,7 @@ Key environment variables (see `.env.example` for complete list):
 - If `TELEGRAM_VOICE_OUT=true`, the bot attempts to transcode TTS output to Telegram-friendly `OGG/Opus` voice notes using `ffmpeg` when needed.
 
 **Optional (proxy):**
-- `TELEGRAM_SECRET`: Shared secret for bot-to-proxy auth when the proxy is reachable beyond localhost (set the same value on both bot and proxy)
+- `TELEGRAM_SECRET`: Shared secret for bot-to-proxy auth when the proxy is reachable beyond localhost (set the same value on both bot and proxy).
 - `TELEGRAM_SYSTEM_PROMPT`: System prompt override; overridden by `config/catbot_system_prompt.txt` when that file exists
 - `TELEGRAM_HISTORY_LIMIT`, `TELEGRAM_CHAT_TIMEOUT`: Conversation tuning (defaults 12, 30)
 - `TELEGRAM_OPENAI_BASE_URL`, `TELEGRAM_OPENAI_CHAT_PATH`: Override LLM endpoint (e.g. Azure/Groq)
@@ -430,6 +430,7 @@ Key environment variables (see `.env.example` for complete list):
 - `TELEGRAM_TOOLS_MAX_ITERATIONS`: Max tool-loop iterations per message (default: 5)
 - `LIST_FILES_TOOL_MAX_ENTRIES`: Caps `listFiles` output rows sent back to the model (default: 60) so large scratch directories do not bloat chat context.
 - When tools are enabled, the following are used by specific tools if set (same as web UI): `BRAVE_API_KEY` (webSearch; else DuckDuckGo), `NEWS_API_KEY` (fetchNews), `GOOGLE_DRIVE_*` (uploadToGoogleDrive), memory/vector-store settings for store/search/list/delete memories. File tools use the proxy scratch directory; runWorkflow uses AutoGen/team-config.
+- Security note: `sendTelegramFile` only sends files from the proxy `scratch/` directory and still enforces path + size checks.
 
 **Todo list (persistent, per user):** The todo list is stored in backend file storage (`todo_data/` by default, or `TODO_DATA_PATH`) per authenticated user. The web UI requires sign-in to load/save todo; tools (manageTodoList, executeTodoTask) call the proxy REST API. Telegram uses the same backend; optional **Telegram account linking** via `config/telegram_user_links.json` (mapping Telegram user ID or conversation ID to app username) lets the same todo list be shared between browser and Telegram. Without linking, Telegram uses a persistent per-chat list keyed by conversation ID.
 
@@ -657,8 +658,9 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 1. Create a bot with [@BotFather](https://core.telegram.org/bots#botfather)
 2. Set `TELEGRAM_BOT_TOKEN` in your `.env` file
 3. Configure `TELEGRAM_ADMIN_IDS` or set `TELEGRAM_ALLOW_ALL=true`
-4. Ensure the proxy server is running (e.g. port 8002). For Telegram-only use, only the proxy and the bot need to run.
-5. Start the bot: run `python scripts/start_all.py` (the Telegram bot is started automatically), or start it only with `python -m src.integrations.telegram_bot` from the project root. Install the dependency first: `pip install -r requirements.txt` or `pip install "python-telegram-bot[rate-limiter]"`.
+4. Set `TELEGRAM_SECRET` on both bot and proxy (recommended).
+5. Ensure the proxy server is running (e.g. port 8002). For Telegram-only use, only the proxy and the bot need to run.
+6. Start the bot: run `python scripts/start_all.py` (the Telegram bot is started automatically), or start it only with `python -m src.integrations.telegram_bot` from the project root. Install the dependency first: `pip install -r requirements.txt` or `pip install "python-telegram-bot[rate-limiter]"`.
 
 **Bot Commands:**
 - `/start` - Greet the user and register the conversation
@@ -669,7 +671,7 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 **Telegram tools (optional):**  
 Set `TELEGRAM_TOOLS_ENABLED=true` in the proxy environment to enable the same tool set as the web client. When enabled, the model can use tools (e.g. web search, read/write files in scratch, todo list, memory cache, workflows, news, calculate, store/search memories). The proxy parses `<tool>...</tool><parameters>...</parameters>` from the model reply, executes the tool server-side, and sends the result back to the model for a natural-language reply.
 
-- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), runCodexCli (Codex CLI for CATBot code changes), restartProxyServer (restart proxy to load new/updated tools), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). The same optional `urls` behaviour is supported in the web (HTML) client.
+- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), runCodexCli (Codex CLI for CATBot code changes), restartProxyServer (restart proxy to load new/updated tools), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, sendTelegramFile (attach file from `scratch/` into current Telegram chat), saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). The same optional `urls` behaviour is supported in the web (HTML) client.
 - **Web-only in Telegram:** PDF to PowerPoint (`pdfToPowerPoint`) — the proxy returns a message directing the user to the CATBot web interface for this feature.
 - **Config:** `config/catbot_system_prompt_with_tools.txt` (included) defines the tool list and format; placeholders `{{MEMORY_CACHE}}` and `{{TODO_LIST}}` are filled per conversation. Max tool-loop iterations per message: `TELEGRAM_TOOLS_MAX_ITERATIONS` (default 5).
 
@@ -822,6 +824,7 @@ Install all Python dependencies with: `pip install -r requirements.txt`
    - Set `OPENAI_API_KEY` or `MCP_LLM_OPENAI_API_KEY` on the proxy so Telegram chat can call the LLM
    - If using `TELEGRAM_SECRET`, set the same value on both the bot and the proxy
    - For **Telegram tools**: set `TELEGRAM_TOOLS_ENABLED=true` on the proxy; ensure `config/catbot_system_prompt_with_tools.txt` exists. Tools need the same backend config as the web UI (e.g. `BRAVE_API_KEY`, `NEWS_API_KEY`).
+   - For Telegram file attachments (`sendTelegramFile`), ensure the file exists in `scratch/` and is within size limits.
    - Check bot logs for connection errors
 
 8. **runCodexCli Not Triggering or Failing (Telegram or Web UI)**
