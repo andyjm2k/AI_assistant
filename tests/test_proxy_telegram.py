@@ -524,6 +524,51 @@ class TestTelegramTaskExecutionNotifications:
         finally:
             ps.task_execution_state.pop(user_key, None)
 
+    @pytest.mark.asyncio
+    async def test_run_task_loop_background_records_learning_outcome(self):
+        from src.servers import proxy_server as ps
+
+        class _Executor:
+            async def run_loop(self):
+                return (ps.STATUS_AWAITING_CONFIRMATION, "I have finished the work for this task.")
+
+            def get_run_diagnostics(self):
+                return {
+                    "iterations": 2,
+                    "max_iterations": 20,
+                    "elapsed_seconds": 1.5,
+                    "tool_usage_counts": {"write_file": 1},
+                    "tool_success_count": 1,
+                    "tool_failure_count": 0,
+                    "tool_error_messages": [],
+                    "last_error": None,
+                }
+
+        user_key = "learning-user-1"
+        ps.task_execution_state[user_key] = {
+            "task_id": 2,
+            "status": ps.STATUS_EXECUTING,
+            "executor": _Executor(),
+            "message": None,
+            "task_description": "Write summary file",
+            "is_scheduled": False,
+            "telegram_chat_ids": [],
+        }
+        mock_memory_manager = MagicMock()
+        mock_memory_manager.record_task_outcome = AsyncMock(return_value={"outcome": "success"})
+        try:
+            with patch.object(ps, "MEMORY_AVAILABLE", True):
+                with patch.object(ps, "memory_manager", mock_memory_manager):
+                    with patch.object(ps, "_write_task_exec_response_to_scratch"):
+                        with patch.object(ps, "_maybe_notify_telegram_task_completion", new=AsyncMock(return_value=None)):
+                            await ps._run_task_loop_background(user_key, _Executor())
+            mock_memory_manager.record_task_outcome.assert_awaited_once()
+            kwargs = mock_memory_manager.record_task_outcome.await_args.kwargs
+            assert kwargs.get("task_description") == "Write summary file"
+            assert kwargs.get("status") == ps.STATUS_AWAITING_CONFIRMATION
+        finally:
+            ps.task_execution_state.pop(user_key, None)
+
 
 class TestTelegramFileSendSecurity:
     """Tests for Telegram scratch-file sending preconditions."""

@@ -4,6 +4,9 @@ Tests high-level memory operations.
 """
 
 import pytest
+import shutil
+import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 from src.memory.memory_manager import MemoryManager
 from src.memory.embeddings_client import EmbeddingsClient
@@ -247,4 +250,66 @@ class TestMemoryManager:
         )
         mock_extractor.extract_memories.assert_not_called()
         assert memory_ids == []
+
+    @pytest.mark.asyncio
+    async def test_record_task_outcome_stores_events_and_learning_memories(
+        self,
+        mock_embeddings_client,
+        mock_vector_store,
+    ):
+        """Task outcome recording writes JSONL events and stores experience memories."""
+        tmp_dir = Path("memory_data") / f"test_task_learning_{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            manager = MemoryManager(
+                storage_path=str(tmp_dir),
+                embeddings_client=mock_embeddings_client,
+                vector_store=mock_vector_store,
+            )
+            result = await manager.record_task_outcome(
+                task_description="Fix weather lookup timeout handling",
+                status="awaiting_confirmation",
+                summary="Added retries and fallback parsing; run completed.",
+                tool_names=["web_search", "write_file"],
+                metadata={"task_id": 7},
+            )
+
+            assert result.get("outcome") == "success"
+            assert len(result.get("memory_ids", [])) >= 1
+            assert mock_vector_store.add_embedding.call_count >= 1
+
+            events = manager.list_task_learning_events(limit=5)
+            assert len(events) == 1
+            assert events[0].get("task_description", "").startswith("Fix weather lookup timeout")
+            assert events[0].get("outcome") == "success"
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_build_task_execution_guidance_uses_task_learning_memories(self, memory_manager):
+        """Guidance builder should include repeat/avoid hints from matching task memories."""
+        memory_manager.search_memories = AsyncMock(
+            return_value=[
+                {
+                    "text": "Successful pattern: use write_file to persist final output.",
+                    "category": "task_learning",
+                    "outcome": "success",
+                    "similarity": 0.86,
+                },
+                {
+                    "text": "Failure trigger to avoid: task stalled without tool usage.",
+                    "category": "task_experience",
+                    "outcome": "failure",
+                    "similarity": 0.83,
+                },
+            ]
+        )
+
+        context = await memory_manager.get_task_learning_context("Generate a report and save it")
+        assert len(context["successes"]) == 1
+        assert len(context["failures"]) == 1
+
+        guidance = await memory_manager.build_task_execution_guidance("Generate a report and save it")
+        assert "Repeat:" in guidance
+        assert "Avoid:" in guidance
 

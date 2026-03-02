@@ -106,3 +106,63 @@ async def test_ensure_token_budget_summarizes_when_over_limit(monkeypatch):
     result = await executor._ensure_token_budget(long_messages, max_tokens=2000)
     assert result == summarized
     assert executor._summarize_messages_for_budget.called
+
+
+def test_initial_messages_include_experience_guidance():
+    executor = TodoTaskExecutor(
+        api_key="test-key",
+        task_id=3,
+        task_description="Prepare deployment notes",
+        get_tools_func=AsyncMock(return_value=[]),
+        experience_guidance="Experience hints from similar tasks:\n- Repeat: write output files.",
+    )
+    system_messages = [m.get("content", "") for m in executor.messages if m.get("role") == "system"]
+    assert any("Experience guidance from similar past tasks" in msg for msg in system_messages)
+
+
+@pytest.mark.asyncio
+async def test_run_diagnostics_capture_tool_failures():
+    executor = TodoTaskExecutor(
+        api_key="test-key",
+        task_id=9,
+        task_description="Test tool diagnostics",
+        tool_executor=AsyncMock(side_effect=RuntimeError("tool blew up")),
+        get_tools_func=AsyncMock(
+            return_value=[
+                {
+                    "name": "dummy_tool",
+                    "description": "Dummy tool for tests",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ]
+        ),
+    )
+
+    responses = [
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "dummy_tool", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "content": "I have finished the work for this task.",
+            "tool_calls": None,
+        },
+    ]
+
+    async def _mock_llm(*args, **kwargs):
+        return responses.pop(0)
+
+    with patch.object(executor, "_call_llm", side_effect=_mock_llm):
+        status, _ = await executor.run_loop()
+
+    assert status == STATUS_AWAITING_CONFIRMATION
+    diagnostics = executor.get_run_diagnostics()
+    assert diagnostics["tool_failure_count"] == 1
+    assert diagnostics["tool_success_count"] == 0
+    assert "dummy_tool" in diagnostics["tool_usage_counts"]

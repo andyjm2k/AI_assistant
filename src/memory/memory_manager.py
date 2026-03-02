@@ -3,10 +3,13 @@ High-level memory manager for storing and retrieving user information.
 Handles automatic memory extraction and explicit memory storage.
 """
 
+import json
 import os
 import re
-from typing import List, Dict, Optional
-from datetime import datetime
+from pathlib import Path
+from threading import Lock
+from typing import List, Dict, Optional, Any
+from datetime import datetime, timezone
 
 from .embeddings_client import EmbeddingsClient
 from .vector_store import VectorStore
@@ -91,6 +94,16 @@ class MemoryManager:
             r"^(search|find|look up|open|run|execute|write|create|send|fetch)\b",
             re.IGNORECASE,
         )
+        self.task_learning_enabled = os.getenv("MEMORY_TASK_LEARNING_ENABLED", "true").lower() == "true"
+        self.task_learning_search_limit = max(
+            1, min(20, int(os.getenv("MEMORY_TASK_LEARNING_SEARCH_LIMIT", "6")))
+        )
+        self.task_learning_similarity_threshold = max(
+            0.0, min(1.0, float(os.getenv("MEMORY_TASK_LEARNING_SIMILARITY_THRESHOLD", "0.55")))
+        )
+        self.task_learning_events_file = Path(self.storage_path) / "task_learning_events.jsonl"
+        self._task_learning_lock = Lock()
+        self._ensure_task_learning_store()
 
     async def store_memory(
         self,
@@ -335,4 +348,326 @@ class MemoryManager:
             return False
 
         return False
+
+    def _ensure_task_learning_store(self) -> None:
+        """Ensure task learning event file exists."""
+        try:
+            self.task_learning_events_file.parent.mkdir(parents=True, exist_ok=True)
+            if not self.task_learning_events_file.exists():
+                self.task_learning_events_file.write_text("", encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: Failed to initialize task learning store: {e}")
+
+    def _sanitize_learning_text(self, text: Optional[str], max_chars: int = 700) -> str:
+        """Normalize and truncate free-form text for stable storage."""
+        normalized = " ".join((text or "").strip().split())
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[: max_chars - 3].rstrip() + "..."
+
+    def _normalize_task_outcome(self, status: Optional[str], message: Optional[str]) -> str:
+        """Map raw execution status to normalized outcome buckets."""
+        raw_status = (status or "").strip().lower()
+        msg = (message or "").strip().lower()
+
+        if raw_status in {"success", "completed", "confirmed_complete"}:
+            return "success"
+        if raw_status in {"failed", "failure", "error"}:
+            return "failure"
+        if raw_status == "cancelled":
+            return "cancelled"
+        if raw_status == "paused_awaiting_feedback":
+            return "paused"
+        if raw_status == "awaiting_confirmation":
+            failure_markers = ("no response", "error", "failed", "exception", "stopped unexpectedly")
+            if any(marker in msg for marker in failure_markers):
+                return "failure"
+            return "success"
+        return "unknown"
+
+    def _derive_task_learning_points(
+        self,
+        *,
+        outcome: str,
+        summary: str,
+        error: str,
+        tool_names: List[str],
+    ) -> List[str]:
+        """Generate concise learning points from an execution outcome."""
+        points: List[str] = []
+        unique_tools = [tool for tool in dict.fromkeys(tool_names) if tool]
+
+        if outcome == "success":
+            if unique_tools:
+                points.append(
+                    f"Successful pattern: use tools {', '.join(unique_tools[:5])} for similar tasks."
+                )
+            if summary:
+                points.append(f"What worked: {summary}")
+        elif outcome == "failure":
+            if error:
+                points.append(f"Failure trigger to avoid: {error}")
+            if not unique_tools:
+                points.append("Task stalled without tool usage; choose tools earlier.")
+            if summary:
+                points.append(f"Failure context: {summary}")
+        elif outcome == "paused":
+            points.append("Ask clarifying questions early when requirements are ambiguous.")
+            if summary:
+                points.append(f"Pause context: {summary}")
+        elif outcome == "cancelled":
+            points.append("Execution was cancelled before completion; checkpoint progress early.")
+        else:
+            if summary:
+                points.append(f"Execution notes: {summary}")
+            if error:
+                points.append(f"Observed issue: {error}")
+
+        deduped: List[str] = []
+        seen = set()
+        for point in points:
+            cleaned = self._sanitize_learning_text(point, max_chars=280)
+            key = cleaned.lower()
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(cleaned)
+            if len(deduped) >= 3:
+                break
+        return deduped
+
+    def _append_task_learning_event(self, event: Dict[str, Any]) -> None:
+        """Append a raw task-learning event to JSONL."""
+        self._ensure_task_learning_store()
+        try:
+            with self._task_learning_lock:
+                with self.task_learning_events_file.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"Warning: Failed to append task learning event: {e}")
+
+    def list_task_learning_events(
+        self,
+        limit: int = 50,
+        outcome: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List recent task-learning events from JSONL (newest first)."""
+        if limit <= 0:
+            return []
+        if not self.task_learning_events_file.exists():
+            return []
+
+        normalized_outcome = (outcome or "").strip().lower()
+        events: List[Dict[str, Any]] = []
+        try:
+            with self.task_learning_events_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if normalized_outcome and (event.get("outcome") or "").strip().lower() != normalized_outcome:
+                        continue
+                    events.append(event)
+        except Exception as e:
+            print(f"Warning: Failed to read task learning events: {e}")
+            return []
+
+        events = events[-limit:]
+        events.reverse()
+        return events
+
+    async def record_task_outcome(
+        self,
+        *,
+        task_description: str,
+        status: str,
+        message: Optional[str] = None,
+        summary: Optional[str] = None,
+        error: Optional[str] = None,
+        tool_names: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        source: str = "task_execution",
+    ) -> Dict[str, Any]:
+        """
+        Record task execution outcome as both raw event and searchable experience memories.
+
+        Returns:
+            Dict with outcome, event, and stored memory IDs (if task learning is enabled).
+        """
+        task_text = self._sanitize_learning_text(task_description, max_chars=500)
+        summary_text = self._sanitize_learning_text(summary or message or "", max_chars=700)
+        error_text = self._sanitize_learning_text(error or "", max_chars=500)
+        normalized_tools = [self._sanitize_learning_text(t, max_chars=80) for t in (tool_names or []) if t]
+        outcome = self._normalize_task_outcome(status=status, message=summary_text or error_text)
+        learning_points = self._derive_task_learning_points(
+            outcome=outcome,
+            summary=summary_text,
+            error=error_text,
+            tool_names=normalized_tools,
+        )
+
+        now = datetime.now(timezone.utc).isoformat()
+        event = {
+            "timestamp": now,
+            "task_description": task_text,
+            "status": status,
+            "outcome": outcome,
+            "summary": summary_text,
+            "error": error_text,
+            "tool_names": normalized_tools,
+            "learning_points": learning_points,
+            "source": source,
+        }
+        if metadata:
+            event["metadata"] = metadata
+        self._append_task_learning_event(event)
+
+        memory_ids: List[str] = []
+        if not self.task_learning_enabled:
+            return {"outcome": outcome, "event": event, "memory_ids": memory_ids}
+        if not task_text:
+            return {"outcome": outcome, "event": event, "memory_ids": memory_ids}
+
+        experience_text = (
+            f"Task outcome memory. Task: {task_text}. Outcome: {outcome}. "
+            f"Status: {status}. Summary: {summary_text or 'No summary provided.'}. "
+            f"Learnings: {'; '.join(learning_points) if learning_points else 'No clear learning extracted.'}"
+        )
+        experience_metadata: Dict[str, Any] = {
+            "memory_type": "task_experience",
+            "task_description": task_text,
+            "status": status,
+            "outcome": outcome,
+            "summary": summary_text,
+            "error": error_text,
+            "tool_names": normalized_tools,
+            "learning_points": learning_points,
+            "event_timestamp": now,
+        }
+        if metadata:
+            experience_metadata.update(metadata)
+
+        try:
+            memory_ids.append(
+                await self.store_memory(
+                    text=experience_text,
+                    category="task_experience",
+                    source=source,
+                    metadata=experience_metadata,
+                )
+            )
+            for idx, point in enumerate(learning_points[:2], start=1):
+                prefix = "Repeat" if outcome == "success" else "Avoid" if outcome == "failure" else "Note"
+                learning_text = (
+                    f"{prefix} for similar tasks: {point} "
+                    f"(task: {task_text})"
+                )
+                learning_metadata: Dict[str, Any] = {
+                    "memory_type": "task_learning",
+                    "task_description": task_text,
+                    "status": status,
+                    "outcome": outcome,
+                    "learning_rank": idx,
+                    "event_timestamp": now,
+                }
+                memory_ids.append(
+                    await self.store_memory(
+                        text=learning_text,
+                        category="task_learning",
+                        source=source,
+                        metadata=learning_metadata,
+                    )
+                )
+        except Exception as e:
+            print(f"Warning: Failed to persist task outcome memories: {e}")
+
+        return {"outcome": outcome, "event": event, "memory_ids": memory_ids}
+
+    async def get_task_learning_context(
+        self,
+        task_description: str,
+        limit: Optional[int] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Retrieve relevant success/failure learnings for a task description."""
+        query = self._sanitize_learning_text(task_description, max_chars=500)
+        if not query:
+            return {"task_description": "", "successes": [], "failures": [], "notes": [], "all": []}
+
+        use_limit = limit if limit is not None else self.task_learning_search_limit
+        use_threshold = (
+            similarity_threshold
+            if similarity_threshold is not None
+            else self.task_learning_similarity_threshold
+        )
+
+        try:
+            results = await self.search_memories(
+                query=f"Task execution learnings for: {query}",
+                limit=use_limit,
+                similarity_threshold=use_threshold,
+                category=None,
+            )
+        except Exception:
+            results = []
+
+        relevant: List[Dict[str, Any]] = []
+        for mem in results:
+            category = (mem.get("category") or "").strip().lower()
+            memory_type = (mem.get("memory_type") or "").strip().lower()
+            if category not in {"task_experience", "task_learning"} and memory_type not in {
+                "task_experience",
+                "task_learning",
+            }:
+                continue
+            relevant.append(mem)
+
+        successes: List[Dict[str, Any]] = []
+        failures: List[Dict[str, Any]] = []
+        notes: List[Dict[str, Any]] = []
+        for mem in relevant:
+            outcome = (mem.get("outcome") or "").strip().lower()
+            if outcome == "success":
+                successes.append(mem)
+            elif outcome in {"failure", "cancelled"}:
+                failures.append(mem)
+            else:
+                notes.append(mem)
+
+        return {
+            "task_description": query,
+            "successes": successes,
+            "failures": failures,
+            "notes": notes,
+            "all": relevant,
+        }
+
+    async def build_task_execution_guidance(
+        self,
+        task_description: str,
+        limit: int = 6,
+    ) -> str:
+        """Build a concise guidance block from prior task-execution experiences."""
+        context = await self.get_task_learning_context(task_description=task_description, limit=limit)
+        successes = context.get("successes", [])
+        failures = context.get("failures", [])
+
+        if not successes and not failures:
+            return ""
+
+        lines = ["Experience hints from similar tasks:"]
+        for mem in successes[:2]:
+            text = self._sanitize_learning_text(mem.get("text", ""), max_chars=220)
+            if text:
+                lines.append(f"- Repeat: {text}")
+        for mem in failures[:2]:
+            text = self._sanitize_learning_text(mem.get("text", ""), max_chars=220)
+            if text:
+                lines.append(f"- Avoid: {text}")
+
+        return "\n".join(lines)
 

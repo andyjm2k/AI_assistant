@@ -22,6 +22,12 @@ except ImportError:
 CALC_EXPR_MAX_LEN = 200
 # Allowed characters for safe calculate (numbers, spaces, + - * / ( ) .)
 CALC_ALLOWED_RE = re.compile(r"^[\d\s+\-*/().]+$")
+_TOOL_CALL_BLOCK_RE = (
+    r"<(?:tool|tool_call)>[\s\S]*?</(?:tool|tool_call)>\s*"
+    r"<parameters>[\s\S]*?</parameters>"
+)
+_TOOL_CALL_BLOCK_PATTERN = re.compile(_TOOL_CALL_BLOCK_RE, re.IGNORECASE)
+_STANDALONE_TOOL_CALL_PATTERN = re.compile(rf"^\s*(?:{_TOOL_CALL_BLOCK_RE})\s*$", re.IGNORECASE)
 
 
 def _get_list_files_tool_max_entries() -> int:
@@ -133,8 +139,22 @@ def reply_looks_like_tool_call(content: str) -> bool:
     """
     if not content or not isinstance(content, str):
         return False
-    # Quick check: contains both tool tag and parameters tag (raw XML we never want to send to user)
-    return "<tool>" in content and "<parameters>" in content
+    # Only treat standalone tool XML as a raw tool call. Mixed natural-language replies
+    # that merely include tool markup should be delivered to the user.
+    return bool(_STANDALONE_TOOL_CALL_PATTERN.match(content.strip()))
+
+
+def strip_tool_call_markup(content: str) -> str:
+    """
+    Remove embedded tool-call XML blocks from a mixed assistant reply.
+    Returns cleaned text; empty string if no user-facing text remains.
+    """
+    if not content or not isinstance(content, str):
+        return ""
+    cleaned = _TOOL_CALL_BLOCK_PATTERN.sub(" ", content)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def tool_result_looks_like_error(message: str) -> bool:
@@ -197,6 +217,7 @@ async def execute_telegram_tool(
     - do_search, do_fetch, do_news, do_weather, do_autogen, do_browser_agent, do_deep_research (async callables)
     - do_restart_proxy (async callable that schedules proxy restart)
     - read_file_internal, write_file_internal, list_files_internal (callables)
+    - send_telegram_file_internal (async callable to send scratch files to current Telegram chat)
     - upload_drive_internal (callable), memory_manager (object with store/search/list/delete)
     Returns a dict with success (bool), message (str), and optional data.
     """
@@ -727,6 +748,25 @@ async def execute_telegram_tool(
             return {"success": False, "message": out.get("message", "List failed.")}
         files = out.get("files") or []
         return {"success": True, "message": _format_list_files_message(files), "data": out}
+
+    # --- sendTelegramFile ---
+    if name == "sendTelegramFile":
+        send_file_internal = context.get("send_telegram_file_internal")
+        if not send_file_internal:
+            return {"success": False, "message": "Telegram file sending is not available."}
+        filename = (arguments.get("filename") or arguments.get("filePath") or "").strip()
+        if not filename:
+            return {"success": False, "message": "filename is required."}
+        caption_raw = arguments.get("caption")
+        caption = str(caption_raw).strip() if caption_raw is not None else None
+        out = await send_file_internal(filename, caption=caption or None)
+        if isinstance(out, dict) and not out.get("success", False):
+            return {"success": False, "message": out.get("message", "Failed to send file.")}
+        return {
+            "success": True,
+            "message": (out or {}).get("message", f"Sent {filename} to Telegram."),
+            "data": out or {},
+        }
 
     # --- saveToFile (map to writeFile) ---
     if name == "saveToFile":

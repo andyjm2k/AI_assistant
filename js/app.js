@@ -7962,7 +7962,7 @@ Parameters:
     "filename": "string (required; e.g. 'presentation.pptx')"
 }
 
-12. uploadToGoogleDrive
+13. uploadToGoogleDrive
 Description: Uploads a file from the scratch directory to Google Drive using service account authentication. Use the filename relative to the scratch directory.
 Parameters:
 {
@@ -7970,20 +7970,20 @@ Parameters:
     "fileName": "string (optional custom name for the file in Drive)"
 }
 
-13. readFile
+14. readFile
 Description: Reads a file from the scratch directory. Supports txt, docx, xlsx, pdf, png, py, js, and html formats.
 Parameters:
 {
     "filename": "string (name of the file to read from the scratch directory)"
 }
 
-14. listFiles
+15. listFiles
 Description: Lists all files currently available in the scratch directory. No parameters are required.
 Parameters:
 {
 }
 
-15. writeFile
+16. writeFile
 Description: Writes content to a file in the scratch directory. Supports txt, docx, xlsx, pdf, py, js, and html formats.
 Parameters:
 {

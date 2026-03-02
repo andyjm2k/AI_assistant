@@ -9,6 +9,7 @@ import collections
 import json
 import html
 import os
+import mimetypes
 import re
 import sys
 import time
@@ -496,6 +497,11 @@ class MemorySearchRequest(BaseModel):
 class MemoryExtractRequest(BaseModel):
     messages: List[Dict[str, str]]
     max_memories: Optional[int] = 3
+
+class MemoryLearningContextRequest(BaseModel):
+    task_description: str
+    limit: Optional[int] = None
+    similarity_threshold: Optional[float] = None
 
 class MemoryResponse(BaseModel):
     success: bool
@@ -1001,6 +1007,94 @@ async def _send_telegram_bot_message(chat_id: str, text: str) -> bool:
         return False
 
 
+async def _send_telegram_file_internal(
+    chat_id: Any,
+    filename: str,
+    caption: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Send a file from scratch to a Telegram chat via sendDocument.
+    Used by Telegram tools only.
+    """
+    token = str(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id_text = str(chat_id or "").strip()
+    logical_name = str(filename or "").strip()
+    if not token:
+        return {"success": False, "message": "TELEGRAM_BOT_TOKEN is not configured."}
+    if not chat_id_text or not _TELEGRAM_CHAT_ID_RE.match(chat_id_text):
+        return {"success": False, "message": "Current Telegram chat id is unavailable."}
+    if not logical_name:
+        return {"success": False, "message": "filename is required."}
+
+    try:
+        filepath = resolve_scratch_path(logical_name)
+    except HTTPException as e:
+        return {"success": False, "message": e.detail or "Invalid filename."}
+
+    if not filepath.exists() or not filepath.is_file():
+        return {"success": False, "message": f"File not found: {logical_name}"}
+
+    try:
+        size_bytes = filepath.stat().st_size
+    except OSError as exc:
+        return {"success": False, "message": f"Failed to read file metadata: {exc}"}
+
+    if size_bytes > FILE_OPS_MAX_SIZE_BYTES:
+        return {
+            "success": False,
+            "message": f"File is too large ({size_bytes} bytes). Limit is {FILE_OPS_MAX_SIZE_BYTES} bytes.",
+        }
+
+    caption_text = (caption or "").strip()
+    if len(caption_text) > 1024:
+        caption_text = caption_text[:1024]
+
+    mime_type, _ = mimetypes.guess_type(str(filepath))
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    payload = {"chat_id": chat_id_text}
+    if caption_text:
+        payload["caption"] = caption_text
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            with filepath.open("rb") as f:
+                response = await client.post(
+                    url,
+                    data=payload,
+                    files={
+                        "document": (
+                            filepath.name,
+                            f,
+                            mime_type or "application/octet-stream",
+                        )
+                    },
+                )
+        if response.status_code != 200:
+            detail = response.text
+            try:
+                parsed = response.json()
+                detail = parsed.get("description") or parsed.get("error_code") or detail
+            except ValueError:
+                pass
+            return {"success": False, "message": f"Telegram sendDocument failed ({response.status_code}): {detail}"}
+        parsed = response.json()
+        if not parsed.get("ok"):
+            return {"success": False, "message": parsed.get("description", "Telegram sendDocument returned ok=false.")}
+        result = parsed.get("result") or {}
+        return {
+            "success": True,
+            "message": f"Sent {filepath.name} to Telegram.",
+            "data": {
+                "filename": filepath.name,
+                "size": size_bytes,
+                "message_id": result.get("message_id"),
+                "chat_id": chat_id_text,
+            },
+        }
+    except Exception as exc:
+        return {"success": False, "message": f"Failed to send file to Telegram: {exc}"}
+
+
 async def _maybe_notify_telegram_task_completion(
     user_key: str,
     state: Dict[str, Any],
@@ -1026,6 +1120,37 @@ async def _maybe_notify_telegram_task_completion(
     )
     for chat_id in chat_ids:
         await _send_telegram_bot_message(str(chat_id), text)
+
+
+def _auto_complete_scheduled_execution(user_key: str, state: Dict[str, Any], status: str) -> Optional[str]:
+    """
+    Automatically complete scheduled executions once the run loop reaches
+    awaiting_confirmation so recurring tasks advance their lifecycle.
+    """
+    if status != STATUS_AWAITING_CONFIRMATION:
+        return None
+    if not bool(state.get("is_scheduled")):
+        return None
+    if not TODO_STORE_AVAILABLE or not _todo_store:
+        return "Scheduled run finished, but automatic completion is unavailable (todo store not available)."
+
+    raw_task_id = state.get("task_id")
+    try:
+        task_id = int(raw_task_id)
+    except (TypeError, ValueError):
+        return "Scheduled run finished, but automatic completion was skipped (invalid task id)."
+    if task_id < 1:
+        return "Scheduled run finished, but automatic completion was skipped (invalid task id)."
+
+    try:
+        result = _todo_store.complete_task(user_key, task_id)
+    except Exception as exc:
+        return f"Scheduled run finished, but automatic completion failed: {exc}"
+
+    if bool(result.get("rescheduled")):
+        next_run = str(result.get("next_run_at") or "").strip() or "the next scheduled run"
+        return f"Scheduled task {task_id} auto-completed and was rescheduled for {next_run}."
+    return f"Scheduled task {task_id} auto-completed and was removed from the todo list."
 
 # Philosopher mode state storage (per conversation)
 philosopher_mode_active: Dict[str, bool] = {}
@@ -1431,18 +1556,26 @@ def trim_telegram_history(history: List[Dict[str, str]]) -> None:
         del history[: len(history) - max_messages]
 
 
+def _telegram_secret_matches(request: Request) -> bool:
+    """Return True when request carries TELEGRAM_SECRET via X-Telegram-Secret or Bearer token."""
+    if not TELEGRAM_SECRET:
+        return False
+    secret_header = request.headers.get("X-Telegram-Secret")
+    if secret_header is not None and secret_header.strip() == TELEGRAM_SECRET:
+        return True
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.strip().startswith("Bearer "):
+        token = auth_header.strip()[7:].strip()
+        if token == TELEGRAM_SECRET:
+            return True
+    return False
+
+
 def _validate_telegram_secret(request: Request) -> None:
     """If TELEGRAM_SECRET is set, require X-Telegram-Secret or Authorization Bearer to match; else raise 401."""
     if not TELEGRAM_SECRET:
         return
-    secret_header = request.headers.get("X-Telegram-Secret")
-    auth_header = request.headers.get("Authorization")
-    token = None
-    if secret_header is not None and secret_header.strip() == TELEGRAM_SECRET:
-        token = TELEGRAM_SECRET
-    if auth_header and auth_header.strip().startswith("Bearer "):
-        token = auth_header.strip()[7:].strip()
-    if token != TELEGRAM_SECRET:
+    if not _telegram_secret_matches(request):
         raise HTTPException(status_code=401, detail="Telegram secret required or invalid")
 
 
@@ -3971,10 +4104,83 @@ def _write_task_exec_response_to_scratch(
         print(f"[TASK_EXEC] Failed to write response to scratch: {e}", flush=True)
 
 
+def _safe_task_execution_diagnostics(executor: Any) -> Dict[str, Any]:
+    """Best-effort fetch of executor diagnostics for learning capture."""
+    if not executor or not hasattr(executor, "get_run_diagnostics"):
+        return {}
+    try:
+        diagnostics = executor.get_run_diagnostics()
+        return diagnostics if isinstance(diagnostics, dict) else {}
+    except Exception as e:
+        print(f"[TASK_EXEC] Failed to read executor diagnostics: {e}", flush=True)
+        return {}
+
+
+async def _record_task_execution_learning(
+    user_key: str,
+    state: Optional[Dict[str, Any]],
+    status: str,
+    message: str,
+    source_phase: str,
+) -> None:
+    """Persist task outcome as experience memory for future task guidance."""
+    if not MEMORY_AVAILABLE or not memory_manager:
+        return
+    if not hasattr(memory_manager, "record_task_outcome"):
+        return
+    if not isinstance(state, dict):
+        return
+
+    task_description = str(state.get("task_description") or "").strip()
+    if not task_description:
+        return
+
+    diagnostics = _safe_task_execution_diagnostics(state.get("executor"))
+    tool_usage = diagnostics.get("tool_usage_counts") or {}
+    if isinstance(tool_usage, dict):
+        tool_names = [str(name) for name in tool_usage.keys() if name]
+    else:
+        tool_names = []
+    if not tool_names:
+        tool_names = [str(name) for name in (diagnostics.get("tools_used") or []) if name]
+
+    summary = str(message or "").strip()
+    error_hint = str(diagnostics.get("last_error") or "").strip()
+    if not error_hint and str(status or "").lower() in {"failed", "failure", "error"}:
+        error_hint = summary
+
+    metadata = {
+        "user_key": user_key,
+        "task_id": state.get("task_id"),
+        "source_phase": source_phase,
+        "iterations": diagnostics.get("iterations"),
+        "max_iterations": diagnostics.get("max_iterations"),
+        "elapsed_seconds": diagnostics.get("elapsed_seconds"),
+        "tool_usage_counts": tool_usage if isinstance(tool_usage, dict) else {},
+        "tool_success_count": diagnostics.get("tool_success_count"),
+        "tool_failure_count": diagnostics.get("tool_failure_count"),
+        "tool_error_messages": diagnostics.get("tool_error_messages") or [],
+    }
+    try:
+        await memory_manager.record_task_outcome(
+            task_description=task_description,
+            status=status,
+            message=message,
+            summary=summary,
+            error=error_hint,
+            tool_names=tool_names,
+            metadata=metadata,
+            source="task_execution",
+        )
+    except Exception as e:
+        print(f"[TASK_EXEC] Failed to record learning memory: {e}", flush=True)
+
+
 async def _run_task_loop_background(user_key: str, executor: Any) -> None:
     """
     Run executor.run_loop() in background; update or clear task_execution_state in finally
     so we never leave state stuck as 'executing' on exception or cancel.
+    Scheduled runs are auto-completed when they reach awaiting_confirmation.
     """
     status = STATUS_AWAITING_CONFIRMATION
     message = "Execution stopped unexpectedly."
@@ -3988,13 +4194,24 @@ async def _run_task_loop_background(user_key: str, executor: Any) -> None:
         # Only update if this user's state is still 'executing' (we own it)
         state = task_execution_state.get(user_key)
         if state and state.get("status") == STATUS_EXECUTING:
+            auto_completion_note = _auto_complete_scheduled_execution(user_key, state, status)
+            if auto_completion_note:
+                base_message = (message or "").strip()
+                message = f"{base_message}\n\n{auto_completion_note}".strip() if base_message else auto_completion_note
             state["status"] = status
             state["message"] = message or ""
+            await _record_task_execution_learning(
+                user_key=user_key,
+                state=state,
+                status=status,
+                message=message or "",
+                source_phase="background_run",
+            )
             # Always capture agent response to scratch with timestamp (paused, awaiting, cancelled, done)
             _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
             await _maybe_notify_telegram_task_completion(user_key, state, status, message or "")
-            # Clear state on cancel so user can start a new execution
-            if status == STATUS_CANCELLED:
+            # Clear state on cancel or after scheduled completion so user can start a new execution.
+            if status == STATUS_CANCELLED or (status == STATUS_AWAITING_CONFIRMATION and bool(state.get("is_scheduled"))):
                 task_execution_state.pop(user_key, None)
 
 
@@ -4032,6 +4249,17 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured.")
+    experience_guidance = ""
+    if MEMORY_AVAILABLE and memory_manager and hasattr(memory_manager, "build_task_execution_guidance"):
+        try:
+            experience_guidance = await memory_manager.build_task_execution_guidance(task_description=task_description)
+            if experience_guidance:
+                print(
+                    f"[TASK_EXEC] Loaded experience guidance for user {user_key} task {task_id}",
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"[TASK_EXEC] Failed to load experience guidance: {e}", flush=True)
     executor = TodoTaskExecutor(
         api_key=api_key,
         task_id=task_id,
@@ -4040,6 +4268,7 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
         max_iterations=TASK_EXECUTION_MAX_ITERATIONS,
         tool_executor=execute_tool_for_philosopher,
         get_tools_func=get_all_available_tools,
+        experience_guidance=experience_guidance,
     )
     # Set state to 'executing' before starting so cancel/status work and we never leave state stuck
     task_execution_state[user_key] = {
@@ -4071,6 +4300,13 @@ async def _task_execute_resume(user_key: str, user_message: str) -> tuple:
         status, message = await executor.run_loop()
         state["status"] = status
         state["message"] = message or ""
+        await _record_task_execution_learning(
+            user_key=user_key,
+            state=state,
+            status=status,
+            message=message or "",
+            source_phase="resume_run",
+        )
         # Capture agent response to scratch (paused or awaiting confirmation after resume)
         _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
         await _maybe_notify_telegram_task_completion(user_key, state, status, message or "")
@@ -4078,6 +4314,13 @@ async def _task_execute_resume(user_key: str, user_message: str) -> tuple:
     except Exception as e:
         state["status"] = STATUS_AWAITING_CONFIRMATION
         state["message"] = str(e)
+        await _record_task_execution_learning(
+            user_key=user_key,
+            state=state,
+            status="failed",
+            message=str(e),
+            source_phase="resume_error",
+        )
         _write_task_exec_response_to_scratch(user_key, state.get("task_id"), STATUS_AWAITING_CONFIRMATION, str(e))
         return (STATUS_AWAITING_CONFIRMATION, str(e))
 
@@ -4114,11 +4357,40 @@ async def todo_task_complete(
     if not TODO_STORE_AVAILABLE or not _todo_store:
         raise HTTPException(status_code=503, detail="Todo store is not available.")
     user_key = current_user["username"]
+    active_state = task_execution_state.get(user_key)
+    task_description_for_learning = ""
+    try:
+        tasks_before = _todo_store.load_tasks(user_key)
+        if 1 <= task_id <= len(tasks_before):
+            task_description_for_learning = str(tasks_before[task_id - 1] or "").strip()
+    except Exception:
+        task_description_for_learning = ""
+    if isinstance(active_state, dict):
+        task_description_for_learning = (
+            str(active_state.get("task_description") or "").strip() or task_description_for_learning
+        )
     task_execution_state.pop(user_key, None)
     try:
         result = _todo_store.complete_task(user_key, task_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if task_description_for_learning and MEMORY_AVAILABLE and memory_manager and hasattr(memory_manager, "record_task_outcome"):
+        completion_state = active_state if isinstance(active_state, dict) else {
+            "task_id": task_id,
+            "task_description": task_description_for_learning,
+            "executor": None,
+        }
+        completion_note = (
+            "Task marked complete by user confirmation."
+            + (" Repeating task was rescheduled." if bool(result.get("rescheduled", False)) else "")
+        )
+        await _record_task_execution_learning(
+            user_key=user_key,
+            state=completion_state,
+            status="confirmed_complete",
+            message=completion_note,
+            source_phase="user_confirmed_completion",
+        )
     meta = {
         "tasks": result.get("tasks", []),
         "task_items": result.get("task_items", []),
@@ -4288,6 +4560,47 @@ def _message_requests_proxy_restart(message_text: str) -> bool:
         "restart the proxy server",
     }
     return normalized in explicit_commands
+
+
+def _coerce_telegram_response_text(content: Any) -> str:
+    """Normalize LLM message content (string or structured parts) into plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    parts.append(text)
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            candidate = item.get("text")
+            if isinstance(candidate, dict):
+                candidate = candidate.get("value") or candidate.get("content")
+            if not isinstance(candidate, str):
+                candidate = item.get("content") or item.get("output_text")
+            if isinstance(candidate, str):
+                text = candidate.strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts).strip()
+
+    if isinstance(content, dict):
+        candidate = content.get("text")
+        if isinstance(candidate, dict):
+            candidate = candidate.get("value") or candidate.get("content")
+        if not isinstance(candidate, str):
+            candidate = content.get("content") or content.get("output_text")
+        if isinstance(candidate, str):
+            return candidate.strip()
+
+    return str(content).strip()
 
 
 async def _restart_proxy_after_delay(trigger: str, requested_by: str) -> None:
@@ -4561,7 +4874,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     choices = data.get("choices") or []
     if choices:
         message = choices[0].get("message") or {}
-        reply = message.get("content")
+        reply = _coerce_telegram_response_text(message.get("content"))
 
     if not reply:
         reply = "I couldn't generate a response right now. Please try again shortly."
@@ -4581,6 +4894,13 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         while iterations < TELEGRAM_TOOLS_MAX_ITERATIONS:
             parsed = _telegram_tools.parse_telegram_tool_response(reply)
             if not parsed:
+                break
+            # After at least one tool execution, prefer mixed natural-language replies
+            # over re-entering the tool loop when the model includes incidental XML.
+            if iterations > 0 and not _telegram_tools.reply_looks_like_tool_call(reply):
+                cleaned_reply = _telegram_tools.strip_tool_call_markup(reply)
+                if cleaned_reply:
+                    reply = cleaned_reply
                 break
             tool_name = parsed.get("name")
             if tool_name:
@@ -4624,6 +4944,11 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 "read_file_internal": _read_file_internal,
                 "write_file_internal": _write_file_internal,
                 "list_files_internal": _list_files_internal,
+                "send_telegram_file_internal": lambda filename, caption=None: _send_telegram_file_internal(
+                    request.user_id or conversation_id,
+                    filename,
+                    caption=caption,
+                ),
                 "upload_drive_internal": _upload_drive_internal,
                 "memory_manager": memory_manager if MEMORY_AVAILABLE else None,
             }
@@ -4695,9 +5020,9 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 print("Telegram tool follow-up returned no choices, using tool result as reply")
                 reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
                 break
-            new_content = (choices_tool[0].get("message") or {}).get("content")
+            new_content = _coerce_telegram_response_text((choices_tool[0].get("message") or {}).get("content"))
             # If follow-up has no content (e.g. GLM 5 returns empty), use tool result so user never sees raw XML
-            if new_content is None or (isinstance(new_content, str) and not new_content.strip()):
+            if not new_content.strip():
                 print("Telegram tool follow-up returned empty content, using tool result as reply")
                 reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
             else:
@@ -4972,6 +5297,67 @@ async def extract_memories(request: MemoryExtractRequest):
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to extract memories: {str(e)}")
+
+@app.get("/v1/memory/learning/events", response_model=MemoryResponse)
+async def memory_learning_events(limit: int = 50, outcome: Optional[str] = None):
+    """List recent task-learning events (captured from task execution outcomes)."""
+    if not MEMORY_AVAILABLE or not memory_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="Memory system is not available. Check MEMORY_ENABLED setting.",
+        )
+    if not hasattr(memory_manager, "list_task_learning_events"):
+        return MemoryResponse(
+            success=False,
+            message="Task learning events are not supported by this memory manager.",
+            data={"events": [], "count": 0},
+        )
+    safe_limit = max(1, min(200, int(limit or 50)))
+    try:
+        events = memory_manager.list_task_learning_events(limit=safe_limit, outcome=outcome)
+        return MemoryResponse(
+            success=True,
+            message=f"Retrieved {len(events)} task learning events",
+            data={"events": events, "count": len(events)},
+        )
+    except Exception as e:
+        print(f"Error listing task learning events: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list task learning events: {str(e)}")
+
+@app.post("/v1/memory/learning/context", response_model=MemoryResponse)
+async def memory_learning_context(request: MemoryLearningContextRequest):
+    """Get experience-based learning context and guidance for a task description."""
+    if not MEMORY_AVAILABLE or not memory_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="Memory system is not available. Check MEMORY_ENABLED setting.",
+        )
+    if not hasattr(memory_manager, "get_task_learning_context"):
+        return MemoryResponse(
+            success=False,
+            message="Task learning context is not supported by this memory manager.",
+            data={"context": {}, "guidance": ""},
+        )
+    try:
+        context = await memory_manager.get_task_learning_context(
+            task_description=request.task_description,
+            limit=request.limit,
+            similarity_threshold=request.similarity_threshold,
+        )
+        guidance = ""
+        if hasattr(memory_manager, "build_task_execution_guidance"):
+            guidance = await memory_manager.build_task_execution_guidance(
+                task_description=request.task_description,
+                limit=request.limit or 6,
+            )
+        return MemoryResponse(
+            success=True,
+            message="Retrieved task learning context",
+            data={"context": context, "guidance": guidance},
+        )
+    except Exception as e:
+        print(f"Error retrieving task learning context: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve task learning context: {str(e)}")
 
 @app.get("/v1/memory/status")
 async def memory_status():

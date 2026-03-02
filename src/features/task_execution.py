@@ -6,6 +6,7 @@ Supports pause for feedback and resume.
 
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -55,6 +56,7 @@ class TodoTaskExecutor:
         max_iterations: int = 20,
         tool_executor: Optional[Any] = None,
         get_tools_func: Optional[Any] = None,
+        experience_guidance: Optional[str] = None,
     ):
         self.api_key = api_key
         self.api_base = (api_base or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")).rstrip("/")
@@ -62,6 +64,7 @@ class TodoTaskExecutor:
         self.task_id = task_id
         self.task_description = task_description
         self.prompt_override = (prompt_override or "").strip() or None
+        self.experience_guidance = (experience_guidance or "").strip() or None
         self.max_iterations = max(max_iterations, 1)
         self.tool_executor = tool_executor
         self.get_tools_func = get_tools_func
@@ -72,6 +75,11 @@ class TodoTaskExecutor:
         self._cancel_requested = False
         self._max_token_limit = get_max_token_limit()
         self.last_error: Optional[str] = None
+        self._run_started_at = time.time()
+        self.tool_usage_counts: Dict[str, int] = {}
+        self.tool_error_messages: List[str] = []
+        self.tool_success_count = 0
+        self.tool_failure_count = 0
         self._build_initial_messages()
 
     def _estimate_total_tokens(self, messages: List[Dict[str, Any]], max_tokens: int) -> int:
@@ -245,10 +253,60 @@ class TodoTaskExecutor:
             "For in-depth research (compare sources, gather information across many pages, produce a research report), use run_deep_research with a research_task. "
             "Before finishing: always write the final output (report, summary, code, or results) to a file using the write_file tool so the user has a persistent copy; then say you have finished the work for this task."
         )
-        self.messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Todo task (id {self.task_id}): {self.task_description}\n\nGoal for this run: {goal}\n\nPlease work on this task. Use tools as needed."},
-        ]
+        self.messages = [{"role": "system", "content": system}]
+        if self.experience_guidance:
+            self.messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Experience guidance from similar past tasks. Use this as hints, but adapt to the current task:\n"
+                        f"{self.experience_guidance}"
+                    ),
+                }
+            )
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Todo task (id {self.task_id}): {self.task_description}\n\n"
+                    f"Goal for this run: {goal}\n\n"
+                    "Please work on this task. Use tools as needed."
+                ),
+            }
+        )
+
+    def _looks_like_tool_error_result(self, result: Any) -> bool:
+        """Best-effort classifier for tool-call failures."""
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                return True
+            msg = str(result.get("message") or "").strip().lower()
+            if msg.startswith("error") or "exception" in msg:
+                return True
+            return False
+        text = str(result or "").strip().lower()
+        if not text:
+            return False
+        return (
+            text.startswith("error:")
+            or "traceback" in text
+            or '"success": false' in text
+            or "'success': false" in text
+        )
+
+    def _record_tool_usage(self, tool_name: str, result: Any, errored: bool = False) -> None:
+        name = str(tool_name or "unknown")
+        self.tool_usage_counts[name] = self.tool_usage_counts.get(name, 0) + 1
+        is_error = errored or self._looks_like_tool_error_result(result)
+        if is_error:
+            self.tool_failure_count += 1
+            summary = str(result or "tool error")
+            if len(summary) > 240:
+                summary = summary[:237] + "..."
+            self.tool_error_messages.append(f"{name}: {summary}")
+            self.tool_error_messages = self.tool_error_messages[-10:]
+        else:
+            self.tool_success_count += 1
 
     async def _get_tools(self) -> List[Dict]:
         if self._available_tools is not None:
@@ -406,12 +464,14 @@ class TodoTaskExecutor:
                         print(f"[TASK_EXEC] Tool {name!r} raw arguments: {raw_args!r}", flush=True)
                     try:
                         result = await self.tool_executor(name, args)
+                        self._record_tool_usage(name, result, errored=False)
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": tc.get("id"),
                             "content": str(result),
                         })
                     except Exception as e:
+                        self._record_tool_usage(name, str(e), errored=True)
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": tc.get("id"),
@@ -437,3 +497,20 @@ class TodoTaskExecutor:
     def request_cancel(self) -> None:
         """Request that run_loop exit at the next iteration boundary (soft cancel)."""
         self._cancel_requested = True
+
+    def get_run_diagnostics(self) -> Dict[str, Any]:
+        """Return diagnostics that can be used for experience-based learning."""
+        elapsed_seconds = max(0.0, time.time() - self._run_started_at)
+        return {
+            "task_id": self.task_id,
+            "task_description": self.task_description,
+            "iterations": self.iteration_count,
+            "max_iterations": self.max_iterations,
+            "elapsed_seconds": elapsed_seconds,
+            "tool_usage_counts": dict(self.tool_usage_counts),
+            "tools_used": list(self.tool_usage_counts.keys()),
+            "tool_success_count": self.tool_success_count,
+            "tool_failure_count": self.tool_failure_count,
+            "tool_error_messages": list(self.tool_error_messages),
+            "last_error": self.last_error,
+        }
