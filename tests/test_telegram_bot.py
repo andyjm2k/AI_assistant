@@ -14,6 +14,13 @@ import pytest
 import src.integrations.telegram_bot as telegram_bot
 
 
+@pytest.fixture(autouse=True)
+def reset_backend_http_client_cache():
+    telegram_bot._backend_http_client = None
+    yield
+    telegram_bot._backend_http_client = None
+
+
 class TestParseAdminIds:
     """Tests for defensive ADMIN_IDS parsing."""
 
@@ -115,8 +122,7 @@ class TestCallBackendChat:
 
         with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
-            mock_client.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
-            mock_client.__aexit__.return_value = None
+            mock_client.post = AsyncMock(return_value=mock_response)
             mock_client_cls.return_value = mock_client
 
             result = await telegram_bot.call_backend_chat(123, "Hi")
@@ -131,8 +137,7 @@ class TestCallBackendChat:
 
         with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
-            mock_client.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
-            mock_client.__aexit__.return_value = None
+            mock_client.post = AsyncMock(return_value=mock_response)
             mock_client_cls.return_value = mock_client
 
             with pytest.raises(RuntimeError):
@@ -150,8 +155,7 @@ class TestClearBackendHistory:
 
         with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
-            mock_client.__aenter__.return_value.delete = AsyncMock(return_value=mock_response)
-            mock_client.__aexit__.return_value = None
+            mock_client.delete = AsyncMock(return_value=mock_response)
             mock_client_cls.return_value = mock_client
 
             result = await telegram_bot.clear_backend_history(123)
@@ -165,8 +169,7 @@ class TestClearBackendHistory:
 
         with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
-            mock_client.__aenter__.return_value.delete = AsyncMock(return_value=mock_response)
-            mock_client.__aexit__.return_value = None
+            mock_client.delete = AsyncMock(return_value=mock_response)
             mock_client_cls.return_value = mock_client
 
             result = await telegram_bot.clear_backend_history(123)
@@ -207,8 +210,7 @@ class TestStatusPoller:
         with patch.object(telegram_bot, "STATUS_UPDATE_INTERVAL", 0.01):
             with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
                 mock_client = AsyncMock()
-                mock_client.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
-                mock_client.__aexit__.return_value = None
+                mock_client.get = AsyncMock(return_value=mock_response)
                 mock_client_cls.return_value = mock_client
 
                 task = asyncio.create_task(
@@ -240,8 +242,7 @@ class TestStatusPoller:
         with patch.object(telegram_bot, "STATUS_UPDATE_INTERVAL", 0.01):
             with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
                 mock_client = AsyncMock()
-                mock_client.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
-                mock_client.__aexit__.return_value = None
+                mock_client.get = AsyncMock(return_value=mock_response)
                 mock_client_cls.return_value = mock_client
 
                 task = asyncio.create_task(

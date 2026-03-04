@@ -4997,6 +4997,46 @@ function saveWAVFile(wavBlob) {
         let memoryCache = [];
         let isToolRequest = false;
         let chatHistory = [];  // Single declaration of chatHistory
+        const MODEL_HISTORY_MAX_MESSAGES = 14;
+        const MODEL_HISTORY_MAX_CHARS = 12000;
+        const MODEL_MESSAGE_MAX_CHARS = 2500;
+        const CHAT_REQUEST_TIMEOUT_MS = 1800000;
+        let activeChatRequest = null;
+
+        function buildModelHistoryWindow() {
+            if (!Array.isArray(chatHistory) || chatHistory.length === 0) {
+                return [];
+            }
+
+            const bounded = [];
+            let totalChars = 0;
+            for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
+                if (bounded.length >= MODEL_HISTORY_MAX_MESSAGES) break;
+
+                const msg = chatHistory[i];
+                if (!msg || (msg.role !== 'user' && msg.role !== 'assistant')) continue;
+
+                let content = typeof msg.content === 'string' ? msg.content.trim() : '';
+                if (!content) continue;
+                if (content.length > MODEL_MESSAGE_MAX_CHARS) {
+                    content = `${content.slice(0, MODEL_MESSAGE_MAX_CHARS)}\n[message truncated]`;
+                }
+
+                if ((totalChars + content.length > MODEL_HISTORY_MAX_CHARS) && bounded.length > 0) {
+                    break;
+                }
+
+                totalChars += content.length;
+                bounded.push({ role: msg.role, content: content });
+            }
+
+            return bounded.reverse();
+        }
+
+        function setChatRequestUiLocked(locked) {
+            if (sendBtn) sendBtn.disabled = locked;
+            if (sendBtnMobile) sendBtnMobile.disabled = locked;
+        }
 
         // Conversation Management System
         let conversations = []; // Array to store all conversations
@@ -5985,7 +6025,7 @@ function saveWAVFile(wavBlob) {
         ];
 
         const SKILL_TOOL_ALIAS_PREFIX = 'skill__';
-        const SKILL_TOOL_CACHE_MS = 15000;
+        const SKILL_TOOL_CACHE_MS = 120000;
         const OVERLAPPING_SKILL_FILE_TOOLS = new Set([
             'filesystem.list_files',
             'filesystem.read_text',
@@ -5995,6 +6035,7 @@ function saveWAVFile(wavBlob) {
         let cachedSkillToolsForLlm = [];
         let cachedSkillPromptLines = [];
         let lastSkillToolFetchAt = 0;
+        let skillToolsRefreshPromise = null;
 
         function createSkillToolAlias(qualifiedName, usedNames) {
             const safeCore = String(qualifiedName || '')
@@ -6018,72 +6059,109 @@ function saveWAVFile(wavBlob) {
             return skillToolAliasToQualifiedName.get(name) || name;
         }
 
-        async function fetchDynamicSkillTools(forceRefresh = false) {
-            const now = Date.now();
-            if (!forceRefresh && now - lastSkillToolFetchAt < SKILL_TOOL_CACHE_MS) {
-                return { tools: cachedSkillToolsForLlm, promptLines: cachedSkillPromptLines };
-            }
-
+        async function refreshDynamicSkillToolsCache(signal) {
             const usedNames = new Set(
                 baseTools
                     .map((tool) => tool?.function?.name)
                     .filter((name) => typeof name === 'string' && name.trim())
             );
-            skillToolAliasToQualifiedName.clear();
+            const nextAliasMap = new Map();
 
-            try {
-                const response = await fetch(`${PROXY_BASE_URL}/v1/skills/tools/openai?qualified_names=true`, {
-                    method: 'GET'
+            const response = await fetch(`${PROXY_BASE_URL}/v1/skills/tools/openai?qualified_names=true`, {
+                method: 'GET',
+                signal
+            });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const payload = await response.json();
+            const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+
+            const llmTools = [];
+            const promptLines = [];
+            for (const tool of tools) {
+                const fn = tool?.function;
+                const qualifiedName = typeof fn?.name === 'string' ? fn.name.trim() : '';
+                if (!qualifiedName) continue;
+                if (OVERLAPPING_SKILL_FILE_TOOLS.has(qualifiedName)) continue;
+
+                const alias = createSkillToolAlias(qualifiedName, usedNames);
+                usedNames.add(alias);
+                nextAliasMap.set(alias, qualifiedName);
+
+                const schema = (fn && typeof fn.parameters === 'object' && fn.parameters)
+                    ? fn.parameters
+                    : { type: 'object', properties: {} };
+                llmTools.push({
+                    type: 'function',
+                    function: {
+                        name: alias,
+                        description: fn?.description || `Skill framework tool: ${qualifiedName}`,
+                        parameters: schema
+                    }
                 });
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-                const payload = await response.json();
-                const tools = Array.isArray(payload?.tools) ? payload.tools : [];
-
-                const llmTools = [];
-                const promptLines = [];
-                for (const tool of tools) {
-                    const fn = tool?.function;
-                    const qualifiedName = typeof fn?.name === 'string' ? fn.name.trim() : '';
-                    if (!qualifiedName) continue;
-                    if (OVERLAPPING_SKILL_FILE_TOOLS.has(qualifiedName)) continue;
-
-                    const alias = createSkillToolAlias(qualifiedName, usedNames);
-                    usedNames.add(alias);
-                    skillToolAliasToQualifiedName.set(alias, qualifiedName);
-
-                    const schema = (fn && typeof fn.parameters === 'object' && fn.parameters)
-                        ? fn.parameters
-                        : { type: 'object', properties: {} };
-                    llmTools.push({
-                        type: 'function',
-                        function: {
-                            name: alias,
-                            description: fn?.description || `Skill framework tool: ${qualifiedName}`,
-                            parameters: schema
-                        }
-                    });
-                    promptLines.push(
-                        `- ${alias} (maps to ${qualifiedName}): ${fn?.description || 'No description.'}`
-                    );
-                }
-
-                cachedSkillToolsForLlm = llmTools;
-                cachedSkillPromptLines = promptLines;
-                lastSkillToolFetchAt = now;
-            } catch (error) {
-                console.warn('Could not load dynamic skill tools from proxy:', error);
-                cachedSkillToolsForLlm = [];
-                cachedSkillPromptLines = [];
-                lastSkillToolFetchAt = now;
+                promptLines.push(
+                    `- ${alias} (maps to ${qualifiedName}): ${fn?.description || 'No description.'}`
+                );
             }
 
+            skillToolAliasToQualifiedName.clear();
+            nextAliasMap.forEach((qualifiedName, alias) => {
+                skillToolAliasToQualifiedName.set(alias, qualifiedName);
+            });
+            cachedSkillToolsForLlm = llmTools;
+            cachedSkillPromptLines = promptLines;
+            lastSkillToolFetchAt = Date.now();
             return { tools: cachedSkillToolsForLlm, promptLines: cachedSkillPromptLines };
         }
 
-        async function buildToolingBundle(forceRefresh = false) {
-            const dynamic = await fetchDynamicSkillTools(forceRefresh);
+        async function fetchDynamicSkillTools(forceRefresh = false, options = {}) {
+            const signal = options?.signal;
+            const now = Date.now();
+            const cacheAge = now - lastSkillToolFetchAt;
+            const hasCache = cachedSkillToolsForLlm.length > 0 || cachedSkillPromptLines.length > 0;
+
+            if (!forceRefresh && hasCache) {
+                if (cacheAge < SKILL_TOOL_CACHE_MS) {
+                    return { tools: cachedSkillToolsForLlm, promptLines: cachedSkillPromptLines };
+                }
+                if (!skillToolsRefreshPromise) {
+                    skillToolsRefreshPromise = refreshDynamicSkillToolsCache(undefined)
+                        .catch((error) => {
+                            console.warn('Background refresh of dynamic skill tools failed:', error);
+                        })
+                        .finally(() => {
+                            skillToolsRefreshPromise = null;
+                        });
+                }
+                return { tools: cachedSkillToolsForLlm, promptLines: cachedSkillPromptLines };
+            }
+
+            try {
+                if (skillToolsRefreshPromise) {
+                    await skillToolsRefreshPromise;
+                    return { tools: cachedSkillToolsForLlm, promptLines: cachedSkillPromptLines };
+                }
+                const fresh = await refreshDynamicSkillToolsCache(signal);
+                return fresh;
+            } catch (error) {
+                if (!hasCache) {
+                    lastSkillToolFetchAt = now;
+                }
+                if (error?.name === 'AbortError') {
+                    throw error;
+                }
+                console.warn('Could not load dynamic skill tools from proxy:', error);
+                if (!hasCache) {
+                    cachedSkillToolsForLlm = [];
+                    cachedSkillPromptLines = [];
+                }
+                return { tools: cachedSkillToolsForLlm, promptLines: cachedSkillPromptLines };
+            }
+        }
+
+        async function buildToolingBundle(forceRefresh = false, options = {}) {
+            const dynamic = await fetchDynamicSkillTools(forceRefresh, options);
             return {
                 tools: [...baseTools, ...dynamic.tools],
                 skillPromptLines: dynamic.promptLines
@@ -6286,6 +6364,7 @@ function saveWAVFile(wavBlob) {
                 await fetch(`${PROXY_BASE_URL}/v1/tools/log`, {
                     method: 'POST',
                     headers,
+                    keepalive: true,
                     body: JSON.stringify(payload)
                 });
             } catch (error) {
@@ -6326,7 +6405,7 @@ function saveWAVFile(wavBlob) {
                 if (resolvedName !== name) {
                     console.log('executeToolCall - Resolved dynamic skill alias:', { alias: name, qualified: resolvedName });
                 }
-                await reportToolInvocationToProxy(resolvedName, args);
+                void reportToolInvocationToProxy(resolvedName, args);
 
                 let result;
                 switch (resolvedName) {
@@ -7988,7 +8067,23 @@ function saveWAVFile(wavBlob) {
             }
             
             console.log('fetchOpenAIResponse called with promptText:', promptText); // Debug log
-            
+
+            if (activeChatRequest) {
+                status.textContent = 'A response is already in progress. Please wait.';
+                return;
+            }
+
+            const chatRequestController = new AbortController();
+            const chatRequestTimeoutId = window.setTimeout(() => {
+                try {
+                    chatRequestController.abort();
+                } catch (_) {}
+            }, CHAT_REQUEST_TIMEOUT_MS);
+            const chatRequestSignal = chatRequestController.signal;
+            activeChatRequest = { controller: chatRequestController, startedAt: Date.now() };
+            setChatRequestUiLocked(true);
+
+            try {
             let endpoint = endpointInput.value;
             const apiKey = apiKeyInput.value.trim();
             
@@ -8338,14 +8433,37 @@ IMPORTANT REMINDER: Use native tool calls when possible. Use <tool> and <paramet
 Current memory cache contents:
 ${memoryCache.map((item, index) => `${index + 1}. ${item}`).join('\n')}`;
 
-            const toolingBundle = await buildToolingBundle();
+            const toolingBundle = await buildToolingBundle(false, { signal: chatRequestSignal });
             const tools = toolingBundle.tools;
             const dynamicSkillPrompt = toolingBundle.skillPromptLines.length
                 ? `\n\nAdditional Skill Framework tools (dynamic):\n${toolingBundle.skillPromptLines.join('\n')}\nUse the alias exactly as listed for native tool calls; it maps to the qualified skill tool on the server.`
                 : '';
+            const compactMemoryLines = memoryCache.length
+                ? memoryCache.map((item, index) => `${index + 1}. ${item}`).join('\n')
+                : '(empty)';
+            const compactSystemPrompt = `You are EVA, a helpful AI assistant with access to tools.
+
+Tool calling rules:
+- Prefer native tool calls when available.
+- If native tool calls are unavailable, use XML fallback:
+<tool>tool_name</tool>
+<parameters>
+{ "key": "value" }
+</parameters>
+- Ask follow-up questions when required inputs are missing.
+- Do not invent tool outputs; rely on real tool results.
+
+Task-specific rules:
+- For PDF-to-PowerPoint requests, always call pdfToPowerPoint instead of replying with plain text.
+- For CATBot code/tool changes, use runCodexCli.
+- Call restartProxyServer only with explicit user confirmation.
+- For scratch files, use relative filenames and preserve requested output names.
+
+Current memory cache contents:
+${compactMemoryLines}`;
 
             // Preserve existing system prompt by default; user input overrides it
-            let effectiveSystemPrompt = systemPromptInput.value.trim() || systemPrompt;
+            let effectiveSystemPrompt = systemPromptInput.value.trim() || compactSystemPrompt;
             if (dynamicSkillPrompt) {
                 effectiveSystemPrompt = `${effectiveSystemPrompt}\n${dynamicSkillPrompt}`;
             }
@@ -8377,12 +8495,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 }
             }
             
+            const modelHistory = isToolRequest ? [] : buildModelHistoryWindow();
             const messages = [
                 { 
                     role: 'system', 
                     content: effectiveSystemPrompt
                 },
-                ...(isToolRequest ? [] : chatHistory),
+                ...modelHistory,
                 {
                     role: 'user',
                     content: promptText
@@ -8454,6 +8573,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${apiKey}`
                     },
+                    signal: chatRequestSignal,
                     body: JSON.stringify(body)
                 });
 
@@ -8495,6 +8615,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     'Content-Type': 'application/json',
                                     'Authorization': `Bearer ${apiKey}`
                                 },
+                                signal: chatRequestSignal,
                                 body: JSON.stringify({
                                     model: getCurrentModel(),
                                     messages: messages,
@@ -8553,6 +8674,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                         'Content-Type': 'application/json',
                                         'Authorization': `Bearer ${apiKey}`
                                     },
+                                    signal: chatRequestSignal,
                                     body: JSON.stringify({
                                         model: getCurrentModel(),
                                         messages: messages,
@@ -8896,9 +9018,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                                     'Content-Type': 'application/json',
                                                     'Authorization': `Bearer ${apiKey}`
                                                 },
+                                                signal: chatRequestSignal,
                                                 body: JSON.stringify({
                                                     model: getCurrentModel(),
-                                                    messages: chatHistory,
+                                                    messages: buildModelHistoryWindow(),
                                                     temperature: 0.7
                                                 })
                                             });
@@ -9234,12 +9357,36 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 }
             } catch (error) {
                 console.error('Error:', error);
-                responseOutput.value = `Error: ${error.message}. Please try again.`;
-                addMessageToHistory('assistant', `Error: ${error.message}. Please try again.`); // Add to message history
+                const isTimeoutAbort = error?.name === 'AbortError';
+                const userErrorMessage = isTimeoutAbort
+                    ? `Error: Request timed out after ${Math.round(CHAT_REQUEST_TIMEOUT_MS / 1000)} seconds. Please try again.`
+                    : `Error: ${error.message}. Please try again.`;
+                responseOutput.value = userErrorMessage;
+                addMessageToHistory('assistant', userErrorMessage); // Add to message history
             } finally {
                 responseOutput.classList.remove('responding');
                 messageHistory.classList.remove('responding'); // Remove pulsing effect from message history
                 stopProgressUpdates();
+            }
+            } catch (outerError) {
+                console.error('Error before chat request completion:', outerError);
+                const isTimeoutAbort = outerError?.name === 'AbortError';
+                const userErrorMessage = isTimeoutAbort
+                    ? `Error: Request timed out after ${Math.round(CHAT_REQUEST_TIMEOUT_MS / 1000)} seconds. Please try again.`
+                    : `Error: ${outerError.message}. Please try again.`;
+                responseOutput.value = userErrorMessage;
+                addMessageToHistory('assistant', userErrorMessage);
+                responseOutput.classList.remove('responding');
+                messageHistory.classList.remove('responding');
+                stopProgressUpdates();
+            } finally {
+                try {
+                    window.clearTimeout(chatRequestTimeoutId);
+                } catch (_) {}
+                if (activeChatRequest && activeChatRequest.controller === chatRequestController) {
+                    activeChatRequest = null;
+                }
+                setChatRequestUiLocked(false);
             }
         }
 
@@ -9265,6 +9412,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 alert('Please enter some text or record your voice.'); // Show alert if empty
                 return; // Exit early
             } // End empty check
+            if (activeChatRequest) {
+                status.textContent = 'A response is already in progress. Please wait.';
+                return;
+            }
 
             // Note: fetchOpenAIResponse will add the user message to history, so we don't add it here
             fetchOpenAIResponse(userText); // Send message to OpenAI API (this will add user message to history)
@@ -9309,6 +9460,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 }
                 
                 if (userText.trim() !== '') { // Check if input is not empty
+                    if (activeChatRequest) {
+                        status.textContent = 'A response is already in progress. Please wait.';
+                        return;
+                    }
                     // Note: fetchOpenAIResponse will add the user message to history, so we don't add it here
                     fetchOpenAIResponse(userText); // Send message to OpenAI API (this will add user message to history)
                     

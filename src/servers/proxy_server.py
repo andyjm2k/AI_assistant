@@ -1433,14 +1433,51 @@ def _get_max_tokens_from_payload(payload: Dict[str, Any]) -> int:
         return 0
 
 
+_shared_chat_http_client: Optional[httpx.AsyncClient] = None
+_shared_chat_http_client_lock = asyncio.Lock()
+
+
+async def _get_shared_chat_http_client() -> httpx.AsyncClient:
+    global _shared_chat_http_client
+    client = _shared_chat_http_client
+    if client is not None and not client.is_closed:
+        return client
+    async with _shared_chat_http_client_lock:
+        client = _shared_chat_http_client
+        if client is None or client.is_closed:
+            _shared_chat_http_client = httpx.AsyncClient()
+        return _shared_chat_http_client
+
+
+async def _close_shared_chat_http_client() -> None:
+    global _shared_chat_http_client
+    async with _shared_chat_http_client_lock:
+        client = _shared_chat_http_client
+        _shared_chat_http_client = None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
 async def _call_chat_completion(
     endpoint: str,
     headers: Dict[str, str],
     payload: Dict[str, Any],
     timeout_seconds: float = 120.0,
 ) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        return await client.post(endpoint, json=payload, headers=headers)
+    client = await _get_shared_chat_http_client()
+    return await client.post(endpoint, json=payload, headers=headers, timeout=timeout_seconds)
+
+
+async def _extract_memories_from_recent_messages_async(recent_messages: List[Dict[str, str]]) -> None:
+    if not MEMORY_AVAILABLE or not memory_manager or not recent_messages:
+        return
+    try:
+        await memory_manager.extract_memories_from_conversation(
+            messages=recent_messages,
+            max_memories=3,
+        )
+    except Exception as e:
+        print(f"Warning: Failed to extract memories: {e}")
 
 
 async def _summarize_messages_for_budget_proxy(
@@ -2079,6 +2116,7 @@ if skill_manager is not None and create_skill_router is not None:
 async def startup_event():
     """Log that the application has started successfully."""
     import sys
+    await _get_shared_chat_http_client()
     print("🚀 FastAPI application startup event fired", flush=True)
     sys.stdout.flush()
     print(f"🚀 App routes registered: {len(app.routes)} routes", flush=True)
@@ -2094,6 +2132,7 @@ async def startup_event():
 async def shutdown_event():
     """Stop AutoGen code executors (e.g. Docker containers) on app shutdown."""
     global autogen_team
+    await _close_shared_chat_http_client()
     if autogen_team is not None:
         await _stop_code_executors(autogen_team)
         autogen_team = None
@@ -5921,16 +5960,19 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     if MEMORY_AVAILABLE and memory_manager:
         auto_extract = os.getenv("MEMORY_AUTO_EXTRACT", "true").lower() == "true"
         if auto_extract:
-            try:
-                # Extract memories from the conversation (last few messages)
-                # Include both user message and assistant response
-                recent_messages = history[-4:] if len(history) >= 4 else history
-                await memory_manager.extract_memories_from_conversation(
-                    messages=recent_messages,
-                    max_memories=3,
-                )
-            except Exception as e:
-                print(f"Warning: Failed to extract memories: {e}")
+            # Extract memories from the latest user+assistant turns without blocking Telegram response delivery.
+            recent_messages = history[-4:] if len(history) >= 4 else history
+            memory_messages: List[Dict[str, str]] = []
+            for msg in recent_messages:
+                if not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role") or "").strip()
+                content = str(msg.get("content") or "")
+                if not role or not content:
+                    continue
+                memory_messages.append({"role": role, "content": content})
+            if memory_messages:
+                asyncio.create_task(_extract_memories_from_recent_messages_async(memory_messages))
 
     usage = data.get("usage") if isinstance(data, dict) else None
 

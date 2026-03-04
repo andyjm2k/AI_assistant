@@ -117,6 +117,8 @@ MAX_VOICE_SECONDS = _parse_max_voice_seconds()
 
 # Track successful user message turns (text or voice transcript)
 message_counts: Dict[int, int] = {}
+_backend_http_client: Optional[httpx.AsyncClient] = None
+_backend_http_client_lock = asyncio.Lock()
 
 
 def _build_backend_url(path_or_url: str) -> str:
@@ -129,6 +131,27 @@ def _backend_headers() -> Dict[str, str]:
     if not TELEGRAM_SECRET:
         return {}
     return {"X-Telegram-Secret": TELEGRAM_SECRET}
+
+
+async def _get_backend_http_client() -> httpx.AsyncClient:
+    global _backend_http_client
+    client = _backend_http_client
+    if client is not None and not client.is_closed:
+        return client
+    async with _backend_http_client_lock:
+        client = _backend_http_client
+        if client is None or client.is_closed:
+            _backend_http_client = httpx.AsyncClient(timeout=CHAT_TIMEOUT, verify=BACKEND_VERIFY_SSL)
+        return _backend_http_client
+
+
+async def _close_backend_http_client() -> None:
+    global _backend_http_client
+    async with _backend_http_client_lock:
+        client = _backend_http_client
+        _backend_http_client = None
+    if client is not None and not client.is_closed:
+        await client.aclose()
 
 
 def is_authorized(user_id: int) -> bool:
@@ -156,12 +179,12 @@ async def _poll_status_updates(
             break
         except asyncio.TimeoutError:
             try:
-                async with httpx.AsyncClient(timeout=CHAT_TIMEOUT, verify=BACKEND_VERIFY_SSL) as client:
-                    resp = await client.get(
-                        url,
-                        params={"conversation_id": conversation_id, "request_id": request_id},
-                        headers=headers,
-                    )
+                client = await _get_backend_http_client()
+                resp = await client.get(
+                    url,
+                    params={"conversation_id": conversation_id, "request_id": request_id},
+                    headers=headers,
+                )
                 if resp.status_code != 200:
                     continue
                 payload = resp.json()
@@ -195,8 +218,8 @@ async def call_backend_chat(user_id: int, message: str, request_id: Optional[str
     headers = _backend_headers()
 
     try:
-        async with httpx.AsyncClient(timeout=CHAT_TIMEOUT, verify=BACKEND_VERIFY_SSL) as client:
-            response = await client.post(url, json=payload, headers=headers)
+        client = await _get_backend_http_client()
+        response = await client.post(url, json=payload, headers=headers)
     except httpx.RequestError as exc:
         raise RuntimeError("Failed to reach CATBot backend chat endpoint.") from exc
 
@@ -237,8 +260,8 @@ async def call_backend_transcription(
     data = {"model": TRANSCRIBE_MODEL}
 
     try:
-        async with httpx.AsyncClient(timeout=CHAT_TIMEOUT, verify=BACKEND_VERIFY_SSL) as client:
-            response = await client.post(url, files=files, data=data, headers=headers)
+        client = await _get_backend_http_client()
+        response = await client.post(url, files=files, data=data, headers=headers)
     except httpx.RequestError as exc:
         raise RuntimeError("Failed to reach transcription endpoint.") from exc
 
@@ -375,14 +398,14 @@ async def call_backend_tts(text: str) -> tuple[bytes, str]:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=CHAT_TIMEOUT, verify=BACKEND_VERIFY_SSL) as client:
-            response = await client.post(
-                url,
-                params={"buffer": "true"},
-                json=payload,
-                headers=headers,
-                timeout=CHAT_TIMEOUT,
-            )
+        client = await _get_backend_http_client()
+        response = await client.post(
+            url,
+            params={"buffer": "true"},
+            json=payload,
+            headers=headers,
+            timeout=CHAT_TIMEOUT,
+        )
     except httpx.RequestError as exc:
         raise RuntimeError("Failed to reach TTS endpoint.") from exc
 
@@ -399,8 +422,8 @@ async def clear_backend_history(user_id: int) -> bool:
     headers = _backend_headers()
 
     try:
-        async with httpx.AsyncClient(timeout=CHAT_TIMEOUT, verify=BACKEND_VERIFY_SSL) as client:
-            response = await client.delete(delete_url, headers=headers)
+        client = await _get_backend_http_client()
+        response = await client.delete(delete_url, headers=headers)
     except httpx.RequestError as exc:
         raise RuntimeError("Unable to reach backend to clear conversation.") from exc
 
@@ -417,8 +440,8 @@ async def check_backend_health() -> tuple[str, Optional[float]]:
     loop = asyncio.get_running_loop()
     start = loop.time()
     try:
-        async with httpx.AsyncClient(timeout=CHAT_TIMEOUT, verify=BACKEND_VERIFY_SSL) as client:
-            response = await client.get(health_url, headers=headers)
+        client = await _get_backend_http_client()
+        response = await client.get(health_url, headers=headers)
     except httpx.RequestError:
         logger.warning("Health check failed", exc_info=True)
         return "Offline", None
@@ -467,14 +490,18 @@ async def _reply_with_backend_answer(
         logger.error("Backend chat failed: %s", exc)
         await update.message.reply_text("CATBot could not process that request right now. Please try again.")
         stop_event.set()
+        if not status_task.done():
+            status_task.cancel()
         with suppress(Exception):
             await status_task
         return
 
     stop_event.set()
+    if not status_task.done():
+        status_task.cancel()
+    await update.message.reply_text(reply)
     with suppress(Exception):
         await status_task
-    await update.message.reply_text(reply)
 
     if VOICE_OUT_ENABLED:
         try:
@@ -774,11 +801,15 @@ def main() -> None:
     async def _post_init(app: Application) -> None:
         logger.info("CATBot Telegram bot initialized")
 
+    async def _post_shutdown(app: Application) -> None:
+        await _close_backend_http_client()
+
     app: Application = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
         .rate_limiter(AIORateLimiter())
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
 
