@@ -29,6 +29,21 @@ _TOOL_CALL_BLOCK_RE = (
 _TOOL_CALL_BLOCK_PATTERN = re.compile(_TOOL_CALL_BLOCK_RE, re.IGNORECASE)
 _STANDALONE_TOOL_CALL_PATTERN = re.compile(rf"^\s*(?:{_TOOL_CALL_BLOCK_RE})\s*$", re.IGNORECASE)
 
+_TELEGRAM_TOOL_NAME_ALIASES = {
+    "read_file": "readFile",
+    "write_file": "writeFile",
+    "list_files": "listFiles",
+    "save_to_file": "writeFile",
+    "saveToFile": "writeFile",
+}
+
+
+def _canonicalize_telegram_tool_name(name: Any) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    return _TELEGRAM_TOOL_NAME_ALIASES.get(raw, raw)
+
 
 def _get_list_files_tool_max_entries() -> int:
     """Return max entries rendered in list-files replies."""
@@ -46,7 +61,14 @@ def _format_list_files_message(files: List[Dict[str, Any]]) -> str:
         return "No files."
     limit = _get_list_files_tool_max_entries()
     shown = files[:limit]
-    lines = [f"- {f.get('name', '')}" for f in shown]
+    lines = []
+    for item in shown:
+        name = str(item.get("name", ""))
+        is_dir = str(item.get("type", "")).lower() == "directory"
+        if is_dir:
+            lines.append(f"- {name}/ [dir]")
+        else:
+            lines.append(f"- {name}")
     remaining = max(0, len(files) - len(shown))
     if remaining > 0:
         lines.append(f"- ... and {remaining} more files.")
@@ -222,6 +244,7 @@ async def execute_telegram_tool(
     Returns a dict with success (bool), message (str), and optional data.
     """
     cid = context.get("conversation_id") or "default"
+    name = _canonicalize_telegram_tool_name(name)
     _log_tool_invocation(name, arguments, cid)
     memory_cache_store = context.get("memory_cache_store") or {}
     todo_user_key = context.get("todo_user_key")
@@ -290,12 +313,6 @@ async def execute_telegram_tool(
         meta = _load_meta()
         tasks = meta["tasks"]
         task_items = meta["task_items"]
-        task_id_by_uid: Dict[str, int] = {}
-        for idx, item in enumerate(task_items, start=1):
-            if isinstance(item, dict):
-                item_uid = item.get("id")
-                if item_uid is not None:
-                    task_id_by_uid[str(item_uid)] = idx
 
         if action in {"list", "due", "list_due", "listdue"}:
             due_only = action in {"due", "list_due", "listdue"}
@@ -345,8 +362,7 @@ async def execute_telegram_tool(
             lines = []
             for i, item in enumerate(items_for_render):
                 description = str(item.get("description") or (tasks_for_render[i] if i < len(tasks_for_render) else "")).strip()
-                item_uid = item.get("id")
-                line_number = task_id_by_uid.get(str(item_uid), i + 1) if item_uid is not None else (i + 1)
+                line_number = _parse_task_id(item.get("task_id")) or (i + 1)
                 next_run = item.get("next_run_at")
                 recurrence_item = item.get("recurrence")
                 suffix_parts = []
@@ -399,7 +415,7 @@ async def execute_telegram_tool(
 
         if action == "update":
             idx = _parse_task_id(task_id)
-            if idx is None or idx < 1 or idx > len(tasks):
+            if idx is None or idx < 1:
                 return {"success": False, "message": "Invalid task ID."}
             description_for_update = task_description if task_description else None
             if (
@@ -431,7 +447,7 @@ async def execute_telegram_tool(
             if task_id is None:
                 return {"success": False, "message": "Task ID is required."}
             idx = _parse_task_id(task_id)
-            if idx is None or idx < 1 or idx > len(tasks):
+            if idx is None or idx < 1:
                 return {"success": False, "message": "Invalid task ID."}
             try:
                 _todo_store_module.delete_task(todo_user_key, idx)
@@ -443,7 +459,7 @@ async def execute_telegram_tool(
             if task_id is None:
                 return {"success": False, "message": "Task ID is required."}
             idx = _parse_task_id(task_id)
-            if idx is None or idx < 1 or idx > len(tasks):
+            if idx is None or idx < 1:
                 return {"success": False, "message": "Invalid task ID."}
             try:
                 complete_fn = getattr(_todo_store_module, "complete_task", None)
@@ -486,14 +502,19 @@ async def execute_telegram_tool(
             chat_id = context.get("user_id") or context.get("conversation_id")
             if callable(register_target_fn):
                 try:
-                    register_target_fn(user_key, chat_id)
+                    register_target_fn(user_key, chat_id, tid)
+                except TypeError:
+                    try:
+                        register_target_fn(user_key, chat_id)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             return {"success": True, "message": message, "status": status}
         except Exception as e:
             msg = str(e)
-            if "409" in msg or "already active" in msg.lower():
-                return {"success": False, "message": "An execution is already active. Complete or cancel it first."}
+            if "409" in msg or "already active" in msg.lower() or "already executing" in msg.lower():
+                return {"success": False, "message": msg or f"Task {tid} is already executing."}
             if "400" in msg or "Invalid" in msg:
                 return {"success": False, "message": msg or "Invalid request."}
             return {"success": False, "message": msg or "Task execution failed."}
@@ -504,8 +525,22 @@ async def execute_telegram_tool(
         if not cancel_fn:
             return {"success": False, "message": "Task execution cancel is not available."}
         user_key = context.get("todo_user_key") or cid
-        ok, msg = cancel_fn(user_key)
-        return {"success": ok, "message": msg}
+        task_id = arguments.get("taskId") or arguments.get("task_id")
+        parsed_task_id: Optional[int] = None
+        if task_id is not None:
+            try:
+                parsed_task_id = int(task_id)
+            except (TypeError, ValueError):
+                return {"success": False, "message": "Invalid task ID."}
+        try:
+            ok, msg, cancelled_task_id = cancel_fn(user_key, parsed_task_id)
+        except TypeError:
+            ok, msg = cancel_fn(user_key)
+            cancelled_task_id = parsed_task_id
+        result: Dict[str, Any] = {"success": ok, "message": msg}
+        if cancelled_task_id is not None:
+            result["taskId"] = cancelled_task_id
+        return result
 
     # --- getTodoExecutionStatus --- (return current execution status for user)
     if name == "getTodoExecutionStatus":
@@ -513,7 +548,17 @@ async def execute_telegram_tool(
         if not status_fn:
             return {"success": True, "message": "No execution status available.", "data": None}
         user_key = context.get("todo_user_key") or cid
-        state = status_fn(user_key)
+        task_id = arguments.get("taskId") or arguments.get("task_id")
+        parsed_task_id: Optional[int] = None
+        if task_id is not None:
+            try:
+                parsed_task_id = int(task_id)
+            except (TypeError, ValueError):
+                return {"success": False, "message": "Invalid task ID."}
+        try:
+            state = status_fn(user_key, parsed_task_id)
+        except TypeError:
+            state = status_fn(user_key)
         if not state:
             return {"success": True, "message": "No task is currently running or paused.", "data": None}
         return {
@@ -627,6 +672,20 @@ async def execute_telegram_tool(
         do_fetch = context.get("do_fetch")
         if not do_fetch:
             return {"success": False, "message": "Web fetch is not available."}
+
+        def _coerce_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"1", "true", "yes", "y", "on"}:
+                    return True
+                if lowered in {"0", "false", "no", "n", "off"}:
+                    return False
+            return default
+
         # Accept single url or list urls; try each until one succeeds (scrape-with-retry)
         url = (arguments.get("url") or "").strip()
         urls_arg = arguments.get("urls")
@@ -636,10 +695,30 @@ async def execute_telegram_tool(
             url_list = [url] if url else []
         if not url_list:
             return {"success": False, "message": "URL or urls is required."}
+
+        render_js = _coerce_bool(arguments.get("render_js", False))
+        render_engine = str(arguments.get("render_engine") or "auto").strip().lower()
+        wait_for_selector = str(arguments.get("wait_for_selector") or "").strip() or None
+        try:
+            js_wait_ms = int(arguments.get("js_wait_ms", 2200))
+        except (TypeError, ValueError):
+            js_wait_ms = 2200
+
+        fetch_kwargs: Dict[str, Any] = {
+            "render_js": render_js,
+            "render_engine": render_engine,
+            "wait_for_selector": wait_for_selector,
+            "js_wait_ms": js_wait_ms,
+        }
+
         last_error: Optional[str] = None
         for one_url in url_list:
             try:
-                out = await do_fetch(one_url)
+                try:
+                    out = await do_fetch(one_url, **fetch_kwargs)
+                except TypeError:
+                    # Backward compatibility for older callback signatures used in tests/integrations.
+                    out = await do_fetch(one_url)
                 content = (out.get("content") or "")[:4000]
                 return {"success": True, "message": f"Fetched content (snippet):\n{content}", "data": out}
             except Exception as e:
@@ -743,11 +822,51 @@ async def execute_telegram_tool(
         list_internal = context.get("list_files_internal")
         if not list_internal:
             return {"success": False, "message": "File list is not available."}
-        out = await list_internal()
+        path_value = (
+            arguments.get("path")
+            or arguments.get("subdir")
+            or arguments.get("directory")
+            or ""
+        )
+        path = str(path_value).strip() if path_value is not None else ""
+        recursive_raw = arguments.get("recursive", False)
+        if isinstance(recursive_raw, bool):
+            recursive = recursive_raw
+        elif isinstance(recursive_raw, (int, float)):
+            recursive = bool(recursive_raw)
+        else:
+            recursive = str(recursive_raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        try:
+            out = await list_internal(path=path, recursive=recursive)
+        except TypeError:
+            # Backward compatibility for older callback signatures in tests/custom integrations.
+            if path or recursive:
+                try:
+                    out = await list_internal(path, recursive)
+                except TypeError:
+                    return {
+                        "success": False,
+                        "message": "File list backend does not support path or recursive arguments.",
+                    }
+            else:
+                out = await list_internal()
         if isinstance(out, dict) and not out.get("success"):
             return {"success": False, "message": out.get("message", "List failed.")}
-        files = out.get("files") or []
-        return {"success": True, "message": _format_list_files_message(files), "data": out}
+        if not isinstance(out, dict):
+            return {"success": False, "message": "File list backend returned an invalid response."}
+        files = out.get("files")
+        if not isinstance(files, list):
+            files = []
+        message = _format_list_files_message(files)
+        skipped_count_raw = out.get("skipped_count", 0)
+        try:
+            skipped_count = int(skipped_count_raw or 0)
+        except (TypeError, ValueError):
+            skipped_count = 0
+        if skipped_count > 0:
+            message += f"\n- ... skipped {skipped_count} inaccessible or unsafe entries."
+        return {"success": True, "message": message, "data": out}
 
     # --- sendTelegramFile ---
     if name == "sendTelegramFile":
@@ -767,14 +886,6 @@ async def execute_telegram_tool(
             "message": (out or {}).get("message", f"Sent {filename} to Telegram."),
             "data": out or {},
         }
-
-    # --- saveToFile (map to writeFile) ---
-    if name == "saveToFile":
-        return await execute_telegram_tool(
-            "writeFile",
-            {"filename": arguments.get("filename", "saved.txt"), "content": arguments.get("content", ""), "format": "txt"},
-            context,
-        )
 
     # --- storeMemory ---
     if name == "storeMemory":
@@ -872,5 +983,40 @@ async def execute_telegram_tool(
             return {"success": False, "message": "query or contentPrompt is required."}
         out = await llm_internal(prompt)
         return {"success": True, "message": out.get("content", str(out)), "data": out}
+
+    # --- dynamic skill framework tools ---
+    skill_executor = context.get("execute_skill_tool")
+    if callable(skill_executor):
+        try:
+            skill_result = await skill_executor(name, arguments)
+        except TypeError:
+            # Backward compatibility for callbacks that still expect context
+            skill_result = await skill_executor(name, arguments, context)
+        except Exception as e:
+            return {"success": False, "message": f"Skill tool execution failed: {e}"}
+
+        if isinstance(skill_result, dict):
+            # Allow unknown tools to fall through to the canonical unknown-tool response.
+            if str(skill_result.get("error_code") or "").strip().lower() == "tool_not_found":
+                pass
+            else:
+                success = bool(skill_result.get("success", True))
+                message = skill_result.get("message")
+                if not message:
+                    data_val = skill_result.get("data")
+                    message = str(data_val) if data_val is not None else f"Executed skill tool: {name}"
+                response = {
+                    "success": success,
+                    "message": str(message),
+                }
+                if "data" in skill_result:
+                    response["data"] = skill_result.get("data")
+                if skill_result.get("error_code"):
+                    response["error_code"] = skill_result.get("error_code")
+                if skill_result.get("tool_name"):
+                    response["tool_name"] = skill_result.get("tool_name")
+                return response
+        elif isinstance(skill_result, str):
+            return {"success": True, "message": skill_result}
 
     return {"success": False, "message": f"Unknown tool: {name}"}

@@ -216,12 +216,12 @@ class TestExecuteTelegramTool:
         mock_store.load_tasks_with_meta.return_value = {
             "tasks": ["Task A", "Task B"],
             "task_items": [
-                {"id": "a", "description": "Task A"},
-                {"id": "b", "description": "Task B", "next_run_at": "2026-03-01T09:00:00+00:00"},
+                {"id": "a", "task_id": 1, "description": "Task A"},
+                {"id": "b", "task_id": 2, "description": "Task B", "next_run_at": "2026-03-01T09:00:00+00:00"},
             ],
         }
         mock_store.list_due_task_items.return_value = [
-            {"id": "b", "description": "Task B", "next_run_at": "2026-03-01T09:00:00+00:00"}
+            {"id": "b", "task_id": 2, "description": "Task B", "next_run_at": "2026-03-01T09:00:00+00:00"}
         ]
         ctx = {"conversation_id": "cid1", "todo_user_key": "user1", "memory_cache_store": {}}
         with patch.object(tg, "_todo_store_module", mock_store):
@@ -276,7 +276,7 @@ class TestExecuteTelegramTool:
         }
         r = await tg.execute_telegram_tool("executeTodoTask", {"taskId": 1}, ctx)
         assert r.get("success") is True
-        mock_register.assert_called_once_with("u1", "123456789")
+        mock_register.assert_called_once_with("u1", "123456789", 1)
 
     @pytest.mark.asyncio
     async def test_cancel_todo_execution_no_cancel_fn_returns_unavailable(self):
@@ -378,6 +378,37 @@ class TestExecuteTelegramTool:
         assert "Hello from page" in r.get("message", "")
 
     @pytest.mark.asyncio
+    async def test_scrape_website_forwards_dynamic_render_args(self):
+        """scrapeWebsite should pass dynamic rendering options to do_fetch when provided."""
+        observed = {}
+
+        async def fake_fetch(u, **kwargs):
+            observed["url"] = u
+            observed["kwargs"] = kwargs
+            return {"content": "Dynamic content"}
+
+        ctx = {"do_fetch": fake_fetch}
+        r = await tg.execute_telegram_tool(
+            "scrapeWebsite",
+            {
+                "url": "https://example.com",
+                "render_js": True,
+                "render_engine": "playwright",
+                "wait_for_selector": ".status-table",
+                "js_wait_ms": 3200,
+            },
+            ctx,
+        )
+        assert r.get("success") is True
+        assert observed["url"] == "https://example.com"
+        assert observed["kwargs"] == {
+            "render_js": True,
+            "render_engine": "playwright",
+            "wait_for_selector": ".status-table",
+            "js_wait_ms": 3200,
+        }
+
+    @pytest.mark.asyncio
     async def test_scrape_website_urls_retry_second_succeeds(self):
         """scrapeWebsite with urls list tries each until one succeeds (scrape-with-retry)."""
         call_count = 0
@@ -452,6 +483,7 @@ class TestExecuteTelegramTool:
             return {
                 "success": True,
                 "files": [
+                    {"name": "images", "type": "directory"},
                     {"name": "a.txt"},
                     {"name": "b.txt"},
                     {"name": "c.txt"},
@@ -464,10 +496,11 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("listFiles", {}, ctx)
         assert r.get("success") is True
         message = r.get("message", "")
+        assert "- images/ [dir]" in message
         assert "- a.txt" in message
         assert "- b.txt" in message
-        assert "- c.txt" in message
-        assert "- ... and 2 more files." in message
+        assert "- ... and 3 more files." in message
+        assert "- c.txt" not in message
         assert "- d.txt" not in message
         assert "- e.txt" not in message
 
@@ -481,6 +514,73 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("listFiles", {}, ctx)
         assert r.get("success") is True
         assert r.get("message") == "No files."
+
+    @pytest.mark.asyncio
+    async def test_list_files_supports_path_and_recursive_arguments(self):
+        """listFiles forwards optional path/recursive arguments to backend list callback."""
+        observed = {}
+
+        async def fake_list_internal(path="", recursive=False):
+            observed["path"] = path
+            observed["recursive"] = recursive
+            return {"success": True, "files": [{"name": "images/a.png"}]}
+
+        ctx = {"conversation_id": "cid1", "list_files_internal": fake_list_internal}
+        r = await tg.execute_telegram_tool(
+            "listFiles",
+            {"path": "images", "recursive": "true"},
+            ctx,
+        )
+        assert r.get("success") is True
+        assert observed == {"path": "images", "recursive": True}
+        assert "images/a.png" in r.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_list_files_path_requires_backend_support(self):
+        """listFiles returns a clear error if custom backend callback cannot accept path/recursive args."""
+        async def fake_list_internal():
+            return {"success": True, "files": [{"name": "a.txt"}]}
+
+        ctx = {"conversation_id": "cid1", "list_files_internal": fake_list_internal}
+        r = await tg.execute_telegram_tool("listFiles", {"path": "images"}, ctx)
+        assert r.get("success") is False
+        assert "does not support path or recursive" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_list_files_snake_case_alias_routes_to_camel_case(self):
+        """list_files alias should resolve to listFiles behavior."""
+        observed = {}
+
+        async def fake_list_internal(path="", recursive=False):
+            observed["path"] = path
+            observed["recursive"] = recursive
+            return {"success": True, "files": [{"name": "images/a.png"}]}
+
+        ctx = {"conversation_id": "cid1", "list_files_internal": fake_list_internal}
+        r = await tg.execute_telegram_tool("list_files", {"path": "images", "recursive": True}, ctx)
+        assert r.get("success") is True
+        assert observed == {"path": "images", "recursive": True}
+        assert "images/a.png" in r.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_save_to_file_alias_routes_to_write_file(self):
+        """saveToFile alias should execute writeFile path for backward compatibility."""
+        observed = {}
+
+        async def fake_write_internal(filename, content, fmt):
+            observed["filename"] = filename
+            observed["content"] = content
+            observed["fmt"] = fmt
+            return {"success": True, "message": "Write OK."}
+
+        ctx = {"conversation_id": "cid1", "write_file_internal": fake_write_internal}
+        r = await tg.execute_telegram_tool(
+            "saveToFile",
+            {"filename": "notes.txt", "content": "hello"},
+            ctx,
+        )
+        assert r.get("success") is True
+        assert observed == {"filename": "notes.txt", "content": "hello", "fmt": "txt"}
 
     @pytest.mark.asyncio
     async def test_send_telegram_file_requires_sender_callback(self):

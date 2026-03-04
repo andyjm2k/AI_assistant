@@ -2,8 +2,8 @@
 Background poller for scheduled todo tasks.
 
 This service periodically checks each authenticated user's due tasks and
-triggers `/v1/todo/execute` for the first due task when no execution is active.
-Execution state remains centralized in proxy_server.
+triggers `/v1/todo/execute` for each due task. Execution state remains
+centralized in proxy_server.
 """
 
 from __future__ import annotations
@@ -70,9 +70,15 @@ def load_auth_usernames(users_file: Path) -> List[str]:
 
 
 def select_due_task_id(todo_due_payload: Dict[str, Any]) -> Optional[int]:
+    ids = select_due_task_ids(todo_due_payload)
+    return ids[0] if ids else None
+
+
+def select_due_task_ids(todo_due_payload: Dict[str, Any]) -> List[int]:
     items = todo_due_payload.get("taskItems")
     if not isinstance(items, list):
-        return None
+        return []
+    task_ids: List[int] = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -82,8 +88,9 @@ def select_due_task_id(todo_due_payload: Dict[str, Any]) -> Optional[int]:
         except (TypeError, ValueError):
             continue
         if task_id >= 1:
-            return task_id
-    return None
+            task_ids.append(task_id)
+    # Preserve due-list order and remove duplicates.
+    return list(dict.fromkeys(task_ids))
 
 
 def _extract_error_message(payload: Any, fallback: str) -> str:
@@ -232,39 +239,40 @@ class ScheduledTaskPoller:
             )
             return
 
-        task_id = select_due_task_id(due_payload)
-        if task_id is None:
+        task_ids = select_due_task_ids(due_payload)
+        if not task_ids:
             return
 
         execute_url = self._url("/v1/todo/execute")
-        exec_status, exec_payload, exec_error = _json_request(
-            method="POST",
-            url=execute_url,
-            bearer_token=token,
-            timeout_seconds=self.config.timeout_seconds,
-            body={"taskId": task_id},
-            skip_tls_verify=skip_tls_verify,
-        )
+        for task_id in task_ids:
+            exec_status, exec_payload, exec_error = _json_request(
+                method="POST",
+                url=execute_url,
+                bearer_token=token,
+                timeout_seconds=self.config.timeout_seconds,
+                body={"taskId": task_id},
+                skip_tls_verify=skip_tls_verify,
+            )
 
-        if exec_status == 200:
+            if exec_status == 200:
+                print(
+                    f"[SCHED_POLLER] Started scheduled execution user={username} task_id={task_id}.",
+                    flush=True,
+                )
+                continue
+            if exec_status == 409:
+                print(
+                    f"[SCHED_POLLER] Skipped user={username} task_id={task_id}: execution already active for this task.",
+                    flush=True,
+                )
+                continue
+
+            message = _extract_error_message(exec_payload, exec_error or "request failed")
             print(
-                f"[SCHED_POLLER] Started scheduled execution user={username} task_id={task_id}.",
+                f"[SCHED_POLLER] Failed to start execution user={username} task_id={task_id} "
+                f"status={exec_status}: {message}",
                 flush=True,
             )
-            return
-        if exec_status == 409:
-            print(
-                f"[SCHED_POLLER] Skipped user={username} task_id={task_id}: execution already active.",
-                flush=True,
-            )
-            return
-
-        message = _extract_error_message(exec_payload, exec_error or "request failed")
-        print(
-            f"[SCHED_POLLER] Failed to start execution user={username} task_id={task_id} "
-            f"status={exec_status}: {message}",
-            flush=True,
-        )
 
     def _url(self, path: str) -> str:
         return f"{self.config.proxy_base_url.rstrip('/')}/{path.lstrip('/')}"

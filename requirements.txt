@@ -43,6 +43,7 @@ cryptography>=41.0.0
 # MCP and browser automation (browser-use runs in mcp-browser-use submodule via uv)
 mcp>=1.6.0
 playwright>=1.40.0
+selenium>=4.18.0
 pyperclip>=1.8.0
 
 # FastMCP HTTP client for mcp-server-browser-use (align with mcp-browser-use submodule)

@@ -218,6 +218,7 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
             telegram_tools_enabled = "true" if enable_tools else "false"
             if enable_tools:
                 print("   Telegram file attachments (sendTelegramFile) require authenticated proxy requests.")
+                print("   listFiles supports path/recursive for scratch sub-directory listings.")
             set_secret = _prompt_yes_no(
                 "   Set TELEGRAM_SECRET for bot-to-proxy authentication (recommended)?",
                 True,

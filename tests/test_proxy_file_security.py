@@ -6,6 +6,8 @@ Includes upload-to-drive: auth required, path restricted to scratch, audit behav
 
 import os
 import sys
+import shutil
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -128,6 +130,103 @@ class TestResolveScratchPath:
         result = resolve_scratch_path("script.py", None)
         assert result.suffix.lower() == ".py"
         result.resolve().relative_to(SCRATCH_DIR.resolve())
+
+    def test_scratch_prefixed_paths_resolve_inside_workspace(self):
+        """Paths prefixed with scratch/ or scratch\\ resolve correctly under SCRATCH_DIR."""
+        unix_style = resolve_scratch_path("scratch/images/sample.png", READ_ALLOWED_EXTENSIONS)
+        windows_style = resolve_scratch_path(r"scratch\images\sample.png", READ_ALLOWED_EXTENSIONS)
+        assert unix_style.resolve().relative_to(SCRATCH_DIR.resolve()) == Path("images") / "sample.png"
+        assert windows_style.resolve().relative_to(SCRATCH_DIR.resolve()) == Path("images") / "sample.png"
+
+
+class TestListFilesInternal:
+    """Unit tests for internal scratch listing robustness and recursion."""
+
+    @pytest.mark.asyncio
+    async def test_recursive_listing_includes_subdirectory_files(self, monkeypatch):
+        """_list_files_internal(recursive=True) should include nested file names."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-list-test-{uuid.uuid4().hex}"
+        try:
+            (scratch / "images" / "2026").mkdir(parents=True, exist_ok=True)
+            (scratch / "root.txt").write_text("root", encoding="utf-8")
+            (scratch / "images" / "a.png").write_text("a", encoding="utf-8")
+            (scratch / "images" / "2026" / "b.png").write_text("b", encoding="utf-8")
+
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            non_recursive = await ps._list_files_internal(path="", recursive=False)
+            assert non_recursive.get("success") is True
+            non_recursive_names = {item.get("name") for item in non_recursive.get("files", [])}
+            assert "root.txt" in non_recursive_names
+            assert "images" in non_recursive_names
+            assert "images/a.png" not in non_recursive_names
+
+            recursive = await ps._list_files_internal(path="", recursive=True)
+            assert recursive.get("success") is True
+            recursive_names = {item.get("name") for item in recursive.get("files", [])}
+            assert "root.txt" in recursive_names
+            assert "images/a.png" in recursive_names
+            assert "images/2026/b.png" in recursive_names
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_listing_skips_entries_with_stat_errors(self, monkeypatch):
+        """_list_files_internal should continue when one entry cannot be stat'ed."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-list-test-{uuid.uuid4().hex}"
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+            (scratch / "good.txt").write_text("ok", encoding="utf-8")
+            (scratch / "bad.txt").write_text("nope", encoding="utf-8")
+
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            original_stat = Path.stat
+
+            def _patched_stat(path_obj, *args, **kwargs):
+                if path_obj.name == "bad.txt":
+                    raise PermissionError("denied")
+                return original_stat(path_obj, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "stat", _patched_stat)
+
+            out = await ps._list_files_internal(path="", recursive=False)
+            assert out.get("success") is True
+            names = {item.get("name") for item in out.get("files", [])}
+            assert "good.txt" in names
+            assert "bad.txt" not in names
+            assert int(out.get("skipped_count", 0) or 0) >= 1
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_listing_accepts_scratch_prefixed_paths(self, monkeypatch):
+        """_list_files_internal should accept path values like scratch/images and scratch\\images."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-list-test-{uuid.uuid4().hex}"
+        try:
+            (scratch / "images").mkdir(parents=True, exist_ok=True)
+            (scratch / "images" / "a.png").write_text("a", encoding="utf-8")
+
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            unix_style = await ps._list_files_internal(path="scratch/images", recursive=False)
+            windows_style = await ps._list_files_internal(path=r"scratch\images", recursive=False)
+
+            assert unix_style.get("success") is True
+            assert windows_style.get("success") is True
+
+            unix_names = {item.get("name") for item in unix_style.get("files", [])}
+            windows_names = {item.get("name") for item in windows_style.get("files", [])}
+            assert "images/a.png" in unix_names
+            assert "images/a.png" in windows_names
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

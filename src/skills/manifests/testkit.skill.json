@@ -1,0 +1,6 @@
+{
+  "name": "testkit",
+  "description": "Reference/example skill with schema and context tooling.",
+  "enabled": true,
+  "module": "src.skills.builtin.test_skill:create_skill"
+}

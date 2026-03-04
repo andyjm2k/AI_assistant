@@ -21,7 +21,7 @@ import glob
 import socket
 import struct
 from typing import Dict, List, Optional, Any, Set, Tuple
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from contextlib import suppress
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
@@ -44,11 +44,44 @@ from src.utils.token_budget import (
     is_context_limit_error,
 )
 try:
+    from src.skills.bootstrap import create_default_skill_manager
+    from src.skills.skill_server import create_skill_router
+    from src.skills.models import SkillContext
+    SKILLS_FRAMEWORK_AVAILABLE = True
+except Exception as e:
+    SKILLS_FRAMEWORK_AVAILABLE = False
+    create_default_skill_manager = None
+    create_skill_router = None
+    SkillContext = None
+    print(f"[WARN] Skills framework not available: {e}")
+try:
     from bs4 import BeautifulSoup
     BS4_AVAILABLE = True
 except ImportError:
     BeautifulSoup = None
     BS4_AVAILABLE = False
+
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_FETCH_AVAILABLE = True
+except ImportError:
+    async_playwright = None
+    PLAYWRIGHT_FETCH_AVAILABLE = False
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options as SeleniumChromeOptions
+    from selenium.webdriver.common.by import By as SeleniumBy
+    from selenium.webdriver.support.ui import WebDriverWait as SeleniumWebDriverWait
+    from selenium.webdriver.support import expected_conditions as SeleniumExpectedConditions
+    SELENIUM_FETCH_AVAILABLE = True
+except ImportError:
+    webdriver = None
+    SeleniumChromeOptions = None
+    SeleniumBy = None
+    SeleniumWebDriverWait = None
+    SeleniumExpectedConditions = None
+    SELENIUM_FETCH_AVAILABLE = False
 
 # Import dotenv to load .env file
 try:
@@ -415,6 +448,11 @@ class TodoExecuteRequest(BaseModel):
 
 class TodoResumeRequest(BaseModel):
     userMessage: str
+    taskId: Optional[int] = None
+
+
+class TodoCancelRequest(BaseModel):
+    taskId: Optional[int] = None
 
 
 class CodexExecRequest(BaseModel):
@@ -425,6 +463,14 @@ class TodoExecuteResponse(BaseModel):
     status: str
     message: str
     taskId: Optional[int] = None
+
+
+class TodoExecutionStatusResponse(BaseModel):
+    active: bool
+    activeTaskIds: List[int] = []
+    runs: List[Dict[str, Any]] = []
+    message: Optional[str] = None
+    task: Optional[Dict[str, Any]] = None
 
 
 class TelegramChatMessage(BaseModel):
@@ -549,6 +595,10 @@ class ProxyFetchRequest(BaseModel):
     crawl: bool = True
     max_pages: int = 3
     max_depth: int = 1
+    render_js: bool = False
+    render_engine: str = "auto"  # auto|playwright|selenium
+    wait_for_selector: Optional[str] = None
+    js_wait_ms: int = 2200
 
 
 # Project root (two levels up from src/servers/proxy_server.py)
@@ -940,20 +990,41 @@ def _resolve_telegram_chat_ids_for_todo_user(user_key: str) -> List[str]:
     return list(dict.fromkeys(chat_ids))
 
 
-def _task_execution_register_telegram_target(user_key: str, chat_id: Optional[Any]) -> bool:
-    """Attach a Telegram chat ID to an in-flight task execution so completion can notify the user."""
-    state = task_execution_state.get(user_key)
-    if not state:
-        return False
+def _task_execution_register_telegram_target(
+    user_key: str,
+    chat_id: Optional[Any],
+    task_id: Optional[int] = None,
+) -> bool:
+    """Attach a Telegram chat ID to in-flight task execution(s) so completion can notify the user."""
     chat_id_text = str(chat_id or "").strip()
     if not chat_id_text or not _TELEGRAM_CHAT_ID_RE.match(chat_id_text):
         return False
-    existing = state.get("telegram_chat_ids")
-    if not isinstance(existing, list):
-        existing = []
-        state["telegram_chat_ids"] = existing
-    if chat_id_text not in existing:
-        existing.append(chat_id_text)
+
+    targets: List[Dict[str, Any]] = []
+    normalized_tid = _coerce_task_id(task_id)
+    if normalized_tid is not None:
+        target = _get_task_run_state(user_key, normalized_tid)
+        if isinstance(target, dict) and not _is_task_execution_terminal_status(_state_status_lower(target)):
+            targets.append(target)
+    else:
+        targets.extend(state for _, state in _active_task_runs(user_key))
+
+    # Legacy single-state fallback (pre-migration tests or stale in-memory state).
+    if not targets:
+        legacy = task_execution_state.get(user_key)
+        if isinstance(legacy, dict) and "runs" not in legacy:
+            targets.append(legacy)
+
+    if not targets:
+        return False
+
+    for state in targets:
+        existing = state.get("telegram_chat_ids")
+        if not isinstance(existing, list):
+            existing = []
+            state["telegram_chat_ids"] = existing
+        if chat_id_text not in existing:
+            existing.append(chat_id_text)
     return True
 
 
@@ -1112,8 +1183,9 @@ async def _maybe_notify_telegram_task_completion(
     chat_ids = state.get("telegram_chat_ids")
     if not isinstance(chat_ids, list) or not chat_ids:
         return
+    resolved_task_id = _resolve_task_id_for_state(user_key, state)
     text = _build_task_execution_telegram_message(
-        task_id=state.get("task_id"),
+        task_id=resolved_task_id or state.get("task_id"),
         task_description=str(state.get("task_description") or ""),
         status=status,
         result_message=message or "",
@@ -1134,12 +1206,8 @@ def _auto_complete_scheduled_execution(user_key: str, state: Dict[str, Any], sta
     if not TODO_STORE_AVAILABLE or not _todo_store:
         return "Scheduled run finished, but automatic completion is unavailable (todo store not available)."
 
-    raw_task_id = state.get("task_id")
-    try:
-        task_id = int(raw_task_id)
-    except (TypeError, ValueError):
-        return "Scheduled run finished, but automatic completion was skipped (invalid task id)."
-    if task_id < 1:
+    task_id = _resolve_task_id_for_state(user_key, state)
+    if task_id is None:
         return "Scheduled run finished, but automatic completion was skipped (invalid task id)."
 
     try:
@@ -1158,7 +1226,8 @@ philosopher_mode_instances: Dict[str, Any] = {}
 
 # Task execution: max iterations per run (configurable via .env)
 TASK_EXECUTION_MAX_ITERATIONS = max(1, min(200, int(os.getenv("TASK_EXECUTION_MAX_ITERATIONS", "200"))))
-# Per-user execution state: user_key -> { "task_id", "status", "executor" } (executor held for resume)
+# Per-user execution state:
+# user_key -> {"runs": {task_id: run_state}}
 task_execution_state: Dict[str, Dict[str, Any]] = {}
 
 # Task execution module (bounded LLM+tools loop for todo tasks)
@@ -1179,6 +1248,153 @@ except ImportError as e:
     STATUS_PAUSED_AWAITING_FEEDBACK = "paused_awaiting_feedback"
     STATUS_AWAITING_CONFIRMATION = "awaiting_confirmation"
     STATUS_CANCELLED = "cancelled"
+
+
+def _is_task_execution_terminal_status(status: Optional[str]) -> bool:
+    """Statuses that should be treated as no-longer-active execution runs."""
+    return str(status or "").strip().lower() in {
+        STATUS_AWAITING_CONFIRMATION,
+        STATUS_CANCELLED,
+    }
+
+
+def _coerce_task_id(value: Any) -> Optional[int]:
+    try:
+        task_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return task_id if task_id >= 1 else None
+
+
+def _state_status_lower(state: Dict[str, Any]) -> str:
+    return str(state.get("status") or "").strip().lower()
+
+
+def _get_user_task_runs(user_key: str, *, create: bool = False) -> Dict[int, Dict[str, Any]]:
+    """
+    Return per-task run map for a user.
+    Backward-compatible with legacy single-state shape by migrating it in-memory.
+    """
+    entry = task_execution_state.get(user_key)
+    if entry is None:
+        if not create:
+            return {}
+        task_execution_state[user_key] = {"runs": {}}
+        return task_execution_state[user_key]["runs"]
+    if not isinstance(entry, dict):
+        if not create:
+            return {}
+        task_execution_state[user_key] = {"runs": {}}
+        return task_execution_state[user_key]["runs"]
+
+    runs_raw = entry.get("runs")
+    if isinstance(runs_raw, dict):
+        normalized: Dict[int, Dict[str, Any]] = {}
+        mutated = False
+        for raw_key, raw_state in runs_raw.items():
+            if not isinstance(raw_state, dict):
+                mutated = True
+                continue
+            tid = _coerce_task_id(raw_key)
+            if tid is None:
+                tid = _coerce_task_id(raw_state.get("task_id"))
+            if tid is None:
+                mutated = True
+                continue
+            raw_state["task_id"] = tid
+            normalized[tid] = raw_state
+            if raw_key != tid:
+                mutated = True
+        if mutated:
+            entry["runs"] = normalized
+        return entry.get("runs", {})
+
+    # Legacy single-run shape: {"task_id", "status", "executor", ...}
+    legacy_tid = _coerce_task_id(entry.get("task_id"))
+    if legacy_tid is None and any(k in entry for k in ("status", "executor", "telegram_chat_ids", "message")):
+        legacy_tid = 1
+    migrated_runs: Dict[int, Dict[str, Any]] = {}
+    if legacy_tid is not None:
+        entry["task_id"] = legacy_tid
+        migrated_runs[legacy_tid] = entry
+    task_execution_state[user_key] = {"runs": migrated_runs}
+    return task_execution_state[user_key]["runs"]
+
+
+def _set_task_run_state(user_key: str, task_id: int, state: Dict[str, Any]) -> None:
+    runs = _get_user_task_runs(user_key, create=True)
+    state["task_id"] = task_id
+    runs[int(task_id)] = state
+
+
+def _remove_task_run_state(user_key: str, task_id: int) -> None:
+    runs = _get_user_task_runs(user_key, create=False)
+    runs.pop(int(task_id), None)
+    if not runs:
+        task_execution_state.pop(user_key, None)
+
+
+def _get_task_run_state(user_key: str, task_id: int) -> Optional[Dict[str, Any]]:
+    runs = _get_user_task_runs(user_key, create=False)
+    return runs.get(int(task_id))
+
+
+def _cleanup_terminal_task_runs(user_key: str) -> None:
+    runs = _get_user_task_runs(user_key, create=False)
+    if not runs:
+        return
+    remove_ids = [tid for tid, state in runs.items() if _is_task_execution_terminal_status(_state_status_lower(state))]
+    for tid in remove_ids:
+        runs.pop(tid, None)
+    if not runs:
+        task_execution_state.pop(user_key, None)
+
+
+def _active_task_runs(user_key: str) -> List[Tuple[int, Dict[str, Any]]]:
+    _cleanup_terminal_task_runs(user_key)
+    runs = _get_user_task_runs(user_key, create=False)
+    out: List[Tuple[int, Dict[str, Any]]] = []
+    for tid, state in runs.items():
+        if _is_task_execution_terminal_status(_state_status_lower(state)):
+            continue
+        out.append((tid, state))
+    out.sort(key=lambda item: item[0])
+    return out
+
+
+def _resolve_task_id_for_state(user_key: str, state: Dict[str, Any]) -> Optional[int]:
+    """Resolve current stable task ID for a run, preferring task item id when available."""
+    fallback = _coerce_task_id(state.get("task_id"))
+    task_item_id = str(state.get("task_item_id") or "").strip()
+    if not task_item_id or not TODO_STORE_AVAILABLE or not _todo_store:
+        return fallback
+    try:
+        meta = _todo_store.load_tasks_with_meta(user_key)
+        task_items = meta.get("task_items") if isinstance(meta, dict) else None
+        if isinstance(task_items, list):
+            for item in task_items:
+                if isinstance(item, dict) and str(item.get("id") or "").strip() == task_item_id:
+                    resolved = _coerce_task_id(item.get("task_id"))
+                    if resolved is not None:
+                        return resolved
+    except Exception:
+        return fallback
+    return fallback
+
+
+def _state_brief_for_response(user_key: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    resolved_task_id = _resolve_task_id_for_state(user_key, state)
+    original_task_id = _coerce_task_id(state.get("task_id"))
+    out = {
+        "status": state.get("status"),
+        "task_id": resolved_task_id or original_task_id,
+        "message": state.get("message"),
+    }
+    if state.get("run_id"):
+        out["run_id"] = state.get("run_id")
+    if original_task_id is not None and resolved_task_id is not None and original_task_id != resolved_task_id:
+        out["original_task_id"] = original_task_id
+    return out
 
 # Assistant context: current date, timezone, and knowledge-gap awareness (prepended to all chat system prompts)
 def _get_assistant_context_block() -> str:
@@ -1352,6 +1568,9 @@ def _get_telegram_system_prompt_with_tools(conversation_id: str, todo_user_key: 
     todo_block = "\n".join([f"{i + 1}. {t}" for i, t in enumerate(todo_list)]) if todo_list else "(empty)"
     mem_block = "\n".join([f"{i + 1}. {m}" for i, m in enumerate(mem_cache)]) if mem_cache else "(empty)"
     content = content.replace("{{MEMORY_CACHE}}", mem_block).replace("{{TODO_LIST}}", todo_block)
+    dynamic_skill_block = _build_telegram_skill_tools_prompt_block()
+    if dynamic_skill_block:
+        content = f"{content.rstrip()}\n\n{dynamic_skill_block}"
     return content
 
 
@@ -1606,6 +1825,161 @@ if MEMORY_AVAILABLE:
         print(f"   Full traceback:\n{error_trace}")
         memory_manager = None
 
+# Initialize skills manager if framework is available
+skill_manager = None
+if SKILLS_FRAMEWORK_AVAILABLE and create_default_skill_manager is not None:
+    try:
+        _skills_manifest_dir = _env_str("SKILLS_MANIFEST_DIR")
+        skill_manager = create_default_skill_manager(manifest_dir=_skills_manifest_dir)
+        loaded_skill_names = [spec.name for spec in skill_manager.list_skills()]
+        print(f"[OK] Skills framework initialized with {len(loaded_skill_names)} skills: {loaded_skill_names}")
+    except Exception as e:
+        skill_manager = None
+        print(f"[WARN] Failed to initialize skills framework: {e}")
+
+
+def _resolve_skill_tool_qualified_name(tool_name: str) -> Optional[str]:
+    """Resolve a skill tool name to its qualified form if available."""
+    if not tool_name or skill_manager is None:
+        return None
+    try:
+        resolved = skill_manager.registry.resolve_tool(tool_name)
+        return resolved.qualified_name
+    except Exception:
+        return None
+
+
+_OVERLAPPING_FILE_SKILL_TOOL_NAMES: Set[str] = {
+    "filesystem.list_files",
+    "filesystem.read_text",
+    "filesystem.write_text",
+}
+
+
+def _filter_overlapping_file_skill_tools(
+    tools: List[Dict[str, Any]],
+    *,
+    openai_schema: bool,
+) -> List[Dict[str, Any]]:
+    """Hide overlapping filesystem skill tools when built-in file tools are already available."""
+    if not FILE_OPS_AVAILABLE:
+        return tools
+
+    filtered: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if openai_schema:
+            function_block = tool.get("function")
+            name = str(function_block.get("name") if isinstance(function_block, dict) else "").strip()
+        else:
+            name = str(tool.get("name") or "").strip()
+        if name in _OVERLAPPING_FILE_SKILL_TOOL_NAMES:
+            continue
+        filtered.append(tool)
+    return filtered
+
+
+def _get_skill_tools_openai_schema() -> List[Dict[str, Any]]:
+    """Return skill tools formatted for OpenAI-style tool-calling."""
+    if skill_manager is None:
+        return []
+    try:
+        tools = skill_manager.openai_tools(qualified_names=True)
+        return _filter_overlapping_file_skill_tools(tools, openai_schema=True)
+    except Exception as exc:
+        print(f"[WARN] Failed to list skill tools (openai schema): {exc}")
+        return []
+
+
+def _get_skill_tools_mcp_schema() -> List[Dict[str, Any]]:
+    """Return skill tools formatted as MCP-style entries for server-managed agents."""
+    if skill_manager is None:
+        return []
+    try:
+        tools = skill_manager.mcp_tools(qualified_names=True)
+        return _filter_overlapping_file_skill_tools(tools, openai_schema=False)
+    except Exception as exc:
+        print(f"[WARN] Failed to list skill tools (mcp schema): {exc}")
+        return []
+
+
+async def _execute_skill_framework_tool(
+    tool_name: str,
+    arguments: Optional[Dict[str, Any]] = None,
+    *,
+    conversation_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Execute a skill framework tool and return a normalized payload."""
+    if skill_manager is None or SkillContext is None:
+        return {
+            "success": False,
+            "message": "Skill framework is not available.",
+            "error_code": "framework_unavailable",
+            "tool_name": tool_name,
+        }
+
+    qualified_name = _resolve_skill_tool_qualified_name(tool_name)
+    if not qualified_name:
+        return {
+            "success": False,
+            "message": f"Skill tool '{tool_name}' is not registered.",
+            "error_code": "tool_not_found",
+            "tool_name": tool_name,
+        }
+
+    context_metadata = dict(metadata or {})
+    context = SkillContext(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        scratch_dir=SCRATCH_DIR,
+        metadata=context_metadata,
+    )
+    result = await skill_manager.execute_tool(
+        tool_name=qualified_name,
+        arguments=arguments or {},
+        context=context,
+        raise_errors=False,
+    )
+    payload = result.to_dict() if hasattr(result, "to_dict") else {
+        "success": False,
+        "message": "Skill execution returned an invalid response.",
+        "error_code": "invalid_result",
+        "tool_name": qualified_name,
+    }
+    if not payload.get("tool_name"):
+        payload["tool_name"] = qualified_name
+    return payload
+
+
+def _build_telegram_skill_tools_prompt_block() -> str:
+    """Render dynamic skill-tool instructions for Telegram XML tool-calling."""
+    skill_tools = _get_skill_tools_mcp_schema()
+    if not skill_tools:
+        return ""
+
+    lines: List[str] = [
+        "Additional Skill Framework tools (dynamically loaded):",
+        "Use the exact tool name shown below with the same XML format.",
+    ]
+    for item in skill_tools:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        description = str(item.get("description") or "No description.").strip()
+        input_schema = item.get("inputSchema")
+        if not isinstance(input_schema, dict):
+            input_schema = {"type": "object", "properties": {}}
+        schema_text = json.dumps(input_schema, ensure_ascii=False, separators=(",", ":"), default=str)
+        lines.append(f"- {name}: {description}")
+        lines.append(f"  Parameters JSON schema: {schema_text}")
+
+    if len(lines) <= 2:
+        return ""
+    return "\n".join(lines)
+
 # MCP Client Manager class to handle transport lifecycle
 class MCPClientManager:
     """Manages MCP client and transport lifecycle."""
@@ -1696,6 +2070,9 @@ class MCPClientManager:
 
 # FastAPI app
 app = FastAPI(title="CATBot Proxy Server", version="2.0.0")
+
+if skill_manager is not None and create_skill_router is not None:
+    app.include_router(create_skill_router(skill_manager, auth_dependency=get_current_user))
 
 # Startup event to verify app initialization
 @app.on_event("startup")
@@ -2225,11 +2602,199 @@ def _is_dns_or_network_error(exc: BaseException) -> bool:
     return False
 
 
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _normalize_render_engine(value: Optional[str]) -> str:
+    engine = str(value).strip().lower() if value is not None else "auto"
+    if engine not in {"auto", "playwright", "selenium"}:
+        raise HTTPException(
+            status_code=400,
+            detail="render_engine must be one of: auto, playwright, selenium",
+        )
+    return engine
+
+
+def _normalize_js_wait_ms(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 2200
+    return max(0, min(parsed, 20000))
+
+
+async def _render_page_playwright(
+    *,
+    url: str,
+    headers: Dict[str, str],
+    timeout_seconds: float,
+    wait_for_selector: Optional[str],
+    js_wait_ms: int,
+) -> Dict[str, Any]:
+    if not PLAYWRIGHT_FETCH_AVAILABLE or async_playwright is None:
+        raise RuntimeError(
+            "Playwright is not installed. Install with: pip install playwright && playwright install chromium"
+        )
+
+    browser = None
+    context = None
+    timeout_ms = max(1000, int(timeout_seconds * 1000))
+    selector = (wait_for_selector or "").strip() or None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=headers.get("User-Agent", "CATBot/1.0"),
+                extra_http_headers={k: v for k, v in headers.items() if k.lower() != "user-agent"},
+            )
+            page = await context.new_page()
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            if selector:
+                await page.wait_for_selector(selector, timeout=timeout_ms)
+            else:
+                with suppress(Exception):
+                    await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 9000))
+            if js_wait_ms > 0:
+                await page.wait_for_timeout(js_wait_ms)
+
+            return {
+                "raw_html": await page.content(),
+                "final_url": page.url or url,
+                "status_code": response.status if response else None,
+                "render_engine": "playwright",
+            }
+    except Exception as exc:
+        raise RuntimeError(f"Playwright rendering failed: {exc}") from exc
+    finally:
+        if context is not None:
+            with suppress(Exception):
+                await context.close()
+        if browser is not None:
+            with suppress(Exception):
+                await browser.close()
+
+
+def _render_page_selenium_sync(
+    *,
+    url: str,
+    timeout_seconds: float,
+    wait_for_selector: Optional[str],
+    js_wait_ms: int,
+) -> Dict[str, Any]:
+    if not SELENIUM_FETCH_AVAILABLE or webdriver is None or SeleniumChromeOptions is None:
+        raise RuntimeError(
+            "Selenium is not installed. Install with: pip install selenium and ensure ChromeDriver is available."
+        )
+
+    options = SeleniumChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1366,768")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    selector = (wait_for_selector or "").strip() or None
+    driver = webdriver.Chrome(options=options)
+    try:
+        driver.set_page_load_timeout(max(5, int(timeout_seconds)))
+        driver.get(url)
+        if selector:
+            SeleniumWebDriverWait(driver, max(1, int(timeout_seconds))).until(
+                SeleniumExpectedConditions.presence_of_element_located((SeleniumBy.CSS_SELECTOR, selector))
+            )
+        if js_wait_ms > 0:
+            time.sleep(js_wait_ms / 1000.0)
+        return {
+            "raw_html": driver.page_source or "",
+            "final_url": driver.current_url or url,
+            "status_code": None,
+            "render_engine": "selenium",
+        }
+    except Exception as exc:
+        raise RuntimeError(f"Selenium rendering failed: {exc}") from exc
+    finally:
+        with suppress(Exception):
+            driver.quit()
+
+
+async def _render_page_selenium(
+    *,
+    url: str,
+    timeout_seconds: float,
+    wait_for_selector: Optional[str],
+    js_wait_ms: int,
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(
+        _render_page_selenium_sync,
+        url=url,
+        timeout_seconds=timeout_seconds,
+        wait_for_selector=wait_for_selector,
+        js_wait_ms=js_wait_ms,
+    )
+
+
+async def _render_page_dynamic(
+    *,
+    url: str,
+    headers: Dict[str, str],
+    timeout_seconds: float,
+    render_engine: str,
+    wait_for_selector: Optional[str],
+    js_wait_ms: int,
+) -> Dict[str, Any]:
+    engine = _normalize_render_engine(render_engine)
+    candidates = [engine] if engine != "auto" else ["playwright", "selenium"]
+    errors: List[str] = []
+
+    for candidate in candidates:
+        try:
+            if candidate == "playwright":
+                return await _render_page_playwright(
+                    url=url,
+                    headers=headers,
+                    timeout_seconds=timeout_seconds,
+                    wait_for_selector=wait_for_selector,
+                    js_wait_ms=js_wait_ms,
+                )
+            return await _render_page_selenium(
+                url=url,
+                timeout_seconds=timeout_seconds,
+                wait_for_selector=wait_for_selector,
+                js_wait_ms=js_wait_ms,
+            )
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "JavaScript rendering failed. "
+            "Install Playwright or Selenium on the proxy host. "
+            + " | ".join(errors[:2])
+        ),
+    )
+
+
 async def _do_proxy_fetch(
     url: str,
     crawl: bool = True,
     max_pages: int = 3,
     max_depth: int = 1,
+    render_js: bool = False,
+    render_engine: str = "auto",
+    wait_for_selector: Optional[str] = None,
+    js_wait_ms: int = 2200,
 ) -> Dict[str, Any]:
     """Shared fetch logic: fetch URL(s), extract readable content, and optionally crawl."""
     if not url or not url.strip():
@@ -2239,6 +2804,10 @@ async def _do_proxy_fetch(
         crawl=bool(crawl),
         max_pages=max_pages,
         max_depth=max_depth,
+        render_js=_coerce_bool(render_js),
+        render_engine=_normalize_render_engine(render_engine),
+        wait_for_selector=(wait_for_selector or "").strip() or None,
+        js_wait_ms=_normalize_js_wait_ms(js_wait_ms),
     )
 
 
@@ -2342,6 +2911,10 @@ async def _fetch_and_extract_content(
     crawl: bool = True,
     max_pages: int = 3,
     max_depth: int = 1,
+    render_js: bool = False,
+    render_engine: str = "auto",
+    wait_for_selector: Optional[str] = None,
+    js_wait_ms: int = 2200,
 ) -> Dict[str, Any]:
     normalized_start = _normalize_url(url)
     max_pages = max(1, min(int(max_pages or 1), 10))
@@ -2359,6 +2932,7 @@ async def _fetch_and_extract_content(
     pages: List[Dict[str, Any]] = []
     last_raw_html = ""
     last_error: Optional[BaseException] = None
+    rendered_engine_used: Optional[str] = None
 
     try:
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
@@ -2369,11 +2943,26 @@ async def _fetch_and_extract_content(
                 visited.add(current_url)
 
                 try:
-                    response = await client.get(current_url, headers=headers)
-                    response.raise_for_status()
-                    raw_html = response.text
-                    final_url = str(response.url)
-                    content_type = (response.headers.get("content-type") or "").lower()
+                    should_render_this_page = bool(render_js) and depth == 0
+                    if should_render_this_page:
+                        rendered = await _render_page_dynamic(
+                            url=current_url,
+                            headers=headers,
+                            timeout_seconds=15.0,
+                            render_engine=render_engine,
+                            wait_for_selector=wait_for_selector,
+                            js_wait_ms=js_wait_ms,
+                        )
+                        raw_html = rendered.get("raw_html") or ""
+                        final_url = rendered.get("final_url") or current_url
+                        content_type = "text/html"
+                        rendered_engine_used = rendered.get("render_engine") or rendered_engine_used
+                    else:
+                        response = await client.get(current_url, headers=headers)
+                        response.raise_for_status()
+                        raw_html = response.text
+                        final_url = str(response.url)
+                        content_type = (response.headers.get("content-type") or "").lower()
 
                     if "text/html" not in content_type and "<html" not in raw_html[:3000].lower():
                         # Non-HTML content is still captured as plain text.
@@ -2388,6 +2977,8 @@ async def _fetch_and_extract_content(
                                 "url": final_url,
                                 "title": extracted_title,
                                 "content": extracted_text,
+                                "rendered": should_render_this_page,
+                                "render_engine": rendered_engine_used if should_render_this_page else None,
                             }
                         )
                         last_raw_html = raw_html
@@ -2399,9 +2990,17 @@ async def _fetch_and_extract_content(
                             if not _is_same_domain(normalized_start, link):
                                 continue
                             queue.append((link, depth + 1))
+                except HTTPException as page_error:
+                    # Surface rendering/config errors for the root page immediately.
+                    if depth == 0:
+                        raise
+                    last_error = page_error
+                    continue
                 except Exception as page_error:
                     last_error = page_error
                     continue
+    except HTTPException:
+        raise
     except Exception as e:
         if _is_dns_or_network_error(e):
             raise HTTPException(
@@ -2415,6 +3014,8 @@ async def _fetch_and_extract_content(
         raise HTTPException(status_code=500, detail=f"Failed to fetch content: {str(e)}")
 
     if not pages:
+        if isinstance(last_error, HTTPException):
+            raise last_error
         if last_error and _is_dns_or_network_error(last_error):
             raise HTTPException(
                 status_code=502,
@@ -2443,6 +3044,8 @@ async def _fetch_and_extract_content(
         "crawled": bool(crawl),
         "page_count": len(pages),
         "raw_html": last_raw_html,
+        "render_js": bool(render_js),
+        "render_engine": rendered_engine_used if render_js else None,
     }
 
 
@@ -2453,10 +3056,23 @@ async def proxy_fetch_get(
     crawl: bool = True,
     max_pages: int = 3,
     max_depth: int = 1,
+    render_js: bool = False,
+    render_engine: str = "auto",
+    wait_for_selector: Optional[str] = None,
+    js_wait_ms: int = 2200,
 ):
     """Fetch web content via GET (query param). Use POST for long URLs (e.g. iOS Safari)."""
     try:
-        result = await _do_proxy_fetch(url, crawl=crawl, max_pages=max_pages, max_depth=max_depth)
+        result = await _do_proxy_fetch(
+            url,
+            crawl=crawl,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            render_js=render_js,
+            render_engine=render_engine,
+            wait_for_selector=wait_for_selector,
+            js_wait_ms=js_wait_ms,
+        )
         cors = build_cors_headers(request)
         return JSONResponse(content=result, headers=cors)
     except HTTPException:
@@ -2485,16 +3101,27 @@ async def proxy_fetch_post(body: ProxyFetchRequest, request: Request):
                 crawl=body.crawl,
                 max_pages=body.max_pages,
                 max_depth=body.max_depth,
+                render_js=body.render_js,
+                render_engine=body.render_engine,
+                wait_for_selector=body.wait_for_selector,
+                js_wait_ms=body.js_wait_ms,
             )
             cors = build_cors_headers(request)
             return JSONResponse(content=result, headers=cors)
-        except HTTPException:
-            raise
+        except HTTPException as e:
+            # Retry next candidate URL for server-side fetch failures.
+            if len(to_try) == 1 or e.status_code == 400:
+                raise
+            last_error = e
+            print(f"Proxy fetch failed for {one_url[:60]}...: {e.detail}")
+            continue
         except Exception as e:
             last_error = e
             print(f"Proxy fetch failed for {one_url[:60]}...: {e}")
             continue
     if last_error:
+        if isinstance(last_error, HTTPException):
+            raise HTTPException(status_code=last_error.status_code, detail=last_error.detail)
         raise HTTPException(status_code=500, detail=f"Failed to fetch content: {str(last_error)}")
     raise HTTPException(status_code=400, detail="No URLs to try")
 
@@ -3887,6 +4514,7 @@ def _build_todo_list_response(
         description = str(item.get("description") or "").strip()
         if not description:
             continue
+        task_public_id = _coerce_task_id(item.get("task_id")) or task_index
         next_run = _parse_todo_datetime(item.get("next_run_at"))
         is_due = bool(next_run and next_run <= now)
         if due_only and not is_due:
@@ -3894,7 +4522,7 @@ def _build_todo_list_response(
         tasks.append(description)
         task_items.append(
             TodoTaskItemResponse(
-                taskId=task_index,
+                taskId=task_public_id,
                 taskDescription=description,
                 scheduledFor=item.get("scheduled_for"),
                 nextRunAt=item.get("next_run_at"),
@@ -3990,7 +4618,7 @@ async def todo_update(
     request: TodoUpdateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Update a task by 1-based index. Requires JWT."""
+    """Update a task by stable task ID. Requires JWT."""
     if not TODO_STORE_AVAILABLE or not _todo_store:
         raise HTTPException(status_code=503, detail="Todo store is not available.")
     user_key = current_user["username"]
@@ -4028,7 +4656,7 @@ async def todo_delete(
     task_id: int,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Delete a task by 1-based index. Requires JWT."""
+    """Delete a task by stable task ID. Requires JWT."""
     if not TODO_STORE_AVAILABLE or not _todo_store:
         raise HTTPException(status_code=503, detail="Todo store is not available.")
     user_key = current_user["username"]
@@ -4176,7 +4804,7 @@ async def _record_task_execution_learning(
         print(f"[TASK_EXEC] Failed to record learning memory: {e}", flush=True)
 
 
-async def _run_task_loop_background(user_key: str, executor: Any) -> None:
+async def _run_task_loop_background(user_key: str, task_id: int, executor: Any) -> None:
     """
     Run executor.run_loop() in background; update or clear task_execution_state in finally
     so we never leave state stuck as 'executing' on exception or cancel.
@@ -4191,9 +4819,10 @@ async def _run_task_loop_background(user_key: str, executor: Any) -> None:
         message = str(e)
         print(f"[TASK_EXEC] run_loop error for user {user_key}: {e}", flush=True)
     finally:
-        # Only update if this user's state is still 'executing' (we own it)
-        state = task_execution_state.get(user_key)
-        if state and state.get("status") == STATUS_EXECUTING:
+        # Only update if this run still belongs to this executor instance.
+        # Status may have changed (e.g. cancellation requested) while the loop was in-flight.
+        state = _get_task_run_state(user_key, task_id)
+        if state and state.get("executor") is executor:
             auto_completion_note = _auto_complete_scheduled_execution(user_key, state, status)
             if auto_completion_note:
                 base_message = (message or "").strip()
@@ -4210,41 +4839,65 @@ async def _run_task_loop_background(user_key: str, executor: Any) -> None:
             # Always capture agent response to scratch with timestamp (paused, awaiting, cancelled, done)
             _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
             await _maybe_notify_telegram_task_completion(user_key, state, status, message or "")
-            # Clear state on cancel or after scheduled completion so user can start a new execution.
-            if status == STATUS_CANCELLED or (status == STATUS_AWAITING_CONFIRMATION and bool(state.get("is_scheduled"))):
-                task_execution_state.pop(user_key, None)
+            # Terminal runs should clear execution state so status returns to idle.
+            if _is_task_execution_terminal_status(status):
+                _remove_task_run_state(user_key, task_id)
 
 
 async def _task_execute_start(user_key: str, task_id: int, prompt_override: Optional[str]) -> tuple:
-    """Start task execution for user_key. Runs loop in background; returns immediately with status 'executing'."""
+    """Start task execution for user_key/task_id. Runs loop in background; returns immediately."""
     if not TASK_EXECUTION_AVAILABLE or not TodoTaskExecutor:
         raise HTTPException(status_code=503, detail="Task execution is not available.")
     if not TODO_STORE_AVAILABLE or not _todo_store:
         raise HTTPException(status_code=503, detail="Todo store is not available.")
-    if user_key in task_execution_state:
-        raise HTTPException(status_code=409, detail="An execution is already active. Complete or cancel it first.")
-    tasks = _todo_store.load_tasks(user_key)
-    if task_id < 1 or task_id > len(tasks):
+    normalized_task_id = _coerce_task_id(task_id)
+    if normalized_task_id is None:
         raise HTTPException(status_code=400, detail="Invalid task ID.")
-    task_description = tasks[task_id - 1]
+
+    _cleanup_terminal_task_runs(user_key)
+    active_same_task = _get_task_run_state(user_key, normalized_task_id)
+    if active_same_task and not _is_task_execution_terminal_status(_state_status_lower(active_same_task)):
+        raise HTTPException(status_code=409, detail=f"Task {normalized_task_id} is already executing.")
+
+    task_description = ""
     task_is_scheduled = False
+    task_item_id: Optional[str] = None
     try:
         meta = _todo_store.load_tasks_with_meta(user_key)
         task_items = meta.get("task_items") if isinstance(meta, dict) else None
-        if isinstance(task_items, list) and task_id >= 1 and task_id <= len(task_items):
-            task_item = task_items[task_id - 1]
-            if isinstance(task_item, dict):
-                item_desc = str(task_item.get("description") or "").strip()
-                if item_desc:
-                    task_description = item_desc
-                task_is_scheduled = bool(
-                    task_item.get("scheduled_for")
-                    or task_item.get("next_run_at")
-                    or task_item.get("recurrence")
-                )
-    except Exception:
-        # Keep execution available even if metadata parsing fails.
-        task_is_scheduled = False
+        task_item: Optional[Dict[str, Any]] = None
+        if isinstance(task_items, list):
+            for item in task_items:
+                if not isinstance(item, dict):
+                    continue
+                if _coerce_task_id(item.get("task_id")) == normalized_task_id:
+                    task_item = item
+                    break
+            # Backward compatibility for legacy datasets with positional task IDs only.
+            if task_item is None and 1 <= normalized_task_id <= len(task_items):
+                candidate = task_items[normalized_task_id - 1]
+                if isinstance(candidate, dict):
+                    task_item = candidate
+        if not isinstance(task_item, dict):
+            raise HTTPException(status_code=400, detail="Invalid task ID.")
+
+        item_desc = str(task_item.get("description") or "").strip()
+        if item_desc:
+            task_description = item_desc
+        item_id = str(task_item.get("id") or "").strip()
+        if item_id:
+            task_item_id = item_id
+        task_is_scheduled = bool(
+            task_item.get("scheduled_for")
+            or task_item.get("next_run_at")
+            or task_item.get("recurrence")
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load task metadata: {exc}")
+    if not task_description:
+        raise HTTPException(status_code=400, detail="Invalid task ID.")
     telegram_chat_ids = _resolve_telegram_chat_ids_for_todo_user(user_key)
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY")
     if not api_key:
@@ -4255,14 +4908,14 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
             experience_guidance = await memory_manager.build_task_execution_guidance(task_description=task_description)
             if experience_guidance:
                 print(
-                    f"[TASK_EXEC] Loaded experience guidance for user {user_key} task {task_id}",
+                    f"[TASK_EXEC] Loaded experience guidance for user {user_key} task {normalized_task_id}",
                     flush=True,
                 )
         except Exception as e:
             print(f"[TASK_EXEC] Failed to load experience guidance: {e}", flush=True)
     executor = TodoTaskExecutor(
         api_key=api_key,
-        task_id=task_id,
+        task_id=normalized_task_id,
         task_description=task_description,
         prompt_override=prompt_override,
         max_iterations=TASK_EXECUTION_MAX_ITERATIONS,
@@ -4270,9 +4923,11 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
         get_tools_func=get_all_available_tools,
         experience_guidance=experience_guidance,
     )
-    # Set state to 'executing' before starting so cancel/status work and we never leave state stuck
-    task_execution_state[user_key] = {
-        "task_id": task_id,
+    # Set state to 'executing' before starting so cancel/status work and we never leave state stuck.
+    state = {
+        "task_id": normalized_task_id,
+        "task_item_id": task_item_id,
+        "run_id": f"task-{normalized_task_id}-{secrets.token_hex(4)}",
         "status": STATUS_EXECUTING,
         "executor": executor,
         "message": None,
@@ -4280,20 +4935,54 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
         "is_scheduled": task_is_scheduled,
         "telegram_chat_ids": telegram_chat_ids,
     }
-    asyncio.create_task(_run_task_loop_background(user_key, executor))
-    return (STATUS_EXECUTING, "Task execution started. Ask me for status or to cancel.")
+    _set_task_run_state(user_key, normalized_task_id, state)
+    asyncio.create_task(_run_task_loop_background(user_key, normalized_task_id, executor))
+
+    active_ids = [tid for tid, _ in _active_task_runs(user_key)]
+    if len(active_ids) <= 1:
+        return (STATUS_EXECUTING, f"Task {normalized_task_id} execution started.")
+    return (
+        STATUS_EXECUTING,
+        f"Task {normalized_task_id} execution started. Active task executions: {', '.join(str(t) for t in active_ids)}.",
+    )
 
 
-async def _task_execute_resume(user_key: str, user_message: str) -> tuple:
-    """Resume paused execution. Returns (status, message)."""
+async def _task_execute_resume(user_key: str, user_message: str, task_id: Optional[int] = None) -> tuple:
+    """Resume paused execution. Returns (status, message, task_id)."""
     if not TASK_EXECUTION_AVAILABLE:
         raise HTTPException(status_code=503, detail="Task execution is not available.")
-    state = task_execution_state.get(user_key)
-    if not state or state.get("status") != STATUS_PAUSED_AWAITING_FEEDBACK:
+    _cleanup_terminal_task_runs(user_key)
+    runs = _get_user_task_runs(user_key, create=False)
+    if not runs:
         raise HTTPException(status_code=400, detail="No paused execution to resume.")
+
+    normalized_tid = _coerce_task_id(task_id)
+    target_tid: Optional[int] = None
+    state: Optional[Dict[str, Any]] = None
+    if normalized_tid is not None:
+        candidate = runs.get(normalized_tid)
+        if not candidate or _state_status_lower(candidate) != STATUS_PAUSED_AWAITING_FEEDBACK:
+            raise HTTPException(status_code=400, detail=f"Task {normalized_tid} is not paused awaiting feedback.")
+        target_tid = normalized_tid
+        state = candidate
+    else:
+        paused_items = [(tid, s) for tid, s in runs.items() if _state_status_lower(s) == STATUS_PAUSED_AWAITING_FEEDBACK]
+        if not paused_items:
+            raise HTTPException(status_code=400, detail="No paused execution to resume.")
+        if len(paused_items) > 1:
+            paused_ids = ", ".join(str(tid) for tid, _ in sorted(paused_items, key=lambda item: item[0]))
+            raise HTTPException(
+                status_code=400,
+                detail=f"Multiple paused tasks found ({paused_ids}). Provide taskId to resume a specific task.",
+            )
+        target_tid, state = paused_items[0]
+
+    if not state or target_tid is None:
+        raise HTTPException(status_code=400, detail="Execution state lost. Start a new execution.")
+
     executor = state.get("executor")
     if not executor:
-        task_execution_state.pop(user_key, None)
+        _remove_task_run_state(user_key, target_tid)
         raise HTTPException(status_code=400, detail="Execution state lost. Start a new execution.")
     executor.add_user_message(user_message or "")
     try:
@@ -4310,7 +4999,9 @@ async def _task_execute_resume(user_key: str, user_message: str) -> tuple:
         # Capture agent response to scratch (paused or awaiting confirmation after resume)
         _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
         await _maybe_notify_telegram_task_completion(user_key, state, status, message or "")
-        return (status, message or "Resumed.")
+        if _is_task_execution_terminal_status(status):
+            _remove_task_run_state(user_key, target_tid)
+        return (status, message or "Resumed.", _coerce_task_id(state.get("task_id")) or target_tid)
     except Exception as e:
         state["status"] = STATUS_AWAITING_CONFIRMATION
         state["message"] = str(e)
@@ -4322,7 +5013,7 @@ async def _task_execute_resume(user_key: str, user_message: str) -> tuple:
             source_phase="resume_error",
         )
         _write_task_exec_response_to_scratch(user_key, state.get("task_id"), STATUS_AWAITING_CONFIRMATION, str(e))
-        return (STATUS_AWAITING_CONFIRMATION, str(e))
+        return (STATUS_AWAITING_CONFIRMATION, str(e), _coerce_task_id(state.get("task_id")) or target_tid)
 
 
 @app.post("/v1/todo/execute", response_model=TodoExecuteResponse)
@@ -4330,7 +5021,7 @@ async def todo_execute(
     request: TodoExecuteRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Start task execution for the given todo task. Requires JWT. One active execution per user."""
+    """Start task execution for the given todo task. Requires JWT. Supports parallel runs per task."""
     user_key = current_user["username"]
     status, message = await _task_execute_start(user_key, request.taskId, request.promptOverride)
     return TodoExecuteResponse(status=status, message=message, taskId=request.taskId)
@@ -4343,9 +5034,12 @@ async def todo_execute_resume(
 ):
     """Resume a paused task execution with user feedback. Requires JWT."""
     user_key = current_user["username"]
-    state = task_execution_state.get(user_key)
-    status, message = await _task_execute_resume(user_key, resume_request.userMessage or "")
-    return TodoExecuteResponse(status=status, message=message, taskId=state.get("task_id") if state else None)
+    status, message, resumed_task_id = await _task_execute_resume(
+        user_key,
+        resume_request.userMessage or "",
+        resume_request.taskId,
+    )
+    return TodoExecuteResponse(status=status, message=message, taskId=resumed_task_id)
 
 
 @app.post("/v1/todo/{task_id}/complete", response_model=TodoListResponse)
@@ -4357,19 +5051,47 @@ async def todo_task_complete(
     if not TODO_STORE_AVAILABLE or not _todo_store:
         raise HTTPException(status_code=503, detail="Todo store is not available.")
     user_key = current_user["username"]
-    active_state = task_execution_state.get(user_key)
+    _cleanup_terminal_task_runs(user_key)
+    active_state: Optional[Dict[str, Any]] = None
     task_description_for_learning = ""
+    completion_task_item_id: Optional[str] = None
     try:
-        tasks_before = _todo_store.load_tasks(user_key)
-        if 1 <= task_id <= len(tasks_before):
-            task_description_for_learning = str(tasks_before[task_id - 1] or "").strip()
+        meta_before = _todo_store.load_tasks_with_meta(user_key)
+        task_items_before = meta_before.get("task_items") if isinstance(meta_before, dict) else None
+        if isinstance(task_items_before, list):
+            matched_item: Optional[Dict[str, Any]] = None
+            for item in task_items_before:
+                if not isinstance(item, dict):
+                    continue
+                if _coerce_task_id(item.get("task_id")) == task_id:
+                    matched_item = item
+                    break
+            if matched_item is None and 1 <= task_id <= len(task_items_before):
+                # Legacy fallback for datasets without stable task_id values.
+                candidate = task_items_before[task_id - 1]
+                if isinstance(candidate, dict):
+                    matched_item = candidate
+            if isinstance(matched_item, dict):
+                task_description_for_learning = str(matched_item.get("description") or "").strip()
+                completion_task_item_id = str(matched_item.get("id") or "").strip() or None
     except Exception:
         task_description_for_learning = ""
+    runs = _get_user_task_runs(user_key, create=False)
+    if completion_task_item_id:
+        for _, run_state in runs.items():
+            if str(run_state.get("task_item_id") or "").strip() == completion_task_item_id:
+                active_state = run_state
+                break
+    if active_state is None:
+        active_state = runs.get(task_id)
     if isinstance(active_state, dict):
         task_description_for_learning = (
             str(active_state.get("task_description") or "").strip() or task_description_for_learning
         )
-    task_execution_state.pop(user_key, None)
+    if isinstance(active_state, dict):
+        running_tid = _coerce_task_id(active_state.get("task_id"))
+        if running_tid is not None:
+            _remove_task_run_state(user_key, running_tid)
     try:
         result = _todo_store.complete_task(user_key, task_id)
     except ValueError as e:
@@ -4404,34 +5126,122 @@ async def todo_task_complete(
     return _build_todo_list_response(meta, completion=completion)
 
 
-def _task_execute_cancel(user_key: str) -> tuple:
-    """Request cancel for current execution (soft cancel). Returns (ok, message)."""
-    state = task_execution_state.get(user_key)
-    if not state:
-        return (False, "No active execution to cancel.")
-    executor = state.get("executor")
+def _task_execute_cancel(user_key: str, task_id: Optional[int] = None) -> tuple:
+    """Request soft cancel for an active run. Returns (ok, message, task_id)."""
+    active_runs = _active_task_runs(user_key)
+    if not active_runs:
+        return (False, "No active execution to cancel.", None)
+
+    target_tid: Optional[int] = _coerce_task_id(task_id)
+    target_state: Optional[Dict[str, Any]] = None
+    if target_tid is not None:
+        candidate = _get_task_run_state(user_key, target_tid)
+        if not candidate or _is_task_execution_terminal_status(_state_status_lower(candidate)):
+            return (False, f"Task {target_tid} is not actively executing.", None)
+        target_state = candidate
+    elif len(active_runs) == 1:
+        target_tid, target_state = active_runs[0]
+    else:
+        active_ids = ", ".join(str(tid) for tid, _ in active_runs)
+        return (
+            False,
+            f"Multiple active tasks ({active_ids}). Provide taskId to cancel a specific task.",
+            None,
+        )
+
+    if target_tid is None or target_state is None:
+        return (False, "No active execution to cancel.", None)
+
+    executor = target_state.get("executor")
     if executor and hasattr(executor, "request_cancel"):
         executor.request_cancel()
-        return (True, "Cancellation requested. The task will stop after the current step.")
-    task_execution_state.pop(user_key, None)
-    return (False, "No active execution to cancel.")
+        # Update visible status immediately so callers don't remain stuck on 'executing'
+        # while the loop finishes the current step.
+        target_state["status"] = STATUS_CANCELLED
+        target_state["message"] = "Cancellation requested. The task will stop after the current step."
+        return (True, "Cancellation requested. The task will stop after the current step.", target_tid)
+    _remove_task_run_state(user_key, target_tid)
+    return (False, "No active execution to cancel.", None)
 
 
-def _task_execution_status(user_key: str) -> Optional[Dict[str, Any]]:
-    """Return current execution state for user_key, or None if none."""
-    state = task_execution_state.get(user_key)
-    if not state:
+def _task_execution_status(user_key: str, task_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Return execution status for one task (if task_id provided) or user-level summary."""
+    active_runs = _active_task_runs(user_key)
+    if not active_runs:
         return None
-    return {"status": state.get("status"), "task_id": state.get("task_id"), "message": state.get("message")}
+
+    normalized_tid = _coerce_task_id(task_id)
+    if normalized_tid is not None:
+        state = _get_task_run_state(user_key, normalized_tid)
+        if not state or _is_task_execution_terminal_status(_state_status_lower(state)):
+            return None
+        return _state_brief_for_response(user_key, state)
+
+    if len(active_runs) == 1:
+        return _state_brief_for_response(user_key, active_runs[0][1])
+
+    run_summaries = [_state_brief_for_response(user_key, state) for _, state in active_runs]
+    active_ids = [summary.get("task_id") for summary in run_summaries if _coerce_task_id(summary.get("task_id")) is not None]
+    active_ids = sorted(set(int(tid) for tid in active_ids))
+    return {
+        "status": "multiple",
+        "task_id": None,
+        "task_ids": active_ids,
+        "message": f"Multiple task executions are active: {', '.join(str(tid) for tid in active_ids)}.",
+        "runs": run_summaries,
+    }
 
 
 @app.post("/v1/todo/execute/cancel", response_model=TodoExecuteResponse)
-async def todo_execute_cancel(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Cancel current task execution; task remains in list. Requires JWT."""
+async def todo_execute_cancel(
+    cancel_request: Optional[TodoCancelRequest] = None,
+    taskId: Optional[int] = Query(default=None),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Cancel an active task execution; task remains in list. Requires JWT."""
     user_key = current_user["username"]
-    ok, msg = _task_execute_cancel(user_key)
-    task_id = task_execution_state.get(user_key, {}).get("task_id") if ok else None
-    return TodoExecuteResponse(status=STATUS_CANCELLED, message=msg, taskId=task_id)
+    requested_task_id = taskId
+    if requested_task_id is None and isinstance(cancel_request, TodoCancelRequest):
+        requested_task_id = cancel_request.taskId
+    ok, msg, cancelled_task_id = _task_execute_cancel(user_key, requested_task_id)
+    response_status = STATUS_CANCELLED if ok else "idle"
+    return TodoExecuteResponse(status=response_status, message=msg, taskId=cancelled_task_id)
+
+
+@app.get("/v1/todo/execute/status", response_model=TodoExecutionStatusResponse)
+async def todo_execute_status(
+    taskId: Optional[int] = Query(default=None),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Return active task execution status with all currently running task IDs."""
+    user_key = current_user["username"]
+    active_runs = _active_task_runs(user_key)
+    run_summaries = [_state_brief_for_response(user_key, state) for _, state in active_runs]
+    active_ids = [summary.get("task_id") for summary in run_summaries if _coerce_task_id(summary.get("task_id")) is not None]
+    active_ids = sorted(set(int(tid) for tid in active_ids))
+
+    task_summary = _task_execution_status(user_key, taskId) if taskId is not None else None
+    summary = _task_execution_status(user_key) if taskId is None else task_summary
+
+    message: Optional[str]
+    if taskId is not None:
+        if task_summary:
+            message = task_summary.get("message") or f"Task {task_summary.get('task_id')} is {task_summary.get('status')}."
+        else:
+            message = f"No active run for task {taskId}."
+    else:
+        if summary:
+            message = summary.get("message") or f"Active task IDs: {', '.join(str(t) for t in active_ids)}."
+        else:
+            message = "No task is currently running or paused."
+
+    return TodoExecutionStatusResponse(
+        active=bool(run_summaries),
+        activeTaskIds=active_ids,
+        runs=run_summaries,
+        message=message,
+        task=task_summary if isinstance(task_summary, dict) else None,
+    )
 
 
 def _is_todo_list_query(message_text: str) -> bool:
@@ -4871,12 +5681,16 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
 
     data = response.json()
     reply = None
+    pending_native_tool_calls: List[Dict[str, Any]] = []
     choices = data.get("choices") or []
     if choices:
         message = choices[0].get("message") or {}
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            pending_native_tool_calls = tool_calls
         reply = _coerce_telegram_response_text(message.get("content"))
 
-    if not reply:
+    if not reply and not pending_native_tool_calls:
         reply = "I couldn't generate a response right now. Please try again shortly."
 
     # Tool loop: when tools enabled, parse for tool calls and execute up to TELEGRAM_TOOLS_MAX_ITERATIONS
@@ -4886,37 +5700,29 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     # Friendly message when tool failed or returned an error (avoid showing raw 404/500 to user)
     _telegram_tool_error_reply = "I wasn't able to get that information just now. Please try again or rephrase your question."
     if TELEGRAM_TOOLS_ENABLED and _telegram_tools is not None:
-        working_messages: List[Dict[str, str]] = []
+        working_messages: List[Dict[str, Any]] = []
         if system_prompt:
             working_messages.append({"role": "system", "content": system_prompt})
         working_messages.extend(history)
         iterations = 0
         while iterations < TELEGRAM_TOOLS_MAX_ITERATIONS:
+            native_tool_calls = pending_native_tool_calls if isinstance(pending_native_tool_calls, list) else []
             parsed = _telegram_tools.parse_telegram_tool_response(reply)
-            if not parsed:
+            result_message = last_tool_result_message or ""
+            if not native_tool_calls and not parsed:
                 break
             # After at least one tool execution, prefer mixed natural-language replies
             # over re-entering the tool loop when the model includes incidental XML.
-            if iterations > 0 and not _telegram_tools.reply_looks_like_tool_call(reply):
+            if (
+                not native_tool_calls
+                and iterations > 0
+                and parsed
+                and not _telegram_tools.reply_looks_like_tool_call(reply)
+            ):
                 cleaned_reply = _telegram_tools.strip_tool_call_markup(reply)
                 if cleaned_reply:
                     reply = cleaned_reply
                 break
-            tool_name = parsed.get("name")
-            if tool_name:
-                await _update_status_session(
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    state=f"Working: executing tool {tool_name}",
-                    phase=f"tool:{tool_name}",
-                )
-            args_str = parsed.get("arguments", "{}")
-            try:
-                tool_args = json.loads(args_str) if isinstance(args_str, str) else args_str
-            except (TypeError, json.JSONDecodeError):
-                tool_args = {}
-            if not isinstance(tool_args, dict):
-                tool_args = {}
             # Build context for tool execution
             tool_ctx = {
                 "conversation_id": conversation_id,
@@ -4950,17 +5756,81 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     caption=caption,
                 ),
                 "upload_drive_internal": _upload_drive_internal,
+                "execute_skill_tool": lambda tool_name, tool_args: _execute_skill_framework_tool(
+                    tool_name=tool_name,
+                    arguments=tool_args,
+                    conversation_id=conversation_id,
+                    user_id=request.user_id,
+                    metadata={"channel": "telegram"},
+                ),
                 "memory_manager": memory_manager if MEMORY_AVAILABLE else None,
             }
-            try:
-                tool_result = await _telegram_tools.execute_telegram_tool(tool_name, tool_args, tool_ctx)
-            except Exception as e:
-                tool_result = {"success": False, "message": str(e)}
-            result_message = tool_result.get("message", str(tool_result))
-            last_tool_result_message = result_message
-            last_tool_success = tool_result.get("success", True)
-            working_messages.append({"role": "assistant", "content": reply})
-            working_messages.append({"role": "user", "content": f"Tool result: {result_message}"})
+
+            if native_tool_calls:
+                working_messages.append({"role": "assistant", "tool_calls": native_tool_calls})
+                for native_call in native_tool_calls:
+                    native_function = native_call.get("function") if isinstance(native_call, dict) else {}
+                    tool_name = (
+                        (native_function.get("name") if isinstance(native_function, dict) else None)
+                        or (native_call.get("name") if isinstance(native_call, dict) else None)
+                    )
+                    if not tool_name:
+                        continue
+                    await _update_status_session(
+                        conversation_id=conversation_id,
+                        request_id=request_id,
+                        state=f"Working: executing tool {tool_name}",
+                        phase=f"tool:{tool_name}",
+                    )
+                    raw_args = (
+                        (native_function.get("arguments") if isinstance(native_function, dict) else None)
+                        or (native_call.get("arguments") if isinstance(native_call, dict) else "{}")
+                    )
+                    try:
+                        tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except (TypeError, json.JSONDecodeError):
+                        tool_args = {}
+                    if not isinstance(tool_args, dict):
+                        tool_args = {}
+                    try:
+                        tool_result = await _telegram_tools.execute_telegram_tool(tool_name, tool_args, tool_ctx)
+                    except Exception as e:
+                        tool_result = {"success": False, "message": str(e)}
+                    result_message = tool_result.get("message", str(tool_result))
+                    last_tool_result_message = result_message
+                    last_tool_success = tool_result.get("success", True)
+                    working_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": native_call.get("id") if isinstance(native_call, dict) else None,
+                            "content": result_message,
+                        }
+                    )
+            else:
+                tool_name = parsed.get("name")
+                if tool_name:
+                    await _update_status_session(
+                        conversation_id=conversation_id,
+                        request_id=request_id,
+                        state=f"Working: executing tool {tool_name}",
+                        phase=f"tool:{tool_name}",
+                    )
+                args_str = parsed.get("arguments", "{}")
+                try:
+                    tool_args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except (TypeError, json.JSONDecodeError):
+                    tool_args = {}
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+                try:
+                    tool_result = await _telegram_tools.execute_telegram_tool(tool_name, tool_args, tool_ctx)
+                except Exception as e:
+                    tool_result = {"success": False, "message": str(e)}
+                result_message = tool_result.get("message", str(tool_result))
+                last_tool_result_message = result_message
+                last_tool_success = tool_result.get("success", True)
+                working_messages.append({"role": "assistant", "content": reply})
+                working_messages.append({"role": "user", "content": f"Tool result: {result_message}"})
             payload_tool = {"model": model_name, "messages": working_messages}
             if request.temperature is not None:
                 payload_tool["temperature"] = request.temperature
@@ -5019,10 +5889,14 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             if not choices_tool:
                 print("Telegram tool follow-up returned no choices, using tool result as reply")
                 reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
+                pending_native_tool_calls = []
                 break
-            new_content = _coerce_telegram_response_text((choices_tool[0].get("message") or {}).get("content"))
+            tool_followup_message = choices_tool[0].get("message") or {}
+            followup_tool_calls = tool_followup_message.get("tool_calls")
+            pending_native_tool_calls = followup_tool_calls if isinstance(followup_tool_calls, list) else []
+            new_content = _coerce_telegram_response_text(tool_followup_message.get("content"))
             # If follow-up has no content (e.g. GLM 5 returns empty), use tool result so user never sees raw XML
-            if not new_content.strip():
+            if not new_content.strip() and not pending_native_tool_calls:
                 print("Telegram tool follow-up returned empty content, using tool result as reply")
                 reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
             else:
@@ -5448,7 +6322,7 @@ async def get_all_available_tools() -> List[Dict]:
     # 2. Web Scraper/Fetcher Tool
     all_tools.append({
         "name": "web_scraper",
-        "description": "Fetch and scrape readable content from a web URL. Can optionally crawl a few same-domain pages and return extracted text content.",
+        "description": "Fetch and scrape readable content from a web URL. Supports JavaScript-rendered pages (Playwright/Selenium) for dynamic sites.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5470,6 +6344,25 @@ async def get_all_available_tools() -> List[Dict]:
                     "type": "integer",
                     "description": "Maximum link depth from the start page",
                     "default": 1,
+                },
+                "render_js": {
+                    "type": "boolean",
+                    "description": "Render JavaScript before extraction (use for dynamic sites).",
+                    "default": False,
+                },
+                "render_engine": {
+                    "type": "string",
+                    "description": "Renderer engine: auto, playwright, or selenium.",
+                    "default": "auto",
+                },
+                "wait_for_selector": {
+                    "type": "string",
+                    "description": "Optional CSS selector to wait for before extracting content.",
+                },
+                "js_wait_ms": {
+                    "type": "integer",
+                    "description": "Extra milliseconds to wait after page load for dynamic content.",
+                    "default": 2200,
                 },
             },
             "required": ["url"]
@@ -5561,10 +6454,20 @@ async def get_all_available_tools() -> List[Dict]:
         })
         all_tools.append({
             "name": "list_files",
-            "description": "List all files in the scratch workspace with name, size, and modified time.",
+            "description": "List files in the scratch workspace (optionally under a subdirectory, optionally recursive).",
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional subdirectory under scratch (e.g. images or reports/2026).",
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "When true, include files in nested folders below path.",
+                        "default": False,
+                    },
+                },
             },
             "server_id": "proxy_server"
         })
@@ -5628,6 +6531,28 @@ async def get_all_available_tools() -> List[Dict]:
         print("[PHILOSOPHER] Added runCodexCli tool")
     else:
         print("[PHILOSOPHER] Codex CLI disabled, skipping runCodexCli tool")
+
+    # 5c. Skill framework tools (manifest-driven tools from src/skills)
+    skill_tools = _get_skill_tools_mcp_schema()
+    if skill_tools:
+        for tool in skill_tools:
+            name = str(tool.get("name") or "").strip()
+            if not name:
+                continue
+            input_schema = tool.get("inputSchema")
+            if not isinstance(input_schema, dict):
+                input_schema = {"type": "object", "properties": {}}
+            all_tools.append(
+                {
+                    "name": name,
+                    "description": str(tool.get("description") or "").strip(),
+                    "inputSchema": input_schema,
+                    "server_id": "skill_framework",
+                }
+            )
+        print(f"[PHILOSOPHER] Added {len(skill_tools)} skill framework tools")
+    else:
+        print("[PHILOSOPHER] No skill framework tools available")
     
     # 6. run_browser_agent (standalone browser-use HTTP server; not tied to mcp_servers)
     # Browser-use runs as a separate HTTP server (MCP_BROWSER_USE_HTTP_URL); add tool when URL is configured
@@ -5789,12 +6714,31 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             if not url:
                 return "Error: 'url' parameter is required for web_scraper"
 
-            crawl = bool(parameters.get("crawl", True))
-            max_pages = int(parameters.get("max_pages", 3) or 3)
-            max_depth = int(parameters.get("max_depth", 1) or 1)
+            crawl = _coerce_bool(parameters.get("crawl", True), default=True)
+            try:
+                max_pages = int(parameters.get("max_pages", 3) or 3)
+            except (TypeError, ValueError):
+                max_pages = 3
+            try:
+                max_depth = int(parameters.get("max_depth", 1) or 1)
+            except (TypeError, ValueError):
+                max_depth = 1
+            render_js = _coerce_bool(parameters.get("render_js", False))
+            render_engine = parameters.get("render_engine", "auto")
+            wait_for_selector = parameters.get("wait_for_selector")
+            js_wait_ms = parameters.get("js_wait_ms", 2200)
 
             # Call the proxy fetch endpoint with extraction + optional crawl
-            result = await _do_proxy_fetch(url, crawl=crawl, max_pages=max_pages, max_depth=max_depth)
+            result = await _do_proxy_fetch(
+                url,
+                crawl=crawl,
+                max_pages=max_pages,
+                max_depth=max_depth,
+                render_js=render_js,
+                render_engine=render_engine,
+                wait_for_selector=wait_for_selector,
+                js_wait_ms=js_wait_ms,
+            )
 
             if result and "content" in result:
                 content = result["content"] or ""
@@ -5911,13 +6855,33 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
     
     elif tool_name == "list_files":
         try:
-            result = await _list_files_internal()
+            requested_path = (
+                str(parameters.get("path", "")).strip()
+                or str(parameters.get("subdir", "")).strip()
+                or str(parameters.get("directory", "")).strip()
+            )
+            recursive = _coerce_bool(parameters.get("recursive", False), default=False)
+
+            result = await _list_files_internal(path=requested_path, recursive=recursive)
+            if not isinstance(result, dict):
+                return "List failed: backend returned an invalid response."
             if not result.get("success"):
                 return result.get("message", "List failed")
             files = result.get("files", [])
+            skipped_count = int(result.get("skipped_count", 0) or 0)
             if not files:
-                return f"Scratch workspace is empty. (Directory: {result.get('scratch_dir', 'scratch')})"
-            return _format_list_files_for_tool_output(files, include_sizes=True)
+                path_label = result.get("path") or requested_path or "."
+                message = (
+                    "Scratch workspace is empty for this scope. "
+                    f"(Directory: {result.get('scratch_dir', 'scratch')}, Path: {path_label}, Recursive: {recursive})"
+                )
+                if skipped_count > 0:
+                    message += f" Skipped {skipped_count} inaccessible or unsafe entries."
+                return message
+            rendered = _format_list_files_for_tool_output(files, include_sizes=True)
+            if skipped_count > 0:
+                rendered += f"\n... skipped {skipped_count} inaccessible or unsafe entries."
+            return rendered
         except Exception as e:
             return f"Error executing list_files: {str(e)}"
     
@@ -6010,6 +6974,30 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             return f"Error executing run_deep_research: {e.detail}"
         except Exception as e:
             return f"Error executing run_deep_research: {str(e)}"
+
+    # Handle skill framework tools (qualified names like skill.tool or unique aliases)
+    elif (qualified_skill_tool := _resolve_skill_tool_qualified_name(tool_name)):
+        try:
+            result = await _execute_skill_framework_tool(
+                tool_name=tool_name,
+                arguments=parameters,
+                conversation_id=str(parameters.get("conversation_id") or ""),
+                user_id=str(parameters.get("user_id") or ""),
+                metadata={"channel": "philosopher"},
+            )
+            message = str(result.get("message") or "").strip()
+            data = result.get("data")
+            if not result.get("success", False):
+                return f"Error executing {qualified_skill_tool}: {message or 'unknown error'}"
+            if data is None:
+                return message or f"Skill tool '{qualified_skill_tool}' executed successfully."
+            if isinstance(data, (dict, list)):
+                data_text = json.dumps(data, ensure_ascii=False, default=str)
+            else:
+                data_text = str(data)
+            return f"{message}\n\n{data_text}".strip()
+        except Exception as e:
+            return f"Error executing {qualified_skill_tool}: {str(e)}"
     
     # Handle MCP tools
     elif MCP_AVAILABLE:
@@ -7589,24 +8577,48 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
 # FILE OPERATIONS ENDPOINTS
 # ============================================================================
 
+def _normalize_scratch_relative_input(raw_input: str) -> str:
+    """Normalize user-provided scratch-relative paths and optional 'scratch/' prefix."""
+    normalized = str(raw_input or "").strip()
+    if not normalized:
+        return normalized
+    normalized = normalized.replace("\\", "/")
+    lowered = normalized.lower()
+    if lowered == "scratch":
+        return "."
+    if lowered.startswith("scratch/"):
+        trimmed = normalized[len("scratch/") :]
+        return trimmed or "."
+    return normalized
+
+
 def resolve_scratch_path(filename: str, allowed_extensions: Optional[Set[str]] = None) -> Path:
     """
     Resolve a user-supplied filename to a path under SCRATCH_DIR.
     Rejects absolute paths, traversal (..), and disallowed extensions.
     Returns the canonical path for safe I/O. Raises HTTPException 400 on invalid input.
     """
+    normalized_name = _normalize_scratch_relative_input(filename)
+
     # Reject empty or whitespace-only filename
-    if not filename or not filename.strip():
+    if not normalized_name or not normalized_name.strip():
         raise HTTPException(status_code=400, detail="Invalid filename")
+
     # Reject absolute paths (Unix / or Windows drive/root)
-    if os.path.isabs(filename) or filename.startswith("/") or filename.startswith("\\"):
+    if (
+        os.path.isabs(normalized_name)
+        or normalized_name.startswith("/")
+        or bool(re.match(r"^[A-Za-z]:/", normalized_name))
+    ):
         raise HTTPException(status_code=400, detail="Invalid filename")
+
     # Reject path traversal components
-    parts = Path(filename).parts
+    parts = PurePosixPath(normalized_name).parts
     if ".." in parts:
         raise HTTPException(status_code=400, detail="Invalid filename")
+
     # Build candidate path and resolve to canonical form
-    candidate = SCRATCH_DIR / filename
+    candidate = SCRATCH_DIR / Path(normalized_name)
     try:
         resolved = candidate.resolve()
     except (OSError, RuntimeError) as e:
@@ -7865,7 +8877,9 @@ async def _write_file_internal(filename: str, content: str, format: str = "txt")
         content_bytes = content.encode("utf-8")
         if len(content_bytes) > FILE_OPS_MAX_SIZE_BYTES:
             return {"success": False, "message": "Content too large"}
-        logical_name = filename.strip()
+        logical_name = (filename or "").strip()
+        if not logical_name:
+            return {"success": False, "message": "Filename is required"}
         if not Path(logical_name).suffix:
             logical_name = f"{logical_name}.{format.lower()}"
         filepath = resolve_scratch_path(logical_name, WRITE_ALLOWED_EXTENSIONS)
@@ -7887,20 +8901,100 @@ async def _write_file_internal(filename: str, content: str, format: str = "txt")
         return {"success": False, "message": str(e)}
 
 
-async def _list_files_internal() -> Dict[str, Any]:
-    """List files in scratch dir. Returns dict with success, files. Used by Telegram tools only."""
+async def _list_files_internal(path: str = "", recursive: bool = False) -> Dict[str, Any]:
+    """List files in scratch dir (optionally scoped to a subdirectory)."""
     try:
+        requested_path = str(path or "").strip()
+        recursive_mode = _coerce_bool(recursive, default=False)
+        target_dir = SCRATCH_DIR.resolve()
+        if requested_path:
+            target_dir = resolve_scratch_path(requested_path)
+        if not target_dir.exists():
+            return {"success": False, "message": f"Path not found: {requested_path or '.'}", "files": []}
+        if not target_dir.is_dir():
+            return {"success": False, "message": f"Path is not a directory: {requested_path}", "files": []}
+
         files = []
-        for file in SCRATCH_DIR.iterdir():
-            if file.is_file():
+        skipped_count = 0
+        scratch_root = SCRATCH_DIR.resolve()
+        pending_dirs = [target_dir]
+        seen_dirs: Set[Path] = set()
+
+        while pending_dirs:
+            current_dir = pending_dirs.pop()
+            try:
+                current_resolved = current_dir.resolve()
+                current_resolved.relative_to(scratch_root)
+            except (OSError, RuntimeError, ValueError):
+                skipped_count += 1
+                continue
+            if current_resolved in seen_dirs:
+                continue
+            seen_dirs.add(current_resolved)
+
+            try:
+                entries = list(current_dir.iterdir())
+            except OSError:
+                skipped_count += 1
+                continue
+
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        skipped_count += 1
+                        continue
+
+                    entry_resolved = entry.resolve()
+                    entry_resolved.relative_to(scratch_root)
+                except (OSError, RuntimeError, ValueError):
+                    skipped_count += 1
+                    continue
+
+                try:
+                    if not entry.is_dir() and not entry.is_file():
+                        continue
+                    entry_stat = entry.stat()
+                    is_dir = entry.is_dir()
+                    if is_dir and recursive_mode:
+                        pending_dirs.append(entry)
+                except OSError:
+                    skipped_count += 1
+                    continue
+
+                rel_path = entry.relative_to(scratch_root).as_posix()
                 files.append({
-                    'name': file.name,
-                    'size': file.stat().st_size,
-                    'modified': file.stat().st_mtime,
-                    'extension': file.suffix
+                    "name": rel_path,
+                    "relative_path": rel_path,
+                    "size": None if is_dir else entry_stat.st_size,
+                    "modified": entry_stat.st_mtime,
+                    "extension": "" if is_dir else entry.suffix,
+                    "type": "directory" if is_dir else "file",
                 })
-        files.sort(key=lambda x: x['modified'], reverse=True)
-        return {"success": True, "files": files, "count": len(files), "scratch_dir": str(SCRATCH_DIR)}
+
+            if not recursive_mode:
+                break
+
+        files.sort(
+            key=lambda x: (
+                x.get("type") != "directory",
+                -float(x.get("modified", 0) or 0),
+                str(x.get("name", "")).lower(),
+            )
+        )
+        result = {
+            "success": True,
+            "files": files,
+            "count": len(files),
+            "scratch_dir": str(SCRATCH_DIR),
+            "path": requested_path or ".",
+            "recursive": recursive_mode,
+            "skipped_count": skipped_count,
+        }
+        if skipped_count > 0:
+            result["message"] = (
+                f"Listed {len(files)} files. Skipped {skipped_count} inaccessible or unsafe entries."
+            )
+        return result
     except Exception as e:
         return {"success": False, "message": str(e), "files": []}
 
@@ -7921,10 +9015,17 @@ def _format_list_files_for_tool_output(files: List[Dict[str, Any]], include_size
         return "Scratch workspace is empty."
     limit = _get_list_files_tool_max_entries()
     shown = files[:limit]
-    if include_sizes:
-        lines = [f"{f.get('name', '?')} ({f.get('size', 0)} bytes)" for f in shown]
-    else:
-        lines = [f.get("name", "?") for f in shown]
+    lines = []
+    for item in shown:
+        name = str(item.get("name", "?"))
+        is_dir = str(item.get("type", "")).lower() == "directory"
+        if is_dir:
+            lines.append(f"{name}/ [dir]")
+            continue
+        if include_sizes:
+            lines.append(f"{name} ({item.get('size', 0)} bytes)")
+        else:
+            lines.append(name)
     remaining = max(0, len(files) - len(shown))
     header = "Files in scratch workspace:"
     if remaining > 0:
@@ -8054,7 +9155,9 @@ async def write_file(
     if len(content_bytes) > FILE_OPS_MAX_SIZE_BYTES:
         return FileResponse(success=False, message="Content too large")
     # Build logical filename with extension from format if missing
-    logical_name = request.filename.strip()
+    logical_name = (request.filename or "").strip()
+    if not logical_name:
+        return FileResponse(success=False, message="Filename is required")
     if not Path(logical_name).suffix:
         logical_name = f"{logical_name}.{request.format.lower()}"
     # Resolve path with containment and extension checks (blocks path traversal)
@@ -8097,30 +9200,20 @@ async def write_file(
 
 @app.get("/v1/files/list")
 async def list_files(
+    path: Optional[str] = None,
+    recursive: bool = False,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """List all files in the scratch directory"""
+    """List files in the scratch directory (optionally scoped by subdirectory and recursion)."""
     try:
-        # Get all files in scratch directory
-        files = []
-        for file in SCRATCH_DIR.iterdir():
-            if file.is_file():
-                files.append({
-                    'name': file.name,
-                    'size': file.stat().st_size,
-                    'modified': file.stat().st_mtime,
-                    'extension': file.suffix
-                })
-        
-        # Sort files by modification time (newest first)
-        files.sort(key=lambda x: x['modified'], reverse=True)
-        
-        return {
-            'success': True,
-            'count': len(files),
-            'files': files,
-            'scratch_dir': str(SCRATCH_DIR)
-        }
+        result = await _list_files_internal(path=(path or ""), recursive=recursive)
+        if not result.get("success"):
+            return {
+                "success": False,
+                "message": result.get("message", "Error listing files"),
+                "files": [],
+            }
+        return result
     
     except Exception as e:
         # Handle any errors during directory listing

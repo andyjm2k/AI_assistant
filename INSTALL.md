@@ -39,6 +39,7 @@ In `.env` set at least:
 - **LLM:** e.g. `MCP_LLM_PROVIDER` and `MCP_LLM_MODEL_NAME`, plus the matching API key (`MCP_LLM_OPENAI_API_KEY`, `MCP_LLM_GOOGLE_API_KEY`, etc.) or use Ollama locally.
 - **Web search:** `BRAVE_API_KEY` (or the app will fall back to DuckDuckGo).
 - **Optional:** `NEWS_API_KEY`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ADMIN_IDS` for Telegram.
+- **Skills:** Built-in `image_generation.generate_image` uses `OPENAI_API_KEY` (or falls back to `MCP_LLM_OPENAI_API_KEY`).
 
 See `config/mcp_config.env.example` and the README Configuration section for the full list.
 
@@ -48,6 +49,7 @@ If you work with large payloads (deep research, long reports, tool outputs), you
 
 - `MAX_TOKEN_LIMIT`: Max total tokens (input + output) allowed per LLM request. The proxy preflights, summarizes, and retries when exceeded.
 - `TOKEN_ESTIMATE_CHARS_PER_TOKEN`: Heuristic for token estimation when no tokenizer is available (default 4).
+- `LIST_FILES_TOOL_MAX_ENTRIES`: Max rows returned by model-facing file list tools (`listFiles`/`list_files`) to keep chat context small.
 - `LARGE_PAYLOAD_MODEL`: Optional model to retry with when context window exhaustion occurs.
 - `LARGE_PAYLOAD_ENDPOINT`: Optional endpoint for the large payload model (OpenAI-compatible).
 
@@ -64,7 +66,8 @@ The Windows `start_all.py` script can start a sibling `whisper-api-server` if pr
 
 1. Create a bot with [BotFather](https://core.telegram.org/bots#botfather) and get the token.
 2. In `.env` set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ADMIN_IDS` (or `TELEGRAM_ALLOW_ALL=true`).
-3. Start the stack; the Telegram bot is started by `start_all.py` on Windows.
+3. If you enable Telegram tools, `listFiles` supports `path` + `recursive` for subdirectory listings, and `sendTelegramFile` accepts subdirectory paths under `scratch/`.
+4. Start the stack; the Telegram bot is started by `start_all.py` on Windows.
 
 ## Optional: Codex CLI tool
 

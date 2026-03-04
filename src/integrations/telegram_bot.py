@@ -78,6 +78,7 @@ VOICE_OUT_ENABLED = os.getenv("TELEGRAM_VOICE_OUT", "false").lower() == "true"
 STATUS_UPDATE_INTERVAL = 60.0
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESTART_WORKER_SCRIPT = PROJECT_ROOT / "scripts" / "restart_all.py"
+BACKUP_WORKER_SCRIPT = PROJECT_ROOT / "scripts" / "backup_all.py"
 
 
 def _parse_admin_ids() -> set[int]:
@@ -526,7 +527,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help - show this message\n"
         "/status - backend status and usage\n"
         "/clear - clear conversation history\n"
-        "/restart - restart all CATBot services\n\n"
+        "/restart - restart all CATBot services\n"
+        "/backup - create a ZIP backup in C:\\Users\\pc\\CATBot\\backups\n\n"
         "You can send text, voice notes, or audio files.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -573,16 +575,16 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Backend did not confirm history clear. Try again shortly.")
 
 
-def _spawn_restart_worker(chat_id: int, requested_by: int) -> None:
-    if not RESTART_WORKER_SCRIPT.exists():
-        raise RuntimeError(f"Restart worker script not found: {RESTART_WORKER_SCRIPT}")
+def _spawn_worker_script(worker_script: Path, chat_id: int, requested_by: int) -> None:
+    if not worker_script.exists():
+        raise RuntimeError(f"Worker script not found: {worker_script}")
 
     # On Windows, launch through a short-lived PowerShell trampoline so the
-    # restart worker is not a direct child of the telegram bot process.
-    # This prevents stop_all.py (taskkill /T) from killing the restart worker.
+    # worker is not a direct child of the telegram bot process.
+    # This prevents stop_all.py (taskkill /T) from killing detached workers.
     if os.name == "nt":
         python_executable = str(Path(sys.executable).resolve())
-        script_path = str(RESTART_WORKER_SCRIPT.resolve())
+        script_path = str(worker_script.resolve())
 
         def _ps_single_quote(value: str) -> str:
             return value.replace("'", "''")
@@ -608,7 +610,7 @@ def _spawn_restart_worker(chat_id: int, requested_by: int) -> None:
 
     cmd = [
         sys.executable,
-        str(RESTART_WORKER_SCRIPT),
+        str(worker_script),
         "--chat-id",
         str(chat_id),
         "--requested-by",
@@ -630,6 +632,14 @@ def _spawn_restart_worker(chat_id: int, requested_by: int) -> None:
     subprocess.Popen(cmd, **popen_kwargs)
 
 
+def _spawn_restart_worker(chat_id: int, requested_by: int) -> None:
+    _spawn_worker_script(RESTART_WORKER_SCRIPT, chat_id=chat_id, requested_by=requested_by)
+
+
+def _spawn_backup_worker(chat_id: int, requested_by: int) -> None:
+    _spawn_worker_script(BACKUP_WORKER_SCRIPT, chat_id=chat_id, requested_by=requested_by)
+
+
 async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -647,6 +657,26 @@ async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text(
         "Restart workflow started. I will post a follow-up message in this chat when services are back."
+    )
+
+
+async def backup_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    user_id = await _authorize_or_reject(update)
+    if user_id is None:
+        return
+
+    chat_id = update.effective_chat.id
+    try:
+        _spawn_backup_worker(chat_id=chat_id, requested_by=user_id)
+    except Exception as exc:
+        logger.error("Failed to launch backup worker: %s", exc, exc_info=True)
+        await update.message.reply_text("Failed to start backup workflow. Check server logs.")
+        return
+
+    await update.message.reply_text(
+        "Backup workflow started. I will post the archive path in this chat when it completes."
     )
 
 
@@ -758,6 +788,8 @@ def main() -> None:
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("restart", restart_bot_command))
     app.add_handler(CommandHandler("restart_bot", restart_bot_command))
+    app.add_handler(CommandHandler("backup", backup_bot_command))
+    app.add_handler(CommandHandler("backup_bot", backup_bot_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_voice))
     app.add_error_handler(error_handler)

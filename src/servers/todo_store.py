@@ -141,6 +141,7 @@ def _build_task_item(
     updated_at: Optional[str] = None,
     last_completed_at: Optional[str] = None,
     task_uid: Optional[str] = None,
+    task_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     if not description or not description.strip():
         raise ValueError("Task description cannot be empty.")
@@ -150,8 +151,18 @@ def _build_task_item(
     normalized_next = _normalize_schedule_datetime(next_run_at) if next_run_at is not None else normalized_schedule
     if normalized_recurrence and normalized_next is None:
         normalized_next = now_iso
+    numeric_task_id: Optional[int] = None
+    if task_id is not None:
+        try:
+            parsed_task_id = int(task_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("task_id must be an integer.") from exc
+        if parsed_task_id < 1:
+            raise ValueError("task_id must be >= 1.")
+        numeric_task_id = parsed_task_id
     return {
         "id": task_uid or uuid.uuid4().hex,
+        "task_id": numeric_task_id,
         "description": description.strip(),
         "scheduled_for": normalized_schedule,
         "next_run_at": normalized_next,
@@ -176,6 +187,15 @@ def _normalize_loaded_item(raw_item: Any, *, fallback_updated_at: Optional[str],
     if not description:
         return None
     recurrence = raw_item.get("recurrence")
+    raw_task_id = raw_item.get("task_id", raw_item.get("taskId"))
+    parsed_task_id: Optional[int] = None
+    if raw_task_id is not None:
+        try:
+            parsed_candidate = int(raw_task_id)
+            if parsed_candidate >= 1:
+                parsed_task_id = parsed_candidate
+        except (TypeError, ValueError):
+            parsed_task_id = None
     return _build_task_item(
         description,
         scheduled_for=raw_item.get("scheduled_for", raw_item.get("scheduledFor")),
@@ -185,23 +205,25 @@ def _normalize_loaded_item(raw_item: Any, *, fallback_updated_at: Optional[str],
         updated_at=raw_item.get("updated_at", raw_item.get("updatedAt", fallback_iso)),
         last_completed_at=raw_item.get("last_completed_at", raw_item.get("lastCompletedAt")),
         task_uid=str(raw_item.get("id") or raw_item.get("task_id") or uuid.uuid4().hex),
+        task_id=parsed_task_id,
     )
 
 
 def _load_items_with_meta(user_key: str) -> Dict[str, Any]:
     path = _get_file_path(user_key)
     if not path.exists():
-        return {"task_items": [], "updated_at": None}
+        return {"task_items": [], "updated_at": None, "next_task_id": 1}
     try:
         raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)
     except (json.JSONDecodeError, OSError):
-        return {"task_items": [], "updated_at": None}
+        return {"task_items": [], "updated_at": None, "next_task_id": 1}
 
     if not isinstance(data, dict):
-        return {"task_items": [], "updated_at": None}
+        return {"task_items": [], "updated_at": None, "next_task_id": 1}
 
     updated_at = data.get("updated_at")
+    raw_next_task_id = data.get("next_task_id", data.get("nextTaskId"))
     raw_items = data.get("task_items")
     if not isinstance(raw_items, list):
         raw_items = data.get("tasks")
@@ -213,20 +235,95 @@ def _load_items_with_meta(user_key: str) -> Dict[str, Any]:
         item = _normalize_loaded_item(raw_item, fallback_updated_at=updated_at, ordinal=idx)
         if item:
             items.append(item)
-    return {"task_items": items, "updated_at": updated_at}
+
+    used_ids: set[int] = set()
+    max_existing = 0
+    for item in items:
+        raw_id = item.get("task_id")
+        try:
+            task_numeric = int(raw_id) if raw_id is not None else None
+        except (TypeError, ValueError):
+            task_numeric = None
+        if task_numeric is None or task_numeric < 1 or task_numeric in used_ids:
+            item["task_id"] = None
+            continue
+        item["task_id"] = task_numeric
+        used_ids.add(task_numeric)
+        if task_numeric > max_existing:
+            max_existing = task_numeric
+
+    try:
+        next_task_id = int(raw_next_task_id) if raw_next_task_id is not None else 1
+    except (TypeError, ValueError):
+        next_task_id = 1
+    if next_task_id < 1:
+        next_task_id = 1
+    if next_task_id <= max_existing:
+        next_task_id = max_existing + 1
+
+    for item in items:
+        if item.get("task_id") is not None:
+            continue
+        while next_task_id in used_ids:
+            next_task_id += 1
+        item["task_id"] = next_task_id
+        used_ids.add(next_task_id)
+        next_task_id += 1
+
+    if not items and next_task_id < 1:
+        next_task_id = 1
+
+    return {"task_items": items, "updated_at": updated_at, "next_task_id": next_task_id}
 
 
-def _save_items(user_key: str, items: List[Dict[str, Any]]) -> None:
+def _save_items(user_key: str, items: List[Dict[str, Any]], *, next_task_id: Optional[int] = None) -> None:
     _ensure_dir()
     path = _get_file_path(user_key)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     now_iso = _iso_utc(_utc_now())
     ordered = _ordered_items(items)
+    used_ids: set[int] = set()
+    max_existing = 0
+    for item in ordered:
+        try:
+            tid = int(item.get("task_id"))
+        except (TypeError, ValueError):
+            tid = None
+        if tid is None or tid < 1 or tid in used_ids:
+            item["task_id"] = None
+            continue
+        item["task_id"] = tid
+        used_ids.add(tid)
+        if tid > max_existing:
+            max_existing = tid
+
+    computed_next = max_existing + 1
+    if next_task_id is not None:
+        try:
+            parsed_next = int(next_task_id)
+        except (TypeError, ValueError):
+            parsed_next = computed_next
+        if parsed_next < computed_next:
+            parsed_next = computed_next
+        computed_next = parsed_next
+
+    for item in ordered:
+        if item.get("task_id") is not None:
+            continue
+        while computed_next in used_ids:
+            computed_next += 1
+        item["task_id"] = computed_next
+        used_ids.add(computed_next)
+        computed_next += 1
+
+    if not ordered and computed_next < 1:
+        computed_next = 1
     data = {
         "version": _TASK_SCHEMA_VERSION,
         # Legacy field preserved for compatibility with old clients.
         "tasks": [item["description"] for item in ordered],
         "task_items": items,
+        "next_task_id": computed_next,
         "updated_at": now_iso,
     }
     raw = json.dumps(data, indent=2, ensure_ascii=False)
@@ -234,14 +331,31 @@ def _save_items(user_key: str, items: List[Dict[str, Any]]) -> None:
     temp_path.replace(path)
 
 
-def _task_item_for_index(items: List[Dict[str, Any]], task_id: int) -> Dict[str, Any]:
-    ordered = _ordered_items(items)
-    if task_id < 1 or task_id > len(ordered):
-        raise ValueError("Invalid task ID")
-    target_id = ordered[task_id - 1]["id"]
+def _task_item_for_task_id(items: List[Dict[str, Any]], task_id: int) -> Dict[str, Any]:
     for item in items:
-        if item.get("id") == target_id:
+        try:
+            candidate = int(item.get("task_id"))
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate == task_id:
             return item
+
+    # Backward compatibility only when there are no usable task_id values.
+    has_stable_ids = False
+    for item in items:
+        try:
+            if int(item.get("task_id")) >= 1:
+                has_stable_ids = True
+                break
+        except (TypeError, ValueError):
+            continue
+    if not has_stable_ids:
+        ordered = _ordered_items(items)
+        if 1 <= task_id <= len(ordered):
+            target_id = ordered[task_id - 1].get("id")
+            for item in items:
+                if item.get("id") == target_id:
+                    return item
     raise ValueError("Invalid task ID")
 
 
@@ -292,6 +406,7 @@ def load_tasks_with_meta(user_key: str) -> dict:
         "tasks": [str(item.get("description", "")) for item in ordered],
         "task_items": ordered,
         "updated_at": loaded.get("updated_at"),
+        "next_task_id": loaded.get("next_task_id", 1),
     }
 
 
@@ -300,6 +415,10 @@ def save_tasks(user_key: str, tasks: List[str]) -> None:
     Save tasks for the given user key using scheduler-aware schema.
     Accepts legacy list[str] and preserves task order.
     """
+    loaded = _load_items_with_meta(user_key)
+    next_task_id = int(loaded.get("next_task_id", 1) or 1)
+    if next_task_id < 1:
+        next_task_id = 1
     now = _utc_now()
     items: List[Dict[str, Any]] = []
     for idx, task in enumerate(tasks):
@@ -307,13 +426,20 @@ def save_tasks(user_key: str, tasks: List[str]) -> None:
             normalized = _normalize_loaded_item(task, fallback_updated_at=_iso_utc(now), ordinal=idx)
             if normalized:
                 items.append(normalized)
+                try:
+                    existing_id = int(normalized.get("task_id"))
+                    if existing_id >= next_task_id:
+                        next_task_id = existing_id + 1
+                except (TypeError, ValueError):
+                    pass
             continue
         text = str(task).strip()
         if not text:
             continue
         created = _iso_utc(now + timedelta(microseconds=idx))
-        items.append(_build_task_item(text, created_at=created, updated_at=created))
-    _save_items(user_key, items)
+        items.append(_build_task_item(text, created_at=created, updated_at=created, task_id=next_task_id))
+        next_task_id += 1
+    _save_items(user_key, items, next_task_id=next_task_id)
 
 
 def add_task(
@@ -328,9 +454,12 @@ def add_task(
         raise ValueError("Task description is required.")
     loaded = _load_items_with_meta(user_key)
     items = loaded["task_items"]
-    item = _build_task_item(desc, scheduled_for=scheduled_for, recurrence=recurrence)
+    next_task_id = int(loaded.get("next_task_id", 1) or 1)
+    if next_task_id < 1:
+        next_task_id = 1
+    item = _build_task_item(desc, scheduled_for=scheduled_for, recurrence=recurrence, task_id=next_task_id)
     items.append(item)
-    _save_items(user_key, items)
+    _save_items(user_key, items, next_task_id=next_task_id + 1)
     return load_tasks(user_key)
 
 
@@ -345,13 +474,13 @@ def update_task(
     clear_recurrence: bool = False,
 ) -> List[str]:
     """
-    Update task at 1-based index task_id.
+    Update task by stable numeric task_id.
     Supports description updates plus schedule/recurrence edits.
     Raises ValueError if task_id out of range or payload invalid.
     """
     loaded = _load_items_with_meta(user_key)
     items = loaded["task_items"]
-    target = _task_item_for_index(items, task_id)
+    target = _task_item_for_task_id(items, task_id)
 
     did_change = False
     now_iso = _iso_utc(_utc_now())
@@ -394,33 +523,33 @@ def update_task(
         raise ValueError("No update fields provided.")
 
     target["updated_at"] = now_iso
-    _save_items(user_key, items)
+    _save_items(user_key, items, next_task_id=loaded.get("next_task_id"))
     return load_tasks(user_key)
 
 
 def delete_task(user_key: str, task_id: int) -> List[str]:
     """
-    Remove task at 1-based index task_id. Raises ValueError if task_id out of range.
+    Remove task by stable numeric task_id. Raises ValueError if task_id is invalid.
     Returns the updated ordered list of task descriptions.
     """
     loaded = _load_items_with_meta(user_key)
     items = loaded["task_items"]
-    target = _task_item_for_index(items, task_id)
+    target = _task_item_for_task_id(items, task_id)
     items[:] = [item for item in items if item.get("id") != target.get("id")]
-    _save_items(user_key, items)
+    _save_items(user_key, items, next_task_id=loaded.get("next_task_id"))
     return load_tasks(user_key)
 
 
 def complete_task(user_key: str, task_id: int) -> Dict[str, Any]:
     """
-    Complete task at 1-based index task_id.
+    Complete task by stable numeric task_id.
     - One-time tasks are removed.
     - Repeating tasks are advanced to their next run time.
     Returns scheduler metadata including whether it was rescheduled.
     """
     loaded = _load_items_with_meta(user_key)
     items = loaded["task_items"]
-    target = _task_item_for_index(items, task_id)
+    target = _task_item_for_task_id(items, task_id)
     recurrence = target.get("recurrence")
     now = _utc_now()
     now_iso = _iso_utc(now)
@@ -437,7 +566,7 @@ def complete_task(user_key: str, task_id: int) -> Dict[str, Any]:
         target["last_completed_at"] = now_iso
         target["next_run_at"] = _iso_utc(next_run)
         target["updated_at"] = now_iso
-        _save_items(user_key, items)
+        _save_items(user_key, items, next_task_id=loaded.get("next_task_id"))
         meta = load_tasks_with_meta(user_key)
         return {
             "rescheduled": True,
@@ -448,7 +577,7 @@ def complete_task(user_key: str, task_id: int) -> Dict[str, Any]:
         }
 
     items[:] = [item for item in items if item.get("id") != target.get("id")]
-    _save_items(user_key, items)
+    _save_items(user_key, items, next_task_id=loaded.get("next_task_id"))
     meta = load_tasks_with_meta(user_key)
     return {
         "rescheduled": False,
@@ -475,5 +604,6 @@ def list_due_task_items(user_key: str, as_of: Optional[str] = None) -> List[Dict
 
 def clear_tasks(user_key: str) -> List[str]:
     """Clear all tasks for the user. Returns empty list."""
-    _save_items(user_key, [])
+    loaded = _load_items_with_meta(user_key)
+    _save_items(user_key, [], next_task_id=loaded.get("next_task_id"))
     return []

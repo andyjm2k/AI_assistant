@@ -1,0 +1,9 @@
+{
+  "name": "image_generation",
+  "description": "OpenRouter-based image generation skill (Seedream 4.5).",
+  "enabled": true,
+  "module": "src.skills.builtin.image_generation_skill:create_skill",
+  "settings": {
+    "root_dir": "./scratch"
+  }
+}

@@ -5397,7 +5397,7 @@ function saveWAVFile(wavBlob) {
         // Todo list is loaded from backend (or localStorage fallback) in fetchTodoListFromServer when runAppInitialization runs
 
         // Replace the ToolManager with OpenAI-style tool definitions
-        const tools = [
+        const baseTools = [
                 {
                     type: "function",
                     function: {
@@ -5413,7 +5413,7 @@ function saveWAVFile(wavBlob) {
                                 },
                                 taskId: {
                                     type: "number",
-                                    description: "The 1-based task index (required for update, complete, and delete actions)"
+                                    description: "The stable task ID (required for update, complete, and delete actions)"
                                 },
                                 taskDescription: {
                                     type: "string",
@@ -5463,11 +5463,11 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "executeTodoTask",
-                    description: "Start execution of a todo task by number. The backend runs a bounded LLM+tools loop (search, files, etc.). Use when user says 'execute task N' or 'run task N'. You MUST call this with taskId set to the number the user said (1-based). If status is paused_awaiting_feedback, use resumeTodoExecution with the user's reply. If status is awaiting_confirmation, use completeTodoTask to mark it done when the user confirms.",
+                    description: "Start execution of a todo task by task ID. The backend runs a bounded LLM+tools loop (search, files, etc.) and supports multiple tasks in parallel. You MUST call this with taskId set to the task ID the user requested. If status is paused_awaiting_feedback, use resumeTodoExecution with the user's reply (and taskId when available). If status is awaiting_confirmation, use completeTodoTask to mark it done when the user confirms.",
                     parameters: {
                         type: "object",
                         properties: {
-                            taskId: { type: "number", description: "1-based task index (required)" },
+                            taskId: { type: "number", description: "Stable task ID (required)" },
                             promptOverride: { type: "string", description: "Optional goal for this run (e.g. 'research and compile a report on X')" }
                         },
                         required: ["taskId"]
@@ -5478,11 +5478,12 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "resumeTodoExecution",
-                    description: "Resume a paused task execution after the user has provided feedback. Call when executeTodoTask returned status 'paused_awaiting_feedback' and the user has replied with their input.",
+                    description: "Resume a paused task execution after the user has provided feedback. Call when executeTodoTask returned status 'paused_awaiting_feedback' and the user has replied with their input. Include taskId when more than one task may be paused.",
                     parameters: {
                         type: "object",
                         properties: {
-                            userMessage: { type: "string", description: "The user's feedback or answer to continue the task" }
+                            userMessage: { type: "string", description: "The user's feedback or answer to continue the task" },
+                            taskId: { type: "number", description: "Optional task ID to resume when multiple paused tasks exist" }
                         },
                         required: ["userMessage"]
                     }
@@ -5496,7 +5497,7 @@ function saveWAVFile(wavBlob) {
                     parameters: {
                         type: "object",
                         properties: {
-                            taskId: { type: "number", description: "1-based task index to mark complete (use the taskId from the execute response)" }
+                            taskId: { type: "number", description: "Stable task ID to mark complete (use the taskId from the execute response or todo list)" }
                         },
                         required: ["taskId"]
                     }
@@ -5506,10 +5507,12 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "cancelTodoExecution",
-                    description: "Cancel the current task execution. The task stays on the list. Use when the user wants to stop the running execution or before starting another one if one is already active.",
+                    description: "Cancel a running task execution. The task stays on the list. Provide taskId when multiple tasks are running in parallel.",
                     parameters: {
                         type: "object",
-                        properties: {},
+                        properties: {
+                            taskId: { type: "number", description: "Optional task ID to cancel. Required when multiple tasks are running." }
+                        },
                         required: []
                     }
                 }
@@ -5539,7 +5542,7 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "scrapeWebsite",
-                    description: "Fetches and summarizes content from a website. Pass one url or multiple urls to try in order until one succeeds (scrape-with-retry).",
+                    description: "Fetches and summarizes content from a website. Pass one url or multiple urls to try in order until one succeeds (scrape-with-retry). Supports JavaScript rendering for dynamic pages via render_js.",
                     parameters: {
                         type: "object",
                         properties: {
@@ -5551,6 +5554,22 @@ function saveWAVFile(wavBlob) {
                                 type: "array",
                                 items: { type: "string" },
                                 description: "Optional list of URLs to try in order; first successful fetch is returned (use after webSearch to retry on failure)"
+                            },
+                            render_js: {
+                                type: "boolean",
+                                description: "Optional. Enable JavaScript rendering for dynamic pages (Playwright/Selenium on proxy)."
+                            },
+                            render_engine: {
+                                type: "string",
+                                description: "Optional renderer: auto, playwright, or selenium."
+                            },
+                            wait_for_selector: {
+                                type: "string",
+                                description: "Optional CSS selector to wait for before extracting content."
+                            },
+                            js_wait_ms: {
+                                type: "number",
+                                description: "Optional extra wait time in milliseconds after page load for dynamic content."
                             }
                         }
                     }
@@ -5864,27 +5883,6 @@ function saveWAVFile(wavBlob) {
             {
                 type: "function",
                 function: {
-                    name: "saveToFile",
-                    description: "Saves content to a file in the specified directory",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            filename: {
-                                type: "string",
-                                description: "The name of the file to save (e.g., 'latest_news.txt', 'data.csv')"
-                            },
-                            content: {
-                                type: "string",
-                                description: "The content to save to the file"
-                            }
-                        },
-                        required: ["filename", "content"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
                     name: "readFile",
                     description: "Reads content from a file",
                     parameters: {
@@ -5928,10 +5926,20 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "listFiles",
-                    description: "Lists files in the scratch directory",
+                    description: "Lists files and directories in the scratch directory (optionally under a subdirectory).",
                     parameters: {
                         type: "object",
-                        properties: {},
+                        properties: {
+                            path: {
+                                type: "string",
+                                description: "Optional subdirectory path under scratch (e.g. images or reports/2026)."
+                            },
+                            recursive: {
+                                type: "boolean",
+                                description: "When true, include nested files/directories.",
+                                default: false
+                            }
+                        },
                         required: []
                     }
                 }
@@ -5976,35 +5984,110 @@ function saveWAVFile(wavBlob) {
             }
         ];
 
-        // Add the new handler function before executeToolCall
-        async function handleSaveToFile({ filename, content }) {
-            try {
-                // Construct the full path
-                // const savePath = `C:\\Users\\andyjm\\scratch\\${filename}`;
-                
-                // Create a Blob with the content
-                const blob = new Blob([content], { type: 'text/plain' });
-                
-                // Create a download link and trigger it
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(blob);
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(a.href);
+        const SKILL_TOOL_ALIAS_PREFIX = 'skill__';
+        const SKILL_TOOL_CACHE_MS = 15000;
+        const OVERLAPPING_SKILL_FILE_TOOLS = new Set([
+            'filesystem.list_files',
+            'filesystem.read_text',
+            'filesystem.write_text',
+        ]);
+        const skillToolAliasToQualifiedName = new Map();
+        let cachedSkillToolsForLlm = [];
+        let cachedSkillPromptLines = [];
+        let lastSkillToolFetchAt = 0;
 
-                return { 
-                    success: true, 
-                    message: `Content has been saved to ${filename}` 
-                };
-            } catch (error) {
-                console.error('Save to file error:', error);
-                return { 
-                    success: false, 
-                    message: `Error saving file: ${error.message}` 
-                };
+        function createSkillToolAlias(qualifiedName, usedNames) {
+            const safeCore = String(qualifiedName || '')
+                .trim()
+                .replace(/[^a-zA-Z0-9_-]/g, '_')
+                .replace(/_+/g, '_')
+                .replace(/^_+|_+$/g, '')
+                .slice(0, 48) || 'tool';
+            let alias = `${SKILL_TOOL_ALIAS_PREFIX}${safeCore}`.slice(0, 64);
+            let suffix = 2;
+            while (usedNames.has(alias)) {
+                const candidate = `${SKILL_TOOL_ALIAS_PREFIX}${safeCore}_${suffix}`;
+                alias = candidate.slice(0, 64);
+                suffix += 1;
             }
+            return alias;
+        }
+
+        function resolveSkillToolName(name) {
+            if (!name || typeof name !== 'string') return name;
+            return skillToolAliasToQualifiedName.get(name) || name;
+        }
+
+        async function fetchDynamicSkillTools(forceRefresh = false) {
+            const now = Date.now();
+            if (!forceRefresh && now - lastSkillToolFetchAt < SKILL_TOOL_CACHE_MS) {
+                return { tools: cachedSkillToolsForLlm, promptLines: cachedSkillPromptLines };
+            }
+
+            const usedNames = new Set(
+                baseTools
+                    .map((tool) => tool?.function?.name)
+                    .filter((name) => typeof name === 'string' && name.trim())
+            );
+            skillToolAliasToQualifiedName.clear();
+
+            try {
+                const response = await fetch(`${PROXY_BASE_URL}/v1/skills/tools/openai?qualified_names=true`, {
+                    method: 'GET'
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const payload = await response.json();
+                const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+
+                const llmTools = [];
+                const promptLines = [];
+                for (const tool of tools) {
+                    const fn = tool?.function;
+                    const qualifiedName = typeof fn?.name === 'string' ? fn.name.trim() : '';
+                    if (!qualifiedName) continue;
+                    if (OVERLAPPING_SKILL_FILE_TOOLS.has(qualifiedName)) continue;
+
+                    const alias = createSkillToolAlias(qualifiedName, usedNames);
+                    usedNames.add(alias);
+                    skillToolAliasToQualifiedName.set(alias, qualifiedName);
+
+                    const schema = (fn && typeof fn.parameters === 'object' && fn.parameters)
+                        ? fn.parameters
+                        : { type: 'object', properties: {} };
+                    llmTools.push({
+                        type: 'function',
+                        function: {
+                            name: alias,
+                            description: fn?.description || `Skill framework tool: ${qualifiedName}`,
+                            parameters: schema
+                        }
+                    });
+                    promptLines.push(
+                        `- ${alias} (maps to ${qualifiedName}): ${fn?.description || 'No description.'}`
+                    );
+                }
+
+                cachedSkillToolsForLlm = llmTools;
+                cachedSkillPromptLines = promptLines;
+                lastSkillToolFetchAt = now;
+            } catch (error) {
+                console.warn('Could not load dynamic skill tools from proxy:', error);
+                cachedSkillToolsForLlm = [];
+                cachedSkillPromptLines = [];
+                lastSkillToolFetchAt = now;
+            }
+
+            return { tools: cachedSkillToolsForLlm, promptLines: cachedSkillPromptLines };
+        }
+
+        async function buildToolingBundle(forceRefresh = false) {
+            const dynamic = await fetchDynamicSkillTools(forceRefresh);
+            return {
+                tools: [...baseTools, ...dynamic.tools],
+                skillPromptLines: dynamic.promptLines
+            };
         }
 
         // Handler for reading files from the scratch directory
@@ -6091,10 +6174,19 @@ function saveWAVFile(wavBlob) {
         }
 
         // Handler for listing files in the scratch directory
-        async function handleListFiles() {
+        async function handleListFiles({ path = '', recursive = false } = {}) {
             try {
+                const search = new URLSearchParams();
+                if (path && typeof path === 'string' && path.trim()) {
+                    search.set('path', path.trim());
+                }
+                if (typeof recursive === 'boolean' ? recursive : String(recursive).trim().toLowerCase() === 'true') {
+                    search.set('recursive', 'true');
+                }
+                const query = search.toString();
+                const url = query ? `${PROXY_BASE_URL}/v1/files/list?${query}` : `${PROXY_BASE_URL}/v1/files/list`;
                 // Call the proxy server to list files
-                const response = await fetch(`${PROXY_BASE_URL}/v1/files/list`, {
+                const response = await fetch(url, {
                     method: 'GET',
                     headers: {
                         'Content-Type': 'application/json'
@@ -6111,7 +6203,12 @@ function saveWAVFile(wavBlob) {
                     const scratchDir = result.scratch_dir;
                     const content = files.length > 0
                         ? files
-                            .map((file, index) => `${index + 1}. ${file.name} (${file.size} bytes)`)
+                            .map((file, index) => {
+                                const isDir = String(file?.type || '').toLowerCase() === 'directory';
+                                return isDir
+                                    ? `${index + 1}. ${file.name}/ [dir]`
+                                    : `${index + 1}. ${file.name} (${file.size ?? 0} bytes)`;
+                            })
                             .join('\n')
                         : 'No files found in the scratch directory.';
 
@@ -6135,6 +6232,44 @@ function saveWAVFile(wavBlob) {
                 return {
                     success: false,
                     message: `Error listing files: ${error.message}. Make sure the proxy server is running on port 8002.`
+                };
+            }
+        }
+
+        async function handleSkillFrameworkTool(toolName, args) {
+            try {
+                const payload = {
+                    tool_name: toolName,
+                    arguments: (args && typeof args === 'object') ? args : {},
+                    context: {
+                        conversation_id: activeConversationId || 'default',
+                        user_id: activeConversationId || 'default',
+                        scratch_dir: 'scratch',
+                        metadata: { channel: 'html_ui' }
+                    }
+                };
+                const response = await fetch(`${PROXY_BASE_URL}/v1/skills/tools/execute`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const result = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    const detail = result?.detail || result?.message || `HTTP ${response.status}`;
+                    return { success: false, message: `Skill tool error: ${detail}` };
+                }
+                return {
+                    success: result.success !== false,
+                    message: result.message || `Skill tool '${toolName}' executed.`,
+                    data: result.data,
+                    error_code: result.error_code,
+                    tool_name: result.tool_name || toolName
+                };
+            } catch (error) {
+                console.error('Skill framework tool error:', error);
+                return {
+                    success: false,
+                    message: `Error executing skill tool '${toolName}': ${error.message}`
                 };
             }
         }
@@ -6187,10 +6322,14 @@ function saveWAVFile(wavBlob) {
             try {
                 const args = typeof argsString === 'string' ? JSON.parse(argsString) : argsString;
                 console.log('executeToolCall - Parsed arguments:', args);
-                await reportToolInvocationToProxy(name, args);
+                const resolvedName = resolveSkillToolName(name);
+                if (resolvedName !== name) {
+                    console.log('executeToolCall - Resolved dynamic skill alias:', { alias: name, qualified: resolvedName });
+                }
+                await reportToolInvocationToProxy(resolvedName, args);
 
                 let result;
-                switch (name) {
+                switch (resolvedName) {
                     case "manageTodoList":
                         result = await handleTodoList(args);
                         break;
@@ -6245,7 +6384,11 @@ function saveWAVFile(wavBlob) {
                         result = await handleLLMQuery(args, context);
                         break;
                     case "saveToFile":
-                        result = await handleSaveToFile(args);
+                        result = await handleWriteFile({
+                            filename: args?.filename,
+                            content: args?.content,
+                            format: args?.format || "txt",
+                        });
                         break;
                     case "fetchNews":
                         result = await handleNews(args);
@@ -6288,11 +6431,12 @@ function saveWAVFile(wavBlob) {
                         result = await handleListFiles(args);
                         break;
                     default:
-                        // Tool not found
-                        result = {
-                            success: false,
-                            message: `Unknown tool: ${name}`
-                        };
+                        result = await handleSkillFrameworkTool(resolvedName, args);
+                        if (!result || result.success === false) {
+                            result = result || {};
+                            result.success = false;
+                            result.message = result.message || `Unknown tool: ${resolvedName}`;
+                        }
                         break;
                 }
                 console.log('executeToolCall - Result:', result);
@@ -6301,6 +6445,30 @@ function saveWAVFile(wavBlob) {
                 console.error('executeToolCall - Error:', error);
                 throw error;
             }
+        }
+
+        function formatToolResultForModel(toolResult) {
+            if (typeof toolResult === 'string') {
+                return toolResult;
+            }
+            if (toolResult && typeof toolResult === 'object' && toolResult.content) {
+                return `${toolResult.message}\n\nContent:\n${toolResult.content}`;
+            }
+            try {
+                return JSON.stringify(toolResult);
+            } catch (_) {
+                return String(toolResult);
+            }
+        }
+
+        function extractToolResultSummary(toolResult) {
+            if (typeof toolResult === 'string') {
+                return toolResult;
+            }
+            if (toolResult && typeof toolResult === 'object' && typeof toolResult.message === 'string' && toolResult.message.trim()) {
+                return toolResult.message.trim();
+            }
+            return formatToolResultForModel(toolResult);
         }
 
 
@@ -6497,13 +6665,18 @@ function saveWAVFile(wavBlob) {
 
         async function handleResumeTodoExecution(args) {
             const userMessage = (args.userMessage ?? args.user_message ?? '').toString().trim();
+            const taskIdRaw = args.taskId ?? args.task_id;
+            const taskId = (taskIdRaw === undefined || taskIdRaw === null) ? null : Number(taskIdRaw);
             if (!authToken) return { success: false, message: "Please sign in to resume task execution." };
             if (!userMessage) return { success: false, message: "userMessage is required to resume." };
+            if (taskIdRaw !== undefined && taskIdRaw !== null && !Number.isFinite(taskId)) {
+                return { success: false, message: "taskId must be a number." };
+            }
             try {
                 const res = await fetch(`${PROXY_BASE_URL}/v1/todo/execute/resume`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
-                    body: JSON.stringify({ userMessage })
+                    body: JSON.stringify({ userMessage, taskId: taskId ?? null })
                 });
                 const data = await res.json().catch(() => ({}));
                 if (!res.ok) {
@@ -6544,10 +6717,18 @@ function saveWAVFile(wavBlob) {
             }
         }
 
-        async function handleCancelTodoExecution() {
+        async function handleCancelTodoExecution(args = {}) {
+            const taskIdRaw = args.taskId ?? args.task_id;
+            const taskId = (taskIdRaw === undefined || taskIdRaw === null) ? null : Number(taskIdRaw);
             if (!authToken) return { success: false, message: "Please sign in to cancel task execution." };
+            if (taskIdRaw !== undefined && taskIdRaw !== null && !Number.isFinite(taskId)) {
+                return { success: false, message: "taskId must be a number." };
+            }
             try {
-                const res = await fetch(`${PROXY_BASE_URL}/v1/todo/execute/cancel`, {
+                const url = taskId !== null
+                    ? `${PROXY_BASE_URL}/v1/todo/execute/cancel?taskId=${encodeURIComponent(String(taskId))}`
+                    : `${PROXY_BASE_URL}/v1/todo/execute/cancel`;
+                const res = await fetch(url, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` }
                 });
@@ -7056,7 +7237,7 @@ function saveWAVFile(wavBlob) {
         }
 
         // Add this new handler function for web scraping (supports single url or urls[] for retry)
-        async function handleWebScraping({ url, urls }) {
+        async function handleWebScraping({ url, urls, render_js, render_engine, wait_for_selector, js_wait_ms }) {
             try {
                 // Build list: single url or urls array; filter invalid
                 const urlList = [];
@@ -7078,9 +7259,24 @@ function saveWAVFile(wavBlob) {
                         message: 'No URL available from previous step. Run a web search first, or specify a URL (or urls array) to scrape.'
                     };
                 }
+
+                const renderJs = Boolean(render_js);
+                const renderEngine = typeof render_engine === 'string' ? render_engine.trim().toLowerCase() : 'auto';
+                const waitForSelector = typeof wait_for_selector === 'string' ? wait_for_selector.trim() : '';
+                const parsedWait = Number.parseInt(js_wait_ms, 10);
+                const jsWaitMs = Number.isFinite(parsedWait) ? Math.max(0, Math.min(parsedWait, 20000)) : 2200;
+
                 // Use POST for proxy fetch; proxy tries each URL until one succeeds when urls[] is sent
                 const proxyUrl = `${PROXY_BASE_URL}/v1/proxy/fetch`;
                 const body = toTry.length === 1 ? { url: toTry[0] } : { urls: toTry };
+                if (renderJs) {
+                    body.render_js = true;
+                    body.render_engine = ['playwright', 'selenium'].includes(renderEngine) ? renderEngine : 'auto';
+                    body.js_wait_ms = jsWaitMs;
+                    if (waitForSelector) {
+                        body.wait_for_selector = waitForSelector;
+                    }
+                }
                 const response = await fetch(proxyUrl, {
                     method: 'POST',
                     headers: {
@@ -7465,7 +7661,7 @@ function saveWAVFile(wavBlob) {
                     query: match[1] || match[0]
                 })
             },
-            saveToFile: {
+            writeFile: {
                 patterns: [
                     /(?:save|write|store|output|export)(?: the)?(?: result| response| content| data)? to (?:file |filename |filepath )?["']?([^"'\s]+\.(?:txt|csv|json))["']?/i,
                     /(?:create|generate|make)(?: a)? (?:new )?file (?:called |named )?["']?([^"'\s]+\.(?:txt|csv|json))["']? (?:with|containing)(?: the)?(?: result| response| content| data)?/i,
@@ -7536,12 +7732,12 @@ function saveWAVFile(wavBlob) {
                         }
                     }
                     break;
-                case 'saveToFile':
+                case 'writeFile':
                     // Re-extract args with async support
-                    for (const pattern of TOOL_PATTERNS.saveToFile.patterns) {
+                    for (const pattern of TOOL_PATTERNS.writeFile.patterns) {
                         const match = task.originalText.match(pattern);
                         if (match) {
-                            const newArgs = await TOOL_PATTERNS.saveToFile.extractArgs(match, context);
+                            const newArgs = await TOOL_PATTERNS.writeFile.extractArgs(match, context);
                             task.function.arguments = JSON.stringify(newArgs);
                             break;
                         }
@@ -7850,7 +8046,8 @@ function saveWAVFile(wavBlob) {
 
             const systemPrompt = `You are EVA, a useful AI assistant that can use various tools to help users.
 
-To use a tool, you MUST ALWAYS respond in this EXACT format:
+When tool calling is available, prefer native function/tool calls from the API.
+If the model cannot emit native tool calls, use this XML fallback format:
 <tool>tool_name</tool>
 <parameters>
 {
@@ -7859,7 +8056,7 @@ To use a tool, you MUST ALWAYS respond in this EXACT format:
 }
 </parameters>
 
-IMPORTANT: Always use the XML-style format shown above. Never return raw JSON or other formats.
+IMPORTANT: Prefer native tool calls. Use the XML fallback only when native tool calls are unavailable.
 
 Available tools:
 
@@ -7933,7 +8130,12 @@ Parameters:
 Description: Fetches and summarizes content from a website
 Parameters:
 {
-    "url": "string (must include http:// or https://)"
+    "url": "string (single URL; must include http:// or https://)",
+    "urls": "array of strings (optional retry list; first successful URL is used)",
+    "render_js": "boolean (optional; true for JavaScript-rendered websites)",
+    "render_engine": "string (optional: auto|playwright|selenium)",
+    "wait_for_selector": "string (optional CSS selector to wait for before extraction)",
+    "js_wait_ms": "number (optional extra wait in milliseconds for dynamic content)"
 }
 
 10. webSearch
@@ -7978,9 +8180,11 @@ Parameters:
 }
 
 15. listFiles
-Description: Lists all files currently available in the scratch directory. No parameters are required.
+Description: Lists files and directories in the scratch directory. Optional parameters allow scoped listing under a subdirectory.
 Parameters:
 {
+    "path": "string (optional subdirectory under scratch, e.g. images or reports/2026)",
+    "recursive": "boolean (optional, default false; when true includes nested files/directories)",
 }
 
 16. writeFile
@@ -8129,19 +8333,28 @@ Assistant: <tool>runWorkflow</tool>
 }
 </parameters>
 
-IMPORTANT REMINDER: Always wrap your tool responses in <tool> and <parameters> tags as shown in the examples above. Never return raw JSON.
+IMPORTANT REMINDER: Use native tool calls when possible. Use <tool> and <parameters> XML only as a fallback.
 
 Current memory cache contents:
 ${memoryCache.map((item, index) => `${index + 1}. ${item}`).join('\n')}`;
-            
+
+            const toolingBundle = await buildToolingBundle();
+            const tools = toolingBundle.tools;
+            const dynamicSkillPrompt = toolingBundle.skillPromptLines.length
+                ? `\n\nAdditional Skill Framework tools (dynamic):\n${toolingBundle.skillPromptLines.join('\n')}\nUse the alias exactly as listed for native tool calls; it maps to the qualified skill tool on the server.`
+                : '';
+
             // Preserve existing system prompt by default; user input overrides it
             let effectiveSystemPrompt = systemPromptInput.value.trim() || systemPrompt;
+            if (dynamicSkillPrompt) {
+                effectiveSystemPrompt = `${effectiveSystemPrompt}\n${dynamicSkillPrompt}`;
+            }
             
             // Prepend context: timezone, knowledge-gap awareness, and todo execution rules (always applies)
             const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
             const contextBlock = `Context: You are running in timezone ${userTimezone}. Use this when interpreting dates/times unless the user specifies otherwise.
 Knowledge awareness: Your training has a cutoff. Acknowledge your knowledge gap; do not assume the current year or recent events. When the user provides current facts, corrections, or information that differs from your training (e.g., "it's 2025 now", "that API changed"), accept them as authoritative and do not contradict them.
-Todo execution: When the user asks to execute a todo task by number (e.g. "execute task 2", "run task 3"), you MUST call executeTodoTask with taskId set to that number—do not only describe steps. If the result has status "paused_awaiting_feedback", ask the user for their input and then call resumeTodoExecution with their message. If the result has status "awaiting_confirmation", tell the user the task is done and call completeTodoTask with the taskId from the result when they confirm. If they get "already active", only one execution runs at a time—suggest cancelTodoExecution or waiting.
+Todo execution: Task IDs are stable and are not list indexes. When the user asks to execute a task, use executeTodoTask with the requested taskId (from the current todo list). Multiple task executions may run in parallel. If the result has status "paused_awaiting_feedback", ask the user for input and call resumeTodoExecution (include taskId if multiple paused tasks exist). If the result has status "awaiting_confirmation", tell the user the task is done and call completeTodoTask with the returned taskId when they confirm. For cancel requests while multiple tasks are active, call cancelTodoExecution with taskId.
 
 `;
             effectiveSystemPrompt = contextBlock + effectiveSystemPrompt;
@@ -8257,23 +8470,15 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                             // Add the assistant's tool call turn to messages
                             messages.push({ role: 'assistant', tool_calls: message.tool_calls });
 
+                            let lastToolSummary = '';
+
                             // Execute each tool call and push results
                             for (const tc of message.tool_calls) {
                                 const toolName = tc?.function?.name || tc?.name || 'tool';
                                 updateProgressState(`Executing tool: ${toolName}`);
                                 const toolResult = await executeToolCall(tc, context);
-                                
-                                // Format the tool result content properly
-                                let toolResultContent;
-                                if (typeof toolResult === 'string') {
-                                    toolResultContent = toolResult;
-                                } else if (toolResult.content) {
-                                    // If the tool result has content (like from readFile), include it in a readable format
-                                    toolResultContent = `${toolResult.message}\n\nContent:\n${toolResult.content}`;
-                                } else {
-                                    // Otherwise, just stringify the result
-                                    toolResultContent = JSON.stringify(toolResult);
-                                }
+                                const toolResultContent = formatToolResultForModel(toolResult);
+                                lastToolSummary = extractToolResultSummary(toolResult);
                                 
                                 messages.push({
                                     role: 'tool',
@@ -8300,8 +8505,69 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                                 })
                             });
                             const followupData = await followupResponse.json();
-                            const finalMsg = followupData?.choices?.[0]?.message?.content || '';
-                            const finalContent = stripThinkTags(finalMsg);
+                            let finalMessage = followupData?.choices?.[0]?.message || {};
+                            let finalContent = stripThinkTags(finalMessage?.content || '');
+                            let followupToolIterations = 0;
+
+                            while (followupToolIterations < 4) {
+                                const nativeFollowupCalls = Array.isArray(finalMessage?.tool_calls)
+                                    ? finalMessage.tool_calls
+                                    : [];
+                                const xmlFollowupCall = (!nativeFollowupCalls.length && finalContent)
+                                    ? parseToolResponse(finalContent)
+                                    : null;
+
+                                if (!nativeFollowupCalls.length && !xmlFollowupCall) {
+                                    break;
+                                }
+
+                                if (nativeFollowupCalls.length) {
+                                    messages.push({ role: 'assistant', tool_calls: nativeFollowupCalls });
+                                    for (const tc of nativeFollowupCalls) {
+                                        const toolName = tc?.function?.name || tc?.name || 'tool';
+                                        updateProgressState(`Executing tool: ${toolName}`);
+                                        const toolResult = await executeToolCall(tc, context);
+                                        const toolResultContent = formatToolResultForModel(toolResult);
+                                        lastToolSummary = extractToolResultSummary(toolResult);
+                                        messages.push({
+                                            role: 'tool',
+                                            content: toolResultContent,
+                                            tool_call_id: tc.id
+                                        });
+                                    }
+                                } else if (xmlFollowupCall) {
+                                    const xmlToolName = xmlFollowupCall?.function?.name || xmlFollowupCall?.name || 'tool';
+                                    updateProgressState(`Executing tool: ${xmlToolName}`);
+                                    const xmlToolResult = await executeToolCall(xmlFollowupCall, context);
+                                    const xmlToolResultContent = formatToolResultForModel(xmlToolResult);
+                                    lastToolSummary = extractToolResultSummary(xmlToolResult);
+
+                                    messages.push({ role: 'assistant', content: finalContent });
+                                    messages.push({ role: 'user', content: `Tool result: ${xmlToolResultContent}` });
+                                }
+
+                                updateProgressState('Requesting final response');
+                                const chainedFollowupResponse = await fetch(endpoint, {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Authorization': `Bearer ${apiKey}`
+                                    },
+                                    body: JSON.stringify({
+                                        model: getCurrentModel(),
+                                        messages: messages,
+                                        max_tokens: 4096,
+                                        temperature: 0.7,
+                                        tools: tools,
+                                        tool_choice: 'auto'
+                                    })
+                                });
+                                const chainedFollowupData = await chainedFollowupResponse.json();
+                                finalMessage = chainedFollowupData?.choices?.[0]?.message || {};
+                                finalContent = stripThinkTags(finalMessage?.content || '');
+                                followupToolIterations += 1;
+                            }
+
                             if (finalContent) {
                                 responseOutput.value = finalContent;
                                 addMessageToHistory('assistant', finalContent); // Add to message history (also updates chatHistory)
@@ -8554,13 +8820,15 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                             } else {
                                 // Fallback: if the model returned no content after tool calls,
                                 // synthesize a simple confirmation from the last tool result
-                                const lastToolMsg = messages.slice().reverse().find(m => m.role === 'tool')?.content;
-                                let confirmText = '';
-                                try {
-                                    const parsed = typeof lastToolMsg === 'string' ? JSON.parse(lastToolMsg) : lastToolMsg;
-                                    confirmText = parsed?.message || '';
-                                } catch (_) {
-                                    confirmText = typeof lastToolMsg === 'string' ? lastToolMsg : '';
+                                let confirmText = lastToolSummary;
+                                if (!confirmText) {
+                                    const lastToolMsg = messages.slice().reverse().find(m => m.role === 'tool')?.content;
+                                    try {
+                                        const parsed = typeof lastToolMsg === 'string' ? JSON.parse(lastToolMsg) : lastToolMsg;
+                                        confirmText = parsed?.message || '';
+                                    } catch (_) {
+                                        confirmText = typeof lastToolMsg === 'string' ? lastToolMsg : '';
+                                    }
                                 }
                                 if (confirmText) {
                                     responseOutput.value = confirmText;
@@ -11307,6 +11575,8 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
             try {
                 const endpoint = endpointInput.value;
                 const apiKey = apiKeyInput.value.trim();
+                const toolingBundle = await buildToolingBundle();
+                const tools = toolingBundle.tools;
 
                 // Format previous results in a clear, structured way
                 let enhancedQuery = query;
@@ -11364,23 +11634,14 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                     // Handle potential tool calls using LM Studio/OpenAI format
                     if (msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
                         try {
+                            let lastToolSummary = '';
                             // Add assistant tool calls
                             subMessages.push({ role: 'assistant', tool_calls: msg.tool_calls });
                             // Execute and add tool results
                             for (const tc of msg.tool_calls) {
                                 const toolResult = await executeToolCall(tc, context);
-                                
-                                // Format the tool result content properly
-                                let toolResultContent;
-                                if (typeof toolResult === 'string') {
-                                    toolResultContent = toolResult;
-                                } else if (toolResult.content) {
-                                    // If the tool result has content (like from readFile), include it in a readable format
-                                    toolResultContent = `${toolResult.message}\n\nContent:\n${toolResult.content}`;
-                                } else {
-                                    // Otherwise, just stringify the result
-                                    toolResultContent = JSON.stringify(toolResult);
-                                }
+                                const toolResultContent = formatToolResultForModel(toolResult);
+                                lastToolSummary = extractToolResultSummary(toolResult);
                                 
                                 subMessages.push({
                                     role: 'tool',
@@ -11388,31 +11649,71 @@ Todo execution: When the user asks to execute a todo task by number (e.g. "execu
                                     tool_call_id: tc.id
                                 });
                             }
-                            // Finalize with a follow-up call
-                            const follow = await fetch(endpoint, {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    'Authorization': `Bearer ${apiKey}`
-                                },
-                                body: JSON.stringify({
-                                    model: getCurrentModel(),
-                                    messages: subMessages,
-                                    temperature: 0.7,
-                                    tools: tools,
-                                    tool_choice: 'auto'
-                                })
-                            });
-                            const followJson = await follow.json();
-                            const finalText = followJson?.choices?.[0]?.message?.content?.trim() || '';
-                            return { success: true, message: finalText };
+                            // Finalize with follow-up calls until no more native/XML tool calls are returned.
+                            let finalMessage = null;
+                            let loopCount = 0;
+                            while (loopCount < 4) {
+                                const follow = await fetch(endpoint, {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Authorization': `Bearer ${apiKey}`
+                                    },
+                                    body: JSON.stringify({
+                                        model: getCurrentModel(),
+                                        messages: subMessages,
+                                        temperature: 0.7,
+                                        tools: tools,
+                                        tool_choice: 'auto'
+                                    })
+                                });
+                                const followJson = await follow.json();
+                                finalMessage = followJson?.choices?.[0]?.message || {};
+                                const nativeCalls = Array.isArray(finalMessage.tool_calls) ? finalMessage.tool_calls : [];
+                                const finalText = stripThinkTags(finalMessage.content || '').trim();
+                                const xmlCall = (!nativeCalls.length && finalText) ? parseToolResponse(finalText) : null;
+
+                                if (!nativeCalls.length && !xmlCall) {
+                                    return { success: true, message: finalText || lastToolSummary };
+                                }
+
+                                if (nativeCalls.length) {
+                                    subMessages.push({ role: 'assistant', tool_calls: nativeCalls });
+                                    for (const tc of nativeCalls) {
+                                        const toolResult = await executeToolCall(tc, context);
+                                        const toolResultContent = formatToolResultForModel(toolResult);
+                                        lastToolSummary = extractToolResultSummary(toolResult);
+                                        subMessages.push({
+                                            role: 'tool',
+                                            content: toolResultContent,
+                                            tool_call_id: tc.id
+                                        });
+                                    }
+                                } else if (xmlCall) {
+                                    const xmlResult = await executeToolCall(xmlCall, context);
+                                    const xmlResultContent = formatToolResultForModel(xmlResult);
+                                    lastToolSummary = extractToolResultSummary(xmlResult);
+                                    subMessages.push({ role: 'assistant', content: finalText });
+                                    subMessages.push({ role: 'user', content: `Tool result: ${xmlResultContent}` });
+                                }
+                                loopCount += 1;
+                            }
+                            return { success: true, message: lastToolSummary };
                         } catch (innerErr) {
                             console.error('Error handling tool calls in handleLLMQuery:', innerErr);
                             // Fall back to plain content if present
                         }
                     }
 
-                    const plain = (msg.content || '').trim();
+                    const plain = stripThinkTags(msg.content || '').trim();
+                    const xmlToolCall = plain ? parseToolResponse(plain) : null;
+                    if (xmlToolCall) {
+                        const xmlResult = await executeToolCall(xmlToolCall, context);
+                        return {
+                            success: true,
+                            message: extractToolResultSummary(xmlResult)
+                        };
+                    }
                     console.log('LLM Response:', plain);
                     return {
                         success: true,

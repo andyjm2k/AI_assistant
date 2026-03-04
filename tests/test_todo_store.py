@@ -133,6 +133,29 @@ class TestTodoStore:
         assert result["rescheduled"] is False
         assert ts.load_tasks("complete_once") == []
 
+    def test_task_ids_are_stable_and_not_reused_after_delete(self, temp_dir):
+        ts.add_task("stable_ids_1", "alpha")
+        ts.add_task("stable_ids_1", "beta")
+        ts.add_task("stable_ids_1", "gamma")
+        meta_before = ts.load_tasks_with_meta("stable_ids_1")
+        ids_before = [int(item["task_id"]) for item in meta_before["task_items"]]
+        assert ids_before == [1, 2, 3]
+
+        ts.delete_task("stable_ids_1", 2)
+        ts.add_task("stable_ids_1", "delta")
+        meta_after = ts.load_tasks_with_meta("stable_ids_1")
+        ids_after = sorted(int(item["task_id"]) for item in meta_after["task_items"])
+        assert ids_after == [1, 3, 4]
+
+    def test_task_ids_are_not_reused_after_clear(self, temp_dir):
+        ts.add_task("stable_ids_2", "one")
+        ts.add_task("stable_ids_2", "two")
+        ts.clear_tasks("stable_ids_2")
+        ts.add_task("stable_ids_2", "three")
+        meta = ts.load_tasks_with_meta("stable_ids_2")
+        assert len(meta["task_items"]) == 1
+        assert int(meta["task_items"][0]["task_id"]) == 3
+
     def test_list_due_task_items_only_returns_due_scheduled(self, temp_dir):
         now = datetime.now(timezone.utc)
         ts.add_task("due1", "due task", scheduled_for=(now - timedelta(hours=1)).isoformat())

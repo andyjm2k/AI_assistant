@@ -87,6 +87,7 @@ See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line i
 - **[Speech Capabilities](https://openai.com/)** — Speech-to-text (Whisper) and text-to-speech (OpenAI-compatible) integration
 - **[3D Avatar Support](https://vroid.com/studio)** — VRM and Live2D avatar integration with emotive animations
 - **[Model Context Protocol](https://modelcontextprotocol.io/)** — MCP integration for extensible tooling
+- **[Skill Framework](docs/SKILL_FRAMEWORK.md)** — Manifest-driven skills, including a working `image_generation.generate_image` example (OpenRouter Seedream 4.5)
 - **[File Operations](proxy_server.py)** — Read/write support for txt, docx, xlsx, pdf, and images
 - **[Web Search](proxy_server.py)** — Brave Search API with DuckDuckGo fallback
 - **[Weather Information (Open-Meteo)](src/servers/proxy_server.py)** — Secure weather tool for web + Telegram using api.open-meteo.com data
@@ -387,7 +388,7 @@ Key environment variables (see `.env.example` for complete list):
 #### Context Window Controls
 - `MAX_TOKEN_LIMIT`: Max total tokens (input + output) per LLM request. The proxy preflights, summarizes, and retries when exceeded.
 - `TOKEN_ESTIMATE_CHARS_PER_TOKEN`: Heuristic for token estimation when no tokenizer is available (default 4).
-- `LIST_FILES_TOOL_MAX_ENTRIES`: Max number of rows returned by LLM-facing file-list tools (`listFiles`/`list_files`, default 60). Use this to keep large scratch directory listings from inflating tool-loop context.
+- `LIST_FILES_TOOL_MAX_ENTRIES`: Max number of rows returned by LLM-facing file-list tools (`listFiles`/`list_files`, default 60). `listFiles` supports optional `path` and `recursive` arguments for subdirectory listing.
  
 #### Large Payload Fallback
 - `LARGE_PAYLOAD_MODEL`: Optional model to retry with when context window exhaustion occurs.
@@ -430,7 +431,8 @@ Key environment variables (see `.env.example` for complete list):
 - `TELEGRAM_TOOLS_MAX_ITERATIONS`: Max tool-loop iterations per message (default: 5)
 - `LIST_FILES_TOOL_MAX_ENTRIES`: Caps `listFiles` output rows sent back to the model (default: 60) so large scratch directories do not bloat chat context.
 - When tools are enabled, the following are used by specific tools if set (same as web UI): `BRAVE_API_KEY` (webSearch; else DuckDuckGo), `NEWS_API_KEY` (fetchNews), `GOOGLE_DRIVE_*` (uploadToGoogleDrive), memory/vector-store settings for store/search/list/delete memories. File tools use the proxy scratch directory; runWorkflow uses AutoGen/team-config.
-- Security note: `sendTelegramFile` only sends files from the proxy `scratch/` directory and still enforces path + size checks.
+- `listFiles` accepts optional `path` (subdirectory under `scratch/`) and `recursive` (default `false`) for scoped listings.
+- Security note: `sendTelegramFile` only sends files from the proxy `scratch/` directory and still enforces path + size checks. Subdirectory paths like `images/generated/file.png` are supported.
 
 **Todo list (persistent, per user):** The todo list is stored in backend file storage (`todo_data/` by default, or `TODO_DATA_PATH`) per authenticated user. The web UI requires sign-in to load/save todo; tools (manageTodoList, executeTodoTask) call the proxy REST API. Telegram uses the same backend; optional **Telegram account linking** via `config/telegram_user_links.json` (mapping Telegram user ID or conversation ID to app username) lets the same todo list be shared between browser and Telegram. Without linking, Telegram uses a persistent per-chat list keyed by conversation ID.
 
@@ -554,7 +556,8 @@ All services are configured to accept connections from devices on your local net
 
 **Web Operations:**
 - `GET /v1/proxy/fetch` - Fetch web content from a URL (query param)
-- `POST /v1/proxy/fetch` - Fetch web content; body: `{"url": "..."}` or `{"urls": ["...", "..."]}`. When `urls` is provided, the server tries each URL in order until one succeeds (scrape-with-retry), e.g. after a web search.
+- `POST /v1/proxy/fetch` - Fetch web content; body: `{"url": "..."}` or `{"urls": ["...", "..."]}`. Optional dynamic-page args: `render_js` (bool), `render_engine` (`auto|playwright|selenium`), `wait_for_selector` (CSS selector), `js_wait_ms` (extra wait). When `urls` is provided, the server tries each URL in order until one succeeds (scrape-with-retry), e.g. after a web search.
+  - Note: JS rendering requires either Playwright (`playwright install chromium`) or Selenium with a working ChromeDriver.
 - `GET /v1/proxy/search` - Perform web search (Brave Search or DuckDuckGo fallback)
 - `GET /v1/proxy/weather` - Weather info (Open-Meteo: current, forecast, summary; supports memory fallback)
 
@@ -584,7 +587,7 @@ All services are configured to accept connections from devices on your local net
 **File Operations:**
 - `POST /v1/files/read` - Read files (supports: txt, docx, xlsx, pdf, png, jpg)
 - `POST /v1/files/write` - Write files (supports: txt, docx, xlsx, pdf)
-- `GET /v1/files/list` - List all files in scratch directory
+- `GET /v1/files/list` - List files in scratch directory (optional query params: `path`, `recursive`)
 - `DELETE /v1/files/delete/{filename}` - Delete a file from scratch directory
 
 **Todo list (all require authentication: `Authorization: Bearer <JWT>`):**
@@ -597,9 +600,11 @@ All services are configured to accept connections from devices on your local net
 
 **Task Execution (all require authentication):**
 - `POST /v1/todo/execute` - Start execution for a task (body: `{"taskId": 1, "promptOverride": "optional"}`)
-- `POST /v1/todo/execute/resume` - Resume paused execution (body: `{"userMessage": "..."}`)
+- `POST /v1/todo/execute/resume` - Resume paused execution (body: `{"userMessage": "...", "taskId": 1}`; `taskId` optional unless multiple paused tasks exist)
 - `POST /v1/todo/{task_id}/complete` - Human verification: mark task complete (one-time tasks removed, repeating tasks rescheduled)
-- `POST /v1/todo/execute/cancel` - Cancel current execution (task remains in list)
+- `POST /v1/todo/execute/cancel` - Cancel an active execution (optional query: `?taskId=1`; required when multiple tasks are active)
+- `GET /v1/todo/execute/status` - Execution status summary (`active`, `activeTaskIds`, `runs`, optional `task` when `?taskId=...` is provided)
+- `taskId` values are stable per task and are never reused for future tasks in that user list.
 
 **Utility:**
 - `GET /health` - Health check endpoint
@@ -639,8 +644,14 @@ curl -X POST http://localhost:8002/v1/files/write \
   -H "Content-Type: application/json" \
   -d '{"filename": "output.docx", "content": "Your content here", "format": "docx"}'
 
-# List all files
+# List top-level files
 curl http://localhost:8002/v1/files/list
+
+# List files in a subdirectory
+curl "http://localhost:8002/v1/files/list?path=images"
+
+# List files recursively under a subdirectory
+curl "http://localhost:8002/v1/files/list?path=images&recursive=true"
 
 # Delete a file
 curl -X DELETE http://localhost:8002/v1/files/delete/document.docx
@@ -671,7 +682,7 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 **Telegram tools (optional):**  
 Set `TELEGRAM_TOOLS_ENABLED=true` in the proxy environment to enable the same tool set as the web client. When enabled, the model can use tools (e.g. web search, read/write files in scratch, todo list, memory cache, workflows, news, calculate, store/search memories). The proxy parses `<tool>...</tool><parameters>...</parameters>` from the model reply, executes the tool server-side, and sends the result back to the model for a natural-language reply.
 
-- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), runCodexCli (Codex CLI for CATBot code changes), restartProxyServer (restart proxy to load new/updated tools), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, sendTelegramFile (attach file from `scratch/` into current Telegram chat), saveToFile, storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). The same optional `urls` behaviour is supported in the web (HTML) client.
+- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), runCodexCli (Codex CLI for CATBot code changes), restartProxyServer (restart proxy to load new/updated tools), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, sendTelegramFile (attach file from `scratch/` into current Telegram chat), storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). For JavaScript-heavy sites, pass `render_js=true` and optional `render_engine`, `wait_for_selector`, `js_wait_ms`. The same behaviour is supported in the web (HTML) client.
 - **Web-only in Telegram:** PDF to PowerPoint (`pdfToPowerPoint`) — the proxy returns a message directing the user to the CATBot web interface for this feature.
 - **Config:** `config/catbot_system_prompt_with_tools.txt` (included) defines the tool list and format; placeholders `{{MEMORY_CACHE}}` and `{{TODO_LIST}}` are filled per conversation. Max tool-loop iterations per message: `TELEGRAM_TOOLS_MAX_ITERATIONS` (default 5).
 
@@ -824,7 +835,7 @@ Install all Python dependencies with: `pip install -r requirements.txt`
    - Set `OPENAI_API_KEY` or `MCP_LLM_OPENAI_API_KEY` on the proxy so Telegram chat can call the LLM
    - If using `TELEGRAM_SECRET`, set the same value on both the bot and the proxy
    - For **Telegram tools**: set `TELEGRAM_TOOLS_ENABLED=true` on the proxy; ensure `config/catbot_system_prompt_with_tools.txt` exists. Tools need the same backend config as the web UI (e.g. `BRAVE_API_KEY`, `NEWS_API_KEY`).
-   - For Telegram file attachments (`sendTelegramFile`), ensure the file exists in `scratch/` and is within size limits.
+- For Telegram file attachments (`sendTelegramFile`), ensure the file exists in `scratch/` (top-level or subdirectory path) and is within size limits.
    - Check bot logs for connection errors
 
 8. **runCodexCli Not Triggering or Failing (Telegram or Web UI)**
@@ -848,7 +859,7 @@ Install all Python dependencies with: `pip install -r requirements.txt`
 
 11. **Todo list not syncing / Task execution not starting**
    - **Todo:** Ensure you are signed in (JWT). Todo is stored per user in `todo_data/` (or `TODO_DATA_PATH`). For Telegram, use `config/telegram_user_links.json` to link your Telegram user ID to your app username so the same list appears in the web UI—see **config/TELEGRAM_TODO_LINK.md** for step-by-step instructions (get your Telegram ID with `/status` in the bot).
-   - **Task execution:** All todo/execution endpoints require authentication (Bearer token). Only one execution can be active per user; complete or cancel the current one before starting another. Set `TASK_EXECUTION_MAX_ITERATIONS` in `.env` if you need a higher iteration limit (default 20).
+   - **Task execution:** All todo/execution endpoints require authentication (Bearer token). Multiple task executions can run in parallel per user (one run per task ID). Use `taskId` for resume/cancel/status targeting when more than one run exists. Set `TASK_EXECUTION_MAX_ITERATIONS` in `.env` if you need a higher iteration limit (default 200).
 
 ### Getting Help
 

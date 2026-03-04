@@ -1,0 +1,6 @@
+{
+  "name": "core",
+  "description": "Core diagnostic and utility tools.",
+  "enabled": true,
+  "module": "src.skills.builtin.core_skill:create_skill"
+}

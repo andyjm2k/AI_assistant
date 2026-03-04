@@ -208,6 +208,72 @@ class TestTelegramSecret:
 class TestTelegramToolsLoop:
     """Tests for Telegram tool loop when TELEGRAM_TOOLS_ENABLED is True."""
 
+    def test_tool_loop_executes_native_tool_calls_and_returns_final_reply(self):
+        """When LLM returns native message.tool_calls, proxy executes tools and returns final reply."""
+        client = _get_client()
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "webSearch",
+                                    "arguments": '{"query": "test query"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        final_response = "Here are the search results: [summary]."
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [{"message": {"content": final_response}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 10},
+        }
+        post_calls = [mock_first, mock_second]
+
+        def next_response(*args, **kwargs):
+            return post_calls.pop(0) if post_calls else mock_second
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            try:
+                from src.servers import proxy_server as ps
+                if getattr(ps, "_telegram_tools", None) is None:
+                    pytest.skip("telegram_tools module not available")
+            except ImportError:
+                pytest.skip("telegram_tools not importable")
+            with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search:
+                mock_search.return_value = {"results": [{"title": "Test", "snippet": "Snippet"}]}
+                with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                    m_getenv.side_effect = lambda k, d=None: (
+                        "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                    )
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(side_effect=next_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={"message": "Search for test", "conversation_id": "tools-native-test"},
+                        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("reply") == final_response
+        assert data.get("conversation_id") == "tools-native-test"
+
     def test_tool_loop_executes_tool_and_returns_final_reply(self):
         """When LLM returns a tool call, proxy executes tool and sends result back; second LLM reply is returned."""
         client = _get_client()
@@ -480,13 +546,15 @@ class TestTelegramTaskExecutionNotifications:
     def test_task_execution_register_telegram_target_adds_chat_id_once(self):
         from src.servers import proxy_server as ps
         user_key = "notify-user-1"
-        ps.task_execution_state[user_key] = {"status": "executing", "telegram_chat_ids": ["111"]}
+        ps.task_execution_state[user_key] = {"task_id": 1, "status": "executing", "telegram_chat_ids": ["111"]}
         try:
             ok1 = ps._task_execution_register_telegram_target(user_key, "222")
             ok2 = ps._task_execution_register_telegram_target(user_key, "222")
             assert ok1 is True
             assert ok2 is True
-            assert ps.task_execution_state[user_key]["telegram_chat_ids"] == ["111", "222"]
+            state = ps._get_task_run_state(user_key, 1)
+            assert state is not None
+            assert state["telegram_chat_ids"] == ["111", "222"]
         finally:
             ps.task_execution_state.pop(user_key, None)
 
@@ -499,10 +567,11 @@ class TestTelegramTaskExecutionNotifications:
                 return (ps.STATUS_AWAITING_CONFIRMATION, "Execution complete.")
 
         user_key = "notify-user-2"
+        executor = _Executor()
         ps.task_execution_state[user_key] = {
             "task_id": 3,
             "status": ps.STATUS_EXECUTING,
-            "executor": _Executor(),
+            "executor": executor,
             "message": None,
             "task_description": "Scheduled task demo",
             "is_scheduled": True,
@@ -516,7 +585,7 @@ class TestTelegramTaskExecutionNotifications:
                             "rescheduled": True,
                             "next_run_at": "2026-03-02T09:00:00+00:00",
                         }
-                        await ps._run_task_loop_background(user_key, _Executor())
+                        await ps._run_task_loop_background(user_key, 3, executor)
             assert user_key not in ps.task_execution_state
             mock_store.complete_task.assert_called_once_with(user_key, 3)
             mock_write.assert_called_once()
@@ -545,10 +614,11 @@ class TestTelegramTaskExecutionNotifications:
                 }
 
         user_key = "learning-user-1"
+        executor = _Executor()
         ps.task_execution_state[user_key] = {
             "task_id": 2,
             "status": ps.STATUS_EXECUTING,
-            "executor": _Executor(),
+            "executor": executor,
             "message": None,
             "task_description": "Write summary file",
             "is_scheduled": False,
@@ -561,11 +631,121 @@ class TestTelegramTaskExecutionNotifications:
                 with patch.object(ps, "memory_manager", mock_memory_manager):
                     with patch.object(ps, "_write_task_exec_response_to_scratch"):
                         with patch.object(ps, "_maybe_notify_telegram_task_completion", new=AsyncMock(return_value=None)):
-                            await ps._run_task_loop_background(user_key, _Executor())
+                            await ps._run_task_loop_background(user_key, 2, executor)
             mock_memory_manager.record_task_outcome.assert_awaited_once()
             kwargs = mock_memory_manager.record_task_outcome.await_args.kwargs
             assert kwargs.get("task_description") == "Write summary file"
             assert kwargs.get("status") == ps.STATUS_AWAITING_CONFIRMATION
+        finally:
+            ps.task_execution_state.pop(user_key, None)
+
+    @pytest.mark.asyncio
+    async def test_run_task_loop_background_clears_unscheduled_terminal_state(self):
+        from src.servers import proxy_server as ps
+
+        class _Executor:
+            async def run_loop(self):
+                return (ps.STATUS_AWAITING_CONFIRMATION, "Finished run.")
+
+        user_key = "terminal-clear-user"
+        executor = _Executor()
+        ps.task_execution_state[user_key] = {
+            "task_id": 4,
+            "status": ps.STATUS_EXECUTING,
+            "executor": executor,
+            "message": None,
+            "task_description": "Terminal clear test",
+            "is_scheduled": False,
+            "telegram_chat_ids": [],
+        }
+        try:
+            with patch.object(ps, "_write_task_exec_response_to_scratch"):
+                with patch.object(ps, "_maybe_notify_telegram_task_completion", new=AsyncMock(return_value=None)):
+                    await ps._run_task_loop_background(user_key, 4, executor)
+            assert user_key not in ps.task_execution_state
+        finally:
+            ps.task_execution_state.pop(user_key, None)
+
+    def test_task_execute_cancel_marks_state_cancelled_immediately(self):
+        from src.servers import proxy_server as ps
+
+        class _Executor:
+            def __init__(self):
+                self.cancelled = False
+
+            def request_cancel(self):
+                self.cancelled = True
+
+        user_key = "cancel-now-user"
+        executor = _Executor()
+        ps.task_execution_state[user_key] = {
+            "task_id": 9,
+            "status": ps.STATUS_EXECUTING,
+            "executor": executor,
+            "message": None,
+        }
+        try:
+            ok, msg, cancelled_task_id = ps._task_execute_cancel(user_key)
+            assert ok is True
+            assert "Cancellation requested" in msg
+            assert cancelled_task_id == 9
+            assert executor.cancelled is True
+            state = ps._get_task_run_state(user_key, 9)
+            assert state is not None
+            assert state["status"] == ps.STATUS_CANCELLED
+        finally:
+            ps.task_execution_state.pop(user_key, None)
+
+    def test_task_execution_status_clears_terminal_state(self):
+        from src.servers import proxy_server as ps
+
+        user_key = "status-clear-user"
+        ps.task_execution_state[user_key] = {
+            "task_id": 2,
+            "status": ps.STATUS_CANCELLED,
+            "message": "Cancellation requested.",
+        }
+        out = ps._task_execution_status(user_key)
+        assert out is None
+        assert user_key not in ps.task_execution_state
+
+    def test_task_execution_status_lists_multiple_active_task_ids(self):
+        from src.servers import proxy_server as ps
+
+        user_key = "status-multi-user"
+        ps.task_execution_state[user_key] = {
+            "runs": {
+                2: {"task_id": 2, "status": ps.STATUS_EXECUTING, "message": "Running task 2"},
+                4: {"task_id": 4, "status": ps.STATUS_PAUSED_AWAITING_FEEDBACK, "message": "Need input"},
+            }
+        }
+        try:
+            out = ps._task_execution_status(user_key)
+            assert out is not None
+            assert out.get("status") == "multiple"
+            assert out.get("task_ids") == [2, 4]
+        finally:
+            ps.task_execution_state.pop(user_key, None)
+
+    def test_task_execute_cancel_requires_task_id_when_multiple_active(self):
+        from src.servers import proxy_server as ps
+
+        class _Executor:
+            def request_cancel(self):
+                return None
+
+        user_key = "cancel-multi-user"
+        ps.task_execution_state[user_key] = {
+            "runs": {
+                1: {"task_id": 1, "status": ps.STATUS_EXECUTING, "executor": _Executor()},
+                2: {"task_id": 2, "status": ps.STATUS_EXECUTING, "executor": _Executor()},
+            }
+        }
+        try:
+            ok, msg, cancelled_task_id = ps._task_execute_cancel(user_key)
+            assert ok is False
+            assert cancelled_task_id is None
+            assert "Multiple active tasks" in msg
         finally:
             ps.task_execution_state.pop(user_key, None)
 
@@ -603,6 +783,25 @@ class TestPhilosopherFileTools:
         assert "delete_file" in names
 
     @pytest.mark.asyncio
+    async def test_overlapping_filesystem_skill_tools_filtered_from_llm_tool_list(self):
+        """Skill framework filesystem file tools should be hidden when built-in file tools are available."""
+        from src.servers import proxy_server as ps
+
+        raw_tools = [
+            {"name": "filesystem.list_files", "description": "list"},
+            {"name": "filesystem.read_text", "description": "read"},
+            {"name": "filesystem.write_text", "description": "write"},
+            {"name": "core.ping", "description": "ping"},
+        ]
+        with patch.object(ps, "FILE_OPS_AVAILABLE", True):
+            filtered = ps._filter_overlapping_file_skill_tools(raw_tools, openai_schema=False)
+        names = [item.get("name") for item in filtered]
+        assert "core.ping" in names
+        assert "filesystem.list_files" not in names
+        assert "filesystem.read_text" not in names
+        assert "filesystem.write_text" not in names
+
+    @pytest.mark.asyncio
     async def test_execute_list_files_returns_string(self):
         """execute_tool_for_philosopher list_files returns a string (empty workspace or file list)."""
         from src.servers import proxy_server as ps
@@ -619,6 +818,7 @@ class TestPhilosopherFileTools:
         fake_result = {
             "success": True,
             "files": [
+                {"name": "images", "type": "directory"},
                 {"name": "a.txt", "size": 1},
                 {"name": "b.txt", "size": 2},
                 {"name": "c.txt", "size": 3},
@@ -629,11 +829,31 @@ class TestPhilosopherFileTools:
         with patch.object(ps, "_list_files_internal", new=AsyncMock(return_value=fake_result)):
             result = await ps.execute_tool_for_philosopher("list_files", {})
         assert isinstance(result, str)
+        assert "images/ [dir]" in result
         assert "a.txt (1 bytes)" in result
         assert "b.txt (2 bytes)" in result
-        assert "c.txt (3 bytes)" in result
-        assert "... and 1 more files." in result
+        assert "... and 2 more files." in result
+        assert "c.txt (3 bytes)" not in result
         assert "d.txt (4 bytes)" not in result
+
+    @pytest.mark.asyncio
+    async def test_execute_list_files_forwards_path_and_recursive(self):
+        """execute_tool_for_philosopher list_files forwards path/recursive to backend list helper."""
+        from src.servers import proxy_server as ps
+
+        fake_result = {
+            "success": True,
+            "files": [{"name": "images/a.png", "size": 10}],
+        }
+
+        with patch.object(ps, "_list_files_internal", new=AsyncMock(return_value=fake_result)) as mock_list:
+            result = await ps.execute_tool_for_philosopher(
+                "list_files",
+                {"path": "images", "recursive": "true"},
+            )
+        mock_list.assert_awaited_once_with(path="images", recursive=True)
+        assert isinstance(result, str)
+        assert "images/a.png (10 bytes)" in result
 
     @pytest.mark.asyncio
     async def test_run_workflow_tool_included_when_autogen_available(self):
@@ -698,6 +918,24 @@ class TestProxyFetchUrls:
         assert data.get("content") == "Content from https://ok.second/page"
         assert len(call_log) == 2
 
+    def test_fetch_with_urls_retries_on_http_exception(self):
+        """POST with urls retries on HTTPException failures from _do_proxy_fetch."""
+        from src.servers import proxy_server as ps
+        client = _get_client()
+
+        async def mock_fetch(url, **kwargs):
+            if "fail" in url:
+                raise ps.HTTPException(status_code=500, detail="temporary failure")
+            return {"content": "Content from " + url}
+
+        with patch.object(ps, "_do_proxy_fetch", new=AsyncMock(side_effect=mock_fetch)):
+            resp = client.post(
+                "/v1/proxy/fetch",
+                json={"urls": ["https://fail.first/page", "https://ok.second/page"]},
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("content") == "Content from https://ok.second/page"
+
     def test_fetch_with_single_url_unchanged(self):
         """POST with single url still works (backward compatible)."""
         from src.servers import proxy_server as ps
@@ -706,6 +944,36 @@ class TestProxyFetchUrls:
             resp = client.post("/v1/proxy/fetch", json={"url": "https://example.com"})
         assert resp.status_code == 200
         assert resp.json().get("content") == "Hello"
+
+    def test_fetch_forwards_dynamic_render_parameters(self):
+        """POST /v1/proxy/fetch forwards JS-render parameters to _do_proxy_fetch."""
+        from src.servers import proxy_server as ps
+        client = _get_client()
+        with patch.object(ps, "_do_proxy_fetch", new=AsyncMock(return_value={"content": "Hello"})) as mock_fetch:
+            resp = client.post(
+                "/v1/proxy/fetch",
+                json={
+                    "url": "https://example.com",
+                    "crawl": False,
+                    "max_pages": 1,
+                    "max_depth": 0,
+                    "render_js": True,
+                    "render_engine": "playwright",
+                    "wait_for_selector": ".status-table",
+                    "js_wait_ms": 3500,
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        mock_fetch.assert_awaited_once_with(
+            "https://example.com",
+            crawl=False,
+            max_pages=1,
+            max_depth=0,
+            render_js=True,
+            render_engine="playwright",
+            wait_for_selector=".status-table",
+            js_wait_ms=3500,
+        )
 
     def test_fetch_no_url_no_urls_returns_400(self):
         """POST without url or urls returns 400."""
