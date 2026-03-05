@@ -664,6 +664,30 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("weatherInfo", {"location": "Sydney", "requestType": 123}, ctx)
         assert r.get("success") is True
         assert observed.get("detail") == "summary"
+
+    @pytest.mark.asyncio
+    async def test_health_check_calls_backend_and_returns_message(self):
+        """health_check alias should route to healthCheck and return backend summary."""
+        async def fake_health(_args=None):
+            return {
+                "success": True,
+                "message": "Browser-use status: healthy. Running tasks: 2. Uptime: 44.2s.",
+                "result": {"status": "healthy", "running_tasks": 2},
+            }
+
+        ctx = {"do_browser_health_check": fake_health}
+        r = await tg.execute_telegram_tool("health_check", {}, ctx)
+        assert r.get("success") is True
+        assert "running tasks" in r.get("message", "").lower()
+        assert isinstance(r.get("data"), dict)
+
+    @pytest.mark.asyncio
+    async def test_health_check_unavailable_without_callback(self):
+        """healthCheck should fail clearly when backend callback is not provided."""
+        r = await tg.execute_telegram_tool("healthCheck", {}, {})
+        assert r.get("success") is False
+        assert "not available" in r.get("message", "").lower()
+
     @pytest.mark.asyncio
     async def test_pdf_to_power_point_returns_web_only_message(self):
         """pdfToPowerPoint returns message directing user to web interface."""

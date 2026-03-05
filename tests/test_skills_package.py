@@ -64,6 +64,32 @@ def test_import_extracts_manifest_and_source_files() -> None:
         shutil.rmtree(temp_base, ignore_errors=True)
 
 
+def test_export_github_skill_includes_local_package_sources() -> None:
+    temp_base = _create_workspace_temp_dir()
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+    output = temp_base / "github-package.catbotskill"
+
+    try:
+        result = manager.export_skill_package(
+            "GitHubProjectManager",
+            output,
+            include_sources=True,
+            source_root=".",
+        )
+        assert result.package_path.exists()
+
+        with zipfile.ZipFile(result.package_path, "r") as archive:
+            names = set(archive.namelist())
+
+        assert "manifests/github_project_manager.skill.json" in names
+        assert "sources/src/skills/github/skill.py" in names
+        assert "sources/src/skills/github/service.py" in names
+        assert "sources/src/skills/github/git_service.py" in names
+        assert "sources/src/skills/github/version_manager.py" in names
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
 def test_import_with_load_skill_registers_skill() -> None:
     temp_base = _create_workspace_temp_dir()
     source_manager = SkillManager.from_manifest_directory("src/skills/manifests")

@@ -35,6 +35,8 @@ _TELEGRAM_TOOL_NAME_ALIASES = {
     "list_files": "listFiles",
     "save_to_file": "writeFile",
     "saveToFile": "writeFile",
+    "health_check": "healthCheck",
+    "run_health_check": "healthCheck",
 }
 
 
@@ -954,6 +956,29 @@ async def execute_telegram_tool(
         out = await do_research(arguments)
         msg = out.get("message") or out.get("output") or str(out)[:500]
         return {"success": True, "message": msg, "data": out}
+
+    # --- healthCheck ---
+    if name == "healthCheck":
+        do_health = context.get("do_browser_health_check")
+        if not do_health:
+            return {"success": False, "message": "Browser health check is not available."}
+        out = await do_health(arguments if isinstance(arguments, dict) else {})
+        success = bool(out.get("success", True)) if isinstance(out, dict) else True
+        message = ""
+        if isinstance(out, dict):
+            message = str(out.get("message") or "").strip()
+            if not message:
+                result_val = out.get("result")
+                if isinstance(result_val, (dict, list)):
+                    try:
+                        message = json.dumps(result_val, ensure_ascii=False, indent=2, default=str)
+                    except Exception:
+                        message = str(result_val)
+                elif result_val is not None:
+                    message = str(result_val)
+        if not message:
+            message = str(out)[:1000]
+        return {"success": success, "message": message, "data": out if isinstance(out, dict) else {"raw": out}}
 
     # --- pdfToPowerPoint ---
     if name == "pdfToPowerPoint":

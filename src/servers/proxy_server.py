@@ -1562,9 +1562,29 @@ def _parse_telegram_history_limit() -> int:
 def _parse_telegram_chat_timeout() -> float:
     """Parse TELEGRAM_CHAT_TIMEOUT with default 30 on invalid value."""
     try:
-        return max(1.0, float(os.getenv("TELEGRAM_CHAT_TIMEOUT", "30")))
+        raw_timeout = float(os.getenv("TELEGRAM_CHAT_TIMEOUT", "30"))
     except ValueError:
         return 30.0
+    hard_cap_raw = os.getenv("TELEGRAM_CHAT_TIMEOUT_HARD_CAP", "120")
+    try:
+        hard_cap = max(1.0, float(hard_cap_raw))
+    except ValueError:
+        hard_cap = 120.0
+    if raw_timeout > hard_cap:
+        print(
+            f"[WARN] TELEGRAM_CHAT_TIMEOUT={raw_timeout} exceeds hard cap {hard_cap}; using {hard_cap}.",
+            flush=True,
+        )
+    return max(1.0, min(raw_timeout, hard_cap))
+
+
+def _parse_telegram_tool_followup_timeout() -> float:
+    """Parse TELEGRAM_TOOL_FOLLOWUP_TIMEOUT with default 45 and cap to chat timeout."""
+    try:
+        raw = float(os.getenv("TELEGRAM_TOOL_FOLLOWUP_TIMEOUT", "45"))
+    except ValueError:
+        raw = 45.0
+    return max(1.0, min(raw, TELEGRAM_CHAT_TIMEOUT))
 
 
 TELEGRAM_DEFAULT_MODEL = os.getenv("TELEGRAM_MODEL") or os.getenv("OPENAI_MODEL") or os.getenv("MCP_LLM_MODEL_NAME", "gpt-4o-mini")
@@ -1613,6 +1633,7 @@ def _get_telegram_system_prompt_with_tools(conversation_id: str, todo_user_key: 
 
 TELEGRAM_HISTORY_LIMIT = _parse_telegram_history_limit()
 TELEGRAM_CHAT_TIMEOUT = _parse_telegram_chat_timeout()
+TELEGRAM_TOOL_FOLLOWUP_TIMEOUT = _parse_telegram_tool_followup_timeout()
 TELEGRAM_OPENAI_BASE_URL = (
     os.getenv("TELEGRAM_OPENAI_BASE_URL")
     or os.getenv("OPENAI_API_BASE")
@@ -2229,6 +2250,7 @@ async def require_auth_for_v1_routes(request: Request, call_next):
         "/v1/proxy/autogen",  # AutoGen workflow proxy - public to avoid mixed content
         "/v1/proxy/browser-agent",  # Browser automation proxy - public to avoid mixed content
         "/v1/proxy/deep-research",  # Deep research proxy - public to avoid mixed content
+        "/v1/proxy/browser-health",  # Browser-use health/status proxy - public to avoid mixed content
         "/v1/proxy/tts/voices",  # TTS voices endpoint - public
         "/v1/proxy/tts/speech",  # TTS speech endpoint - public
         "/v1/proxy/search",  # Search proxy - public
@@ -5786,6 +5808,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 ),
                 "do_browser_agent": _do_browser_agent,
                 "do_deep_research": _do_deep_research,
+                "do_browser_health_check": _do_browser_health_check,
                 "read_file_internal": _read_file_internal,
                 "write_file_internal": _write_file_internal,
                 "list_files_internal": _list_files_internal,
@@ -5897,9 +5920,20 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 phase="llm_followup",
             )
             try:
-                response_tool = await _call_chat_completion(url, headers, payload_tool, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                response_tool = await _call_chat_completion(
+                    url,
+                    headers,
+                    payload_tool,
+                    timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                )
             except httpx.RequestError as exc:
                 print(f"Telegram tool-loop request error: {exc}")
+                reply = (
+                    _telegram_tool_error_reply
+                    if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message))
+                    else f"Here's what I found:\n\n{result_message}"
+                )
+                pending_native_tool_calls = []
                 break
             if response_tool.status_code != 200:
                 print(f"Telegram tool follow-up returned status {response_tool.status_code}, using tool result as reply")
@@ -5915,11 +5949,21 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                             large_endpoint=LARGE_PAYLOAD_ENDPOINT,
                         )
                         summarized_tool = True
-                        response_tool = await _call_chat_completion(url, headers, payload_tool, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                        response_tool = await _call_chat_completion(
+                            url,
+                            headers,
+                            payload_tool,
+                            timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                        )
                     if response_tool.status_code != 200 and LARGE_PAYLOAD_MODEL:
                         payload_tool["model"] = LARGE_PAYLOAD_MODEL
                         large_url = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or url)
-                        response_tool = await _call_chat_completion(large_url, headers, payload_tool, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                        response_tool = await _call_chat_completion(
+                            large_url,
+                            headers,
+                            payload_tool,
+                            timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                        )
                 if response_tool.status_code != 200:
                     reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
                     break
@@ -6656,6 +6700,17 @@ async def get_all_available_tools() -> List[Dict]:
             "server_id": "proxy_server"
         })
         print("[PHILOSOPHER] Added run_deep_research (deep research agent)")
+        all_tools.append({
+            "name": "health_check",
+            "description": "Get browser-use server health and running background task status. Use when the user asks for update/progress/state of browser automation or deep research (e.g., still running vs completed).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+            "server_id": "proxy_server"
+        })
+        print("[PHILOSOPHER] Added health_check (browser-use status)")
     else:
         print("[PHILOSOPHER] MCP_BROWSER_USE_HTTP_URL not set, skipping run_browser_agent")
     
@@ -7016,6 +7071,19 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             return f"Error executing run_deep_research: {e.detail}"
         except Exception as e:
             return f"Error executing run_deep_research: {str(e)}"
+
+    # Handle health_check (calls browser-use MCP tool health_check for running-task visibility)
+    elif tool_name in {"health_check", "run_health_check"}:
+        try:
+            result = await _do_browser_health_check(parameters)
+            payload = result.get("result")
+            if isinstance(payload, (dict, list)):
+                return json.dumps(payload, ensure_ascii=False, default=str, indent=2)
+            return str(result.get("message") or payload or result)
+        except HTTPException as e:
+            return f"Error executing health_check: {e.detail}"
+        except Exception as e:
+            return f"Error executing health_check: {str(e)}"
 
     # Handle skill framework tools (qualified names like skill.tool or unique aliases)
     elif (qualified_skill_tool := _resolve_skill_tool_qualified_name(tool_name)):
@@ -7552,6 +7620,48 @@ async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
     return response.json()
 
 
+async def _do_browser_health_check(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Call browser-use MCP health_check and normalize to JSON for CATBot tool consumers."""
+    if not MCP_BROWSER_USE_HTTP_URL:
+        raise HTTPException(status_code=503, detail="Browser-use is not configured (MCP_BROWSER_USE_HTTP_URL not set).")
+    # Upstream health_check tool currently accepts no arguments.
+    # Ignore caller-provided payload to avoid schema mismatch errors.
+    payload: Dict[str, Any] = {}
+    try:
+        result = await _browser_use_http_call_tool("health_check", payload)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"{BROWSER_USE_HTTP_UNAVAILABLE_MSG} {str(e)}")
+
+    content = result.get("content", [])
+    text_parts: List[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text is not None:
+                    text_parts.append(str(text))
+            elif item is not None:
+                text_parts.append(str(item))
+    text_blob = "\n".join(part for part in text_parts if part).strip()
+
+    parsed: Optional[Any] = None
+    if text_blob:
+        try:
+            parsed = json.loads(text_blob)
+        except Exception:
+            parsed = None
+
+    if isinstance(parsed, dict):
+        status = str(parsed.get("status") or "unknown")
+        running = parsed.get("running_tasks")
+        uptime = parsed.get("uptime_seconds")
+        message = f"Browser-use status: {status}. Running tasks: {running}. Uptime: {uptime}s."
+        return {"success": True, "message": message, "result": parsed}
+
+    fallback = text_blob or "Health check completed but returned no content."
+    return {"success": True, "message": fallback, "result": {"raw": fallback}}
+
+
 @app.post("/v1/proxy/deep-research")
 async def proxy_deep_research(request: Request):
     """Proxy deep research requests to the MCP browser server."""
@@ -7566,6 +7676,25 @@ async def proxy_deep_research(request: Request):
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy deep-research request: {str(e)}")
+
+
+@app.post("/v1/proxy/browser-health")
+async def proxy_browser_health(request: Request):
+    """Proxy browser-use health/status requests to MCP health_check tool."""
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = await _do_browser_health_check(body if isinstance(body, dict) else {})
+        return JSONResponse(content=result, status_code=200)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Browser-health proxy error: {e}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to proxy browser health request: {str(e)}")
 
 # Chat completions proxy endpoint to handle CORS and mixed content
 @app.post("/v1/proxy/chat/completions")

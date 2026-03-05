@@ -15,6 +15,7 @@ Environment variables:
     TELEGRAM_MAX_VOICE_SECONDS: Max accepted voice duration in seconds (default: 300)
     TELEGRAM_SEND_TRANSCRIPT: Set to "false" to suppress transcript echo message
     TELEGRAM_CHAT_TIMEOUT: Backend request timeout in seconds (default: 30)
+    TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP: Max allowed backend timeout in seconds (default: 180)
     TELEGRAM_BACKEND_VERIFY_SSL: Set to "false" to skip SSL verification
     TELEGRAM_BOT_SYSTEM_PROMPT: Optional system prompt override passed to backend chat
     TELEGRAM_CHAT_MODEL: Optional model override passed to backend chat
@@ -97,10 +98,16 @@ def _parse_admin_ids() -> set[int]:
 
 def _parse_chat_timeout() -> float:
     try:
-        return max(1.0, float(os.getenv("TELEGRAM_CHAT_TIMEOUT", "30")))
+        raw_timeout = float(os.getenv("TELEGRAM_CHAT_TIMEOUT", "30"))
     except ValueError:
         logger.warning("Invalid TELEGRAM_CHAT_TIMEOUT; using 30")
         return 30.0
+    hard_cap_raw = os.getenv("TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP", "180")
+    try:
+        hard_cap = max(1.0, float(hard_cap_raw))
+    except ValueError:
+        hard_cap = 180.0
+    return max(1.0, min(raw_timeout, hard_cap))
 
 
 def _parse_max_voice_seconds() -> int:
@@ -171,6 +178,7 @@ async def _poll_status_updates(
     request_id: str,
 ) -> None:
     last_seq = 0
+    last_state_sent = ""
     url = _build_backend_url("/v1/status/latest")
     headers = _backend_headers()
     while True:
@@ -193,12 +201,28 @@ async def _poll_status_updates(
                 event = payload.get("event") or {}
                 seq = int(event.get("seq") or 0)
                 state_text = (event.get("state") or "").strip()
+                event_type = str(event.get("type") or "").strip().lower()
                 if seq <= last_seq or not state_text:
                     continue
+                # Heartbeats repeat the same state every minute. Suppress duplicates
+                # so users only receive meaningful progress transitions.
+                if event_type == "heartbeat" and state_text == last_state_sent:
+                    last_seq = seq
+                    continue
                 last_seq = seq
+                last_state_sent = state_text
                 await bot.send_message(chat_id=chat_id, text=state_text)
             except Exception:
                 logger.debug("Status polling failed for chat_id=%s", chat_id, exc_info=True)
+
+
+async def _stop_status_updates(stop_event: asyncio.Event, status_task: asyncio.Task) -> None:
+    """Stop and await the status poller without leaking CancelledError."""
+    stop_event.set()
+    if not status_task.done():
+        status_task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await status_task
 
 
 async def call_backend_chat(user_id: int, message: str, request_id: Optional[str] = None) -> str:
@@ -488,20 +512,14 @@ async def _reply_with_backend_answer(
         reply = await call_backend_chat(user_id, prompt_text, request_id=request_id)
     except RuntimeError as exc:
         logger.error("Backend chat failed: %s", exc)
-        await update.message.reply_text("CATBot could not process that request right now. Please try again.")
         stop_event.set()
-        if not status_task.done():
-            status_task.cancel()
-        with suppress(Exception):
-            await status_task
+        await update.message.reply_text("CATBot could not process that request right now. Please try again.")
+        await _stop_status_updates(stop_event, status_task)
         return
 
     stop_event.set()
-    if not status_task.done():
-        status_task.cancel()
     await update.message.reply_text(reply)
-    with suppress(Exception):
-        await status_task
+    await _stop_status_updates(stop_event, status_task)
 
     if VOICE_OUT_ENABLED:
         try:

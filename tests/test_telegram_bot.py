@@ -39,6 +39,21 @@ class TestParseAdminIds:
         assert result == set()
 
 
+class TestParseChatTimeout:
+    """Tests for TELEGRAM_CHAT_TIMEOUT parsing with hard cap."""
+
+    def test_parse_chat_timeout_applies_hard_cap(self):
+        with patch("src.integrations.telegram_bot.os.getenv") as m_getenv:
+            def _getenv(key, default=""):
+                if key == "TELEGRAM_CHAT_TIMEOUT":
+                    return "1800"
+                if key == "TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP":
+                    return "120"
+                return default
+            m_getenv.side_effect = _getenv
+            assert telegram_bot._parse_chat_timeout() == 120.0
+
+
 class TestIsAuthorized:
     """Tests for is_authorized when ALLOW_ALL_USERS and ADMIN_IDS are patched."""
 
@@ -259,3 +274,77 @@ class TestStatusPoller:
                 await task
 
         bot.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_status_poller_skips_duplicate_heartbeats(self):
+        """Status poller suppresses repeated heartbeat states to avoid spam."""
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        stop_event = asyncio.Event()
+
+        response_1 = MagicMock()
+        response_1.status_code = 200
+        response_1.json.return_value = {
+            "found": True,
+            "event": {"seq": 1, "state": "Working: contacting model", "type": "update"},
+        }
+        response_2 = MagicMock()
+        response_2.status_code = 200
+        response_2.json.return_value = {
+            "found": True,
+            "event": {"seq": 2, "state": "Working: contacting model", "type": "heartbeat"},
+        }
+
+        with patch.object(telegram_bot, "STATUS_UPDATE_INTERVAL", 0.01):
+            with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
+                mock_client = AsyncMock()
+                mock_client.get = AsyncMock(side_effect=[response_1, response_2, response_2, response_2])
+                mock_client_cls.return_value = mock_client
+
+                task = asyncio.create_task(
+                    telegram_bot._poll_status_updates(
+                        bot,
+                        chat_id=123,
+                        stop_event=stop_event,
+                        conversation_id="123",
+                        request_id="req-1",
+                    )
+                )
+                await asyncio.sleep(0.05)
+                stop_event.set()
+                await task
+
+        sent_texts = [kwargs.get("text") for _, kwargs in bot.send_message.await_args_list]
+        assert "Working: contacting model" in sent_texts
+        assert sent_texts.count("Working: contacting model") == 1
+
+
+class TestReplyWithBackendAnswer:
+    """Regression tests for status-task cleanup in reply flow."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_calls_do_not_propagate_cancelled_error(self):
+        """Cancelling status poller should not break subsequent Telegram replies."""
+        message = MagicMock()
+        message.chat = MagicMock()
+        message.chat.send_action = AsyncMock()
+        message.reply_text = AsyncMock()
+
+        update = MagicMock()
+        update.message = message
+        update.effective_chat = MagicMock(id=123)
+
+        context = MagicMock()
+        context.bot = MagicMock()
+
+        async def hanging_status_poller(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        with patch.object(telegram_bot, "_poll_status_updates", new=hanging_status_poller):
+            with patch.object(telegram_bot, "call_backend_chat", new=AsyncMock(return_value="hello")) as mock_chat:
+                with patch.object(telegram_bot, "VOICE_OUT_ENABLED", False):
+                    await telegram_bot._reply_with_backend_answer(update, context, 123, "first")
+                    await telegram_bot._reply_with_backend_answer(update, context, 123, "second")
+
+        assert mock_chat.await_count == 2
+        assert message.reply_text.await_count == 2

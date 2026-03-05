@@ -1,0 +1,2 @@
+# Dependencies required by src.skills.github
+httpx>=0.25.0

@@ -6021,6 +6021,18 @@ function saveWAVFile(wavBlob) {
                         required: ["researchTask"]
                     }
                 }
+            },
+            {
+                type: "function",
+                function: {
+                    name: "health_check",
+                    description: "Checks browser-use server health and running background tasks. Use for status/progress/update questions about browser automation or deep research (e.g. still running, completed, current state).",
+                    parameters: {
+                        type: "object",
+                        properties: {},
+                        required: []
+                    }
+                }
             }
         ];
 
@@ -6499,6 +6511,9 @@ function saveWAVFile(wavBlob) {
                         break;
                     case "runDeepResearch":
                         result = await handleDeepResearch(args);
+                        break;
+                    case "health_check":
+                        result = await handleBrowserHealthCheck(args);
                         break;
                     case "readFile":
                         result = await handleReadFile(args);
@@ -13337,6 +13352,44 @@ ${fullText.substring(0, 6000)}...${minimalImageInfo}`;
                 return {
                     success: false,
                     message: `Deep research failed: ${error.message}\n\nPlease ensure:\n1. The browser-use HTTP server is running (in mcp-browser-use: uv run mcp-server-browser-use server)\n2. The MCP Browser HTTP bridge is running (python start_mcp_browser_server.py) if using the Flask API\n3. MCP_RESEARCH_TOOL_SAVE_DIR is configured in environment\n4. The browser-use MCP server is accessible (MCP_BROWSER_USE_HTTP_URL)\n5. You have sufficient system resources for parallel browsers`
+                };
+            }
+        }
+
+        async function handleBrowserHealthCheck(_) {
+            try {
+                const response = await fetch(`${PROXY_BASE_URL}/v1/proxy/browser-health`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({})
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({ error: response.statusText }));
+                    throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.message || 'Unknown error occurred');
+                }
+
+                const resultPayload = data.result !== undefined ? data.result : data;
+                const pretty = (typeof resultPayload === 'string')
+                    ? resultPayload
+                    : JSON.stringify(resultPayload, null, 2);
+                const summary = data.message ? `${data.message}\n\n` : '';
+                return {
+                    success: true,
+                    message: `Browser Health Check:\n\n${summary}${pretty}`
+                };
+            } catch (error) {
+                console.error('Browser health check error:', error);
+                return {
+                    success: false,
+                    message: `Browser health check failed: ${error.message}`
                 };
             }
         }

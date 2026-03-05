@@ -22,12 +22,14 @@ Core capabilities:
 - `src/skills/manager.py`: High-level API combining loader/registry/executor/packager.
 - `src/skills/package.py`: `.catbotskill` archive export/import.
 - `src/skills/skill_server.py`: FastAPI router/app for skill management.
-- `src/skills/builtin/`: Built-in skills (`core`, `filesystem`, `image_generation`, `testkit`).
+- `src/skills/builtin/`: Built-in compatibility entrypoints/shims.
+- `src/skills/github/`: Encapsulated GitHub skill package and integration services.
 - `src/skills/manifests/`: Built-in manifests.
 
 ## Built-in Skills
 - `core`: `ping`, `echo`
 - `filesystem`: `list_files`, `read_text`, `write_text` (root-sandboxed)
+- `GitHubProjectManager`: `initialize_repository`, `status`, `fetch`, `pull`, `push`, `sync`, `create_branch`, `checkout_branch`, `bump_version`, `commit_versioned_change`, `create_pull_request`, `list_pull_requests`, `repository_info`, `publish_release`
 - `image_generation`: `generate_image` (OpenRouter Seedream 4.5 image generation)
 - `testkit`: `analyze_text`, `render_template`, `context_snapshot` (reference/demo skill)
 
@@ -48,7 +50,8 @@ Skills endpoints are mounted on `src.servers.proxy_server` and follow the existi
 A `.catbotskill` file is a ZIP archive with:
 - `package.json`: Package metadata (`format`, skill name, module target, timestamp)
 - `manifests/<name>.skill.json`: Skill manifest
-- `sources/<python-module-path>.py`: Optional source files
+- `sources/<python-module-path>.py`: Optional source files (one or many)
+- Manifest `package_sources` (optional): package/module roots to include in exports
 
 Safety behavior:
 - Archive members are validated to block path traversal (`..`, absolute paths)

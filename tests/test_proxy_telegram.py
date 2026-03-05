@@ -883,6 +883,7 @@ class TestPhilosopherFileTools:
                 tools = await ps.get_all_available_tools()
         names = [t.get("name") for t in tools]
         assert "run_deep_research" in names
+        assert "health_check" in names
 
     @pytest.mark.asyncio
     async def test_execute_run_deep_research_requires_research_task(self):
@@ -891,6 +892,25 @@ class TestPhilosopherFileTools:
         result = await ps.execute_tool_for_philosopher("run_deep_research", {})
         assert isinstance(result, str)
         assert "research_task" in result or "researchTask" in result or "required" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_health_check_returns_json_payload(self):
+        """execute_tool_for_philosopher health_check should return parsed JSON text when backend succeeds."""
+        from src.servers import proxy_server as ps
+        fake = {
+            "success": True,
+            "message": "Browser-use status: healthy. Running tasks: 1. Uptime: 10.0s.",
+            "result": {
+                "status": "healthy",
+                "running_tasks": 1,
+                "tasks": [{"task_id": "abcd1234", "tool": "run_deep_research"}],
+            },
+        }
+        with patch.object(ps, "_do_browser_health_check", new=AsyncMock(return_value=fake)):
+            result = await ps.execute_tool_for_philosopher("health_check", {})
+        assert isinstance(result, str)
+        assert '"status": "healthy"' in result
+        assert '"running_tasks": 1' in result
 
 
 class TestProxyFetchUrls:
@@ -980,3 +1000,23 @@ class TestProxyFetchUrls:
         client = _get_client()
         resp = client.post("/v1/proxy/fetch", json={})
         assert resp.status_code == 400
+
+
+class TestBrowserHealthProxy:
+    """Tests for POST /v1/proxy/browser-health."""
+
+    def test_browser_health_proxy_returns_backend_payload(self):
+        """Proxy should return the normalized browser health payload from backend helper."""
+        from src.servers import proxy_server as ps
+        client = _get_client()
+        fake = {
+            "success": True,
+            "message": "Browser-use status: healthy. Running tasks: 0. Uptime: 5.0s.",
+            "result": {"status": "healthy", "running_tasks": 0, "tasks": []},
+        }
+        with patch.object(ps, "_do_browser_health_check", new=AsyncMock(return_value=fake)):
+            resp = client.post("/v1/proxy/browser-health", json={})
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("success") is True
+        assert data.get("result", {}).get("status") == "healthy"

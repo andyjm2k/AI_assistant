@@ -53,6 +53,8 @@ def test_manifest_loading_discovers_builtin_skills() -> None:
     names = [spec.name for spec in manager.list_skills()]
     assert "core" in names
     assert "filesystem" in names
+    assert "GitHubProjectManager" in names
+    assert "google_slides" in names
     assert "image_generation" in names
     assert "testkit" in names
 
@@ -60,6 +62,13 @@ def test_manifest_loading_discovers_builtin_skills() -> None:
     assert "core.ping" in tool_names
     assert "core.echo" in tool_names
     assert "filesystem.list_files" in tool_names
+    assert "GitHubProjectManager.status" in tool_names
+    assert "GitHubProjectManager.fetch" in tool_names
+    assert "GitHubProjectManager.sync" in tool_names
+    assert "GitHubProjectManager.list_pull_requests" in tool_names
+    assert "google_slides.create_outline" in tool_names
+    assert "google_slides.create_outline_from_markdown" in tool_names
+    assert "google_slides.build_batch_update_requests" in tool_names
     assert "image_generation.generate_image" in tool_names
     assert "testkit.context_snapshot" in tool_names
 
@@ -278,6 +287,345 @@ async def test_image_generation_requires_openai_api_key(monkeypatch: pytest.Monk
 
     assert result.success is False
     assert result.error_code == "framework_error"
+
+
+@pytest.mark.asyncio
+async def test_google_slides_create_outline_returns_requested_slide_count() -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    result = await manager.execute_tool(
+        "google_slides.create_outline",
+        {
+            "topic": "Q3 Product Roadmap",
+            "audience": "Executive team",
+            "slide_count": 8,
+            "objective": "Approve milestone and staffing plan",
+        },
+    )
+
+    assert result.success is True
+    assert result.data["slide_count"] == 8
+    assert len(result.data["slides"]) == 8
+    assert result.data["slides"][0]["title"] == "Q3 Product Roadmap"
+
+
+@pytest.mark.asyncio
+async def test_google_slides_build_batch_update_requests_generates_payload() -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    result = await manager.execute_tool(
+        "google_slides.build_batch_update_requests",
+        {
+            "presentation_id": "test-presentation-id",
+            "slides": [
+                {"title": "Overview", "bullets": ["Goal", "Scope"]},
+                {"title": "Plan", "bullets": ["Milestone 1", "Milestone 2"]},
+            ],
+        },
+    )
+
+    assert result.success is True
+    assert result.data["presentation_id"] == "test-presentation-id"
+    assert result.data["slide_count"] == 2
+    assert result.data["request_count"] == 6
+    assert result.data["requests"][0]["createSlide"]["objectId"] == "slide_1"
+    assert result.data["requests"][1]["insertText"]["objectId"] == "title_1"
+
+
+@pytest.mark.asyncio
+async def test_google_slides_create_outline_from_markdown_attaches_matching_scratch_images() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        images_dir = temp_base / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        (images_dir / "overview-metrics.png").write_bytes(b"overview")
+        (images_dir / "execution-timeline.png").write_bytes(b"timeline")
+
+        manager = SkillManager.from_manifest_directory("src/skills/manifests")
+        markdown = (
+            "# Q3 Product Roadmap\n\n"
+            "## Overview Metrics\n"
+            "- Revenue trend\n\n"
+            "## Execution Timeline\n"
+            "- Key milestones\n"
+        )
+        result = await manager.execute_tool(
+            "google_slides.create_outline_from_markdown",
+            {
+                "markdown": markdown,
+                "attach_scratch_images": True,
+                "image_dir": "images",
+                "image_match_mode": "title",
+            },
+            context=SkillContext(scratch_dir=temp_base),
+        )
+
+        assert result.success is True
+        assert result.data["slide_count"] == 3
+        slides = result.data["slides"]
+        overview = next(item for item in slides if item["title"] == "Overview Metrics")
+        timeline = next(item for item in slides if item["title"] == "Execution Timeline")
+        assert overview["images"][0]["path"] == "images/overview-metrics.png"
+        assert timeline["images"][0]["path"] == "images/execution-timeline.png"
+        assert result.data["auto_attached_images"] == 2
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_google_slides_build_batch_update_requests_includes_image_requests_from_scratch_paths() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        images_dir = temp_base / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        (images_dir / "overview.png").write_bytes(b"overview")
+
+        manager = SkillManager.from_manifest_directory("src/skills/manifests")
+        result = await manager.execute_tool(
+            "google_slides.build_batch_update_requests",
+            {
+                "presentation_id": "test-presentation-id",
+                "image_url_prefix": "https://cdn.example.com/decks",
+                "slides": [
+                    {
+                        "title": "Overview",
+                        "bullets": ["Goal"],
+                        "images": [{"path": "images/overview.png", "alt": "Overview chart"}],
+                    }
+                ],
+            },
+            context=SkillContext(scratch_dir=temp_base),
+        )
+
+        assert result.success is True
+        assert result.data["slide_count"] == 1
+        assert result.data["image_request_count"] == 1
+        assert result.data["request_count"] == 4
+        image_request = next(
+            req["createImage"] for req in result.data["requests"] if "createImage" in req
+        )
+        assert image_request["objectId"] == "image_1_1"
+        assert image_request["url"] == "https://cdn.example.com/decks/images/overview.png"
+        assert result.data["skipped_images"] == []
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_github_project_manager_status_and_bump_with_mock_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.github import skill as gpm_skill
+
+    class FakeGitHubIntegrationService:
+        def __init__(self, workspace: Path) -> None:
+            self.workspace = Path(workspace).resolve()
+
+        @classmethod
+        def from_env(
+            cls, workspace: str | Path | None = None
+        ) -> "FakeGitHubIntegrationService":
+            return cls(Path(workspace or "."))
+
+        def status(self) -> dict[str, Any]:
+            return {
+                "version": "1.2.3",
+                "branch": "main",
+                "ahead_by": 0,
+                "behind_by": 0,
+                "staged": [],
+                "changed": [],
+                "untracked": [],
+            }
+
+        def bump_version(self, bump: str) -> dict[str, Any]:
+            return {
+                "previous": "1.2.3",
+                "current": "1.2.4" if bump == "patch" else "1.3.0",
+                "bump": bump,
+                "workspace": str(self.workspace),
+            }
+
+    monkeypatch.setattr(
+        gpm_skill,
+        "_load_integration_service_class",
+        lambda: FakeGitHubIntegrationService,
+    )
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    status_result = await manager.execute_tool("GitHubProjectManager.status", {"workspace": "."})
+    assert status_result.success is True
+    assert status_result.data["status"]["branch"] == "main"
+    assert status_result.data["status"]["version"] == "1.2.3"
+
+    bump_result = await manager.execute_tool(
+        "GitHubProjectManager.bump_version",
+        {"workspace": ".", "bump": "patch"},
+    )
+    assert bump_result.success is True
+    assert bump_result.data["version"]["previous"] == "1.2.3"
+    assert bump_result.data["version"]["current"] == "1.2.4"
+
+
+@pytest.mark.asyncio
+async def test_github_project_manager_extended_tools_with_mock_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.github import skill as gpm_skill
+
+    class FakeGitHubIntegrationService:
+        def __init__(self, workspace: Path) -> None:
+            self.workspace = Path(workspace).resolve()
+
+        @classmethod
+        def from_env(
+            cls, workspace: str | Path | None = None
+        ) -> "FakeGitHubIntegrationService":
+            return cls(Path(workspace or "."))
+
+        def fetch(self, remote_name: str | None = None) -> dict[str, Any]:
+            return {"remote": remote_name or "origin", "branch": "main", "ahead_by": 0, "behind_by": 0}
+
+        def pull(
+            self,
+            *,
+            remote_name: str | None = None,
+            branch: str | None = None,
+            rebase: bool = False,
+        ) -> dict[str, Any]:
+            return {
+                "remote": remote_name or "origin",
+                "branch": branch or "main",
+                "ahead_by": 0,
+                "behind_by": 0,
+                "rebase": rebase,
+            }
+
+        def push(
+            self,
+            *,
+            remote_name: str | None = None,
+            branch: str | None = None,
+            set_upstream: bool = False,
+            tags: bool = False,
+        ) -> dict[str, Any]:
+            return {
+                "remote": remote_name or "origin",
+                "branch": branch or "main",
+                "set_upstream": set_upstream,
+                "tags": tags,
+            }
+
+        def sync(
+            self,
+            *,
+            remote_name: str | None = None,
+            branch: str | None = None,
+            rebase: bool = False,
+            set_upstream: bool = False,
+            tags: bool = False,
+        ) -> dict[str, Any]:
+            return {
+                "pull": {"remote": remote_name or "origin", "branch": branch or "main", "rebase": rebase},
+                "push": {"remote": remote_name or "origin", "branch": branch or "main", "set_upstream": set_upstream, "tags": tags},
+            }
+
+        def create_branch(
+            self,
+            branch: str,
+            *,
+            from_ref: str | None = None,
+            push: bool = False,
+            set_upstream: bool = True,
+            remote_name: str | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "branch": branch,
+                "created_from": from_ref,
+                "push": {
+                    "remote": remote_name or "origin",
+                    "set_upstream": set_upstream,
+                }
+                if push
+                else None,
+            }
+
+        def checkout_branch(self, branch: str) -> dict[str, Any]:
+            return {"branch": branch, "ahead_by": 0, "behind_by": 0}
+
+        def list_pull_requests(
+            self,
+            *,
+            state: str = "open",
+            sort: str = "created",
+            direction: str = "desc",
+            per_page: int = 30,
+            page: int = 1,
+        ) -> list[dict[str, Any]]:
+            return [
+                {
+                    "number": 10,
+                    "title": "Example",
+                    "state": state,
+                    "sort": sort,
+                    "direction": direction,
+                    "per_page": per_page,
+                    "page": page,
+                }
+            ]
+
+        def repository_info(self, *, include_rate_limit: bool = False) -> dict[str, Any]:
+            payload: dict[str, Any] = {"full_name": "owner/CATBot", "has_rate_limit": include_rate_limit}
+            if include_rate_limit:
+                payload["rate_limit"] = {"remaining": 100}
+            return payload
+
+    monkeypatch.setattr(
+        gpm_skill,
+        "_load_integration_service_class",
+        lambda: FakeGitHubIntegrationService,
+    )
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    fetch_result = await manager.execute_tool("GitHubProjectManager.fetch", {"workspace": "."})
+    pull_result = await manager.execute_tool("GitHubProjectManager.pull", {"workspace": ".", "rebase": True})
+    push_result = await manager.execute_tool(
+        "GitHubProjectManager.push",
+        {"workspace": ".", "branch": "feature/test", "set_upstream": True, "tags": True},
+    )
+    sync_result = await manager.execute_tool("GitHubProjectManager.sync", {"workspace": ".", "branch": "main"})
+    branch_result = await manager.execute_tool(
+        "GitHubProjectManager.create_branch",
+        {"workspace": ".", "branch": "feature/new", "from_ref": "main", "push": True},
+    )
+    checkout_result = await manager.execute_tool(
+        "GitHubProjectManager.checkout_branch",
+        {"workspace": ".", "branch": "main"},
+    )
+    list_pr_result = await manager.execute_tool(
+        "GitHubProjectManager.list_pull_requests",
+        {"workspace": ".", "state": "open", "per_page": 10, "page": 2},
+    )
+    repo_result = await manager.execute_tool(
+        "GitHubProjectManager.repository_info",
+        {"workspace": ".", "include_rate_limit": True},
+    )
+
+    assert fetch_result.success is True
+    assert pull_result.success is True
+    assert pull_result.data["pull"]["rebase"] is True
+    assert push_result.success is True
+    assert push_result.data["push"]["set_upstream"] is True
+    assert sync_result.success is True
+    assert sync_result.data["sync"]["pull"]["branch"] == "main"
+    assert branch_result.success is True
+    assert branch_result.data["branch"]["branch"] == "feature/new"
+    assert checkout_result.success is True
+    assert checkout_result.data["checkout"]["branch"] == "main"
+    assert list_pr_result.success is True
+    assert list_pr_result.data["pull_requests"][0]["page"] == 2
+    assert repo_result.success is True
+    assert repo_result.data["repository"]["rate_limit"]["remaining"] == 100
 
 
 def _create_temp_filesystem_manifest_dir(base: Path, root: Path) -> Path:

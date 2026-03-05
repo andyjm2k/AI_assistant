@@ -1,0 +1,9 @@
+{
+  "name": "GitHubProjectManager",
+  "description": "GitHub project management tools for repository initialization, status, versioning, pull requests, and releases.",
+  "enabled": true,
+  "module": "src.skills.github.skill:create_skill",
+  "package_sources": [
+    "src.skills.github"
+  ]
+}

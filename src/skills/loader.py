@@ -21,6 +21,7 @@ class SkillManifest:
     description: str = ""
     enabled: bool = True
     settings: Dict[str, Any] = field(default_factory=dict)
+    package_sources: List[str] = field(default_factory=list)
     path: Optional[Path] = None
 
 
@@ -68,6 +69,21 @@ class SkillManifestLoader:
             raise SkillValidationError(
                 f"Manifest '{manifest_path}' field 'settings' must be an object."
             )
+        package_sources_raw = data.get("package_sources", [])
+        if package_sources_raw is None:
+            package_sources_raw = []
+        if not isinstance(package_sources_raw, list):
+            raise SkillValidationError(
+                f"Manifest '{manifest_path}' field 'package_sources' must be an array when provided."
+            )
+        package_sources: List[str] = []
+        for raw in package_sources_raw:
+            value = str(raw).strip()
+            if not value:
+                raise SkillValidationError(
+                    f"Manifest '{manifest_path}' contains an empty package_sources entry."
+                )
+            package_sources.append(value)
 
         return SkillManifest(
             name=name,
@@ -75,6 +91,7 @@ class SkillManifestLoader:
             description=str(data.get("description", "")).strip(),
             enabled=bool(data.get("enabled", True)),
             settings=settings,
+            package_sources=package_sources,
             path=manifest_path,
         )
 

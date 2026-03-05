@@ -29,6 +29,38 @@ def _module_to_source_path(module_target: str) -> Path:
     return Path(*module_name.split(".")).with_suffix(".py")
 
 
+def _module_name_to_path(module_name: str) -> Path:
+    return Path(*module_name.split("."))
+
+
+def _resolve_package_source_members(source_root: Path, package_source: str) -> List[Path]:
+    package_source = package_source.strip()
+    if not package_source:
+        raise SkillPackageError("Package source entry cannot be empty.")
+
+    base_path = _module_name_to_path(package_source)
+    file_candidate = (source_root / base_path).with_suffix(".py")
+    if file_candidate.exists() and file_candidate.is_file():
+        return [file_candidate.relative_to(source_root)]
+
+    dir_candidate = source_root / base_path
+    if dir_candidate.exists() and dir_candidate.is_dir():
+        members = sorted(
+            path.relative_to(source_root)
+            for path in dir_candidate.rglob("*.py")
+            if path.is_file()
+        )
+        if members:
+            return members
+        raise SkillPackageError(
+            f"Package source directory contains no Python files: {dir_candidate}"
+        )
+
+    raise SkillPackageError(
+        f"Package source '{package_source}' did not resolve to a Python module or package under {source_root}."
+    )
+
+
 @dataclass(frozen=True)
 class SkillPackageExportResult:
     package_path: Path
@@ -77,14 +109,30 @@ class SkillPackageManager:
         members: List[str] = []
         manifest_member = f"manifests/{manifest_file.name}"
         module_source_rel = _module_to_source_path(manifest.module)
-        source_member = f"sources/{module_source_rel.as_posix()}"
-        source_file = (source_root_path / module_source_rel).resolve()
+        source_rel_paths: List[Path] = [module_source_rel]
+        for package_source in manifest.package_sources:
+            source_rel_paths.extend(
+                _resolve_package_source_members(source_root_path, package_source)
+            )
+
+        unique_source_rel_paths: List[Path] = []
+        seen: set[str] = set()
+        for rel_path in source_rel_paths:
+            key = rel_path.as_posix()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_source_rel_paths.append(rel_path)
+
+        source_members = [f"sources/{path.as_posix()}" for path in unique_source_rel_paths]
+        source_files = [(source_root_path / path).resolve() for path in unique_source_rel_paths]
 
         if include_sources:
-            if not source_file.exists() or not source_file.is_file():
-                raise SkillPackageError(
-                    f"Source file for module '{manifest.module}' not found: {source_file}"
-                )
+            for source_file in source_files:
+                if not source_file.exists() or not source_file.is_file():
+                    raise SkillPackageError(
+                        f"Source file for module '{manifest.module}' not found: {source_file}"
+                    )
 
         metadata: Dict[str, Any] = {
             "format": "catbotskill.v1",
@@ -94,7 +142,7 @@ class SkillPackageManager:
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "manifest_member": manifest_member,
             "includes_sources": include_sources,
-            "source_members": [source_member] if include_sources else [],
+            "source_members": source_members if include_sources else [],
         }
 
         with zipfile.ZipFile(package_file, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -108,8 +156,9 @@ class SkillPackageManager:
             members.append(manifest_member)
 
             if include_sources:
-                archive.writestr(source_member, source_file.read_text(encoding="utf-8"))
-                members.append(source_member)
+                for source_member, source_file in zip(source_members, source_files):
+                    archive.writestr(source_member, source_file.read_text(encoding="utf-8"))
+                    members.append(source_member)
 
         return SkillPackageExportResult(
             package_path=package_file,
