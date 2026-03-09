@@ -25,6 +25,18 @@ python -m src.skills.github.cli --workspace . commit --message "chore: update" -
 
 See `.env.example` in this folder for expected variables.
 
+Recommended branch/PR-safe defaults:
+
+- `GITHUB_OWNER=andyjm2k`
+- `GITHUB_REPO=CATBot`
+- `GITHUB_TARGET_REPOSITORY=andyjm2k/CATBot`
+- `GITHUB_ENFORCE_BRANCH_PR_FLOW=true`
+- `GITHUB_PROTECTED_BRANCHES=main,master`
+- `GITHUB_ENFORCE_SENSITIVE_PATH_GUARD=true`
+
+With `GITHUB_ENFORCE_BRANCH_PR_FLOW=true`, the service blocks commits/pushes/PR-heads on protected branches.
+With `GITHUB_ENFORCE_SENSITIVE_PATH_GUARD=true`, the service blocks commit/push/PR creation when sensitive path patterns are present (for example `.env`, key/cert files, and secret-like config files, including `config/*.json`).
+
 ## Packaging
 
 The skill manifest at `src/skills/manifests/github_project_manager.skill.json` includes:

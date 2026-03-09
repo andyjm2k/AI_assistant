@@ -895,9 +895,23 @@ async def execute_telegram_tool(
         if not mm:
             return {"success": False, "message": "Memory system is not available."}
         text = (arguments.get("text") or arguments.get("content") or "").strip()
+        category = (arguments.get("category") or "").strip() or None
         if not text:
             return {"success": False, "message": "text is required."}
-        mid = await mm.store_memory(text=text, source="telegram")
+        guard_fn = getattr(mm, "should_store_as_conversational_memory", None)
+        if callable(guard_fn):
+            allow_store = guard_fn(
+                text=text,
+                category=category,
+                source="telegram",
+                metadata=None,
+            )
+            if isinstance(allow_store, bool) and not allow_store:
+                return {
+                    "success": False,
+                    "message": "Refused to store transient task/list/status state as memory.",
+                }
+        mid = await mm.store_memory(text=text, category=category, source="telegram")
         return {"success": True, "message": "Memory stored.", "data": {"memory_id": mid}}
 
     # --- searchMemories ---

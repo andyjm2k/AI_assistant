@@ -9,6 +9,7 @@ import json
 import tempfile
 import shutil
 from pathlib import Path
+import uuid
 from src.memory.vector_store import VectorStore
 
 
@@ -184,6 +185,25 @@ class TestVectorStore:
         assert deleted is True
         assert memory_id not in vector_store.metadata
         assert len(vector_store.embeddings) == 0
+
+    def test_delete_last_memory_removes_embeddings_file(self):
+        """Deleting the final memory should remove persisted embeddings.npy."""
+        temp_dir = Path(f"vector_store_delete_test_{uuid.uuid4().hex}")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            vector_store = VectorStore(storage_path=str(temp_dir))
+            memory_id = vector_store.add_embedding(
+                embedding=[0.1, 0.2, 0.3],
+                text="Final memory",
+            )
+            assert vector_store.embeddings_file.exists()
+
+            deleted = vector_store.delete_memory(memory_id)
+            assert deleted is True
+            assert vector_store.count() == 0
+            assert not vector_store.embeddings_file.exists()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_list_memories(self, vector_store):
         """Test listing all memories."""

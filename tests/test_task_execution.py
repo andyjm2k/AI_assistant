@@ -81,6 +81,42 @@ class TestTodoTaskExecutorCancel:
         assert status == STATUS_AWAITING_CONFIRMATION
         assert "finished" in message.lower() or "task" in message.lower()
 
+    @pytest.mark.asyncio
+    async def test_run_loop_executes_tool_calls_before_done_return(self):
+        """When content includes done + tool_calls, tool_calls must execute before completion."""
+        tool_executor = AsyncMock(return_value={"ok": True})
+        executor = TodoTaskExecutor(
+            api_key="test-key",
+            task_id=1,
+            task_description="Test",
+            tool_executor=tool_executor,
+            get_tools_func=AsyncMock(return_value=[]),
+        )
+
+        async def mock_llm_done_with_tool(*args, **kwargs):
+            return {
+                "content": "I have finished the work for this task.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"filename\":\"done.txt\",\"content\":\"ok\"}",
+                        },
+                    }
+                ],
+            }
+
+        with patch.object(executor, "_call_llm", side_effect=mock_llm_done_with_tool):
+            status, _ = await executor.run_loop()
+
+        assert status == STATUS_AWAITING_CONFIRMATION
+        tool_executor.assert_awaited_once_with(
+            "write_file",
+            {"filename": "done.txt", "content": "ok"},
+        )
+
 
 @pytest.mark.asyncio
 async def test_ensure_token_budget_summarizes_when_over_limit(monkeypatch):

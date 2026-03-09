@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable
 
 from .config import GitHubIntegrationConfig
 from .errors import GitCommandError, GitIntegrationError
@@ -52,6 +52,132 @@ class GitHubIntegrationService:
     def _resolved_branch(self, branch: str | None) -> str:
         return (branch or self.git.current_branch()).strip()
 
+    def _is_protected_branch(self, branch: str) -> bool:
+        protected = {b.strip().lower() for b in self.config.protected_branches if b and b.strip()}
+        return branch.strip().lower() in protected
+
+    def _assert_repository_configured(self) -> None:
+        if self.config.repository_slug:
+            return
+        raise GitIntegrationError(
+            "GitHub repository is not configured. Set GITHUB_OWNER and GITHUB_REPO "
+            "(for example: andyjm2k/CATBot)."
+        )
+
+    def _assert_required_repository_match(self) -> None:
+        required = (self.config.required_repository or "").strip().lower()
+        if not required:
+            return
+        current = (self.config.repository_slug or "").strip().lower()
+        if not current:
+            raise GitIntegrationError(
+                f"Repository context is required ('{self.config.required_repository}'). "
+                "Set GITHUB_OWNER and GITHUB_REPO."
+            )
+        if current != required:
+            raise GitIntegrationError(
+                f"Repository mismatch: configured '{self.config.repository_slug}' but "
+                f"required '{self.config.required_repository}'."
+            )
+
+    def _assert_remote_workflow_context(self) -> None:
+        self._assert_repository_configured()
+        self._assert_required_repository_match()
+
+    def _assert_mutation_branch_allowed(self, branch: str, operation: str) -> None:
+        if not self.config.enforce_branch_pr_flow:
+            return
+        if self._is_protected_branch(branch):
+            protected = ", ".join(self.config.protected_branches)
+            raise GitIntegrationError(
+                f"Refusing to {operation} on protected branch '{branch}'. "
+                f"Create/use a feature branch and open a pull request. Protected branches: {protected}."
+            )
+
+    def _normalize_path_for_matching(self, path: str) -> str:
+        normalized = path.strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        while normalized.startswith("/"):
+            normalized = normalized[1:]
+        return normalized
+
+    def _matches_any_pattern(self, path: str, patterns: Iterable[str]) -> bool:
+        candidate = PurePosixPath(path.lower())
+        for raw_pattern in patterns:
+            pattern = (raw_pattern or "").strip().replace("\\", "/")
+            while pattern.startswith("./"):
+                pattern = pattern[2:]
+            while pattern.startswith("/"):
+                pattern = pattern[1:]
+            pattern = pattern.lower()
+            if not pattern:
+                continue
+            if candidate.match(pattern):
+                return True
+        return False
+
+    def _is_sensitive_path(self, path: str) -> bool:
+        normalized = self._normalize_path_for_matching(path)
+        if not normalized:
+            return False
+        if self._matches_any_pattern(normalized, self.config.sensitive_path_allowlist_patterns):
+            return False
+        return self._matches_any_pattern(normalized, self.config.blocked_path_patterns)
+
+    def _assert_no_sensitive_paths(self, paths: Iterable[str], operation: str) -> None:
+        if not self.config.enforce_sensitive_path_guard:
+            return
+        blocked = sorted(
+            {
+                self._normalize_path_for_matching(path)
+                for path in paths
+                if self._is_sensitive_path(path)
+            }
+        )
+        if not blocked:
+            return
+        preview = ", ".join(blocked[:8])
+        extra = f" (+{len(blocked) - 8} more)" if len(blocked) > 8 else ""
+        raise GitIntegrationError(
+            f"Blocked {operation}: sensitive file path(s) detected: {preview}{extra}. "
+            "Move secrets to environment variables or a secure secret manager."
+        )
+
+    def _assert_no_sensitive_paths_pending(self, operation: str, *, include_untracked: bool = False) -> None:
+        status = self.git.status()
+        pending_paths = [*status.staged, *status.changed]
+        if include_untracked:
+            pending_paths.extend(status.untracked)
+        self._assert_no_sensitive_paths(pending_paths, operation)
+
+    def _assert_no_sensitive_paths_in_pr_diff(self, *, base_branch: str, head_branch: str) -> None:
+        if not self.config.enforce_sensitive_path_guard:
+            return
+        diff_files: list[str] | None = None
+        errors: list[str] = []
+        base_candidates: list[str] = []
+        for candidate in (base_branch, f"origin/{base_branch}"):
+            candidate = candidate.strip()
+            if candidate and candidate not in base_candidates:
+                base_candidates.append(candidate)
+        for base_ref in base_candidates:
+            try:
+                diff_files = self.git.diff_name_only(base_ref, head_branch)
+                break
+            except GitCommandError as exc:
+                errors.append(str(exc))
+                continue
+        if diff_files is None:
+            joined = " | ".join(errors) if errors else "unknown diff error"
+            raise GitIntegrationError(
+                f"Unable to verify changed files between '{base_branch}' and '{head_branch}': {joined}"
+            )
+        self._assert_no_sensitive_paths(
+            diff_files,
+            f"pull request from '{head_branch}' to '{base_branch}'",
+        )
+
     def initialize_repository(self, remote_url: str | None = None) -> dict[str, Any]:
         if not self.git.is_repository():
             self.git.init(default_branch=self.config.default_branch)
@@ -86,6 +212,7 @@ class GitHubIntegrationService:
         }
 
     def fetch(self, remote_name: str | None = None) -> dict[str, Any]:
+        self._assert_remote_workflow_context()
         remote = self._resolve_remote(remote_name)
         self.git.fetch(remote)
         status = self.git.status()
@@ -103,6 +230,7 @@ class GitHubIntegrationService:
         branch: str | None = None,
         rebase: bool = False,
     ) -> dict[str, Any]:
+        self._assert_remote_workflow_context()
         remote = self._resolve_remote(remote_name)
         target_branch = branch or None
         self.git.pull(remote, target_branch, rebase=rebase)
@@ -123,8 +251,15 @@ class GitHubIntegrationService:
         set_upstream: bool = False,
         tags: bool = False,
     ) -> dict[str, Any]:
+        self._assert_remote_workflow_context()
         remote = self._resolve_remote(remote_name)
         target_branch = self._resolved_branch(branch)
+        self._assert_mutation_branch_allowed(target_branch, "push")
+        self._assert_no_sensitive_paths_pending("push")
+        self._assert_no_sensitive_paths_in_pr_diff(
+            base_branch=self.config.default_branch,
+            head_branch=target_branch,
+        )
         self.git.push(remote, target_branch, set_upstream=set_upstream, tags=tags)
         return {
             "remote": remote,
@@ -142,6 +277,7 @@ class GitHubIntegrationService:
         set_upstream: bool = False,
         tags: bool = False,
     ) -> dict[str, Any]:
+        self._assert_remote_workflow_context()
         pull_result = self.pull(remote_name=remote_name, branch=branch, rebase=rebase)
         push_result = self.push(
             remote_name=remote_name,
@@ -160,15 +296,19 @@ class GitHubIntegrationService:
         set_upstream: bool = True,
         remote_name: str | None = None,
     ) -> dict[str, Any]:
+        self._assert_remote_workflow_context()
         target_branch = branch.strip()
         if not target_branch:
             raise GitIntegrationError("Branch name cannot be empty.")
-        self.git.checkout(target_branch, create=True, from_ref=from_ref)
+        self._assert_mutation_branch_allowed(target_branch, "create branch")
+        base_ref = (from_ref or self.config.default_branch).strip()
+        self.git.checkout(target_branch, create=True, from_ref=base_ref)
         result: dict[str, Any] = {
             "branch": self.git.current_branch(),
-            "created_from": from_ref,
+            "created_from": base_ref,
         }
         if push:
+            self._assert_no_sensitive_paths_pending("push new branch")
             remote = self._resolve_remote(remote_name)
             self.git.push(remote, target_branch, set_upstream=set_upstream)
             result["push"] = {
@@ -206,6 +346,10 @@ class GitHubIntegrationService:
         tag_prefix: str = "v",
         push: bool = False,
     ) -> VersionedCommit:
+        self._assert_remote_workflow_context()
+        current_branch = self.git.current_branch().strip()
+        self._assert_mutation_branch_allowed(current_branch, "commit")
+        self._assert_no_sensitive_paths_pending("commit", include_untracked=True)
         version_change = self.versions.bump(bump)
         self.git.add()
         final_message = f"{message} ({tag_prefix}{version_change.current})"
@@ -213,17 +357,29 @@ class GitHubIntegrationService:
         tag_name = f"{tag_prefix}{version_change.current}"
         self.git.tag(tag_name, message=f"Release {tag_name}")
         if push:
-            self.git.push(self.config.remote_name, commit.branch, set_upstream=True)
+            self.git.push(self.config.remote_name, current_branch, set_upstream=True)
             self.git.push(self.config.remote_name, tags=True)
         return VersionedCommit(commit=commit, tag=tag_name, version=version_change)
 
     def create_pull_request(self, title: str, head: str, body: str = "", base: str | None = None) -> dict[str, Any]:
+        self._assert_remote_workflow_context()
         if not self.github:
             raise GitIntegrationError("GitHub API client not configured. Set GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO.")
+        head_branch = head.strip()
+        base_branch = (base or self.config.default_branch).strip()
+        if not head_branch:
+            raise GitIntegrationError("Pull request head branch cannot be empty.")
+        if not base_branch:
+            raise GitIntegrationError("Pull request base branch cannot be empty.")
+        if head_branch == base_branch:
+            raise GitIntegrationError("Pull request head and base must be different branches.")
+        self._assert_mutation_branch_allowed(head_branch, "open pull request from")
+        self._assert_no_sensitive_paths_pending("open pull request")
+        self._assert_no_sensitive_paths_in_pr_diff(base_branch=base_branch, head_branch=head_branch)
         return self.github.create_pull_request(
             title=title,
-            head=head,
-            base=base or self.config.default_branch,
+            head=head_branch,
+            base=base_branch,
             body=body,
         )
 
@@ -236,6 +392,7 @@ class GitHubIntegrationService:
         per_page: int = 30,
         page: int = 1,
     ) -> list[dict[str, Any]]:
+        self._assert_remote_workflow_context()
         if not self.github:
             raise GitIntegrationError("GitHub API client not configured. Set GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO.")
         normalized_state = state.strip().lower() or "open"
@@ -250,10 +407,18 @@ class GitHubIntegrationService:
         )
 
     def repository_info(self, *, include_rate_limit: bool = False) -> dict[str, Any]:
+        self._assert_remote_workflow_context()
         payload: dict[str, Any] = {
             "workspace": str(self.config.workspace),
             "default_branch": self.config.default_branch,
             "remote_name": self.config.remote_name,
+            "repository": {"full_name": self.config.repository_slug},
+            "required_repository": self.config.required_repository,
+            "enforce_branch_pr_flow": self.config.enforce_branch_pr_flow,
+            "protected_branches": list(self.config.protected_branches),
+            "enforce_sensitive_path_guard": self.config.enforce_sensitive_path_guard,
+            "blocked_path_patterns": list(self.config.blocked_path_patterns),
+            "sensitive_path_allowlist_patterns": list(self.config.sensitive_path_allowlist_patterns),
             "has_github_client": self.github is not None,
         }
         if not self.github:
@@ -287,6 +452,7 @@ class GitHubIntegrationService:
         prerelease: bool = False,
         push: bool = True,
     ) -> dict[str, Any]:
+        self._assert_remote_workflow_context()
         if not self.github:
             raise GitIntegrationError("GitHub API client not configured. Set GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO.")
         versioned_commit = self.commit_versioned_change(

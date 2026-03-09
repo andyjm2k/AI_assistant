@@ -94,6 +94,33 @@ class MemoryManager:
             r"^(search|find|look up|open|run|execute|write|create|send|fetch)\b",
             re.IGNORECASE,
         )
+        self._operational_state_pattern = re.compile(
+            r"\b(todo|to-?do|task list|my tasks?|due tasks?|overdue tasks?|task execution|"
+            r"execution status|status update|awaiting confirmation|paused awaiting feedback|"
+            r"pending tasks?|completed tasks?|cancelled tasks?|task id|current state|"
+            r"list state|working:|done:|failed:)\b",
+            re.IGNORECASE,
+        )
+        self._operational_list_pattern = re.compile(
+            r"(?:^|\n)\s*(?:[-*]|\d+\.)\s+(?:task|todo|to-?do|due|overdue|pending|"
+            r"completed|cancelled|in progress|status)\b",
+            re.IGNORECASE,
+        )
+        self._task_learning_categories = {"task_experience", "task_learning"}
+        blocked_category_csv = os.getenv(
+            "MEMORY_CONTEXT_BLOCKED_CATEGORIES",
+            "task_experience,task_learning",
+        )
+        self._context_blocked_categories = {
+            c.strip().lower() for c in blocked_category_csv.split(",") if c.strip()
+        } or set(self._task_learning_categories)
+        blocked_source_csv = os.getenv(
+            "MEMORY_CONTEXT_BLOCKED_SOURCES",
+            "task_execution,task_scheduler,status_system",
+        )
+        self._context_blocked_sources = {
+            s.strip().lower() for s in blocked_source_csv.split(",") if s.strip()
+        }
         self.task_learning_enabled = os.getenv("MEMORY_TASK_LEARNING_ENABLED", "true").lower() == "true"
         self.task_learning_search_limit = max(
             1, min(20, int(os.getenv("MEMORY_TASK_LEARNING_SEARCH_LIMIT", "6")))
@@ -288,6 +315,14 @@ class MemoryManager:
             category = (mem.get("category") or "").strip().lower()
             if category not in self._durable_categories:
                 continue
+            source = (mem.get("source") or "conversation").strip()
+            if not self.should_store_as_conversational_memory(
+                text=raw_text,
+                category=category,
+                source=source,
+                metadata=mem,
+            ):
+                continue
 
             if await self._memory_already_exists(raw_text):
                 continue
@@ -295,7 +330,7 @@ class MemoryManager:
             memory_id = await self.store_memory(
                 text=raw_text,
                 category=category,
-                source=mem.get("source", "conversation"),
+                source=source,
             )
             memory_ids.append(memory_id)
             seen_normalized.add(normalized)
@@ -322,7 +357,74 @@ class MemoryManager:
             return False
         if self._command_like_pattern.search(text):
             return False
+        if self.is_operational_memory_text(text):
+            return False
         return True
+
+    def is_operational_memory_text(self, text: str) -> bool:
+        """Return True when text looks like transient task/list/runtime state."""
+        if not text:
+            return False
+        normalized = " ".join(str(text).split())
+        if not normalized:
+            return False
+        if self._operational_state_pattern.search(normalized):
+            return True
+        if self._operational_list_pattern.search(normalized):
+            return True
+        return False
+
+    def should_store_as_conversational_memory(
+        self,
+        *,
+        text: str,
+        category: Optional[str] = None,
+        source: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Gate conversational memory storage to durable, non-operational content."""
+        category_norm = (category or "").strip().lower()
+        source_norm = (source or "").strip().lower()
+        memory_type = str((metadata or {}).get("memory_type") or "").strip().lower()
+        if category_norm in self._task_learning_categories:
+            return False
+        if memory_type in self._task_learning_categories:
+            return False
+        if source_norm in self._context_blocked_sources:
+            return False
+        if self.is_operational_memory_text(text):
+            return False
+        return True
+
+    def filter_memories_for_conversation_context(
+        self,
+        memories: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Drop operational/task-state memories before injecting context into chat."""
+        filtered: List[Dict[str, Any]] = []
+        for mem in memories or []:
+            if not isinstance(mem, dict):
+                continue
+            category = (mem.get("category") or "").strip().lower()
+            source = (mem.get("source") or "").strip().lower()
+            memory_type = str(mem.get("memory_type") or "").strip().lower()
+            text = str(mem.get("text") or "")
+
+            if category in self._context_blocked_categories:
+                continue
+            if memory_type in self._context_blocked_categories:
+                continue
+            if source in self._context_blocked_sources:
+                continue
+            if not self.should_store_as_conversational_memory(
+                text=text,
+                category=category or None,
+                source=source or None,
+                metadata=mem,
+            ):
+                continue
+            filtered.append(mem)
+        return filtered
 
     async def _memory_already_exists(self, text: str) -> bool:
         """Return True when memory text is already stored (exact or semantic duplicate)."""

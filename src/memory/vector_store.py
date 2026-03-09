@@ -68,9 +68,14 @@ class VectorStore:
 
     def _save(self) -> None:
         """Save embeddings and metadata to disk."""
-        # Save embeddings array
+        # Save embeddings array. When empty, remove stale on-disk vectors.
         if len(self.embeddings) > 0:
             np.save(str(self.embeddings_file), self.embeddings)
+        elif self.embeddings_file.exists():
+            try:
+                self.embeddings_file.unlink()
+            except Exception as e:
+                print(f"Warning: Failed to remove stale embeddings file: {e}")
         
         # Save metadata as JSON
         memories_list = list(self.metadata.values())

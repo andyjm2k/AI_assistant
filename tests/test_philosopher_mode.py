@@ -201,6 +201,26 @@ class TestPhilosopherMode:
             assert result is False
 
     @pytest.mark.asyncio
+    async def test_is_satisfied_uses_full_contemplation_context_when_short(self, philosopher_mode):
+        """When full contemplation is short enough, include it in LLM satisfaction prompt."""
+        captured = {}
+
+        async def _capture_call(messages, **kwargs):
+            captured["prompt"] = messages[1]["content"]
+            return {"content": "no", "tool_calls": None}
+
+        with patch.object(philosopher_mode, "_call_llm", side_effect=_capture_call):
+            await philosopher_mode.is_satisfied_with_answer(
+                "Test question",
+                "Recent step",
+                "Full contemplation context should be present.",
+            )
+
+        prompt = captured.get("prompt", "")
+        assert "Current contemplation context" in prompt
+        assert "Full contemplation context should be present." in prompt
+
+    @pytest.mark.asyncio
     async def test_store_contemplation(self, philosopher_mode, mock_memory_manager):
         """Test storing a contemplation in memory."""
         # Call method

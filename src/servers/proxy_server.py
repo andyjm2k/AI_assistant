@@ -651,6 +651,15 @@ MEMORY_AUTO_SEARCH_LIMIT = max(1, min(10, int(os.getenv("MEMORY_AUTO_SEARCH_LIMI
 MEMORY_AUTO_SEARCH_SCORE_WINDOW = max(
     0.0, min(1.0, float(os.getenv("MEMORY_AUTO_SEARCH_SCORE_WINDOW", "0.12")))
 )
+MEMORY_CONTEXT_BLOCKED_CATEGORIES = {"task_experience", "task_learning"}
+MEMORY_CONTEXT_BLOCKED_SOURCES = {"task_execution", "task_scheduler", "status_system"}
+MEMORY_CONTEXT_OPERATIONAL_PATTERN = re.compile(
+    r"\b(todo|to-?do|task list|my tasks?|due tasks?|overdue tasks?|task execution|"
+    r"execution status|status update|awaiting confirmation|paused awaiting feedback|"
+    r"pending tasks?|completed tasks?|cancelled tasks?|task id|current state|"
+    r"list state|working:|done:|failed:)\b",
+    re.IGNORECASE,
+)
 # Optional: map Telegram user_id or conversation_id to app username for shared todo list
 TELEGRAM_USER_LINKS_FILE = _PROJECT_ROOT / "config" / "telegram_user_links.json"
 _TELEGRAM_CHAT_ID_RE = re.compile(r"^-?\d+$")
@@ -1464,8 +1473,140 @@ async def _call_chat_completion(
     payload: Dict[str, Any],
     timeout_seconds: float = 120.0,
 ) -> httpx.Response:
-    client = await _get_shared_chat_http_client()
-    return await client.post(endpoint, json=payload, headers=headers, timeout=timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        return await client.post(endpoint, json=payload, headers=headers)
+
+
+_NO_KEY_LLM_PROVIDERS = frozenset({"ollama", "bedrock"})
+_MCP_PROVIDER_API_KEY_ENV_CANDIDATES: Dict[str, List[str]] = {
+    "openai": ["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"],
+    "anthropic": ["ANTHROPIC_API_KEY", "MCP_LLM_ANTHROPIC_API_KEY"],
+    "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "MCP_LLM_GOOGLE_API_KEY"],
+    "azure_openai": ["AZURE_OPENAI_API_KEY", "MCP_LLM_AZURE_OPENAI_API_KEY"],
+    "groq": ["GROQ_API_KEY", "MCP_LLM_GROQ_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY", "MCP_LLM_DEEPSEEK_API_KEY"],
+    "cerebras": ["CEREBRAS_API_KEY", "MCP_LLM_CEREBRAS_API_KEY"],
+    "browser_use": ["BROWSER_USE_API_KEY", "MCP_LLM_BROWSER_USE_API_KEY"],
+    "openrouter": [
+        "OPENROUTER_API_KEY",
+        "MCP_LLM_OPENROUTER_API_KEY",
+        "MCP_LLM_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+    ],
+    "vercel": ["VERCEL_API_KEY", "MCP_LLM_VERCEL_API_KEY"],
+}
+
+
+def _first_non_empty_env(var_names: List[str]) -> Optional[str]:
+    for var_name in var_names:
+        value = os.getenv(var_name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _get_mcp_llm_provider() -> str:
+    return (os.getenv("MCP_LLM_PROVIDER") or "").strip().lower()
+
+
+def _get_mcp_llm_chat_endpoint() -> Optional[str]:
+    base = (os.getenv("MCP_LLM_BASE_URL") or "").strip()
+    if not base:
+        return None
+    return _normalize_chat_endpoint(base)
+
+
+def _get_mcp_llm_model_name() -> Optional[str]:
+    model_name = (os.getenv("MCP_LLM_MODEL_NAME") or "").strip()
+    return model_name or None
+
+
+def _resolve_mcp_llm_api_key(provider: Optional[str] = None) -> Optional[str]:
+    normalized_provider = (provider or _get_mcp_llm_provider() or "").strip().lower()
+    candidates: List[str] = ["MCP_LLM_API_KEY"]
+    candidates.extend(_MCP_PROVIDER_API_KEY_ENV_CANDIDATES.get(normalized_provider, []))
+
+    if normalized_provider:
+        candidates.append(f"MCP_LLM_{normalized_provider.upper()}_API_KEY")
+    else:
+        # OpenAI-compatible default fallback for generic/unspecified provider.
+        candidates.extend(["MCP_LLM_OPENAI_API_KEY", "OPENAI_API_KEY"])
+
+    api_key = _first_non_empty_env(candidates)
+    if api_key:
+        return api_key
+    if normalized_provider in _NO_KEY_LLM_PROVIDERS:
+        return None
+    return None
+
+
+def _build_mcp_fallback_headers(primary_headers: Dict[str, str]) -> Dict[str, str]:
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+
+    for header_name in ("OpenAI-Organization", "OpenAI-Project", "HTTP-Referer", "X-Title"):
+        header_value = primary_headers.get(header_name)
+        if header_value:
+            headers[header_name] = header_value
+
+    provider = _get_mcp_llm_provider()
+    api_key = _resolve_mcp_llm_api_key(provider)
+    inherited_auth = (primary_headers.get("Authorization") or "").strip()
+
+    if provider == "azure_openai":
+        if api_key:
+            headers["api-key"] = api_key
+        elif inherited_auth.lower().startswith("bearer "):
+            inherited_token = inherited_auth[7:].strip()
+            if inherited_token:
+                headers["api-key"] = inherited_token
+        return headers
+
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif inherited_auth:
+        headers["Authorization"] = inherited_auth
+    return headers
+
+
+def _build_mcp_fallback_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    fallback_payload = dict(payload)
+    fallback_model = _get_mcp_llm_model_name()
+    if fallback_model:
+        fallback_payload["model"] = fallback_model
+    return fallback_payload
+
+
+async def _attempt_mcp_chat_fallback(
+    primary_headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout_seconds: float,
+    source_label: str,
+) -> Tuple[Optional[httpx.Response], Optional[str]]:
+    fallback_endpoint = _get_mcp_llm_chat_endpoint()
+    if not fallback_endpoint:
+        return None, "MCP_LLM_BASE_URL is not configured"
+
+    fallback_payload = _build_mcp_fallback_payload(payload)
+    fallback_headers = _build_mcp_fallback_headers(primary_headers)
+    fallback_model = fallback_payload.get("model", "")
+    fallback_provider = _get_mcp_llm_provider() or "openai-compatible"
+    print(
+        f"[LLM_FALLBACK] {source_label}: trying provider={fallback_provider}, model={fallback_model}, endpoint={fallback_endpoint}",
+        flush=True,
+    )
+    try:
+        response = await _call_chat_completion(
+            fallback_endpoint,
+            fallback_headers,
+            fallback_payload,
+            timeout_seconds=timeout_seconds,
+        )
+        print(f"[LLM_FALLBACK] {source_label}: status={response.status_code}", flush=True)
+        return response, None
+    except httpx.RequestError as exc:
+        err = str(exc)
+        print(f"[LLM_FALLBACK] {source_label}: request error: {err}", flush=True)
+        return None, err
 
 
 async def _extract_memories_from_recent_messages_async(recent_messages: List[Dict[str, str]]) -> None:
@@ -5393,7 +5534,10 @@ def _extract_memory_search_query(message_text: str) -> str:
     return topic[:500]
 
 
-def _filter_high_relevance_memories(memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _filter_high_relevance_memories(
+    memories: List[Dict[str, Any]],
+    memory_manager: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
     """
     Keep only high-confidence memory matches:
     - top hit must pass minimum similarity
@@ -5410,6 +5554,32 @@ def _filter_high_relevance_memories(memories: List[Dict[str, Any]]) -> List[Dict
 
     floor = max(MEMORY_AUTO_SEARCH_MIN_SIMILARITY, top_score - MEMORY_AUTO_SEARCH_SCORE_WINDOW)
     filtered = [m for m in sorted_memories if float(m.get("similarity", 0.0)) >= floor]
+    context_safe: List[Dict[str, Any]] = []
+    for mem in filtered:
+        category = (mem.get("category") or "").strip().lower()
+        source = (mem.get("source") or "").strip().lower()
+        memory_type = str(mem.get("memory_type") or "").strip().lower()
+        text = str(mem.get("text") or "")
+        if category in MEMORY_CONTEXT_BLOCKED_CATEGORIES:
+            continue
+        if memory_type in MEMORY_CONTEXT_BLOCKED_CATEGORIES:
+            continue
+        if source in MEMORY_CONTEXT_BLOCKED_SOURCES:
+            continue
+        if MEMORY_CONTEXT_OPERATIONAL_PATTERN.search(text):
+            continue
+        context_safe.append(mem)
+
+    if memory_manager:
+        try:
+            filter_fn = getattr(memory_manager, "filter_memories_for_conversation_context", None)
+            if callable(filter_fn):
+                maybe_filtered = filter_fn(context_safe)
+                if isinstance(maybe_filtered, list):
+                    context_safe = maybe_filtered
+        except Exception as e:
+            print(f"Warning: MemoryManager context filter failed: {e}")
+    filtered = context_safe
     return filtered[:MEMORY_AUTO_SEARCH_LIMIT]
 
 
@@ -5554,9 +5724,9 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         trim_telegram_history(history)
         return TelegramChatResponse(reply=reply_text, conversation_id=conversation_id, usage=None)
 
-    # Prefer OPENAI_API_KEY; fall back to MCP_LLM_OPENAI_API_KEY for single .env setups
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY")
-    if not api_key:
+    # Primary Telegram call uses OPENAI_* key, fallback uses MCP_LLM_* endpoint/model on request errors.
+    primary_api_key = _first_non_empty_env(["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"])
+    if not primary_api_key:
         await _finish_status_session(
             conversation_id=conversation_id,
             request_id=request_id,
@@ -5609,7 +5779,10 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 similarity_threshold=MEMORY_AUTO_SEARCH_CANDIDATE_THRESHOLD,
             )
 
-            relevant_memories = _filter_high_relevance_memories(candidate_memories)
+            relevant_memories = _filter_high_relevance_memories(
+                candidate_memories,
+                memory_manager=memory_manager,
+            )
             if relevant_memories:
                 print(
                     f"Memory context: kept {len(relevant_memories)}/{len(candidate_memories)} "
@@ -5650,10 +5823,9 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     if request.max_output_tokens is not None:
         payload["max_tokens"] = request.max_output_tokens
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if primary_api_key:
+        headers["Authorization"] = f"Bearer {primary_api_key}"
 
     if OPENAI_ORG_ID:
         headers["OpenAI-Organization"] = OPENAI_ORG_ID
@@ -5680,17 +5852,30 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             )
             summarized = True
 
+    used_mcp_fallback = False
     try:
         response = await _call_chat_completion(url, headers, payload, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
     except httpx.RequestError as exc:
         print(f"Telegram chat request error: {exc}")
-        await _finish_status_session(
-            conversation_id=conversation_id,
-            request_id=request_id,
-            final_state="Failed: could not contact model service",
-            phase="error",
+        fallback_response, fallback_error = await _attempt_mcp_chat_fallback(
+            primary_headers=headers,
+            payload=payload,
+            timeout_seconds=TELEGRAM_CHAT_TIMEOUT,
+            source_label="telegram_chat_request_error",
         )
-        raise HTTPException(status_code=502, detail="Failed to contact language model service") from exc
+        if fallback_response is None:
+            await _finish_status_session(
+                conversation_id=conversation_id,
+                request_id=request_id,
+                final_state="Failed: could not contact model service",
+                phase="error",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to contact language model service. Primary error: {exc}. Fallback error: {fallback_error or 'not configured'}",
+            ) from exc
+        response = fallback_response
+        used_mcp_fallback = True
 
     if response.status_code != 200:
         print(f"Telegram chat API error {response.status_code}: {response.text}")
@@ -5716,14 +5901,76 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     large_endpoint=LARGE_PAYLOAD_ENDPOINT,
                 )
                 summarized = True
-                response = await _call_chat_completion(url, headers, payload, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                try:
+                    response = await _call_chat_completion(url, headers, payload, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                except httpx.RequestError:
+                    fallback_response, _ = await _attempt_mcp_chat_fallback(
+                        primary_headers=headers,
+                        payload=payload,
+                        timeout_seconds=TELEGRAM_CHAT_TIMEOUT,
+                        source_label="telegram_chat_context_retry_error",
+                    )
+                    if fallback_response is None:
+                        raise
+                    response = fallback_response
             if response.status_code != 200 and LARGE_PAYLOAD_MODEL:
                 payload["model"] = LARGE_PAYLOAD_MODEL
                 large_url = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or url)
-                response = await _call_chat_completion(large_url, headers, payload, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                try:
+                    response = await _call_chat_completion(large_url, headers, payload, timeout_seconds=TELEGRAM_CHAT_TIMEOUT)
+                except httpx.RequestError:
+                    fallback_response, _ = await _attempt_mcp_chat_fallback(
+                        primary_headers=headers,
+                        payload=payload,
+                        timeout_seconds=TELEGRAM_CHAT_TIMEOUT,
+                        source_label="telegram_chat_large_retry_error",
+                    )
+                    if fallback_response is None:
+                        raise
+                    response = fallback_response
             if response.status_code == 200:
                 data = response.json()
             else:
+                if not used_mcp_fallback:
+                    fallback_response, _ = await _attempt_mcp_chat_fallback(
+                        primary_headers=headers,
+                        payload=payload,
+                        timeout_seconds=TELEGRAM_CHAT_TIMEOUT,
+                        source_label="telegram_chat_non_200_after_context_retry",
+                    )
+                    if fallback_response is not None:
+                        response = fallback_response
+                        used_mcp_fallback = True
+                        if response.status_code == 200:
+                            data = response.json()
+                            # Continue with normal response parsing below.
+                            pass
+                        else:
+                            detail = response.text or detail
+                if response.status_code != 200:
+                    await _finish_status_session(
+                        conversation_id=conversation_id,
+                        request_id=request_id,
+                        final_state="Failed: model returned error",
+                        phase="error",
+                    )
+                    raise HTTPException(status_code=response.status_code, detail=detail)
+        else:
+            if not used_mcp_fallback:
+                fallback_response, _ = await _attempt_mcp_chat_fallback(
+                    primary_headers=headers,
+                    payload=payload,
+                    timeout_seconds=TELEGRAM_CHAT_TIMEOUT,
+                    source_label="telegram_chat_non_200",
+                )
+                if fallback_response is not None:
+                    response = fallback_response
+                    used_mcp_fallback = True
+                    if response.status_code == 200:
+                        data = response.json()
+                    else:
+                        detail = response.text or detail
+            if response.status_code != 200:
                 await _finish_status_session(
                     conversation_id=conversation_id,
                     request_id=request_id,
@@ -5731,14 +5978,6 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     phase="error",
                 )
                 raise HTTPException(status_code=response.status_code, detail=detail)
-        else:
-            await _finish_status_session(
-                conversation_id=conversation_id,
-                request_id=request_id,
-                final_state="Failed: model returned error",
-                phase="error",
-            )
-            raise HTTPException(status_code=response.status_code, detail=detail)
 
     data = response.json()
     reply = None
@@ -5928,13 +6167,21 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 )
             except httpx.RequestError as exc:
                 print(f"Telegram tool-loop request error: {exc}")
-                reply = (
-                    _telegram_tool_error_reply
-                    if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message))
-                    else f"Here's what I found:\n\n{result_message}"
+                fallback_response_tool, _ = await _attempt_mcp_chat_fallback(
+                    primary_headers=headers,
+                    payload=payload_tool,
+                    timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                    source_label="telegram_tool_followup_request_error",
                 )
-                pending_native_tool_calls = []
-                break
+                if fallback_response_tool is None:
+                    reply = (
+                        _telegram_tool_error_reply
+                        if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message))
+                        else f"Here's what I found:\n\n{result_message}"
+                    )
+                    pending_native_tool_calls = []
+                    break
+                response_tool = fallback_response_tool
             if response_tool.status_code != 200:
                 print(f"Telegram tool follow-up returned status {response_tool.status_code}, using tool result as reply")
                 if is_context_limit_error(response_tool.status_code, response_tool.text or ""):
@@ -5949,21 +6196,52 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                             large_endpoint=LARGE_PAYLOAD_ENDPOINT,
                         )
                         summarized_tool = True
-                        response_tool = await _call_chat_completion(
-                            url,
-                            headers,
-                            payload_tool,
-                            timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
-                        )
+                        try:
+                            response_tool = await _call_chat_completion(
+                                url,
+                                headers,
+                                payload_tool,
+                                timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                            )
+                        except httpx.RequestError:
+                            fallback_response_tool, _ = await _attempt_mcp_chat_fallback(
+                                primary_headers=headers,
+                                payload=payload_tool,
+                                timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                                source_label="telegram_tool_followup_context_retry_error",
+                            )
+                            if fallback_response_tool is None:
+                                raise
+                            response_tool = fallback_response_tool
                     if response_tool.status_code != 200 and LARGE_PAYLOAD_MODEL:
                         payload_tool["model"] = LARGE_PAYLOAD_MODEL
                         large_url = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or url)
-                        response_tool = await _call_chat_completion(
-                            large_url,
-                            headers,
-                            payload_tool,
-                            timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
-                        )
+                        try:
+                            response_tool = await _call_chat_completion(
+                                large_url,
+                                headers,
+                                payload_tool,
+                                timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                            )
+                        except httpx.RequestError:
+                            fallback_response_tool, _ = await _attempt_mcp_chat_fallback(
+                                primary_headers=headers,
+                                payload=payload_tool,
+                                timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                                source_label="telegram_tool_followup_large_retry_error",
+                            )
+                            if fallback_response_tool is None:
+                                raise
+                            response_tool = fallback_response_tool
+                if response_tool.status_code != 200:
+                    fallback_response_tool, _ = await _attempt_mcp_chat_fallback(
+                        primary_headers=headers,
+                        payload=payload_tool,
+                        timeout_seconds=TELEGRAM_TOOL_FOLLOWUP_TIMEOUT,
+                        source_label="telegram_tool_followup_non_200",
+                    )
+                    if fallback_response_tool is not None:
+                        response_tool = fallback_response_tool
                 if response_tool.status_code != 200:
                     reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
                     break
@@ -7113,19 +7391,51 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
     elif MCP_AVAILABLE:
         # Find which server has this tool
         all_tools = await get_all_available_tools()
-        server_id = None
-        
-        for tool in all_tools:
-            if tool.get("name") == tool_name:
-                server_id = tool.get("server_id")
-                break
-        
-        if not server_id:
+        matching_tools = [
+            tool for tool in all_tools
+            if isinstance(tool, dict) and str(tool.get("name") or "").strip() == tool_name
+        ]
+        if not matching_tools:
             return f"Error: Tool '{tool_name}' not found on any connected server"
+
+        requested_server_id = str(
+            parameters.get("server_id")
+            or parameters.get("_server_id")
+            or ""
+        ).strip()
+        if requested_server_id:
+            matching_tools = [
+                tool for tool in matching_tools
+                if str(tool.get("server_id") or "").strip() == requested_server_id
+            ]
+            if not matching_tools:
+                return (
+                    f"Error: Tool '{tool_name}' is not available on server '{requested_server_id}'."
+                )
+
+        unique_server_ids = sorted(
+            {
+                str(tool.get("server_id") or "").strip()
+                for tool in matching_tools
+                if str(tool.get("server_id") or "").strip()
+            }
+        )
+        if len(unique_server_ids) > 1:
+            return (
+                f"Error: Tool '{tool_name}' is available on multiple servers ({', '.join(unique_server_ids)}). "
+                "Specify 'server_id' in parameters."
+            )
+
+        server_id = unique_server_ids[0] if unique_server_ids else None
+        if not server_id:
+            return f"Error: Tool '{tool_name}' has no executable server mapping."
         
         # Execute the tool using the existing call_tool logic
         try:
-            request = ToolCallRequest(toolName=tool_name, parameters=parameters)
+            forwarded_parameters = dict(parameters or {})
+            forwarded_parameters.pop("server_id", None)
+            forwarded_parameters.pop("_server_id", None)
+            request = ToolCallRequest(toolName=tool_name, parameters=forwarded_parameters)
             result = await call_tool(server_id, request)
             
             # Extract result content
@@ -7430,74 +7740,61 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
     Routes requests to the OpenAI-compatible API endpoint specified in the request.
     """
     try:
-        # Get the endpoint from query parameter or use default
         if not endpoint:
             endpoint = request.query_params.get('endpoint', '')
-        
-        # If still no endpoint, use default from environment or localhost
+
         if not endpoint:
             endpoint = os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/models')
         else:
-            # Ensure the endpoint includes the full path if not already present
             if not endpoint.endswith('/models'):
                 endpoint = endpoint.rstrip('/') + '/models'
-        
-        # Get Authorization header from the request
+
         auth_header = request.headers.get('Authorization', '')
-        
-        # Build headers for the forwarded request
         headers = {}
         if auth_header:
             headers['Authorization'] = auth_header
-        
-        # Add organization/project headers if present in original request
+
         org_header = request.headers.get('OpenAI-Organization')
         if org_header:
             headers['OpenAI-Organization'] = org_header
-        
+
         project_header = request.headers.get('OpenAI-Project')
         if project_header:
             headers['OpenAI-Project'] = project_header
-        
-        print(f"📋 Proxying models list request to: {endpoint}")
-        
-        # Forward the request to the LLM service
+
+        print(f"Proxying models list request to: {endpoint}")
+
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                endpoint,
-                headers=headers
-            )
-        
-        print(f"✅ Models list response status: {response.status_code}")
-        
-        # Check if the response is successful
+            response = await client.get(endpoint, headers=headers)
+
+        print(f"Models list response status: {response.status_code}")
+
         if response.status_code != 200:
-            print(f"âŒ LLM service returned error: {response.status_code}")
+            print(f"LLM service returned error: {response.status_code}")
             print(f"   Response text: {response.text[:500]}")
             return JSONResponse(
                 content=response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text},
-                status_code=response.status_code
+                status_code=response.status_code,
             )
-        
-        # Return the JSON response
+
         try:
             response_data = response.json()
             return JSONResponse(content=response_data, status_code=200)
         except Exception as json_error:
-            print(f"âŒ Failed to parse JSON response: {json_error}")
+            print(f"Failed to parse JSON response: {json_error}")
             return JSONResponse(
                 content={"error": "Invalid JSON response from LLM service"},
-                status_code=500
+                status_code=500,
             )
-    
-    except httpx.ConnectError as e:
-        print(f"âŒ Connection error: Could not connect to LLM service")
+
+    except httpx.ConnectError:
+        print("Connection error: Could not connect to LLM service")
         raise HTTPException(
             status_code=503,
-            detail=f"Could not connect to LLM service. Please check the endpoint configuration."
+            detail="Could not connect to LLM service. Please check the endpoint configuration.",
         )
     except Exception as e:
-        print(f"âŒ Models list proxy error: {e}")
+        print(f"Models list proxy error: {e}")
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy models list request: {str(e)}")
@@ -7706,43 +8003,50 @@ async def proxy_chat_completions(request: Request):
     try:
         # Get the request body
         body = await request.json()
-        
+
         # Get the endpoint from query parameter or request body, or use default
         endpoint = request.query_params.get('endpoint', '')
         if not endpoint:
-            # Try to get from body (some clients might send it)
             endpoint = body.get('_endpoint', '')
-        
+
         # If still no endpoint, use default from environment or localhost
         if not endpoint:
             endpoint = os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/chat/completions')
         endpoint = _normalize_chat_endpoint(endpoint)
-        
+
         # Remove internal endpoint parameter from body before forwarding
         body_clean = {k: v for k, v in body.items() if k != '_endpoint'}
-        
-        # Get Authorization header from the request
-        auth_header = request.headers.get('Authorization', '')
-        
+        if not body_clean.get("model"):
+            default_openai_model = (os.getenv("OPENAI_MODEL") or "").strip()
+            if default_openai_model:
+                body_clean["model"] = default_openai_model
+
+        # Get Authorization header from the request (or server default key)
+        auth_header = (request.headers.get('Authorization', '') or "").strip()
+        if not auth_header:
+            primary_api_key = _first_non_empty_env(["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"])
+            if primary_api_key:
+                auth_header = f"Bearer {primary_api_key}"
+
         # Build headers for the forwarded request
         headers = {
             'Content-Type': 'application/json'
         }
         if auth_header:
             headers['Authorization'] = auth_header
-        
+
         # Add organization/project headers if present in original request
         org_header = request.headers.get('OpenAI-Organization')
         if org_header:
             headers['OpenAI-Organization'] = org_header
-        
+
         project_header = request.headers.get('OpenAI-Project')
         if project_header:
             headers['OpenAI-Project'] = project_header
-        
-        print(f"💬 Proxying chat completions request to: {endpoint}")
+
+        print(f"Proxying chat completions request to: {endpoint}")
         print(f"   Model: {body_clean.get('model', 'unknown')}")
-        
+
         max_tokens = _get_max_tokens_from_payload(body_clean)
         summarized = False
         if isinstance(body_clean.get("messages"), list):
@@ -7759,13 +8063,37 @@ async def proxy_chat_completions(request: Request):
                 )
                 summarized = True
 
-        response = await _call_chat_completion(endpoint, headers, body_clean, timeout_seconds=120.0)
-        
-        print(f"✅ Chat completions response status: {response.status_code}")
-        
+        response: Optional[httpx.Response] = None
+        primary_request_error: Optional[Exception] = None
+        try:
+            response = await _call_chat_completion(endpoint, headers, body_clean, timeout_seconds=120.0)
+        except httpx.RequestError as exc:
+            primary_request_error = exc
+
+        if response is None:
+            print(f"Primary chat request error: {primary_request_error}")
+            fallback_response, fallback_error = await _attempt_mcp_chat_fallback(
+                primary_headers=headers,
+                payload=body_clean,
+                timeout_seconds=120.0,
+                source_label="proxy_chat_completions_request_error",
+            )
+            if fallback_response is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Could not connect to LLM service. "
+                        f"Primary error: {primary_request_error}. "
+                        f"Fallback error: {fallback_error or 'not configured'}"
+                    ),
+                )
+            response = fallback_response
+
+        print(f"Chat completions response status: {response.status_code}")
+
         # Check if the response is successful
         if response.status_code != 200:
-            print(f"âŒ LLM service returned error: {response.status_code}")
+            print(f"LLM service returned error: {response.status_code}")
             print(f"   Response text: {response.text[:500]}")
             error_text = response.text or ""
             if is_context_limit_error(response.status_code, error_text):
@@ -7781,43 +8109,77 @@ async def proxy_chat_completions(request: Request):
                         large_endpoint=LARGE_PAYLOAD_ENDPOINT,
                     )
                     summarized = True
-                    response = await _call_chat_completion(endpoint, headers, body_clean, timeout_seconds=120.0)
+                    try:
+                        response = await _call_chat_completion(endpoint, headers, body_clean, timeout_seconds=120.0)
+                    except httpx.RequestError:
+                        fallback_response, _ = await _attempt_mcp_chat_fallback(
+                            primary_headers=headers,
+                            payload=body_clean,
+                            timeout_seconds=120.0,
+                            source_label="proxy_chat_completions_context_retry_error",
+                        )
+                        if fallback_response is None:
+                            raise
+                        response = fallback_response
                 # Retry with large payload model if configured
                 if response.status_code != 200 and LARGE_PAYLOAD_MODEL:
                     body_clean["model"] = LARGE_PAYLOAD_MODEL
                     large_endpoint = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or endpoint)
-                    response = await _call_chat_completion(large_endpoint, headers, body_clean, timeout_seconds=120.0)
+                    try:
+                        response = await _call_chat_completion(large_endpoint, headers, body_clean, timeout_seconds=120.0)
+                    except httpx.RequestError:
+                        fallback_response, _ = await _attempt_mcp_chat_fallback(
+                            primary_headers=headers,
+                            payload=body_clean,
+                            timeout_seconds=120.0,
+                            source_label="proxy_chat_completions_large_retry_error",
+                        )
+                        if fallback_response is None:
+                            raise
+                        response = fallback_response
                 if response.status_code == 200:
                     try:
                         response_data = response.json()
                         return JSONResponse(content=response_data, status_code=200)
                     except Exception as json_error:
-                        print(f"âŒ Failed to parse JSON response after retry: {json_error}")
+                        print(f"Failed to parse JSON response after retry: {json_error}")
                         return JSONResponse(content={"error": "Invalid JSON response from LLM service"}, status_code=500)
+
+            fallback_response, _fallback_error = await _attempt_mcp_chat_fallback(
+                primary_headers=headers,
+                payload=body_clean,
+                timeout_seconds=120.0,
+                source_label="proxy_chat_completions_non_200",
+            )
+            if fallback_response is not None:
+                response = fallback_response
+
             return JSONResponse(
                 content=response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text},
                 status_code=response.status_code
             )
-        
+
         # Return the JSON response
         try:
             response_data = response.json()
             return JSONResponse(content=response_data, status_code=200)
         except Exception as json_error:
-            print(f"âŒ Failed to parse JSON response: {json_error}")
+            print(f"Failed to parse JSON response: {json_error}")
             return JSONResponse(
                 content={"error": "Invalid JSON response from LLM service"},
                 status_code=500
             )
-    
+
+    except HTTPException:
+        raise
     except httpx.ConnectError as e:
-        print(f"âŒ Connection error: Could not connect to LLM service")
+        print(f"Connection error: Could not connect to LLM service")
         raise HTTPException(
             status_code=503,
             detail=f"Could not connect to LLM service. Please check the endpoint configuration."
         )
     except Exception as e:
-        print(f"âŒ Chat completions proxy error: {e}")
+        print(f"Chat completions proxy error: {e}")
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to proxy chat completions request: {str(e)}")

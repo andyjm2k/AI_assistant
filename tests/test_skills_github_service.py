@@ -19,13 +19,18 @@ class FakeGitService:
         self.pull_calls: list[tuple[str, str | None, bool]] = []
         self.fetch_calls: list[str] = []
         self.checkout_calls: list[tuple[str, bool, str | None]] = []
+        self.branch = "main"
+        self.staged: list[str] = []
+        self.changed: list[str] = []
+        self.untracked: list[str] = []
+        self.pr_diff_files: list[str] = []
 
     def add(self) -> None:
         self.add_called = True
 
     def commit(self, message: str) -> CommitResult:
         self.commit_messages.append(message)
-        return CommitResult(commit_hash="abc123", branch="main", message=message)
+        return CommitResult(commit_hash="abc123", branch=self.branch, message=message)
 
     def tag(self, tag_name: str, message: str | None = None, annotated: bool = True, force: bool = False) -> None:
         self.tags.append(tag_name)
@@ -34,7 +39,14 @@ class FakeGitService:
         self.push_calls.append((remote_name, branch, set_upstream, tags))
 
     def status(self) -> GitStatus:
-        return GitStatus(branch="main", ahead_by=0, behind_by=0, staged=[], changed=[], untracked=[])
+        return GitStatus(
+            branch=self.branch,
+            ahead_by=0,
+            behind_by=0,
+            staged=list(self.staged),
+            changed=list(self.changed),
+            untracked=list(self.untracked),
+        )
 
     def is_repository(self) -> bool:
         return True
@@ -49,10 +61,14 @@ class FakeGitService:
         return None
 
     def current_branch(self) -> str:
-        return "main"
+        return self.branch
 
     def checkout(self, branch: str, create: bool = False, from_ref: str | None = None) -> None:
         self.checkout_calls.append((branch, create, from_ref))
+        self.branch = branch
+
+    def diff_name_only(self, base_ref: str, head_ref: str) -> list[str]:
+        return list(self.pr_diff_files)
 
 
 class FakeGitHubClient:
@@ -73,6 +89,9 @@ class FakeGitHubClient:
     def list_pull_requests(self, **kwargs: object) -> list[dict[str, object]]:
         return [{"number": 1, "title": "Test PR", "kwargs": kwargs}]
 
+    def create_pull_request(self, **kwargs: object) -> dict[str, object]:
+        return {"number": 123, "title": kwargs.get("title"), "head": kwargs.get("head"), "base": kwargs.get("base")}
+
 
 class FakeVersionManager:
     version_path = Path("VERSION")
@@ -85,8 +104,16 @@ class FakeVersionManager:
 
 
 def test_commit_versioned_change_flow() -> None:
-    config = GitHubIntegrationConfig(workspace=Path("."), default_branch="main", remote_name="origin")
+    config = GitHubIntegrationConfig(
+        workspace=Path("."),
+        default_branch="main",
+        remote_name="origin",
+        github_owner="owner",
+        github_repo="CATBot",
+        required_repository="owner/CATBot",
+    )
     fake_git = FakeGitService()
+    fake_git.branch = "feature/release-prep"
     fake_versions = FakeVersionManager()
     service = GitHubIntegrationService(config, git_service=fake_git, version_manager=fake_versions, github_client=None)
 
@@ -114,15 +141,22 @@ def test_status_reports_version_and_git_state() -> None:
 
 
 def test_fetch_pull_push_sync_and_branch_helpers() -> None:
-    config = GitHubIntegrationConfig(workspace=Path("."), remote_name="origin")
+    config = GitHubIntegrationConfig(
+        workspace=Path("."),
+        remote_name="origin",
+        github_owner="owner",
+        github_repo="CATBot",
+        required_repository="owner/CATBot",
+    )
     fake_git = FakeGitService()
+    fake_git.branch = "feature/current"
     fake_versions = FakeVersionManager()
     service = GitHubIntegrationService(config, git_service=fake_git, version_manager=fake_versions, github_client=None)
 
     fetch_result = service.fetch()
-    pull_result = service.pull(branch="main", rebase=True)
-    push_result = service.push(branch="main", set_upstream=True, tags=True)
-    sync_result = service.sync(branch="main", set_upstream=True)
+    pull_result = service.pull(branch="feature/current", rebase=True)
+    push_result = service.push(branch="feature/current", set_upstream=True, tags=True)
+    sync_result = service.sync(branch="feature/current", set_upstream=True)
     branch_result = service.create_branch("feature/test", from_ref="main", push=True, set_upstream=True)
     checkout_result = service.checkout_branch("main")
 
@@ -130,11 +164,111 @@ def test_fetch_pull_push_sync_and_branch_helpers() -> None:
     assert pull_result["rebase"] is True
     assert push_result["tags"] is True
     assert sync_result["pull"]["remote"] == "origin"
-    assert sync_result["push"]["branch"] == "main"
-    assert branch_result["branch"] == "main"
+    assert sync_result["push"]["branch"] == "feature/current"
+    assert branch_result["branch"] == "feature/test"
     assert checkout_result["branch"] == "main"
-    assert ("origin", "main", True, False) in fake_git.push_calls
+    assert ("origin", "feature/current", True, False) in fake_git.push_calls
     assert ("feature/test", True, "main") in fake_git.checkout_calls
+
+
+def test_push_rejects_protected_branch() -> None:
+    config = GitHubIntegrationConfig(
+        workspace=Path("."),
+        github_owner="owner",
+        github_repo="CATBot",
+        required_repository="owner/CATBot",
+        default_branch="main",
+    )
+    service = GitHubIntegrationService(
+        config,
+        git_service=FakeGitService(),
+        version_manager=FakeVersionManager(),
+        github_client=None,
+    )
+
+    with pytest.raises(GitIntegrationError):
+        service.push(branch="main")
+
+
+def test_commit_versioned_change_rejects_protected_branch() -> None:
+    config = GitHubIntegrationConfig(
+        workspace=Path("."),
+        github_owner="owner",
+        github_repo="CATBot",
+        required_repository="owner/CATBot",
+        default_branch="main",
+    )
+    service = GitHubIntegrationService(
+        config,
+        git_service=FakeGitService(),
+        version_manager=FakeVersionManager(),
+        github_client=None,
+    )
+
+    with pytest.raises(GitIntegrationError):
+        service.commit_versioned_change("chore: direct-main-change", bump="patch", push=False)
+
+
+def test_push_rejects_sensitive_paths_pending() -> None:
+    config = GitHubIntegrationConfig(
+        workspace=Path("."),
+        github_owner="owner",
+        github_repo="CATBot",
+        required_repository="owner/CATBot",
+    )
+    fake_git = FakeGitService()
+    fake_git.branch = "feature/safe"
+    fake_git.changed = ["config/prod.env"]
+    service = GitHubIntegrationService(
+        config,
+        git_service=fake_git,
+        version_manager=FakeVersionManager(),
+        github_client=None,
+    )
+
+    with pytest.raises(GitIntegrationError):
+        service.push(branch="feature/safe")
+
+
+def test_create_pull_request_rejects_sensitive_paths_in_pr_diff() -> None:
+    config = GitHubIntegrationConfig(
+        workspace=Path("."),
+        github_owner="owner",
+        github_repo="CATBot",
+        required_repository="owner/CATBot",
+    )
+    fake_git = FakeGitService()
+    fake_git.pr_diff_files = ["config/prod.env"]
+    service = GitHubIntegrationService(
+        config,
+        git_service=fake_git,
+        version_manager=FakeVersionManager(),
+        github_client=FakeGitHubClient(),
+    )
+
+    with pytest.raises(GitIntegrationError):
+        service.create_pull_request("Test PR", head="feature/new", base="main", body="")
+
+
+def test_push_rejects_sensitive_config_json_pending() -> None:
+    config = GitHubIntegrationConfig(
+        workspace=Path("."),
+        github_owner="owner",
+        github_repo="CATBot",
+        required_repository="owner/CATBot",
+    )
+    fake_git = FakeGitService()
+    fake_git.branch = "feature/safe"
+    fake_git.changed = ["config/team-config.json"]
+    service = GitHubIntegrationService(
+        config,
+        git_service=fake_git,
+        version_manager=FakeVersionManager(),
+        github_client=None,
+    )
+
+    with pytest.raises(GitIntegrationError):
+        service.push(branch="feature/safe")
 
 
 def test_repository_info_and_pull_request_listing() -> None:

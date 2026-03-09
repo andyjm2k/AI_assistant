@@ -435,14 +435,16 @@ class TodoTaskExecutor:
                 return (STATUS_AWAITING_CONFIRMATION, last_message or self.last_error or "Execution stopped (no response).")
             content = (llm_response.get("content") or "").strip()
             tool_calls = llm_response.get("tool_calls")
-            # Check content for done/pause even when there are tool_calls (model may say "I'm done" and still emit a final tool call)
+            pending_status: Optional[str] = None
+            # If the model returns done/pause text with tool_calls, execute tool_calls first
+            # so final side effects (e.g. write_file) are not skipped.
             if content:
                 status = self._check_pause_or_done(content)
-                if status:
-                    # Append only content so we don't leave unexecuted tool_calls in history
+                if status and not tool_calls:
                     self.messages.append({"role": "assistant", "content": content})
                     print(f"[TASK_EXEC] Detected {status} in assistant message (iteration {self.iteration_count})")
                     return (status, content)
+                pending_status = status
             if tool_calls and self.tool_executor:
                 self.messages.append({
                     "role": "assistant",
@@ -478,6 +480,12 @@ class TodoTaskExecutor:
                             "content": f"Error: {e}",
                         })
                 last_message = content or last_message
+                if pending_status:
+                    print(
+                        f"[TASK_EXEC] Detected {pending_status} in assistant message after tool execution "
+                        f"(iteration {self.iteration_count})"
+                    )
+                    return (pending_status, last_message or content or "")
                 continue
             self.messages.append({"role": "assistant", "content": content or "(No content)"})
             last_message = content

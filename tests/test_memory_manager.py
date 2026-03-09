@@ -251,6 +251,22 @@ class TestMemoryManager:
         mock_extractor.extract_memories.assert_not_called()
         assert memory_ids == []
 
+    def test_is_operational_memory_text_detects_task_state(self, memory_manager):
+        """Operational todo/task/status snapshots should be detected as non-durable memory text."""
+        assert memory_manager.is_operational_memory_text("Todo list: 1. Pay rent 2. Submit report") is True
+        assert memory_manager.is_operational_memory_text("Task execution status: awaiting confirmation") is True
+        assert memory_manager.is_operational_memory_text("User prefers dark mode for coding.") is False
+
+    def test_filter_memories_for_conversation_context_excludes_task_and_state(self, memory_manager):
+        """Conversation context filter should keep durable profile memories only."""
+        memories = [
+            {"text": "User prefers dark mode.", "category": "preference", "source": "conversation", "similarity": 0.92},
+            {"text": "Task outcome memory. Task: deploy app.", "category": "task_experience", "source": "task_execution", "similarity": 0.90},
+            {"text": "Todo list: 1. buy milk", "category": "general", "source": "telegram", "similarity": 0.89},
+        ]
+        out = memory_manager.filter_memories_for_conversation_context(memories)
+        assert [m.get("text") for m in out] == ["User prefers dark mode."]
+
     @pytest.mark.asyncio
     async def test_record_task_outcome_stores_events_and_learning_memories(
         self,

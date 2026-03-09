@@ -115,7 +115,14 @@ When contemplating, you should use tools to gather information to inform your ow
             # Filter out excluded category if specified
             if exclude_category:
                 memories = [mem for mem in memories if mem.get('category') != exclude_category]
-            
+
+            # Reuse MemoryManager conversational context filters to avoid operational/task-state contamination.
+            filter_fn = getattr(self.memory_manager, "filter_memories_for_conversation_context", None)
+            if callable(filter_fn):
+                maybe_filtered = filter_fn(memories)
+                if isinstance(maybe_filtered, list):
+                    memories = maybe_filtered
+             
             return memories
         except Exception as e:
             print(f"Error retrieving memories for philosopher mode: {e}")
@@ -614,7 +621,14 @@ ACTION REQUIRED: If I need information, I MUST use the appropriate tools NOW to 
             },
             {
                 "role": "user",
-                "content": f"Question: {question}\n\nYour most recent contemplation step: {recent_step}\n\nAre you satisfied with this answer, or do you need to think more? Respond with ONLY 'yes' if satisfied, or 'no' if you need to continue thinking. Keep your response very brief."
+                "content": (
+                    f"Question: {question}\n\n"
+                    f"Your most recent contemplation step: {recent_step}\n\n"
+                    f"Current contemplation context:\n{contemplation_text}\n\n"
+                    "Are you satisfied with this answer, or do you need to think more? "
+                    "Respond with ONLY 'yes' if satisfied, or 'no' if you need to continue thinking. "
+                    "Keep your response very brief."
+                )
             }
         ]
         

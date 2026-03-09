@@ -566,7 +566,7 @@ class PublishReleaseTool(BaseTool):
 class GitHubProjectManagerSkill(BaseSkill):
     name = "GitHubProjectManager"
     description = "Project lifecycle automation for git workflows, semantic versioning, pull requests, and releases."
-    version = "1.1.0"
+    version = "1.2.0"
     tags = ["git", "github", "release", "versioning", "devops"]
 
     def create_tools(self) -> Sequence[BaseTool]:

@@ -497,6 +497,16 @@ class TestAutoMemorySearchHelpers:
         out = _filter_high_relevance_memories(memories)
         assert [m["text"] for m in out] == ["Top", "Close"]
 
+    def test_filter_high_relevance_memories_excludes_task_learning_and_operational(self):
+        from src.servers.proxy_server import _filter_high_relevance_memories
+        memories = [
+            {"text": "Useful preference", "category": "preference", "similarity": 0.86},
+            {"text": "Task outcome memory. Task: deploy app", "category": "task_experience", "source": "task_execution", "similarity": 0.84},
+            {"text": "Todo list: 1. buy milk", "category": "general", "similarity": 0.83},
+        ]
+        out = _filter_high_relevance_memories(memories)
+        assert [m.get("text") for m in out] == ["Useful preference"]
+
 
 class TestResolveTodoUserForTelegram:
     """Tests for _resolve_todo_user_for_telegram (Telegram -> app username linking)."""

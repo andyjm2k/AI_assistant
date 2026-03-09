@@ -96,6 +96,7 @@ What counts as "important":
 Do NOT include:
 - Inferred or vague observations the user did not state
 - One-off task context, small talk, or politeness ("thanks", "ok")
+- Operational state snapshots (todo/task lists, due/overdue status, task execution states)
 - Generic statements or advice that could apply to anyone
 - Anything you are unsure about; when in doubt, omit it
 
@@ -120,6 +121,7 @@ JSON:"""
             "You are a memory extraction system. You output a JSON array of memories. "
             "Return an empty array [] when nothing in the conversation is important enough to remember. "
             "Do not try to fill the list; it is better to return nothing than to store low-value items. "
+            "Never output transient operational state such as todo lists, task progress, or status snapshots. "
             "Always respond with valid JSON only (a single array, or an object containing an array under 'memories' or 'items')."
         )
         # Prepare request payload

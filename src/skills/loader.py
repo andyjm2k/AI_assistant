@@ -43,6 +43,22 @@ def _load_python_target(path: str) -> Any:
 class SkillManifestLoader:
     """Load skills from JSON manifests."""
 
+    @staticmethod
+    def _parse_enabled_flag(raw_enabled: Any, manifest_path: Path) -> bool:
+        if isinstance(raw_enabled, bool):
+            return raw_enabled
+        if isinstance(raw_enabled, (int, float)):
+            return bool(raw_enabled)
+        if isinstance(raw_enabled, str):
+            normalized = raw_enabled.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off", ""}:
+                return False
+        raise SkillValidationError(
+            f"Manifest '{manifest_path}' field 'enabled' must be a boolean-like value."
+        )
+
     def parse_manifest_file(self, path: str | Path) -> SkillManifest:
         manifest_path = Path(path)
         try:
@@ -89,7 +105,7 @@ class SkillManifestLoader:
             name=name,
             module=module,
             description=str(data.get("description", "")).strip(),
-            enabled=bool(data.get("enabled", True)),
+            enabled=self._parse_enabled_flag(data.get("enabled", True), manifest_path),
             settings=settings,
             package_sources=package_sources,
             path=manifest_path,

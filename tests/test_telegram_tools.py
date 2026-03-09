@@ -343,6 +343,43 @@ class TestExecuteTelegramTool:
         assert "cats" in r2.get("message", "")
 
     @pytest.mark.asyncio
+    async def test_store_memory_rejects_transient_operational_state(self):
+        """storeMemory should refuse task/list/status snapshots when manager exposes guard."""
+        mm = MagicMock()
+        mm.should_store_as_conversational_memory = MagicMock(return_value=False)
+        mm.store_memory = AsyncMock(return_value="mem_x")
+        ctx = {"memory_manager": mm}
+
+        out = await tg.execute_telegram_tool(
+            "storeMemory",
+            {"text": "Todo list: 1. buy milk"},
+            ctx,
+        )
+        assert out.get("success") is False
+        assert "transient" in out.get("message", "").lower()
+        mm.store_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_store_memory_allows_durable_memory_text(self):
+        """storeMemory should pass durable text through to memory manager."""
+        mm = MagicMock()
+        mm.should_store_as_conversational_memory = MagicMock(return_value=True)
+        mm.store_memory = AsyncMock(return_value="mem_123")
+        ctx = {"memory_manager": mm}
+
+        out = await tg.execute_telegram_tool(
+            "storeMemory",
+            {"text": "User prefers dark mode", "category": "preference"},
+            ctx,
+        )
+        assert out.get("success") is True
+        mm.store_memory.assert_awaited_once_with(
+            text="User prefers dark mode",
+            category="preference",
+            source="telegram",
+        )
+
+    @pytest.mark.asyncio
     async def test_navigate_to_url_returns_message_with_link(self):
         """navigateToUrl returns message with URL (no actual navigation in Telegram)."""
         ctx = {}

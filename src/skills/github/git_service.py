@@ -168,6 +168,12 @@ class GitService:
             args.append("--tags")
         self._run(args)
 
+    def diff_name_only(self, base_ref: str, head_ref: str) -> list[str]:
+        base = _validate_ref_name(base_ref, "base ref")
+        head = _validate_ref_name(head_ref, "head ref")
+        output = self._run(["diff", "--name-only", f"{base}...{head}"])
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
     def tag(self, name: str, message: str | None = None, annotated: bool = True, force: bool = False) -> None:
         tag_name = _validate_ref_name(name, "tag name")
         args = ["tag"]
