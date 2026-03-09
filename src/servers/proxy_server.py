@@ -635,6 +635,16 @@ telegram_conversations: Dict[str, List[Dict[str, str]]] = {}
 # Per-conversation todo list and memory cache for Telegram tools (same semantics as web client)
 telegram_todo: Dict[str, List[str]] = {}
 telegram_memory_cache: Dict[str, List[str]] = {}
+# Guard long-running ad hoc deep-research calls to avoid overlapping runs per Telegram conversation.
+telegram_deep_research_active: Dict[str, Dict[str, Any]] = {}
+telegram_deep_research_lock = asyncio.Lock()
+try:
+    TELEGRAM_DEEP_RESEARCH_STALE_SECONDS = max(
+        300,
+        int(os.getenv("TELEGRAM_DEEP_RESEARCH_STALE_SECONDS", "21600")),
+    )
+except ValueError:
+    TELEGRAM_DEEP_RESEARCH_STALE_SECONDS = 21600
 
 # Optional: tool-capable system prompt for Telegram when TELEGRAM_TOOLS_ENABLED=true
 CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE = _PROJECT_ROOT / "config" / "catbot_system_prompt_with_tools.txt"
@@ -2158,6 +2168,7 @@ def _build_telegram_skill_tools_prompt_block() -> str:
     skill_tools = _get_skill_tools_mcp_schema()
     if not skill_tools:
         return ""
+    excluded_tool_names = {"googleworkspace_cli.run_readonly_command"}
 
     lines: List[str] = [
         "Additional Skill Framework tools (dynamically loaded):",
@@ -2167,6 +2178,8 @@ def _build_telegram_skill_tools_prompt_block() -> str:
         name = str(item.get("name") or "").strip()
         if not name:
             continue
+        if name in excluded_tool_names:
+            continue
         description = str(item.get("description") or "No description.").strip()
         input_schema = item.get("inputSchema")
         if not isinstance(input_schema, dict):
@@ -2174,6 +2187,25 @@ def _build_telegram_skill_tools_prompt_block() -> str:
         schema_text = json.dumps(input_schema, ensure_ascii=False, separators=(",", ":"), default=str)
         lines.append(f"- {name}: {description}")
         lines.append(f"  Parameters JSON schema: {schema_text}")
+
+    tool_names = {str(item.get("name") or "").strip() for item in skill_tools if isinstance(item, dict)}
+    if "googleworkspace_cli.gmail_list_unread" in tool_names:
+        lines.extend(
+            [
+                "",
+                "Gmail tool examples (prefer these over generic run_readonly_command):",
+                "<tool>googleworkspace_cli.gmail_list_unread</tool>",
+                "<parameters>{\"max_results\": 5}</parameters>",
+                "<tool>googleworkspace_cli.gmail_get_message</tool>",
+                "<parameters>{\"message_id\": \"18c...\", \"format\": \"full\"}</parameters>",
+                "<tool>googleworkspace_cli.gmail_compose_draft</tool>",
+                "<parameters>{\"to\": \"user@example.com\", \"subject\": \"Status\", \"body_text\": \"Hi\"}</parameters>",
+                "<tool>googleworkspace_cli.gmail_send_message</tool>",
+                "<parameters>{\"to\": \"user@example.com\", \"subject\": \"Status\", \"body_text\": \"Hi\"}</parameters>",
+                "<tool>googleworkspace_cli.gmail_mark_read</tool>",
+                "<parameters>{\"message_id\": \"18c...\"}</parameters>",
+            ]
+        )
 
     if len(lines) <= 2:
         return ""
@@ -5997,6 +6029,16 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     # Track last tool result so we can show it to the user if the LLM never returns a final text reply
     last_tool_result_message: Optional[str] = None
     last_tool_success: Optional[bool] = None
+    preferred_tool_result_message: Optional[str] = None
+    preferred_tool_success: Optional[bool] = None
+    _tool_discovery_or_setup_names = {
+        "list_available_commands",
+        "googleworkspace_cli.list_available_commands",
+        "check_auth",
+        "googleworkspace_cli.check_auth",
+        "check_cli",
+        "googleworkspace_cli.check_cli",
+    }
     # Friendly message when tool failed or returned an error (avoid showing raw 404/500 to user)
     _telegram_tool_error_reply = "I wasn't able to get that information just now. Please try again or rephrase your question."
     if TELEGRAM_TOOLS_ENABLED and _telegram_tools is not None:
@@ -6010,6 +6052,21 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             parsed = _telegram_tools.parse_telegram_tool_response(reply)
             result_message = last_tool_result_message or ""
             if not native_tool_calls and not parsed:
+                planning_chatter_checker = getattr(_telegram_tools, "reply_looks_like_tool_planning", None)
+                if (
+                    iterations > 0
+                    and result_message
+                    and callable(planning_chatter_checker)
+                    and planning_chatter_checker(reply)
+                ):
+                    if bool(last_tool_success):
+                        reply = f"Here's what I found:\n\n{result_message}"
+                    else:
+                        reply = (
+                            _telegram_tool_error_reply
+                            if _telegram_tools.tool_result_looks_like_error(result_message)
+                            else f"I ran into an issue while calling the tool:\n\n{result_message}"
+                        )
                 break
             # After at least one tool execution, prefer mixed natural-language replies
             # over re-entering the tool loop when the model includes incidental XML.
@@ -6046,7 +6103,11 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     requested_by=f"telegram:{request.user_id or conversation_id}",
                 ),
                 "do_browser_agent": _do_browser_agent,
-                "do_deep_research": _do_deep_research,
+                "do_deep_research": lambda args: _do_deep_research_for_telegram(
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    body=args if isinstance(args, dict) else {},
+                ),
                 "do_browser_health_check": _do_browser_health_check,
                 "read_file_internal": _read_file_internal,
                 "write_file_internal": _write_file_internal,
@@ -6100,6 +6161,14 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     result_message = tool_result.get("message", str(tool_result))
                     last_tool_result_message = result_message
                     last_tool_success = tool_result.get("success", True)
+                    normalized_tool_name = str(tool_name or "").strip()
+                    if (
+                        bool(last_tool_success)
+                        and normalized_tool_name
+                        and normalized_tool_name not in _tool_discovery_or_setup_names
+                    ):
+                        preferred_tool_result_message = result_message
+                        preferred_tool_success = True
                     working_messages.append(
                         {
                             "role": "tool",
@@ -6130,6 +6199,14 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 result_message = tool_result.get("message", str(tool_result))
                 last_tool_result_message = result_message
                 last_tool_success = tool_result.get("success", True)
+                normalized_tool_name = str(tool_name or "").strip()
+                if (
+                    bool(last_tool_success)
+                    and normalized_tool_name
+                    and normalized_tool_name not in _tool_discovery_or_setup_names
+                ):
+                    preferred_tool_result_message = result_message
+                    preferred_tool_success = True
                 working_messages.append({"role": "assistant", "content": reply})
                 working_messages.append({"role": "user", "content": f"Tool result: {result_message}"})
             payload_tool = {"model": model_name, "messages": working_messages}
@@ -6264,14 +6341,64 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 reply = new_content
             iterations += 1
 
+        # If loop exited due iteration cap, prevent planning chatter from leaking
+        # when we already have a concrete tool result.
+        planning_chatter_checker = getattr(_telegram_tools, "reply_looks_like_tool_planning", None)
+        if (
+            callable(planning_chatter_checker)
+            and planning_chatter_checker(reply)
+            and last_tool_result_message
+        ):
+            result_for_user = preferred_tool_result_message or last_tool_result_message
+            success_for_user = (
+                preferred_tool_success
+                if preferred_tool_result_message is not None
+                else last_tool_success
+            )
+            if bool(success_for_user):
+                reply = f"Here's what I found:\n\n{result_for_user}"
+            else:
+                reply = (
+                    _telegram_tool_error_reply
+                    if _telegram_tools.tool_result_looks_like_error(result_for_user)
+                    else f"I ran into an issue while calling the tool:\n\n{result_for_user}"
+                )
+
+    # Never send raw tool-call XML to the user: if reply still looks like a tool call, show last tool result instead
+    if _telegram_tools is not None:
+        strip_think_fn = getattr(_telegram_tools, "strip_think_markup", None)
+        if callable(strip_think_fn):
+            cleaned_reply = strip_think_fn(reply)
+            if cleaned_reply:
+                reply = cleaned_reply
+            elif preferred_tool_result_message or last_tool_result_message:
+                result_for_user = preferred_tool_result_message or last_tool_result_message
+                success_for_user = (
+                    preferred_tool_success
+                    if preferred_tool_result_message is not None
+                    else last_tool_success
+                )
+                if not success_for_user or _telegram_tools.tool_result_looks_like_error(str(result_for_user or "")):
+                    reply = _telegram_tool_error_reply
+                else:
+                    reply = f"Here's what I found:\n\n{result_for_user}"
+            else:
+                reply = "I couldn't generate a response right now. Please try again shortly."
+
     # Never send raw tool-call XML to the user: if reply still looks like a tool call, show last tool result instead
     if _telegram_tools is not None and _telegram_tools.reply_looks_like_tool_call(reply):
-        if last_tool_result_message is not None:
+        result_for_user = preferred_tool_result_message or last_tool_result_message
+        success_for_user = (
+            preferred_tool_success
+            if preferred_tool_result_message is not None
+            else last_tool_success
+        )
+        if result_for_user is not None:
             print("Telegram: reply was raw tool call, using last tool result for user")
-            if not last_tool_success or _telegram_tools.tool_result_looks_like_error(last_tool_result_message):
+            if not success_for_user or _telegram_tools.tool_result_looks_like_error(result_for_user):
                 reply = _telegram_tool_error_reply
             else:
-                reply = f"Here's what I found:\n\n{last_tool_result_message}"
+                reply = f"Here's what I found:\n\n{result_for_user}"
         else:
             reply = "I used a tool but couldn't format the result. Please try again."
 
@@ -7915,6 +8042,82 @@ async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
         error_content = response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text}
         raise HTTPException(status_code=response.status_code, detail=error_content.get("error", str(error_content)))
     return response.json()
+
+
+async def _acquire_telegram_deep_research_slot(
+    conversation_id: str,
+    request_id: str,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Acquire per-conversation deep-research slot. Returns (acquired, active_holder_if_busy)."""
+    now_ts = time.time()
+    stale_before = now_ts - float(TELEGRAM_DEEP_RESEARCH_STALE_SECONDS)
+    async with telegram_deep_research_lock:
+        stale_keys = [
+            cid
+            for cid, meta in telegram_deep_research_active.items()
+            if float(meta.get("started_at_ts") or 0.0) < stale_before
+        ]
+        for cid in stale_keys:
+            telegram_deep_research_active.pop(cid, None)
+
+        active = telegram_deep_research_active.get(conversation_id)
+        if active and active.get("request_id") != request_id:
+            return False, dict(active)
+
+        telegram_deep_research_active[conversation_id] = {
+            "request_id": request_id,
+            "started_at_ts": now_ts,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return True, None
+
+
+async def _release_telegram_deep_research_slot(conversation_id: str, request_id: str) -> None:
+    """Release per-conversation deep-research slot if owned by request_id."""
+    async with telegram_deep_research_lock:
+        active = telegram_deep_research_active.get(conversation_id)
+        if active and active.get("request_id") == request_id:
+            telegram_deep_research_active.pop(conversation_id, None)
+
+
+async def _do_deep_research_for_telegram(
+    conversation_id: str,
+    request_id: str,
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Run deep research with per-conversation concurrency guard for Telegram adhoc flows.
+    Prevents overlapping long-running runs when users send repeated messages before prior completion.
+    """
+    acquired, active = await _acquire_telegram_deep_research_slot(conversation_id, request_id)
+    if not acquired:
+        active_request_id = str((active or {}).get("request_id") or "").strip()
+        active_started = str((active or {}).get("started_at") or "").strip()
+        suffix = []
+        if active_started:
+            suffix.append(f"started {active_started}")
+        if active_request_id:
+            suffix.append(f"request_id={active_request_id}")
+        suffix_text = f" ({', '.join(suffix)})" if suffix else ""
+        return {
+            "success": False,
+            "message": (
+                "A deep research request is already running for this chat"
+                f"{suffix_text}. Please wait for it to finish before starting another."
+            ),
+            "busy": True,
+            "active_request_id": active_request_id or None,
+        }
+
+    try:
+        return await _do_deep_research(body)
+    except HTTPException as e:
+        detail = e.detail if isinstance(e.detail, str) else str(e.detail)
+        return {"success": False, "message": detail or "Deep research request failed."}
+    except Exception as e:
+        return {"success": False, "message": f"Deep research request failed: {e}"}
+    finally:
+        await _release_telegram_deep_research_slot(conversation_id, request_id)
 
 
 async def _do_browser_health_check(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

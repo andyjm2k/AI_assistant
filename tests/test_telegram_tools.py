@@ -4,6 +4,7 @@ Covers parse_telegram_tool_response (XML, JSON, code-block stripping) and execut
 """
 
 import json
+import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -73,6 +74,28 @@ class TestParseTelegramToolResponse:
         """Plain text with no tool format returns None."""
         assert tg.parse_telegram_tool_response("Just a normal reply.") is None
 
+    def test_tool_xml_wrapped_in_think_still_parsed(self):
+        """Tool call parsing should still work even if model wraps text in <think> blocks."""
+        content = (
+            "<think>I'll call a tool now.</think>\n"
+            '<tool>webSearch</tool>\n<parameters>{"query":"x"}</parameters>'
+        )
+        out = tg.parse_telegram_tool_response(content)
+        assert out is not None
+        assert out.get("name") == "webSearch"
+        assert json.loads(out["arguments"]) == {"query": "x"}
+
+
+class TestStripThinkMarkup:
+    """Tests for stripping <think>...</think> blocks from assistant text."""
+
+    def test_strip_think_markup_removes_reasoning_block(self):
+        content = "Before\n<think>private reasoning</think>\nAfter"
+        out = tg.strip_think_markup(content)
+        assert "private reasoning" not in out
+        assert "Before" in out
+        assert "After" in out
+
 
 class TestReplyLooksLikeToolCall:
     """Tests for reply_looks_like_tool_call (used to avoid sending raw XML to the user)."""
@@ -107,6 +130,14 @@ class TestReplyLooksLikeToolCall:
         )
         assert tg.reply_looks_like_tool_call(content) is False
 
+    def test_tool_xml_wrapped_in_think_is_still_detected(self):
+        """Raw tool XML wrapped in <think> should still be detected as tool-call-only output."""
+        content = (
+            "<think>internal</think>\n"
+            '<tool>scrapeWebsite</tool>\n<parameters>{"url":"https://example.com"}</parameters>'
+        )
+        assert tg.reply_looks_like_tool_call(content) is True
+
 
 class TestStripToolCallMarkup:
     """Tests for stripping embedded tool XML from mixed replies."""
@@ -122,6 +153,15 @@ class TestStripToolCallMarkup:
         assert "<parameters>" not in out
         assert "Here is the final response." in out
         assert "Anything else?" in out
+
+    def test_strip_tool_call_markup_removes_think_blocks(self):
+        content = (
+            "<think>private chain-of-thought</think>\n"
+            "Visible reply."
+        )
+        out = tg.strip_tool_call_markup(content)
+        assert "chain-of-thought" not in out
+        assert out == "Visible reply."
 
 
 class TestToolResultLooksLikeError:
@@ -149,6 +189,22 @@ class TestToolResultLooksLikeError:
         assert tg.tool_result_looks_like_error(None) is False
 
 
+class TestReplyLooksLikeToolPlanning:
+    """Tests for planning-chatter detection after tool execution."""
+
+    def test_planning_chatter_returns_true(self):
+        content = "Let me see what Gmail commands are available first."
+        assert tg.reply_looks_like_tool_planning(content) is True
+
+    def test_normal_reply_returns_false(self):
+        content = "I found 5 recent emails in your inbox."
+        assert tg.reply_looks_like_tool_planning(content) is False
+
+    def test_mid_sentence_planning_with_trailing_colon_returns_true(self):
+        content = "I found your latest emails. Let me fetch the details to show you:"
+        assert tg.reply_looks_like_tool_planning(content) is True
+
+
 class TestExecuteTelegramTool:
     """Tests for execute_telegram_tool (async) with mocked dependencies."""
 
@@ -159,6 +215,349 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("manageTodoList", {"action": "add", "taskDescription": "Buy milk"}, ctx)
         assert r.get("success") is False
         assert "not available" in r.get("message", "").lower() or "persistent" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_uses_structured_data_when_message_is_ok(self):
+        """Dynamic skill results should surface useful payload text instead of generic 'OK'."""
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "response": {
+                        "parsed_json": {"messages": [{"id": "m1"}]},
+                    }
+                },
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.run_readonly_command", {"service": "gmail"}, ctx)
+        assert out.get("success") is True
+        assert "messages" in out.get("message", "")
+        assert "m1" in out.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_googleworkspace_cli_skill_name_alias_maps_to_run_readonly_command(self):
+        """Skill-name alias should execute the primary googleworkspace_cli tool."""
+
+        captured = {}
+
+        async def mock_skill_executor(name, arguments):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            return {"success": True, "message": "OK", "data": {"response": {"parsed_json": {"ok": True}}}}
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli", {"service": "gmail", "action": "list"}, ctx)
+        assert out.get("success") is True
+        assert captured.get("name") == "googleworkspace_cli.gmail_list_unread"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_formats_gmail_message_summaries(self):
+        """When gmail_message_summaries are present, output should be human-readable."""
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "gmail_message_summaries": [
+                        {
+                            "id": "msg_1",
+                            "from": "Alice <alice@example.com>",
+                            "subject": "Status update",
+                            "date": "Mon, 9 Mar 2026",
+                            "snippet": "Quick update on the rollout.",
+                        }
+                    ]
+                },
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.run_readonly_command", {"service": "gmail"}, ctx)
+        assert out.get("success") is True
+        assert "Latest emails:" in out.get("message", "")
+        assert "Status update" in out.get("message", "")
+        assert "alice@example.com" in out.get("message", "")
+        assert "ID: msg_1" in out.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_formats_gmail_summaries_without_unknown_placeholders(self):
+        """When sender/subject are missing, render a clean fallback without unknown placeholders."""
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "gmail_message_summaries": [
+                        {
+                            "snippet": "Newsletter preview text from marketing team",
+                        }
+                    ]
+                },
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.run_readonly_command", {"service": "gmail"}, ctx)
+        assert out.get("success") is True
+        msg = out.get("message", "")
+        assert "Latest emails:" in msg
+        assert "(unknown sender)" not in msg
+        assert "(no subject)" not in msg
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_formats_gmail_message_get_details_recursively(self):
+        """Nested Gmail headers/body should be rendered as details, not raw JSON."""
+
+        body_encoded = base64.urlsafe_b64encode(b"Hello from the decoded body").decode("utf-8").rstrip("=")
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "response": {
+                        "parsed_json": {
+                            "id": "m42",
+                            "threadId": "t42",
+                            "snippet": "Hello from snippet",
+                            "labelIds": ["INBOX", "UNREAD"],
+                            "payload": {
+                                "parts": [
+                                    {
+                                        "mimeType": "multipart/alternative",
+                                        "parts": [
+                                            {
+                                                "mimeType": "text/plain",
+                                                "body": {"data": body_encoded},
+                                            }
+                                        ],
+                                        "headers": [
+                                            {"name": "From", "value": "Carol <carol@example.com>"},
+                                            {"name": "To", "value": "me@example.com"},
+                                            {"name": "Subject", "value": "Nested hello"},
+                                            {"name": "Date", "value": "Mon, 9 Mar 2026"},
+                                        ],
+                                    }
+                                ]
+                            },
+                        }
+                    }
+                },
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.run_readonly_command", {"service": "gmail"}, ctx)
+        assert out.get("success") is True
+        msg = out.get("message", "")
+        assert "Email ID: m42" in msg
+        assert "From: Carol <carol@example.com>" in msg
+        assert "To: me@example.com" in msg
+        assert "Subject: Nested hello" in msg
+        assert "Snippet: Hello from snippet" in msg
+        assert "Body: Hello from the decoded body" in msg
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_caches_gmail_summary_ids_for_followups(self):
+        """List results should cache summary IDs so follow-up detail requests can resolve by index."""
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "gmail_message_summaries": [
+                        {"id": "id_a", "subject": "A"},
+                        {"id": "id_b", "subject": "B"},
+                    ]
+                },
+            }
+
+        memory_cache_store = {}
+        ctx = {
+            "conversation_id": "cid1",
+            "memory_cache_store": memory_cache_store,
+            "execute_skill_tool": mock_skill_executor,
+        }
+        out = await tg.execute_telegram_tool(
+            "googleworkspace_cli.run_readonly_command",
+            {"service": "gmail", "resource": "messages", "action": "list"},
+            ctx,
+        )
+        assert out.get("success") is True
+        gmail_state = memory_cache_store.get("__gmail_tool_state__", {}).get("cid1", {})
+        assert gmail_state.get("last_message_ids") == ["id_a", "id_b"]
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_resolves_numeric_gmail_detail_reference(self):
+        """A detail request with id='1' should resolve to the first cached Gmail message ID."""
+
+        captured = {}
+
+        async def mock_skill_executor(name, arguments):
+            captured["args"] = arguments
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "response": {
+                        "parsed_json": {
+                            "id": "id_a",
+                            "payload": {"headers": [{"name": "Subject", "value": "Resolved"}]},
+                        }
+                    }
+                },
+            }
+
+        memory_cache_store = {"__gmail_tool_state__": {"cid1": {"last_message_ids": ["id_a", "id_b"]}}}
+        ctx = {
+            "conversation_id": "cid1",
+            "memory_cache_store": memory_cache_store,
+            "execute_skill_tool": mock_skill_executor,
+        }
+        out = await tg.execute_telegram_tool(
+            "googleworkspace_cli.run_readonly_command",
+            {
+                "service": "gmail",
+                "resource": "messages",
+                "action": "get",
+                "params": {"id": "1"},
+            },
+            ctx,
+        )
+        assert out.get("success") is True
+        assert captured["args"]["params"]["id"] == "id_a"
+        assert captured["args"]["params"]["userId"] == "me"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_formats_wrapped_gmail_message_payload(self):
+        """Wrapped payloads like {'message': {...}} should still render readable email details."""
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "response": {
+                        "parsed_json": {
+                            "message": {
+                                "id": "m_wrap",
+                                "threadId": "t_wrap",
+                                "snippet": "Wrapped snippet",
+                                "payload": {
+                                    "headers": [
+                                        {"name": "From", "value": "Wrapped <wrap@example.com>"},
+                                        {"name": "Subject", "value": "Wrapped subject"},
+                                    ]
+                                },
+                            }
+                        }
+                    }
+                },
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.run_readonly_command", {"service": "gmail"}, ctx)
+        assert out.get("success") is True
+        msg = out.get("message", "")
+        assert "Email ID: m_wrap" in msg
+        assert "Subject: Wrapped subject" in msg
+        assert "From: Wrapped <wrap@example.com>" in msg
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_parses_noisy_json_stdout_for_gmail_details(self):
+        """When parsed_json is missing but stdout contains noisy JSON, extract and summarize it."""
+
+        async def mock_skill_executor(name, arguments):
+            noisy = (
+                "debug: running command\n"
+                '{"id":"m_stdout","threadId":"t_stdout","snippet":"From stdout",'
+                '"payload":{"headers":[{"name":"Subject","value":"Stdout subject"},'
+                '{"name":"From","value":"Stdout <stdout@example.com>"}]}}'
+            )
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {"response": {"parsed_json": None, "stdout": noisy}},
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.run_readonly_command", {"service": "gmail"}, ctx)
+        assert out.get("success") is True
+        msg = out.get("message", "")
+        assert "Email ID: m_stdout" in msg
+        assert "Subject: Stdout subject" in msg
+        assert "From: Stdout <stdout@example.com>" in msg
+        assert "{" not in msg
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_reports_when_no_inline_body_or_snippet(self):
+        """If no snippet/body exists, include a clear body-not-found line instead of vague emptiness."""
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "response": {
+                        "parsed_json": {
+                            "id": "m_no_body",
+                            "payload": {
+                                "headers": [
+                                    {"name": "From", "value": "NoBody <nobody@example.com>"},
+                                    {"name": "Subject", "value": "Attachment only"},
+                                ]
+                            },
+                        }
+                    }
+                },
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.run_readonly_command", {"service": "gmail"}, ctx)
+        assert out.get("success") is True
+        msg = out.get("message", "")
+        assert "Subject: Attachment only" in msg
+        assert "Body: (no inline text body found in this message)" in msg
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_renders_html_body_content_when_plain_text_missing(self):
+        """HTML-only body parts should be rendered into readable text."""
+
+        html_body = base64.urlsafe_b64encode(b"<p>Hello <b>HTML</b> only</p>").decode("utf-8").rstrip("=")
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "response": {
+                        "parsed_json": {
+                            "id": "m_html_only",
+                            "payload": {
+                                "parts": [
+                                    {
+                                        "mimeType": "text/html",
+                                        "body": {"data": html_body},
+                                    }
+                                ],
+                                "headers": [
+                                    {"name": "Subject", "value": "HTML only"},
+                                ],
+                            },
+                        }
+                    }
+                },
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.run_readonly_command", {"service": "gmail"}, ctx)
+        assert out.get("success") is True
+        msg = out.get("message", "")
+        assert "Subject: HTML only" in msg
+        assert "Body: Hello HTML only" in msg
 
     @pytest.mark.asyncio
     async def test_manage_todo_list_add_and_list_with_persistent_store(self):
@@ -724,6 +1123,28 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("healthCheck", {}, {})
         assert r.get("success") is False
         assert "not available" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_run_deep_research_propagates_backend_failure(self):
+        """runDeepResearch should preserve backend success=False instead of forcing success=True."""
+        async def fake_research(_args):
+            return {"success": False, "message": "Deep research already running"}
+
+        ctx = {"do_deep_research": fake_research}
+        r = await tg.execute_telegram_tool("runDeepResearch", {"researchTask": "x"}, ctx)
+        assert r.get("success") is False
+        assert "already running" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_run_browser_agent_propagates_backend_failure(self):
+        """runBrowserAgent should preserve backend success=False instead of forcing success=True."""
+        async def fake_browser(_args):
+            return {"success": False, "message": "Browser backend unavailable"}
+
+        ctx = {"do_browser_agent": fake_browser}
+        r = await tg.execute_telegram_tool("runBrowserAgent", {"task": "x"}, ctx)
+        assert r.get("success") is False
+        assert "unavailable" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
     async def test_pdf_to_power_point_returns_web_only_message(self):

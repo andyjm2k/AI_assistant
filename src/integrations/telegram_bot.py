@@ -15,7 +15,7 @@ Environment variables:
     TELEGRAM_MAX_VOICE_SECONDS: Max accepted voice duration in seconds (default: 300)
     TELEGRAM_SEND_TRANSCRIPT: Set to "false" to suppress transcript echo message
     TELEGRAM_CHAT_TIMEOUT: Backend request timeout in seconds (default: 30)
-    TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP: Max allowed backend timeout in seconds (default: 180)
+    TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP: Max allowed backend timeout in seconds (default: 10800)
     TELEGRAM_BACKEND_VERIFY_SSL: Set to "false" to skip SSL verification
     TELEGRAM_BOT_SYSTEM_PROMPT: Optional system prompt override passed to backend chat
     TELEGRAM_CHAT_MODEL: Optional model override passed to backend chat
@@ -102,11 +102,17 @@ def _parse_chat_timeout() -> float:
     except ValueError:
         logger.warning("Invalid TELEGRAM_CHAT_TIMEOUT; using 30")
         return 30.0
-    hard_cap_raw = os.getenv("TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP", "180")
+    hard_cap_raw = os.getenv("TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP", "10800")
     try:
         hard_cap = max(1.0, float(hard_cap_raw))
     except ValueError:
-        hard_cap = 180.0
+        hard_cap = 10800.0
+    if raw_timeout > hard_cap:
+        logger.warning(
+            "TELEGRAM_CHAT_TIMEOUT=%s exceeds TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP=%s; using cap.",
+            raw_timeout,
+            hard_cap,
+        )
     return max(1.0, min(raw_timeout, hard_cap))
 
 
@@ -132,6 +138,11 @@ def _build_backend_url(path_or_url: str) -> str:
     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
         return path_or_url
     return f"{BACKEND_BASE_URL.rstrip('/')}{path_or_url}"
+
+
+def build_chat_url() -> str:
+    """Backward-compatible helper used by tests and scripts."""
+    return _build_backend_url(CHAT_ENDPOINT)
 
 
 def _backend_headers() -> Dict[str, str]:

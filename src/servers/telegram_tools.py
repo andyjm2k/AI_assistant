@@ -6,6 +6,8 @@ Todo list uses persistent todo_store when context provides todo_user_key.
 
 import ast
 import asyncio
+import base64
+import html
 import json
 import os
 import re
@@ -22,12 +24,14 @@ except ImportError:
 CALC_EXPR_MAX_LEN = 200
 # Allowed characters for safe calculate (numbers, spaces, + - * / ( ) .)
 CALC_ALLOWED_RE = re.compile(r"^[\d\s+\-*/().]+$")
+SKILL_RESULT_MESSAGE_MAX_CHARS = 4000
 _TOOL_CALL_BLOCK_RE = (
     r"<(?:tool|tool_call)>[\s\S]*?</(?:tool|tool_call)>\s*"
     r"<parameters>[\s\S]*?</parameters>"
 )
 _TOOL_CALL_BLOCK_PATTERN = re.compile(_TOOL_CALL_BLOCK_RE, re.IGNORECASE)
 _STANDALONE_TOOL_CALL_PATTERN = re.compile(rf"^\s*(?:{_TOOL_CALL_BLOCK_RE})\s*$", re.IGNORECASE)
+_THINK_BLOCK_PATTERN = re.compile(r"<think\b[^>]*>[\s\S]*?</think>", re.IGNORECASE)
 
 _TELEGRAM_TOOL_NAME_ALIASES = {
     "read_file": "readFile",
@@ -37,7 +41,10 @@ _TELEGRAM_TOOL_NAME_ALIASES = {
     "saveToFile": "writeFile",
     "health_check": "healthCheck",
     "run_health_check": "healthCheck",
+    # Model sometimes emits the skill name instead of a concrete tool name.
+    "googleworkspace_cli": "googleworkspace_cli.gmail_list_unread",
 }
+_GMAIL_STATE_CACHE_KEY = "__gmail_tool_state__"
 
 
 def _canonicalize_telegram_tool_name(name: Any) -> str:
@@ -156,12 +163,28 @@ def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def strip_think_markup(content: str) -> str:
+    """
+    Remove internal reasoning blocks (<think>...</think>) from assistant text.
+    Keeps other content intact and normalizes extra blank lines left by removal.
+    """
+    if not content or not isinstance(content, str):
+        return ""
+    cleaned = _THINK_BLOCK_PATTERN.sub(" ", content)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def reply_looks_like_tool_call(content: str) -> bool:
     """
     Return True if content looks like raw tool-call XML and should not be shown to the user.
     Used to fall back to tool result when the LLM returns only a tool call and no final text.
     """
     if not content or not isinstance(content, str):
+        return False
+    content = strip_think_markup(content)
+    if not content:
         return False
     # Only treat standalone tool XML as a raw tool call. Mixed natural-language replies
     # that merely include tool markup should be delivered to the user.
@@ -175,6 +198,7 @@ def strip_tool_call_markup(content: str) -> str:
     """
     if not content or not isinstance(content, str):
         return ""
+    content = strip_think_markup(content)
     cleaned = _TOOL_CALL_BLOCK_PATTERN.sub(" ", content)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -196,6 +220,458 @@ def tool_result_looks_like_error(message: str) -> bool:
     if "http status" in lower or "connection error" in lower or "timeout" in lower:
         return True
     return False
+
+
+def reply_looks_like_tool_planning(content: str) -> bool:
+    """
+    Return True for meta/planning chatter that should not be sent as a final reply
+    after tool execution (for example: "let me see what gmail commands are available").
+    """
+    if not content or not isinstance(content, str):
+        return False
+    lowered = re.sub(r"\s+", " ", content.strip().lower())
+    if not any(marker in lowered for marker in ("let me ", "i'll ", "i will ", "checking ")):
+        return False
+
+    if any(
+        marker in lowered
+        for marker in (
+            "let me check",
+            "let me see",
+            "let me fetch",
+            "let me find",
+            "let me verify",
+            "i'll check",
+            "i will check",
+            "available command",
+            "commands are available",
+            "what commands",
+        )
+    ):
+        return True
+
+    # A trailing colon after planning language often indicates an unfinished handoff.
+    if lowered.endswith(":") and "let me " in lowered:
+        return True
+
+    return any(
+        marker in lowered
+        for marker in (
+            "to show you",
+            "first.",
+            "first,",
+        )
+    )
+
+
+def _get_conversation_gmail_state(memory_cache_store: Dict[str, Any], conversation_id: str) -> Dict[str, Any]:
+    if not isinstance(memory_cache_store, dict):
+        return {}
+    root = memory_cache_store.get(_GMAIL_STATE_CACHE_KEY)
+    if not isinstance(root, dict):
+        root = {}
+        memory_cache_store[_GMAIL_STATE_CACHE_KEY] = root
+    state = root.get(conversation_id)
+    if not isinstance(state, dict):
+        state = {}
+        root[conversation_id] = state
+    return state
+
+
+def _parse_gmail_index_reference(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{1,2}", text):
+        try:
+            parsed = int(text)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    match = re.search(r"(?:email|message)\s*#?\s*(\d{1,2})", text)
+    if not match:
+        return None
+    try:
+        parsed = int(match.group(1))
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _looks_like_gmail_message_detail_request(arguments: Dict[str, Any]) -> bool:
+    service = str(arguments.get("service") or "").strip().lower()
+    if service != "gmail":
+        return False
+    action_text = str(arguments.get("action") or "").strip().lower()
+    resource_text = str(arguments.get("resource") or "").strip().lower()
+    if not action_text:
+        return False
+    action_tokens = [tok for tok in re.split(r"[\\/\s.]+", action_text) if tok]
+    if not any(tok in {"get", "read"} for tok in action_tokens):
+        return False
+    if "messages" in resource_text:
+        return True
+    return "messages" in action_tokens
+
+
+def _resolve_gmail_message_reference(
+    arguments: Dict[str, Any],
+    *,
+    memory_cache_store: Dict[str, Any],
+    conversation_id: str,
+) -> Dict[str, Any]:
+    if not _looks_like_gmail_message_detail_request(arguments):
+        return arguments
+
+    state = _get_conversation_gmail_state(memory_cache_store, conversation_id)
+    ids_raw = state.get("last_message_ids")
+    if not isinstance(ids_raw, list):
+        return arguments
+    ids = [str(item).strip() for item in ids_raw if str(item).strip()]
+    if not ids:
+        return arguments
+
+    args_out = dict(arguments)
+    params_raw = args_out.get("params")
+    params = dict(params_raw) if isinstance(params_raw, dict) else {}
+
+    index_candidate = _parse_gmail_index_reference(params.get("id"))
+    if index_candidate is None:
+        for key in ("email_index", "message_index", "index"):
+            index_candidate = _parse_gmail_index_reference(args_out.get(key))
+            if index_candidate is not None:
+                break
+    if index_candidate is None:
+        return arguments
+
+    if index_candidate < 1 or index_candidate > len(ids):
+        return arguments
+
+    params["id"] = ids[index_candidate - 1]
+    if not str(params.get("userId") or "").strip():
+        params["userId"] = "me"
+    args_out["params"] = params
+    return args_out
+
+
+def _cache_gmail_summary_ids(
+    data: Any,
+    *,
+    memory_cache_store: Dict[str, Any],
+    conversation_id: str,
+) -> None:
+    if not isinstance(data, dict):
+        return
+    summaries = data.get("gmail_message_summaries")
+    if not isinstance(summaries, list):
+        return
+    ids: List[str] = []
+    for item in summaries:
+        if not isinstance(item, dict):
+            continue
+        msg_id = str(item.get("id") or "").strip()
+        if msg_id:
+            ids.append(msg_id)
+    if not ids:
+        return
+    state = _get_conversation_gmail_state(memory_cache_store, conversation_id)
+    state["last_message_ids"] = ids
+
+
+def _extract_gmail_headers_map(payload: Any) -> Dict[str, str]:
+    headers_map: Dict[str, str] = {}
+    header_lists: List[List[Dict[str, Any]]] = []
+
+    def _walk(node: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, list):
+            if node and all(isinstance(item, dict) and "value" in item for item in node):
+                if any("name" in item for item in node):
+                    header_lists.append(node)
+            for item in node:
+                _walk(item, depth + 1)
+            return
+        if isinstance(node, dict):
+            for value in node.values():
+                _walk(value, depth + 1)
+
+    _walk(payload)
+
+    for raw_headers in header_lists:
+        for entry in raw_headers:
+            name = str(entry.get("name") or "").strip().lower()
+            value = str(entry.get("value") or "").strip()
+            if name and value and name not in headers_map:
+                headers_map[name] = value
+    return headers_map
+
+
+def _decode_gmail_base64_text(value: str) -> str:
+    encoded = str(value or "").strip()
+    if not encoded:
+        return ""
+    padded = encoded + ("=" * (-len(encoded) % 4))
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("utf-8"))
+    except Exception:
+        return ""
+    text = decoded.decode("utf-8", errors="replace")
+    return re.sub(r"\s+", " ", text.replace("\x00", " ")).strip()
+
+
+def _extract_text_from_html(html_content: str) -> str:
+    text = str(html_content or "").strip()
+    if not text:
+        return ""
+    # Drop non-visible content and convert simple block separators before tag stripping.
+    text = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</(p|div|li|h[1-6]|tr|td|th)\s*>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_gmail_body_preview(payload: Any) -> str:
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+
+    def _walk(node: Any, depth: int = 0) -> None:
+        if depth > 10:
+            return
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+
+        mime_type = str(node.get("mimeType") or "").strip().lower()
+        body = node.get("body")
+        if isinstance(body, dict):
+            body_data = body.get("data")
+            if isinstance(body_data, str) and body_data.strip():
+                decoded = _decode_gmail_base64_text(body_data)
+                if decoded:
+                    if mime_type.startswith("text/plain"):
+                        plain_parts.append(decoded)
+                    elif mime_type.startswith("text/html"):
+                        rendered = _extract_text_from_html(decoded)
+                        if rendered:
+                            html_parts.append(rendered)
+
+        for child in node.values():
+            if isinstance(child, (dict, list)):
+                _walk(child, depth + 1)
+
+    _walk(payload)
+
+    for value in plain_parts:
+        if value:
+            return value
+    for value in html_parts:
+        if value:
+            return value
+    return ""
+
+
+def _looks_like_gmail_message_payload(parsed_json: Dict[str, Any]) -> bool:
+    if not isinstance(parsed_json, dict):
+        return False
+    marker_keys = {"payload", "snippet", "threadId", "labelIds", "internalDate", "historyId", "sizeEstimate"}
+    if any(key in parsed_json for key in marker_keys):
+        return True
+    return bool(_extract_gmail_headers_map(parsed_json))
+
+
+def _parse_json_from_text(value: Any) -> Any:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[idx:])
+            return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _select_gmail_message_node(payload: Dict[str, Any], depth: int = 0) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict) or depth > 6:
+        return None
+    marker_keys = {"payload", "snippet", "threadId", "labelIds", "internalDate", "historyId", "sizeEstimate", "id"}
+    if any(key in payload for key in marker_keys):
+        return payload
+    direct_payload = payload.get("payload")
+    if isinstance(direct_payload, dict):
+        direct_headers = direct_payload.get("headers")
+        if isinstance(direct_headers, list) and direct_headers:
+            return payload
+    if any(key in payload for key in ("from", "to", "subject", "date")):
+        return payload
+
+    for key in ("message", "draft", "result", "response", "data"):
+        child = payload.get(key)
+        if isinstance(child, dict):
+            resolved = _select_gmail_message_node(child, depth + 1)
+            if resolved is not None:
+                return resolved
+    if len(payload) == 1:
+        only_value = next(iter(payload.values()))
+        if isinstance(only_value, dict):
+            return _select_gmail_message_node(only_value, depth + 1)
+    return None
+
+
+def _format_gmail_message_payload(parsed_json: Dict[str, Any]) -> str:
+    message_payload = _select_gmail_message_node(parsed_json)
+    if message_payload is None:
+        return ""
+
+    headers = _extract_gmail_headers_map(message_payload)
+    lines: List[str] = []
+    message_id = str(message_payload.get("id") or parsed_json.get("id") or "").strip()
+    if message_id:
+        lines.append(f"Email ID: {message_id}")
+    thread_id = str(message_payload.get("threadId") or parsed_json.get("threadId") or "").strip()
+    if thread_id:
+        lines.append(f"Thread ID: {thread_id}")
+
+    from_value = (
+        headers.get("from")
+        or headers.get("sender")
+        or headers.get("reply-to")
+        or headers.get("return-path")
+        or str(message_payload.get("from") or parsed_json.get("from") or "").strip()
+    )
+    to_value = headers.get("to") or str(message_payload.get("to") or parsed_json.get("to") or "").strip()
+    subject_value = headers.get("subject") or str(message_payload.get("subject") or parsed_json.get("subject") or "").strip()
+    date_value = headers.get("date") or str(message_payload.get("date") or parsed_json.get("date") or "").strip()
+
+    if from_value:
+        lines.append(f"From: {from_value}")
+    if to_value:
+        lines.append(f"To: {to_value}")
+    if subject_value:
+        lines.append(f"Subject: {subject_value}")
+    if date_value:
+        lines.append(f"Date: {date_value}")
+
+    for key, label in (("cc", "Cc"), ("bcc", "Bcc")):
+        value = headers.get(key, "")
+        if value:
+            lines.append(f"{label}: {value}")
+    labels = message_payload.get("labelIds")
+    if not isinstance(labels, list):
+        labels = parsed_json.get("labelIds")
+    if isinstance(labels, list) and labels:
+        clean_labels = [str(item).strip() for item in labels if str(item).strip()]
+        if clean_labels:
+            lines.append(f"Labels: {', '.join(clean_labels[:8])}")
+    snippet = str(message_payload.get("snippet") or parsed_json.get("snippet") or "").strip()
+    if snippet:
+        lines.append(f"Snippet: {snippet}")
+    body_preview = _extract_gmail_body_preview(message_payload)
+    if body_preview and body_preview != snippet:
+        lines.append(f"Body: {body_preview[:700]}")
+    elif not snippet:
+        lines.append("Body: (no inline text body found in this message)")
+    if lines:
+        return "\n".join(lines)[:SKILL_RESULT_MESSAGE_MAX_CHARS]
+    return ""
+
+
+def _summarize_skill_data_message(data: Any) -> str:
+    """
+    Convert a skill tool payload into a useful text message.
+    Prefer parsed JSON and stdout over generic placeholders like "OK".
+    """
+    if data is None:
+        return ""
+    if isinstance(data, dict):
+        raw_summaries = data.get("gmail_message_summaries")
+        if isinstance(raw_summaries, list) and raw_summaries:
+            lines: List[str] = []
+            for index, item in enumerate(raw_summaries[:5], 1):
+                if not isinstance(item, dict):
+                    continue
+                message_id = str(item.get("id") or "").strip()
+                sender = str(item.get("from") or item.get("sender") or "").strip()
+                subject = str(item.get("subject") or "").strip()
+                date = str(item.get("date") or "").strip()
+                snippet = str(item.get("snippet") or "").strip()
+                if not subject:
+                    if snippet:
+                        subject = snippet[:72] + ("..." if len(snippet) > 72 else "")
+                    else:
+                        subject = "Email"
+                line = f"{index}. {subject}"
+                if sender:
+                    line = f"{line} - {sender}"
+                if date:
+                    line = f"{line} ({date})"
+                lines.append(line)
+                if message_id:
+                    lines.append(f"   ID: {message_id}")
+                if snippet:
+                    lines.append(f"   {snippet}")
+            if lines:
+                return ("Latest emails:\n" + "\n".join(lines))[:SKILL_RESULT_MESSAGE_MAX_CHARS]
+
+        response = data.get("response")
+        if isinstance(response, dict):
+            parsed_json = response.get("parsed_json")
+            if parsed_json is not None:
+                # Prefer compact Gmail summaries over full payload dumps.
+                if isinstance(parsed_json, dict):
+                    formatted_gmail = _format_gmail_message_payload(parsed_json)
+                    if formatted_gmail:
+                        return formatted_gmail
+
+                try:
+                    text = json.dumps(parsed_json, ensure_ascii=False, indent=2, default=str)
+                except Exception:
+                    text = str(parsed_json)
+                return text[:SKILL_RESULT_MESSAGE_MAX_CHARS]
+            stdout = str(response.get("stdout") or "").strip()
+            if stdout:
+                parsed_stdout = _parse_json_from_text(stdout)
+                if isinstance(parsed_stdout, dict):
+                    formatted_gmail = _format_gmail_message_payload(parsed_stdout)
+                    if formatted_gmail:
+                        return formatted_gmail
+                return stdout[:SKILL_RESULT_MESSAGE_MAX_CHARS]
+        try:
+            text = json.dumps(data, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(data)
+        return text[:SKILL_RESULT_MESSAGE_MAX_CHARS]
+    if isinstance(data, list):
+        try:
+            text = json.dumps(data, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(data)
+        return text[:SKILL_RESULT_MESSAGE_MAX_CHARS]
+    return str(data)[:SKILL_RESULT_MESSAGE_MAX_CHARS]
 
 
 def _safe_calculate(expression: str) -> Optional[float]:
@@ -248,7 +724,8 @@ async def execute_telegram_tool(
     cid = context.get("conversation_id") or "default"
     name = _canonicalize_telegram_tool_name(name)
     _log_tool_invocation(name, arguments, cid)
-    memory_cache_store = context.get("memory_cache_store") or {}
+    memory_cache_store_raw = context.get("memory_cache_store")
+    memory_cache_store = memory_cache_store_raw if isinstance(memory_cache_store_raw, dict) else {}
     todo_user_key = context.get("todo_user_key")
 
     def mem_cache() -> List[str]:
@@ -959,8 +1436,14 @@ async def execute_telegram_tool(
         if not do_browser:
             return {"success": False, "message": "Browser agent is not available."}
         out = await do_browser(arguments)
-        msg = out.get("message") or out.get("output") or str(out)[:500]
-        return {"success": True, "message": msg, "data": out}
+        success = True
+        if isinstance(out, dict):
+            success = bool(out.get("success", True))
+        msg = out.get("message") if isinstance(out, dict) else None
+        if not msg and isinstance(out, dict):
+            msg = out.get("output")
+        msg = msg or str(out)[:500]
+        return {"success": success, "message": msg, "data": out}
 
     # --- runDeepResearch ---
     if name == "runDeepResearch":
@@ -968,8 +1451,14 @@ async def execute_telegram_tool(
         if not do_research:
             return {"success": False, "message": "Deep research is not available."}
         out = await do_research(arguments)
-        msg = out.get("message") or out.get("output") or str(out)[:500]
-        return {"success": True, "message": msg, "data": out}
+        success = True
+        if isinstance(out, dict):
+            success = bool(out.get("success", True))
+        msg = out.get("message") if isinstance(out, dict) else None
+        if not msg and isinstance(out, dict):
+            msg = out.get("output")
+        msg = msg or str(out)[:500]
+        return {"success": success, "message": msg, "data": out}
 
     # --- healthCheck ---
     if name == "healthCheck":
@@ -1026,11 +1515,18 @@ async def execute_telegram_tool(
     # --- dynamic skill framework tools ---
     skill_executor = context.get("execute_skill_tool")
     if callable(skill_executor):
+        execution_arguments = arguments
+        if name == "googleworkspace_cli.run_readonly_command" and isinstance(arguments, dict):
+            execution_arguments = _resolve_gmail_message_reference(
+                arguments,
+                memory_cache_store=memory_cache_store if isinstance(memory_cache_store, dict) else {},
+                conversation_id=str(cid),
+            )
         try:
-            skill_result = await skill_executor(name, arguments)
+            skill_result = await skill_executor(name, execution_arguments)
         except TypeError:
             # Backward compatibility for callbacks that still expect context
-            skill_result = await skill_executor(name, arguments, context)
+            skill_result = await skill_executor(name, execution_arguments, context)
         except Exception as e:
             return {"success": False, "message": f"Skill tool execution failed: {e}"}
 
@@ -1041,9 +1537,17 @@ async def execute_telegram_tool(
             else:
                 success = bool(skill_result.get("success", True))
                 message = skill_result.get("message")
+                data_val = skill_result.get("data")
+                if name == "googleworkspace_cli.run_readonly_command":
+                    _cache_gmail_summary_ids(
+                        data_val,
+                        memory_cache_store=memory_cache_store if isinstance(memory_cache_store, dict) else {},
+                        conversation_id=str(cid),
+                    )
+                if not message or str(message).strip().lower() in {"ok", "success", "done"}:
+                    message = _summarize_skill_data_message(data_val)
                 if not message:
-                    data_val = skill_result.get("data")
-                    message = str(data_val) if data_val is not None else f"Executed skill tool: {name}"
+                    message = f"Executed skill tool: {name}"
                 response = {
                     "success": success,
                     "message": str(message),
@@ -1059,3 +1563,4 @@ async def execute_telegram_tool(
             return {"success": True, "message": skill_result}
 
     return {"success": False, "message": f"Unknown tool: {name}"}
+

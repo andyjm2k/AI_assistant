@@ -424,7 +424,7 @@ Key environment variables (see `.env.example` for complete list):
 - `TELEGRAM_SECRET`: Shared secret for bot-to-proxy auth when the proxy is reachable beyond localhost (set the same value on both bot and proxy).
 - `TELEGRAM_SYSTEM_PROMPT`: System prompt override; overridden by `config/catbot_system_prompt.txt` when that file exists
 - `TELEGRAM_HISTORY_LIMIT`, `TELEGRAM_CHAT_TIMEOUT`: Conversation tuning (defaults 12, 30)
-- `TELEGRAM_CHAT_TIMEOUT_HARD_CAP`, `TELEGRAM_TOOL_FOLLOWUP_TIMEOUT`, `TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP`: Timeout safety limits to prevent multi-minute hangs (defaults 120, 45, 180)
+- `TELEGRAM_CHAT_TIMEOUT_HARD_CAP`, `TELEGRAM_TOOL_FOLLOWUP_TIMEOUT`, `TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP`: Timeout safety limits to prevent hangs while still allowing long-running tools (defaults 120, 45, 10800)
 - `TELEGRAM_OPENAI_BASE_URL`, `TELEGRAM_OPENAI_CHAT_PATH`: Override LLM endpoint (e.g. Azure/Groq)
 
 **Telegram tools (optional, proxy only):**

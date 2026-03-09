@@ -31,6 +31,7 @@ Core capabilities:
 - `filesystem`: `list_files`, `read_text`, `write_text` (root-sandboxed)
 - `GitHubProjectManager`: `initialize_repository`, `status`, `fetch`, `pull`, `push`, `sync`, `create_branch`, `checkout_branch`, `bump_version`, `commit_versioned_change`, `create_pull_request`, `list_pull_requests`, `repository_info`, `publish_release`
 - `image_generation`: `generate_image` (OpenRouter Seedream 4.5 image generation)
+- `googleworkspace_cli`: `check_cli`, `check_auth`, `list_available_commands`, `run_readonly_command` (Google Workspace CLI wrappers)
 - `testkit`: `analyze_text`, `render_template`, `context_snapshot` (reference/demo skill)
 
 ## Proxy API Endpoints
