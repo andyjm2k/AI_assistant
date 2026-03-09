@@ -6,6 +6,7 @@ Covers TodoTaskExecutor.request_cancel and run_loop behaviour when cancel is req
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from src.features.task_execution import (
@@ -13,6 +14,27 @@ from src.features.task_execution import (
     STATUS_AWAITING_CONFIRMATION,
     TodoTaskExecutor,
 )
+
+
+class _FakeResponse:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = text or (json_dumps(payload) if payload is not None else "")
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+def json_dumps(payload):
+    import json
+
+    try:
+        return json.dumps(payload)
+    except Exception:
+        return ""
 
 
 class TestTodoTaskExecutorCancel:
@@ -202,3 +224,108 @@ async def test_run_diagnostics_capture_tool_failures():
     assert diagnostics["tool_failure_count"] == 1
     assert diagnostics["tool_success_count"] == 0
     assert "dummy_tool" in diagnostics["tool_usage_counts"]
+
+
+@pytest.mark.asyncio
+async def test_call_llm_falls_back_on_primary_non_200(monkeypatch):
+    monkeypatch.setenv("MCP_LLM_BASE_URL", "https://fallback.example/v1")
+    monkeypatch.setenv("MCP_LLM_MODEL_NAME", "fallback-model")
+
+    executor = TodoTaskExecutor(
+        api_key="primary-key",
+        task_id=42,
+        task_description="Test fallback on non-200",
+        get_tools_func=AsyncMock(return_value=[]),
+    )
+
+    primary_response = _FakeResponse(
+        400,
+        payload={"error": {"message": "No models loaded. Please load a model."}},
+    )
+    fallback_response = _FakeResponse(
+        200,
+        payload={
+            "choices": [
+                {"message": {"content": "Recovered via fallback", "tool_calls": None}}
+            ]
+        },
+    )
+
+    post_mock = AsyncMock(side_effect=[primary_response, fallback_response])
+    with patch.object(executor, "_post_chat_completion", post_mock):
+        result = await executor._call_llm(
+            [{"role": "user", "content": "hello"}],
+            allow_summarize=False,
+        )
+
+    assert result is not None
+    assert result["content"] == "Recovered via fallback"
+    assert post_mock.await_count == 2
+    first_payload = post_mock.await_args_list[0].args[2]
+    second_payload = post_mock.await_args_list[1].args[2]
+    assert first_payload["model"] != second_payload["model"]
+    assert second_payload["model"] == "fallback-model"
+
+
+@pytest.mark.asyncio
+async def test_call_llm_falls_back_on_primary_request_error(monkeypatch):
+    monkeypatch.setenv("MCP_LLM_BASE_URL", "https://fallback.example/v1")
+
+    executor = TodoTaskExecutor(
+        api_key="primary-key",
+        task_id=43,
+        task_description="Test fallback on request error",
+        get_tools_func=AsyncMock(return_value=[]),
+    )
+
+    request_error = httpx.RequestError(
+        "primary endpoint unreachable",
+        request=httpx.Request("POST", "https://primary.example/v1/chat/completions"),
+    )
+    fallback_response = _FakeResponse(
+        200,
+        payload={
+            "choices": [
+                {"message": {"content": "Recovered after request error", "tool_calls": None}}
+            ]
+        },
+    )
+
+    post_mock = AsyncMock(side_effect=[request_error, fallback_response])
+    with patch.object(executor, "_post_chat_completion", post_mock):
+        result = await executor._call_llm(
+            [{"role": "user", "content": "hello"}],
+            allow_summarize=False,
+        )
+
+    assert result is not None
+    assert "Recovered after request error" in result["content"]
+    assert post_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_call_llm_returns_none_when_fallback_not_configured(monkeypatch):
+    monkeypatch.delenv("MCP_LLM_BASE_URL", raising=False)
+
+    executor = TodoTaskExecutor(
+        api_key="primary-key",
+        task_id=44,
+        task_description="Test fallback disabled",
+        get_tools_func=AsyncMock(return_value=[]),
+    )
+
+    primary_response = _FakeResponse(
+        400,
+        payload={"error": {"message": "No models loaded. Please load a model."}},
+    )
+
+    post_mock = AsyncMock(return_value=primary_response)
+    with patch.object(executor, "_post_chat_completion", post_mock):
+        result = await executor._call_llm(
+            [{"role": "user", "content": "hello"}],
+            allow_summarize=False,
+        )
+
+    assert result is None
+    assert post_mock.await_count == 1
+    assert "LLM error 400" in (executor.last_error or "")

@@ -7,7 +7,7 @@ Supports pause for feedback and resume.
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -37,6 +37,127 @@ DONE_PHRASES = [
     "i have finished the work for this task",
     "completed the task", "task has been completed", "i've completed", "i have completed the task",
 ]
+
+_NO_KEY_LLM_PROVIDERS = frozenset({"ollama", "bedrock"})
+_MCP_PROVIDER_API_KEY_ENV_CANDIDATES: Dict[str, List[str]] = {
+    "openai": ["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"],
+    "anthropic": ["ANTHROPIC_API_KEY", "MCP_LLM_ANTHROPIC_API_KEY"],
+    "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "MCP_LLM_GOOGLE_API_KEY"],
+    "azure_openai": ["AZURE_OPENAI_API_KEY", "MCP_LLM_AZURE_OPENAI_API_KEY"],
+    "groq": ["GROQ_API_KEY", "MCP_LLM_GROQ_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY", "MCP_LLM_DEEPSEEK_API_KEY"],
+    "cerebras": ["CEREBRAS_API_KEY", "MCP_LLM_CEREBRAS_API_KEY"],
+    "browser_use": ["BROWSER_USE_API_KEY", "MCP_LLM_BROWSER_USE_API_KEY"],
+    "openrouter": [
+        "OPENROUTER_API_KEY",
+        "MCP_LLM_OPENROUTER_API_KEY",
+        "MCP_LLM_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+    ],
+    "vercel": ["VERCEL_API_KEY", "MCP_LLM_VERCEL_API_KEY"],
+}
+
+
+def _normalize_chat_endpoint(endpoint: str) -> str:
+    if not endpoint:
+        return ""
+    if endpoint.endswith("/chat/completions"):
+        return endpoint
+    return endpoint.rstrip("/") + "/chat/completions"
+
+
+def _first_non_empty_env(var_names: List[str]) -> Optional[str]:
+    for var_name in var_names:
+        value = os.getenv(var_name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _get_mcp_llm_provider() -> str:
+    return (os.getenv("MCP_LLM_PROVIDER") or "").strip().lower()
+
+
+def _get_mcp_llm_chat_endpoint() -> Optional[str]:
+    base = (os.getenv("MCP_LLM_BASE_URL") or "").strip()
+    if not base:
+        return None
+    return _normalize_chat_endpoint(base)
+
+
+def _get_mcp_llm_model_name() -> Optional[str]:
+    model_name = (os.getenv("MCP_LLM_MODEL_NAME") or "").strip()
+    return model_name or None
+
+
+def _resolve_mcp_llm_api_key(provider: Optional[str] = None) -> Optional[str]:
+    normalized_provider = (provider or _get_mcp_llm_provider() or "").strip().lower()
+    candidates: List[str] = ["MCP_LLM_API_KEY"]
+    candidates.extend(_MCP_PROVIDER_API_KEY_ENV_CANDIDATES.get(normalized_provider, []))
+
+    if normalized_provider:
+        candidates.append(f"MCP_LLM_{normalized_provider.upper()}_API_KEY")
+    else:
+        # OpenAI-compatible default fallback for generic/unspecified provider.
+        candidates.extend(["MCP_LLM_OPENAI_API_KEY", "OPENAI_API_KEY"])
+
+    api_key = _first_non_empty_env(candidates)
+    if api_key:
+        return api_key
+    if normalized_provider in _NO_KEY_LLM_PROVIDERS:
+        return None
+    return None
+
+
+def _build_mcp_fallback_headers(primary_headers: Dict[str, str]) -> Dict[str, str]:
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+
+    for header_name in ("OpenAI-Organization", "OpenAI-Project", "HTTP-Referer", "X-Title"):
+        header_value = primary_headers.get(header_name)
+        if header_value:
+            headers[header_name] = header_value
+
+    provider = _get_mcp_llm_provider()
+    api_key = _resolve_mcp_llm_api_key(provider)
+    inherited_auth = (primary_headers.get("Authorization") or "").strip()
+
+    if provider == "azure_openai":
+        if api_key:
+            headers["api-key"] = api_key
+        elif inherited_auth.lower().startswith("bearer "):
+            inherited_token = inherited_auth[7:].strip()
+            if inherited_token:
+                headers["api-key"] = inherited_token
+        return headers
+
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif inherited_auth:
+        headers["Authorization"] = inherited_auth
+    return headers
+
+
+def _build_mcp_fallback_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    fallback_payload = dict(payload)
+    fallback_model = _get_mcp_llm_model_name()
+    if fallback_model:
+        fallback_payload["model"] = fallback_model
+    return fallback_payload
+
+
+def _extract_llm_error_text(response: httpx.Response) -> str:
+    detail = (response.text or "").strip()
+    try:
+        payload = response.json()
+    except ValueError:
+        return detail
+    if isinstance(payload, dict):
+        message = payload.get("error")
+        if isinstance(message, dict):
+            detail = str(message.get("message") or detail)
+        else:
+            detail = str(payload.get("message") or payload.get("detail") or message or detail)
+    return detail
 
 
 class TodoTaskExecutor:
@@ -84,6 +205,53 @@ class TodoTaskExecutor:
 
     def _estimate_total_tokens(self, messages: List[Dict[str, Any]], max_tokens: int) -> int:
         return estimate_tokens_from_messages(messages) + max_tokens
+
+    async def _post_chat_completion(
+        self,
+        endpoint: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        timeout_seconds: float = 60.0,
+    ) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            return await client.post(endpoint, headers=headers, json=payload)
+
+    async def _attempt_mcp_fallback(
+        self,
+        primary_headers: Dict[str, str],
+        payload: Dict[str, Any],
+        source_label: str,
+        timeout_seconds: float = 60.0,
+    ) -> Tuple[Optional[httpx.Response], Optional[str]]:
+        fallback_endpoint = _get_mcp_llm_chat_endpoint()
+        if not fallback_endpoint:
+            return None, "MCP_LLM_BASE_URL is not configured"
+
+        fallback_payload = _build_mcp_fallback_payload(payload)
+        fallback_headers = _build_mcp_fallback_headers(primary_headers)
+        fallback_model = fallback_payload.get("model", "")
+        fallback_provider = _get_mcp_llm_provider() or "openai-compatible"
+        print(
+            f"[TASK_EXEC][LLM_FALLBACK] {source_label}: trying provider={fallback_provider}, "
+            f"model={fallback_model}, endpoint={fallback_endpoint}",
+            flush=True,
+        )
+        try:
+            response = await self._post_chat_completion(
+                fallback_endpoint,
+                fallback_headers,
+                fallback_payload,
+                timeout_seconds=timeout_seconds,
+            )
+            print(
+                f"[TASK_EXEC][LLM_FALLBACK] {source_label}: status={response.status_code}",
+                flush=True,
+            )
+            return response, None
+        except httpx.RequestError as exc:
+            err = str(exc)
+            print(f"[TASK_EXEC][LLM_FALLBACK] {source_label}: request error: {err}", flush=True)
+            return None, err
 
     async def _summarize_messages_for_budget(
         self,
@@ -357,51 +525,102 @@ class TodoTaskExecutor:
         org = os.getenv("OPENAI_ORG_ID") or os.getenv("OPENAI_ORGANIZATION")
         if org:
             headers["OpenAI-Organization"] = org
+        project = os.getenv("OPENAI_PROJECT_ID")
+        if project:
+            headers["OpenAI-Project"] = project
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                r = await client.post(url, headers=headers, json=payload)
-            if r.status_code != 200:
-                error_text = r.text[:500]
-                print(f"[TASK_EXEC] LLM error {r.status_code}: {error_text}")
-                self.last_error = f"LLM error {r.status_code}: {error_text}"
-                if allow_summarize and _retry_on_context_error and is_context_limit_error(r.status_code, error_text):
-                    summarized = await self._ensure_token_budget(messages, max_tokens=max_tokens)
-                    if summarized is not messages:
-                        if messages is self.messages:
-                            self.messages = summarized
-                        retry = await self._call_llm(
-                            summarized,
-                            tools=tools,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            allow_summarize=False,
-                            _retry_on_context_error=False,
-                        )
-                        if retry:
-                            return retry
-                    # Force-trim if summarization/estimation didn't reduce enough
-                    forced = self._force_trim_messages(summarized, max_tokens=max_tokens)
-                    if forced is not summarized:
-                        if messages is self.messages:
-                            self.messages = forced
-                        return await self._call_llm(
-                            forced,
-                            tools=tools,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            allow_summarize=False,
-                            _retry_on_context_error=False,
-                        )
+            response = await self._post_chat_completion(
+                url,
+                headers,
+                payload,
+                timeout_seconds=60.0,
+            )
+        except httpx.RequestError as e:
+            print(f"[TASK_EXEC] LLM request failed: {e}")
+            fallback_response, fallback_error = await self._attempt_mcp_fallback(
+                primary_headers=headers,
+                payload=payload,
+                source_label="task_exec_primary_request_error",
+                timeout_seconds=60.0,
+            )
+            if fallback_response is None:
+                self.last_error = (
+                    f"LLM request failed: {e}. "
+                    f"Fallback error: {fallback_error or 'not configured'}"
+                )
                 return None
-            data = r.json()
+            response = fallback_response
+        except Exception as e:
+            print(f"[TASK_EXEC] LLM request failed: {e}")
+            self.last_error = f"LLM request failed: {e}"
+            return None
+
+        if response.status_code != 200:
+            error_text = _extract_llm_error_text(response)[:500]
+            print(f"[TASK_EXEC] LLM error {response.status_code}: {error_text}")
+            self.last_error = f"LLM error {response.status_code}: {error_text}"
+            if allow_summarize and _retry_on_context_error and is_context_limit_error(response.status_code, error_text):
+                summarized = await self._ensure_token_budget(messages, max_tokens=max_tokens)
+                if summarized is not messages:
+                    if messages is self.messages:
+                        self.messages = summarized
+                    retry = await self._call_llm(
+                        summarized,
+                        tools=tools,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        allow_summarize=False,
+                        _retry_on_context_error=False,
+                    )
+                    if retry:
+                        return retry
+                # Force-trim if summarization/estimation didn't reduce enough
+                forced = self._force_trim_messages(summarized, max_tokens=max_tokens)
+                if forced is not summarized:
+                    if messages is self.messages:
+                        self.messages = forced
+                    retry = await self._call_llm(
+                        forced,
+                        tools=tools,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        allow_summarize=False,
+                        _retry_on_context_error=False,
+                    )
+                    if retry:
+                        return retry
+
+            fallback_response, fallback_error = await self._attempt_mcp_fallback(
+                primary_headers=headers,
+                payload=payload,
+                source_label="task_exec_primary_non_200",
+                timeout_seconds=60.0,
+            )
+            if fallback_response is None:
+                if fallback_error:
+                    self.last_error = (
+                        f"{self.last_error}. Fallback error: {fallback_error}"
+                    )
+                return None
+            if fallback_response.status_code != 200:
+                fallback_error_text = _extract_llm_error_text(fallback_response)[:500]
+                self.last_error = (
+                    f"{self.last_error}. Fallback LLM error {fallback_response.status_code}: "
+                    f"{fallback_error_text}"
+                )
+                return None
+            response = fallback_response
+
+        try:
+            data = response.json()
             choices = data.get("choices", [])
             if not choices:
                 return None
             msg = choices[0].get("message", {})
             return {"content": msg.get("content"), "tool_calls": msg.get("tool_calls")}
         except Exception as e:
-            print(f"[TASK_EXEC] LLM request failed: {e}")
-            self.last_error = f"LLM request failed: {e}"
+            print(f"[TASK_EXEC] Failed to parse LLM response: {e}")
+            self.last_error = f"Failed to parse LLM response: {e}"
             return None
 
     def _check_pause_or_done(self, content: str) -> Optional[str]:
