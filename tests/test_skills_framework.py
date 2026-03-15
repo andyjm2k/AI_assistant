@@ -64,6 +64,7 @@ def test_manifest_loading_discovers_builtin_skills() -> None:
     assert "core.ping" in tool_names
     assert "core.echo" in tool_names
     assert "filesystem.list_files" in tool_names
+    assert "filesystem.search_files" in tool_names
     assert "GitHubProjectManager.status" in tool_names
     assert "GitHubProjectManager.fetch" in tool_names
     assert "GitHubProjectManager.sync" in tool_names
@@ -121,6 +122,32 @@ async def test_filesystem_write_and_read_roundtrip() -> None:
 
 
 @pytest.mark.asyncio
+async def test_filesystem_read_text_supports_line_ranges() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        root = temp_base / "root"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "notes.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+
+        manager = SkillManager()
+        manager.load_manifests(
+            _create_temp_filesystem_manifest_dir(temp_base, root=root),
+            replace=True,
+        )
+
+        result = await manager.execute_tool(
+            "filesystem.read_text",
+            {"path": "notes.txt", "start_line": 2, "end_line": 3, "include_line_numbers": True},
+        )
+        assert result.success is True
+        assert result.data["content"] == "2: two\n3: three"
+        assert result.data["excerpt_start_line"] == 2
+        assert result.data["excerpt_end_line"] == 3
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_filesystem_list_files_supports_recursive_subdirectories() -> None:
     temp_base = _create_workspace_temp_dir()
     try:
@@ -161,6 +188,37 @@ async def test_filesystem_list_files_supports_recursive_subdirectories() -> None
 
 
 @pytest.mark.asyncio
+async def test_filesystem_search_files_finds_filename_and_content_matches() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        root = temp_base / "root"
+        (root / "docs").mkdir(parents=True, exist_ok=True)
+        (root / "docs" / "roadmap_notes.txt").write_text("alpha topic\nrelease plan\n", encoding="utf-8")
+        (root / "docs" / "misc.txt").write_text("contains alpha in body\n", encoding="utf-8")
+
+        manager = SkillManager()
+        manager.load_manifests(
+            _create_temp_filesystem_manifest_dir(temp_base, root=root),
+            replace=True,
+        )
+
+        result = await manager.execute_tool(
+            "filesystem.search_files",
+            {"query": "alpha", "path": "docs"},
+        )
+        assert result.success is True
+        assert result.data["total_matches"] == 2
+        paths = [item.get("relative_path") for item in result.data["items"]]
+        assert "docs/misc.txt" in paths
+        assert "docs/roadmap_notes.txt" in paths
+        content_match = next(item for item in result.data["items"] if item["relative_path"] == "docs/misc.txt")
+        assert content_match["line_number"] == 1
+        assert "alpha" in content_match["excerpt"].lower()
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_filesystem_list_files_accepts_scratch_prefixed_path() -> None:
     temp_base = _create_workspace_temp_dir()
     try:
@@ -192,6 +250,36 @@ async def test_filesystem_list_files_accepts_scratch_prefixed_path() -> None:
         }
         assert "images/one.png" in unix_paths
         assert "images/one.png" in windows_paths
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_list_files_supports_offset_pagination() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        root = temp_base / "root"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "c.txt").write_text("c", encoding="utf-8")
+        (root / "a.txt").write_text("a", encoding="utf-8")
+        (root / "b.txt").write_text("b", encoding="utf-8")
+
+        manager = SkillManager()
+        manager.load_manifests(
+            _create_temp_filesystem_manifest_dir(temp_base, root=root),
+            replace=True,
+        )
+
+        result = await manager.execute_tool(
+            "filesystem.list_files",
+            {"offset": 1, "max_entries": 1},
+        )
+        assert result.success is True
+        assert result.data["total_count"] == 3
+        assert result.data["returned_count"] == 1
+        assert result.data["has_more"] is True
+        assert result.data["next_offset"] == 2
+        assert [item.get("relative_path") for item in result.data["items"]] == ["b.txt"]
     finally:
         shutil.rmtree(temp_base, ignore_errors=True)
 
@@ -789,6 +877,214 @@ async def test_googleworkspace_cli_gmail_mark_read_tool_calls_modify(
     assert params_payload["id"] == "m1"
     json_payload = json.loads(captured["args"][captured["args"].index("--json") + 1])
     assert json_payload["removeLabelIds"] == ["UNREAD"]
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_calendar_create_event_tool_builds_insert_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        captured["args"] = list(args)
+        captured["timeout_seconds"] = timeout_seconds
+        return {
+            "command": list(args),
+            "returncode": 0,
+            "duration_ms": 9,
+            "stdout": '{"id":"evt_1"}',
+            "stderr": "",
+            "parsed_json": {"id": "evt_1"},
+        }
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    result = await manager.execute_tool(
+        "googleworkspace_cli.calendar_create_event",
+        {
+            "summary": "Team sync",
+            "start_time": "2026-03-12T09:00:00+11:00",
+            "end_time": "2026-03-12T09:30:00+11:00",
+            "calendar_id": "primary",
+            "location": "Meeting Room 1",
+            "description": "Weekly team sync",
+            "attendees": ["alice@example.com", "bob@example.com"],
+        },
+    )
+    assert result.success is True
+    assert captured["args"][:3] == ["gws", "calendar", "+insert"]
+    assert "--calendar" in captured["args"]
+    assert captured["args"][captured["args"].index("--calendar") + 1] == "primary"
+    assert captured["args"][captured["args"].index("--summary") + 1] == "Team sync"
+    assert captured["args"][captured["args"].index("--start") + 1] == "2026-03-12T09:00:00+11:00"
+    assert captured["args"][captured["args"].index("--end") + 1] == "2026-03-12T09:30:00+11:00"
+    attendees = [
+        captured["args"][index + 1]
+        for index, token in enumerate(captured["args"])
+        if token == "--attendee"
+    ]
+    assert attendees == ["alice@example.com", "bob@example.com"]
+    assert result.data["response"]["parsed_json"]["id"] == "evt_1"
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_calendar_cancel_event_tool_builds_delete_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        captured["args"] = list(args)
+        return {
+            "command": list(args),
+            "returncode": 0,
+            "duration_ms": 8,
+            "stdout": "{}",
+            "stderr": "",
+            "parsed_json": {},
+        }
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    result = await manager.execute_tool(
+        "googleworkspace_cli.calendar_cancel_event",
+        {
+            "event_id": "evt_123",
+            "calendar_id": "work@example.com",
+            "send_updates": "externalOnly",
+        },
+    )
+    assert result.success is True
+    assert captured["args"][:4] == ["gws", "calendar", "events", "delete"]
+    params_payload = json.loads(captured["args"][captured["args"].index("--params") + 1])
+    assert params_payload == {
+        "calendarId": "work@example.com",
+        "eventId": "evt_123",
+        "sendUpdates": "externalOnly",
+    }
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_calendar_list_today_tool_uses_agenda_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        captured["args"] = list(args)
+        return {
+            "command": list(args),
+            "returncode": 0,
+            "duration_ms": 7,
+            "stdout": '{"events":[{"id":"evt_today","summary":"Standup","start":{"dateTime":"2026-03-10T09:00:00+11:00"},"end":{"dateTime":"2026-03-10T09:15:00+11:00"}}]}',
+            "stderr": "",
+            "parsed_json": {
+                "events": [
+                    {
+                        "id": "evt_today",
+                        "summary": "Standup",
+                        "start": {"dateTime": "2026-03-10T09:00:00+11:00"},
+                        "end": {"dateTime": "2026-03-10T09:15:00+11:00"},
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    result = await manager.execute_tool(
+        "googleworkspace_cli.calendar_list_today",
+        {"calendar": "Work"},
+    )
+    assert result.success is True
+    assert captured["args"] == ["gws", "calendar", "+agenda", "--today", "--calendar", "Work"]
+    summaries = (result.data or {}).get("calendar_event_summaries")
+    assert isinstance(summaries, list) and len(summaries) == 1
+    assert summaries[0]["summary"] == "Standup"
+    assert summaries[0]["start"] == "2026-03-10T09:00:00+11:00"
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_calendar_list_week_tool_extracts_nested_event_summaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        captured["args"] = list(args)
+        return {
+            "command": list(args),
+            "returncode": 0,
+            "duration_ms": 8,
+            "stdout": '{"calendars":[{"calendarId":"primary","calendarSummary":"Work","events":[{"id":"evt_week","summary":"Planning","start":{"dateTime":"2026-03-11T10:00:00+11:00"},"end":{"dateTime":"2026-03-11T11:00:00+11:00"}}]}]}',
+            "stderr": "",
+            "parsed_json": {
+                "calendars": [
+                    {
+                        "calendarId": "primary",
+                        "calendarSummary": "Work",
+                        "events": [
+                            {
+                                "id": "evt_week",
+                                "summary": "Planning",
+                                "start": {"dateTime": "2026-03-11T10:00:00+11:00"},
+                                "end": {"dateTime": "2026-03-11T11:00:00+11:00"},
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    result = await manager.execute_tool(
+        "googleworkspace_cli.calendar_list_week",
+        {},
+    )
+    assert result.success is True
+    assert captured["args"] == ["gws", "calendar", "+agenda", "--week"]
+    summaries = (result.data or {}).get("calendar_event_summaries")
+    assert isinstance(summaries, list) and len(summaries) == 1
+    assert summaries[0]["summary"] == "Planning"
+    assert summaries[0]["calendar_id"] == "primary"
+    assert summaries[0]["calendar_name"] == "Work"
 
 
 @pytest.mark.asyncio

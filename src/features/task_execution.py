@@ -4,6 +4,7 @@ Human-in-the-loop: task is never auto-removed; user must confirm completion.
 Supports pause for feedback and resume.
 """
 
+import inspect
 import json
 import os
 import time
@@ -56,7 +57,6 @@ _MCP_PROVIDER_API_KEY_ENV_CANDIDATES: Dict[str, List[str]] = {
     ],
     "vercel": ["VERCEL_API_KEY", "MCP_LLM_VERCEL_API_KEY"],
 }
-
 
 def _normalize_chat_endpoint(endpoint: str) -> str:
     if not endpoint:
@@ -178,6 +178,7 @@ class TodoTaskExecutor:
         tool_executor: Optional[Any] = None,
         get_tools_func: Optional[Any] = None,
         experience_guidance: Optional[str] = None,
+        progress_callback: Optional[Any] = None,
     ):
         self.api_key = api_key
         self.api_base = (api_base or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")).rstrip("/")
@@ -189,6 +190,7 @@ class TodoTaskExecutor:
         self.max_iterations = max(max_iterations, 1)
         self.tool_executor = tool_executor
         self.get_tools_func = get_tools_func
+        self.progress_callback = progress_callback
         self.messages: List[Dict[str, Any]] = []
         self.iteration_count = 0
         self._available_tools: Optional[List[Dict]] = None
@@ -202,6 +204,16 @@ class TodoTaskExecutor:
         self.tool_success_count = 0
         self.tool_failure_count = 0
         self._build_initial_messages()
+
+    async def _emit_progress(self, event: str, **payload: Any) -> None:
+        if not self.progress_callback:
+            return
+        try:
+            maybe_awaitable = self.progress_callback(event, payload)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
+        except Exception as e:
+            print(f"[TASK_EXEC] Progress callback error: {e}", flush=True)
 
     def _estimate_total_tokens(self, messages: List[Dict[str, Any]], max_tokens: int) -> int:
         return estimate_tokens_from_messages(messages) + max_tokens
@@ -415,6 +427,9 @@ class TodoTaskExecutor:
             "When you need a decision or more context from the user, say so clearly (e.g. 'I need your input' or 'need feedback') and we will pause for their input. "
             "When you have finished the work for this task, include the phrase 'I have finished the work for this task' so the system can record completion and wait for user confirmation. "
             "Never claim the task is deleted or removed—only the user can confirm completion. "
+            "Response rules: when another tool is needed, call the tool immediately instead of narrating the next step. "
+            "Do not say you will use a tool later; either emit the tool call now or give a substantive progress update/result. "
+            "Do not ask the user to repeat filenames, URLs, search results, or prior tool output already available in the conversation. "
             "Tool selection: For CATBot codebase changes or new tool capabilities, prefer runCodexCli with a clear prompt. "
             "For other coding tasks (building apps, generating code, creating scripts), prefer runWorkflow with a clear contentPrompt rather than writing code manually with write_file. "
             "For web tasks that need browser actions (navigate, click, fill forms, automate a site), use run_browser_agent with an instruction. "
@@ -643,14 +658,50 @@ class TodoTaskExecutor:
         """
         tools = await self._get_tools()
         last_message = ""
+        await self._emit_progress(
+            "workflow_start",
+            task_id=self.task_id,
+            workflow_name=self.task_description,
+            phase="preparation",
+            message=f"Starting task execution for task {self.task_id}.",
+            current_step=self.iteration_count,
+            total_steps=self.max_iterations,
+        )
         while self.iteration_count < self.max_iterations:
             # Check for user-requested cancel at each iteration so we can exit cleanly
             if self._cancel_requested:
                 print(f"[TASK_EXEC] Cancel requested (iteration {self.iteration_count})")
+                await self._emit_progress(
+                    "cancel_requested",
+                    task_id=self.task_id,
+                    workflow_name=self.task_description,
+                    phase="cancelled",
+                    message=f"Cancellation requested for task {self.task_id}.",
+                    current_step=self.iteration_count,
+                    total_steps=self.max_iterations,
+                )
                 return (STATUS_CANCELLED, last_message or "Cancelled by user.")
             self.iteration_count += 1
+            await self._emit_progress(
+                "iteration_start",
+                task_id=self.task_id,
+                workflow_name=self.task_description,
+                phase="executing",
+                message=f"Running task step {self.iteration_count} of {self.max_iterations}.",
+                current_step=self.iteration_count,
+                total_steps=self.max_iterations,
+            )
             llm_response = await self._call_llm(self.messages, tools=tools if tools else None)
             if not llm_response:
+                await self._emit_progress(
+                    "llm_no_response",
+                    task_id=self.task_id,
+                    workflow_name=self.task_description,
+                    phase="awaiting_confirmation",
+                    message="Task execution stopped because the model returned no response.",
+                    current_step=self.iteration_count,
+                    total_steps=self.max_iterations,
+                )
                 return (STATUS_AWAITING_CONFIRMATION, last_message or self.last_error or "Execution stopped (no response).")
             content = (llm_response.get("content") or "").strip()
             tool_calls = llm_response.get("tool_calls")
@@ -662,9 +713,28 @@ class TodoTaskExecutor:
                 if status and not tool_calls:
                     self.messages.append({"role": "assistant", "content": content})
                     print(f"[TASK_EXEC] Detected {status} in assistant message (iteration {self.iteration_count})")
+                    await self._emit_progress(
+                        "status_detected",
+                        task_id=self.task_id,
+                        workflow_name=self.task_description,
+                        phase=status,
+                        message=content,
+                        current_step=self.iteration_count,
+                        total_steps=self.max_iterations,
+                    )
                     return (status, content)
                 pending_status = status
             if tool_calls and self.tool_executor:
+                await self._emit_progress(
+                    "tool_calls",
+                    task_id=self.task_id,
+                    workflow_name=self.task_description,
+                    phase="executing",
+                    message=f"Executing {len(tool_calls)} tool call(s) in step {self.iteration_count}.",
+                    current_step=self.iteration_count,
+                    total_steps=self.max_iterations,
+                    tool_call_count=len(tool_calls),
+                )
                 self.messages.append({
                     "role": "assistant",
                     "content": content or None,
@@ -704,6 +774,15 @@ class TodoTaskExecutor:
                         f"[TASK_EXEC] Detected {pending_status} in assistant message after tool execution "
                         f"(iteration {self.iteration_count})"
                     )
+                    await self._emit_progress(
+                        "status_detected_after_tools",
+                        task_id=self.task_id,
+                        workflow_name=self.task_description,
+                        phase=pending_status,
+                        message=last_message or content or "",
+                        current_step=self.iteration_count,
+                        total_steps=self.max_iterations,
+                    )
                     return (pending_status, last_message or content or "")
                 continue
             self.messages.append({"role": "assistant", "content": content or "(No content)"})
@@ -712,10 +791,37 @@ class TodoTaskExecutor:
                 status = self._check_pause_or_done(content)
                 if status:
                     print(f"[TASK_EXEC] Detected {status} in assistant message (iteration {self.iteration_count})")
+                    await self._emit_progress(
+                        "status_detected",
+                        task_id=self.task_id,
+                        workflow_name=self.task_description,
+                        phase=status,
+                        message=last_message,
+                        current_step=self.iteration_count,
+                        total_steps=self.max_iterations,
+                    )
                     return (status, last_message)
             if self.iteration_count >= self.max_iterations:
                 print(f"[TASK_EXEC] Reached max iterations ({self.max_iterations}), returning awaiting_confirmation")
+                await self._emit_progress(
+                    "max_iterations_reached",
+                    task_id=self.task_id,
+                    workflow_name=self.task_description,
+                    phase="awaiting_confirmation",
+                    message=f"Reached max iterations ({self.max_iterations}).",
+                    current_step=self.iteration_count,
+                    total_steps=self.max_iterations,
+                )
                 return (STATUS_AWAITING_CONFIRMATION, last_message or f"Reached max iterations ({self.max_iterations}).")
+        await self._emit_progress(
+            "workflow_complete",
+            task_id=self.task_id,
+            workflow_name=self.task_description,
+            phase="awaiting_confirmation",
+            message=last_message or "Done.",
+            current_step=self.iteration_count,
+            total_steps=self.max_iterations,
+        )
         return (STATUS_AWAITING_CONFIRMATION, last_message or "Done.")
 
     def add_user_message(self, text: str) -> None:

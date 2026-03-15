@@ -22,3 +22,32 @@ def test_app_js_applies_model_and_voice_fallbacks_when_tts_voice_fetch_fails():
     assert "Failed to fetch voices from all endpoints" in content
     assert "applyEnvDefaultTtsModelOnFetchFailure();" in content
     assert "applyEnvDefaultTtsVoiceOnFetchFailure();" in content
+
+
+def test_app_js_has_conversational_progress_tts_hooks():
+    content = _app_js_text()
+    assert "const PROGRESS_VOICE_INITIAL_DELAY_MS = 0;" in content
+    assert "const PROGRESS_VOICE_REPEAT_DELAY_MS = 5000;" in content
+    assert "function getConversationalProgressPrompt(stateText, announcementCount = 0)" in content
+    assert "function announceConversationalProgress(force = false)" in content
+    assert "textToSpeechFallback(prompt.text" in content
+
+
+def test_app_js_uses_thinking_fillers_for_non_tool_progress_and_specific_tool_prompts():
+    content = _app_js_text()
+    assert '"Let me think."' in content
+    assert '"Meow, let me think."' in content
+    assert '"I\'m on it, looking that up now."' in content
+
+
+def test_app_js_has_small_talk_progress_suppression_helpers():
+    content = _app_js_text()
+    assert "const SMALL_TALK_PROMPT_PATTERNS = [" in content
+    assert "function isSmallTalkPrompt(promptText = '')" in content
+    assert "function shouldStartProgressUpdatesForPrompt(promptText = '')" in content
+
+
+def test_app_js_only_starts_progress_updates_for_request_like_prompts():
+    content = _app_js_text()
+    assert "if (shouldStartProgressUpdatesForPrompt(promptText)) {" in content
+    assert "startProgressUpdates('Analyzing request');" in content

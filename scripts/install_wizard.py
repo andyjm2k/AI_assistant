@@ -24,7 +24,6 @@ LLM_PROVIDERS = [
     ("anthropic", "Anthropic (Claude)"),
     ("azure_openai", "Azure OpenAI"),
     ("deepseek", "DeepSeek"),
-    ("mistral", "Mistral"),
     ("openrouter", "OpenRouter"),
     ("other", "Other (edit .env later)"),
 ]
@@ -33,11 +32,10 @@ LLM_PROVIDERS = [
 DEFAULT_MODELS = {
     "ollama": "llama3.2",
     "openai": "gpt-4o-mini",
-    "google": "gemini-2.0-flash-exp",
+    "google": "gemini-3-flash-preview",
     "anthropic": "claude-3-5-sonnet-20241022",
     "azure_openai": "gpt-4o",
     "deepseek": "deepseek-chat",
-    "mistral": "mistral-large-latest",
     "openrouter": "openai/gpt-4o-mini",
 }
 
@@ -49,7 +47,6 @@ PROVIDER_API_KEY_VAR = {
     "anthropic": "MCP_LLM_ANTHROPIC_API_KEY",
     "azure_openai": "MCP_LLM_AZURE_OPENAI_API_KEY",
     "deepseek": "MCP_LLM_DEEPSEEK_API_KEY",
-    "mistral": "MCP_LLM_MISTRAL_API_KEY",
     "openrouter": "MCP_LLM_OPENROUTER_API_KEY",
 }
 
@@ -178,7 +175,7 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     # 3. API key for chosen provider (skip for ollama unless they want to set base URL)
     api_key = ""
     if provider == "ollama":
-        endpoint = _prompt("3) Ollama endpoint (leave blank for localhost:11434)", "http://localhost:11434")
+        endpoint = _prompt("3) Ollama base URL (leave blank for localhost:11434)", "http://localhost:11434")
     else:
         endpoint = ""
         api_key = _prompt("3) API key for " + provider, "", secret=True)
@@ -250,7 +247,7 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     content = _set_key_in_env_content(content, "MCP_LLM_PROVIDER", provider)
     content = _set_key_in_env_content(content, "MCP_LLM_MODEL_NAME", model)
     if endpoint:
-        content = _set_key_in_env_content(content, "MCP_LLM_OLLAMA_ENDPOINT", endpoint)
+        content = _set_key_in_env_content(content, "MCP_LLM_BASE_URL", endpoint)
     if api_key:
         key_var = PROVIDER_API_KEY_VAR.get(provider)
         if key_var:

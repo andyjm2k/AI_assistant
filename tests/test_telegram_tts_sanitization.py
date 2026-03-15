@@ -5,6 +5,13 @@ import pytest
 import src.integrations.telegram_bot as telegram_bot
 
 
+@pytest.fixture(autouse=True)
+def reset_backend_http_client_cache():
+    telegram_bot._backend_http_client = None
+    yield
+    telegram_bot._backend_http_client = None
+
+
 def test_sanitize_tts_text_removes_bracketed_content_special_chars_and_emojis():
     raw = "Hello (meta info) [debug] world!!! \U0001F63A #$%^"
     assert telegram_bot._sanitize_tts_text(raw) == "Hello world!!!"
@@ -24,8 +31,7 @@ async def test_call_backend_tts_sends_sanitized_payload_input():
 
     with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
-        mock_client.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
-        mock_client.__aexit__.return_value = None
+        mock_client.post = AsyncMock(return_value=mock_response)
         mock_client_cls.return_value = mock_client
 
         audio_bytes, content_type = await telegram_bot.call_backend_tts("Hi [note] there \U0001F63A !!!")
@@ -33,7 +39,7 @@ async def test_call_backend_tts_sends_sanitized_payload_input():
         assert audio_bytes == b"audio-bytes"
         assert content_type == "audio/mpeg"
 
-        post_call = mock_client.__aenter__.return_value.post.call_args
+        post_call = mock_client.post.call_args
         assert post_call.kwargs["json"]["input"] == "Hi there !!!"
 
 

@@ -1,0 +1,9 @@
+{
+  "name": "googleworkspace_cli",
+  "description": "Google Workspace CLI (gws) wrappers for auth checks, Gmail actions, Calendar event management, and advanced command execution.",
+  "enabled": true,
+  "module": "src.skills.builtin.googleworkspace_cli_skill:create_skill",
+  "settings": {
+    "root_dir": "./scratch"
+  }
+}

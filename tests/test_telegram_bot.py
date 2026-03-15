@@ -244,6 +244,44 @@ class TestStatusPoller:
         assert bot.send_message.call_count >= 1
 
     @pytest.mark.asyncio
+    async def test_status_poller_fetches_immediately_before_first_interval(self):
+        """Status poller should emit the latest status without waiting for the first timeout window."""
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        stop_event = asyncio.Event()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "found": True,
+            "event": {"seq": 1, "state": "On it. I'm looking for the best sources now."},
+        }
+
+        with patch.object(telegram_bot, "STATUS_UPDATE_INTERVAL", 30.0):
+            with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
+                mock_client = AsyncMock()
+                mock_client.get = AsyncMock(return_value=mock_response)
+                mock_client_cls.return_value = mock_client
+
+                task = asyncio.create_task(
+                    telegram_bot._poll_status_updates(
+                        bot,
+                        chat_id=123,
+                        stop_event=stop_event,
+                        conversation_id="123",
+                        request_id="req-1",
+                    )
+                )
+                await asyncio.sleep(0.01)
+                stop_event.set()
+                await task
+
+        bot.send_message.assert_awaited_once_with(
+            chat_id=123,
+            text="On it. I'm looking for the best sources now.",
+        )
+
+    @pytest.mark.asyncio
     async def test_status_poller_skips_when_not_found(self):
         """Status poller does not send when backend returns found=false."""
         bot = MagicMock()
@@ -286,13 +324,13 @@ class TestStatusPoller:
         response_1.status_code = 200
         response_1.json.return_value = {
             "found": True,
-            "event": {"seq": 1, "state": "Working: contacting model", "type": "update"},
+            "event": {"seq": 1, "state": "On it. I'm getting started now.", "type": "update"},
         }
         response_2 = MagicMock()
         response_2.status_code = 200
         response_2.json.return_value = {
             "found": True,
-            "event": {"seq": 2, "state": "Working: contacting model", "type": "heartbeat"},
+            "event": {"seq": 2, "state": "On it. I'm getting started now.", "type": "heartbeat"},
         }
 
         with patch.object(telegram_bot, "STATUS_UPDATE_INTERVAL", 0.01):
@@ -315,12 +353,28 @@ class TestStatusPoller:
                 await task
 
         sent_texts = [kwargs.get("text") for _, kwargs in bot.send_message.await_args_list]
-        assert "Working: contacting model" in sent_texts
-        assert sent_texts.count("Working: contacting model") == 1
+        assert "On it. I'm getting started now." in sent_texts
+        assert sent_texts.count("On it. I'm getting started now.") == 1
 
 
 class TestReplyWithBackendAnswer:
     """Regression tests for status-task cleanup in reply flow."""
+
+    def test_split_telegram_text_reply_breaks_long_text_into_chunks(self):
+        text = ("A" * 2500) + "\n" + ("B" * 2500)
+        chunks = telegram_bot._split_telegram_text_reply(text, max_chars=4000)
+        assert len(chunks) == 2
+        assert "".join(chunks) == text
+        assert all(len(chunk) <= 4000 for chunk in chunks)
+
+    def test_should_send_voice_reply_skips_transient_planning_text(self):
+        assert telegram_bot._should_send_voice_reply(
+            "I have the search results. Now I will use those URLs to scrape the content from each one."
+        ) is False
+        assert telegram_bot._should_send_voice_reply("On it. I'm checking that now.") is False
+
+    def test_should_send_voice_reply_allows_substantive_final_text(self):
+        assert telegram_bot._should_send_voice_reply("Here is the scraped summary with the key findings.") is True
 
     @pytest.mark.asyncio
     async def test_repeated_calls_do_not_propagate_cancelled_error(self):
@@ -348,3 +402,113 @@ class TestReplyWithBackendAnswer:
 
         assert mock_chat.await_count == 2
         assert message.reply_text.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_voice_reply_is_skipped_for_transient_planning_text(self):
+        message = MagicMock()
+        message.chat = MagicMock()
+        message.chat.send_action = AsyncMock()
+        message.reply_text = AsyncMock()
+        message.reply_voice = AsyncMock()
+        message.reply_audio = AsyncMock()
+
+        update = MagicMock()
+        update.message = message
+        update.effective_chat = MagicMock(id=123)
+
+        context = MagicMock()
+        context.bot = MagicMock()
+
+        with patch.object(
+            telegram_bot,
+            "call_backend_chat",
+            new=AsyncMock(return_value="I have the search results. Now I will use those URLs to scrape the content from each one."),
+        ), patch.object(telegram_bot, "_poll_status_updates", new=AsyncMock()), patch.object(
+            telegram_bot, "_stop_status_updates", new=AsyncMock()
+        ) as mock_stop, patch.object(telegram_bot, "VOICE_OUT_ENABLED", True), patch.object(
+            telegram_bot, "call_backend_tts", new=AsyncMock()
+        ) as mock_tts:
+            await telegram_bot._reply_with_backend_answer(update, context, 123, "search")
+
+        message.reply_text.assert_awaited_once()
+        mock_stop.assert_awaited_once()
+        mock_tts.assert_not_awaited()
+        message.reply_voice.assert_not_called()
+        message.reply_audio.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_voice_reply_runs_in_background_without_blocking_text_reply(self):
+        message = MagicMock()
+        message.chat = MagicMock()
+        message.chat.send_action = AsyncMock()
+        message.reply_text = AsyncMock()
+        message.reply_voice = AsyncMock()
+        message.reply_audio = AsyncMock()
+
+        update = MagicMock()
+        update.message = message
+        update.effective_chat = MagicMock(id=123)
+
+        context = MagicMock()
+        context.bot = MagicMock()
+
+        tts_started = asyncio.Event()
+        release_tts = asyncio.Event()
+
+        async def slow_tts(_text: str):
+            tts_started.set()
+            await release_tts.wait()
+            return b"OggS\x00OpusHead", "audio/ogg; codecs=opus"
+
+        with patch.object(
+            telegram_bot,
+            "call_backend_chat",
+            new=AsyncMock(return_value="Here is the scraped summary with the key findings."),
+        ), patch.object(telegram_bot, "_poll_status_updates", new=AsyncMock()), patch.object(
+            telegram_bot, "_stop_status_updates", new=AsyncMock()
+        ), patch.object(telegram_bot, "VOICE_OUT_ENABLED", True), patch.object(
+            telegram_bot, "call_backend_tts", new=slow_tts
+        ):
+            await asyncio.wait_for(
+                telegram_bot._reply_with_backend_answer(update, context, 123, "search"),
+                timeout=0.1,
+            )
+            await asyncio.wait_for(tts_started.wait(), timeout=0.1)
+            message.reply_voice.assert_not_awaited()
+            release_tts.set()
+            if telegram_bot._background_tasks:
+                await asyncio.gather(*tuple(telegram_bot._background_tasks), return_exceptions=True)
+
+        message.reply_text.assert_awaited_once_with("Here is the scraped summary with the key findings.")
+        message.reply_voice.assert_awaited_once()
+        message.reply_audio.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_long_final_reply_is_sent_in_multiple_messages(self):
+        message = MagicMock()
+        message.chat = MagicMock()
+        message.chat.send_action = AsyncMock()
+        message.reply_text = AsyncMock()
+
+        update = MagicMock()
+        update.message = message
+        update.effective_chat = MagicMock(id=123)
+
+        context = MagicMock()
+        context.bot = MagicMock()
+
+        long_reply = ("A" * 2500) + "\n" + ("B" * 2500)
+
+        with patch.object(
+            telegram_bot,
+            "call_backend_chat",
+            new=AsyncMock(return_value=long_reply),
+        ), patch.object(telegram_bot, "_poll_status_updates", new=AsyncMock()), patch.object(
+            telegram_bot, "_stop_status_updates", new=AsyncMock()
+        ), patch.object(telegram_bot, "VOICE_OUT_ENABLED", False):
+            await telegram_bot._reply_with_backend_answer(update, context, 123, "search")
+
+        sent_parts = [call.args[0] for call in message.reply_text.await_args_list]
+        assert len(sent_parts) == 2
+        assert "".join(sent_parts) == long_reply
+        assert all(len(part) <= telegram_bot.TELEGRAM_TEXT_MESSAGE_LIMIT for part in sent_parts)

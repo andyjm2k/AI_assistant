@@ -16,9 +16,9 @@ from scripts.setup_env_and_dirs import (
 
 def test_path_env_vars_contains_expected():
     """PATH_ENV_VARS includes known MCP path variables."""
-    assert "MCP_RESEARCH_TOOL_SAVE_DIR" in PATH_ENV_VARS
-    assert "MCP_AGENT_TOOL_SAVE_RECORDING_PATH" in PATH_ENV_VARS
-    assert "MCP_SERVER_LOG_FILE" in PATH_ENV_VARS
+    assert "MCP_RESEARCH_SAVE_DIRECTORY" in PATH_ENV_VARS
+    assert "MCP_BROWSER_USER_DATA_DIR" in PATH_ENV_VARS
+    assert "MCP_SERVER_RESULTS_DIR" in PATH_ENV_VARS
 
 
 def test_normalize_path_for_env_windows():
@@ -37,7 +37,7 @@ def test_normalize_path_for_env_posix():
 
 def test_substitute_path_ignores_comments():
     """Comment lines are returned unchanged."""
-    line = "# MCP_RESEARCH_TOOL_SAVE_DIR=something\n"
+    line = "# MCP_RESEARCH_SAVE_DIRECTORY=something\n"
     root = Path("C:/project")
     assert _substitute_path_in_line(line, root, on_windows=True) == line
 
@@ -45,9 +45,9 @@ def test_substitute_path_ignores_comments():
 def test_substitute_path_replaces_known_var():
     """Path var line gets project root substituted."""
     root = Path("D:/CATBot")
-    line = "MCP_RESEARCH_TOOL_SAVE_DIR=C:\\Users\\andyj\\AI_assistant\\research\n"
+    line = "MCP_RESEARCH_SAVE_DIRECTORY=C:\\Users\\andyj\\AI_assistant\\research\n"
     result = _substitute_path_in_line(line, root, on_windows=True)
-    assert "MCP_RESEARCH_TOOL_SAVE_DIR=" in result
+    assert "MCP_RESEARCH_SAVE_DIRECTORY=" in result
     assert "D:" in result or "research" in result
 
 

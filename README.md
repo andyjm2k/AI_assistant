@@ -445,26 +445,17 @@ See `config/telegram_env_example.txt` for the full list and examples.
 
 ### Team Configuration (AutoGen)
 
-Edit `config/team-config.json` to configure your AutoGen team. The default setup is an **actor-critic** workflow:
+The AutoGen team source of truth is now [`src/autogen/team_builder.py`](src/autogen/team_builder.py). The proxy loads that Python-defined team directly at runtime.
 
-- **Actor (assistant_agent)**: An `AssistantAgent` with a workbench that includes **code execution** (Python in a Docker container, with `pip install` and multi-step code supported) and **other tools** (e.g. calculator). The proxy server injects `PythonCodeExecutionTool` backed by `DockerCommandLineCodeExecutor` when available (`autogen-ext[docker]` installed) and starts/stops the Docker executor on first use and on shutdown or config reload.
-- **Critic (critic_agent)**: A text-only agent that reviews the actor's output and requests improvements; when satisfied, it asks the actor to TERMINATE.
+`config/team-config.json` is still kept for tools such as AutoGen Studio, but it is a generated export, not the primary definition. Refresh it with:
 
-Ensure Docker is installed and running if you use the code execution tool. The proxy server manages the executor lifecycle (start before first run, stop on reload or app shutdown).
-
-```json
-{
-  "label": "My AI Team",
-  "type": "team",
-  "members": [
-    {
-      "name": "assistant",
-      "type": "assistant",
-      "model": "gpt-4o-mini"
-    }
-  ]
-}
+```bash
+python scripts/export_autogen_team_config.py
 ```
+
+`scripts/start_all.py` runs that export automatically before launching AutoGen Studio.
+
+Ensure Docker is installed and running if you use the lead engineer's injected code execution tool. The proxy server manages that executor lifecycle (start before first run, stop on reload or app shutdown).
 
 **Resources:**
 - [AutoGen Documentation](https://microsoft.github.io/autogen/)
@@ -503,6 +494,9 @@ python -m http.server 8000
 
 # Start proxy server
 python -m src.servers.proxy_server
+
+# Export the current Python-defined team for Studio
+python scripts/export_autogen_team_config.py
 
 # Start AutoGen Studio
 autogenstudio serve --team config/team-config.json --port 8084

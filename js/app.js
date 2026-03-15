@@ -569,12 +569,223 @@
         let statusRequestId = null;
         let statusConversationId = null;
         let statusSinceSeq = 0;
+        const PROGRESS_VOICE_INITIAL_DELAY_MS = 0;
+        const PROGRESS_VOICE_REPEAT_DELAY_MS = 5000;
+        const PROGRESS_VOICE_STATE_COOLDOWN_MS = 5000;
+        const PROGRESS_VOICE_MAX_ANNOUNCEMENTS = 4;
+        let progressVoiceTimer = null;
+        let progressVoiceRepeatTimer = null;
+        let progressVoiceSessionId = 0;
+        let progressVoiceStartedAt = 0;
+        let progressVoiceCurrentState = '';
+        let progressVoiceLastAnnouncementAt = 0;
+        let progressVoiceAnnouncementCount = 0;
+        let progressVoiceLastStateKey = '';
 
         function generateRequestId() {
             if (window.crypto && typeof window.crypto.randomUUID === 'function') {
                 return window.crypto.randomUUID();
             }
             return `web-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        }
+
+        function clearProgressVoiceTimers() {
+            if (progressVoiceTimer) {
+                clearTimeout(progressVoiceTimer);
+                progressVoiceTimer = null;
+            }
+            if (progressVoiceRepeatTimer) {
+                clearTimeout(progressVoiceRepeatTimer);
+                progressVoiceRepeatTimer = null;
+            }
+        }
+
+        function humanizeToolName(toolName) {
+            return String(toolName || 'tool')
+                .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+                .replace(/[_-]+/g, ' ')
+                .trim()
+                .toLowerCase();
+        }
+
+        function getConversationalProgressPrompt(stateText, announcementCount = 0) {
+            const rawState = String(stateText || '').trim();
+            const lowerState = rawState.toLowerCase();
+            const safeIndex = Math.max(0, announcementCount);
+
+            if (lowerState.startsWith('executing tool:')) {
+                const rawToolName = rawState.split(':').slice(1).join(':').trim();
+                const normalizedToolName = rawToolName.replace(/[^a-z0-9]/gi, '').toLowerCase();
+                const spokenToolName = humanizeToolName(rawToolName);
+                const toolPromptMap = {
+                    websearch: [
+                        "I'm on it, looking that up now.",
+                        "I'm on it, still checking the web for that.",
+                        "I'm on it, finishing that search now."
+                    ],
+                    scrapewebsite: [
+                        "I'm on it, checking that page now.",
+                        "I'm on it, still reading through that page.",
+                        "I'm on it, wrapping up that page check now."
+                    ],
+                    readfile: [
+                        "I'm on it, reading through the file now.",
+                        "I'm on it, still going through the file.",
+                        "I'm on it, almost done reviewing the file."
+                    ],
+                    writefile: [
+                        "I'm on it, putting that file together now.",
+                        "I'm on it, still writing that up.",
+                        "I'm on it, just finishing that file now."
+                    ],
+                    runcodexcli: [
+                        "I'm on it, making that code change now.",
+                        "I'm on it, still working through the code update.",
+                        "I'm on it, just cleaning up the code change."
+                    ],
+                    fetchnews: [
+                        "I'm on it, pulling the latest articles now.",
+                        "I'm on it, still gathering the latest coverage.",
+                        "I'm on it, finishing that news pass now."
+                    ],
+                    uploadtogoogledrive: [
+                        "I'm on it, uploading that now.",
+                        "I'm on it, still sending that file over.",
+                        "I'm on it, just waiting for the upload to finish."
+                    ],
+                    managetodolist: [
+                        "I'm on it, updating that task now.",
+                        "I'm on it, still sorting out the task list.",
+                        "I'm on it, just finishing the task update."
+                    ]
+                };
+                const mappedPrompts = toolPromptMap[normalizedToolName];
+                if (mappedPrompts && mappedPrompts.length > 0) {
+                    return {
+                        key: `tool:${normalizedToolName}`,
+                        text: mappedPrompts[Math.min(safeIndex, mappedPrompts.length - 1)]
+                    };
+                }
+                const genericToolPrompts = [
+                    `I'm on it, using ${spokenToolName || 'a tool'} for that now.`,
+                    `I'm on it, still working through ${spokenToolName || 'that tool'} right now.`,
+                    `I'm on it, almost done with ${spokenToolName || 'that tool'}.`
+                ];
+                return {
+                    key: `tool:${normalizedToolName || 'generic'}`,
+                    text: genericToolPrompts[Math.min(safeIndex, genericToolPrompts.length - 1)]
+                };
+            }
+
+            const promptGroups = [
+                {
+                    match: () => lowerState.includes('analyzing request'),
+                    key: 'analyzing-request',
+                    prompts: [
+                        "Let me think.",
+                        "Meow, let me think.",
+                        "Let me think, almost there."
+                    ]
+                },
+                {
+                    match: () => lowerState.includes('planning tool chain'),
+                    key: 'planning-tool-chain',
+                    prompts: [
+                        "I'm on it, lining up the steps now.",
+                        "I'm on it, still organizing the best path through this.",
+                        "I'm on it, nearly got the plan set."
+                    ]
+                },
+                {
+                    match: () => lowerState.includes('executing tool chain'),
+                    key: 'executing-tool-chain',
+                    prompts: [
+                        "I'm on it, working through the steps now.",
+                        "I'm on it, still moving through that tool chain.",
+                        "I'm on it, wrapping up the last step now."
+                    ]
+                },
+                {
+                    match: () => lowerState.includes('contacting model'),
+                    key: 'contacting-model',
+                    prompts: [
+                        "Let me think.",
+                        "Meow, still thinking.",
+                        "Let me think, I nearly have it."
+                    ]
+                },
+                {
+                    match: () => lowerState.includes('requesting final response'),
+                    key: 'requesting-final-response',
+                    prompts: [
+                        "Let me think, putting the answer together.",
+                        "Meow, still polishing the response.",
+                        "Let me think, about to send it."
+                    ]
+                }
+            ];
+
+            const matchedGroup = promptGroups.find(group => group.match());
+            if (matchedGroup) {
+                return {
+                    key: matchedGroup.key,
+                    text: matchedGroup.prompts[Math.min(safeIndex, matchedGroup.prompts.length - 1)]
+                };
+            }
+
+            const genericPrompts = [
+                "Let me think.",
+                "Meow, still thinking.",
+                "Let me think, nearly done."
+            ];
+            return {
+                key: lowerState || 'generic-progress',
+                text: genericPrompts[Math.min(safeIndex, genericPrompts.length - 1)]
+            };
+        }
+
+        function announceConversationalProgress(force = false) {
+            if (!statusRequestId || !statusConversationId) return;
+            if (!progressVoiceStartedAt || !progressVoiceCurrentState) return;
+            if (isMuted) return;
+            if (!force && (Date.now() - progressVoiceStartedAt) < PROGRESS_VOICE_INITIAL_DELAY_MS) return;
+            if (progressVoiceAnnouncementCount >= PROGRESS_VOICE_MAX_ANNOUNCEMENTS) return;
+            if (!force && progressVoiceLastAnnouncementAt && (Date.now() - progressVoiceLastAnnouncementAt) < PROGRESS_VOICE_STATE_COOLDOWN_MS) return;
+
+            const prompt = getConversationalProgressPrompt(progressVoiceCurrentState, progressVoiceAnnouncementCount);
+            if (!prompt || !prompt.text) return;
+
+            progressVoiceLastAnnouncementAt = Date.now();
+            progressVoiceAnnouncementCount += 1;
+            progressVoiceLastStateKey = prompt.key || '';
+            textToSpeechFallback(prompt.text, { preserveThinkingPose: true });
+        }
+
+        function scheduleProgressVoiceAnnouncement(delayMs, sessionId = progressVoiceSessionId) {
+            if (!statusRequestId || !statusConversationId) return;
+            if (progressVoiceAnnouncementCount >= PROGRESS_VOICE_MAX_ANNOUNCEMENTS) return;
+            if (progressVoiceTimer) {
+                clearTimeout(progressVoiceTimer);
+            }
+            progressVoiceTimer = setTimeout(() => {
+                if (sessionId !== progressVoiceSessionId) return;
+                progressVoiceTimer = null;
+                announceConversationalProgress(false);
+            }, Math.max(0, delayMs));
+        }
+
+        function scheduleProgressVoiceRepeat(sessionId = progressVoiceSessionId) {
+            if (!statusRequestId || !statusConversationId) return;
+            if (progressVoiceAnnouncementCount >= PROGRESS_VOICE_MAX_ANNOUNCEMENTS) return;
+            if (progressVoiceRepeatTimer) {
+                clearTimeout(progressVoiceRepeatTimer);
+            }
+            progressVoiceRepeatTimer = setTimeout(() => {
+                if (sessionId !== progressVoiceSessionId) return;
+                progressVoiceRepeatTimer = null;
+                announceConversationalProgress(false);
+                scheduleProgressVoiceRepeat(sessionId);
+            }, PROGRESS_VOICE_REPEAT_DELAY_MS);
         }
 
         async function postStatusStart(stateText) {
@@ -651,19 +862,70 @@
             } catch (_) {}
         }
 
+        const SMALL_TALK_PROMPT_PATTERNS = [
+            /^(?:hi|hello|hey|hiya|yo|howdy)(?:\s+(?:cat|catbot|there))?[!.?]*$/i,
+            /^(?:hi|hello|hey)[,!\s]*(?:how are you|how's it going|how are things|what's up)[?.!\s]*$/i,
+            /^(?:how are you|how's it going|how are things|what's up)[?.!\s]*$/i,
+            /^(?:thanks|thank you|cheers|cool|awesome|great|nice|sounds good|got it|ok|okay|alright)[!.?\s]*$/i,
+            /^(?:bye|goodbye|see ya|see you|cya|ttyl|talk to you later|good night)[!.?\s]*$/i
+        ];
+
+        function isSmallTalkPrompt(promptText = '') {
+            const normalized = String(promptText || '').replace(/\s+/g, ' ').trim();
+            if (!normalized) return false;
+            if (normalized.length > 120) return false;
+            return SMALL_TALK_PROMPT_PATTERNS.some(pattern => pattern.test(normalized));
+        }
+
+        function shouldStartProgressUpdatesForPrompt(promptText = '') {
+            return !isSmallTalkPrompt(promptText);
+        }
+
         function startProgressUpdates(stateText) {
             stopProgressUpdates();
             statusRequestId = generateRequestId();
             statusConversationId = activeConversationId || 'default';
             statusSinceSeq = 0;
+            progressVoiceSessionId += 1;
+            progressVoiceStartedAt = Date.now();
+            progressVoiceCurrentState = typeof stateText === 'string' ? stateText.trim() : '';
+            progressVoiceLastAnnouncementAt = 0;
+            progressVoiceAnnouncementCount = 0;
+            progressVoiceLastStateKey = '';
             postStatusStart(stateText);
             pollStatusEvents();
             statusPollTimer = setInterval(pollStatusEvents, 60000);
+            announceConversationalProgress(true);
+            scheduleProgressVoiceAnnouncement(PROGRESS_VOICE_INITIAL_DELAY_MS, progressVoiceSessionId);
+            scheduleProgressVoiceRepeat(progressVoiceSessionId);
         }
 
         function updateProgressState(stateText) {
             if (typeof stateText === 'string' && stateText.trim()) {
-                postStatusUpdate(stateText);
+                const trimmedState = stateText.trim();
+                const nextPrompt = getConversationalProgressPrompt(trimmedState, progressVoiceAnnouncementCount);
+                const nextStateKey = nextPrompt?.key || trimmedState.toLowerCase();
+                const previousStateKey = progressVoiceLastStateKey || getConversationalProgressPrompt(progressVoiceCurrentState, Math.max(0, progressVoiceAnnouncementCount - 1))?.key || '';
+                progressVoiceCurrentState = trimmedState;
+                postStatusUpdate(trimmedState);
+
+                if (progressVoiceAnnouncementCount >= PROGRESS_VOICE_MAX_ANNOUNCEMENTS) {
+                    return;
+                }
+
+                const elapsedMs = progressVoiceStartedAt ? (Date.now() - progressVoiceStartedAt) : 0;
+                if (elapsedMs < PROGRESS_VOICE_INITIAL_DELAY_MS) {
+                    scheduleProgressVoiceAnnouncement(PROGRESS_VOICE_INITIAL_DELAY_MS - elapsedMs, progressVoiceSessionId);
+                    return;
+                }
+
+                if (nextStateKey && nextStateKey !== previousStateKey) {
+                    const msSinceLastAnnouncement = progressVoiceLastAnnouncementAt ? (Date.now() - progressVoiceLastAnnouncementAt) : Number.POSITIVE_INFINITY;
+                    const delayMs = msSinceLastAnnouncement >= PROGRESS_VOICE_STATE_COOLDOWN_MS
+                        ? 1200
+                        : (PROGRESS_VOICE_STATE_COOLDOWN_MS - msSinceLastAnnouncement) + 200;
+                    scheduleProgressVoiceAnnouncement(delayMs, progressVoiceSessionId);
+                }
             }
         }
 
@@ -672,10 +934,16 @@
                 clearInterval(statusPollTimer);
                 statusPollTimer = null;
             }
+            clearProgressVoiceTimers();
             postStatusFinish('Done: response delivered');
             statusRequestId = null;
             statusConversationId = null;
             statusSinceSeq = 0;
+            progressVoiceCurrentState = '';
+            progressVoiceStartedAt = 0;
+            progressVoiceLastAnnouncementAt = 0;
+            progressVoiceAnnouncementCount = 0;
+            progressVoiceLastStateKey = '';
         }
         
         // Function to add a message to the history display
@@ -1169,6 +1437,7 @@
 		let microsoftTtsSmoothedAmplitude = 0; // Current smoothed amplitude value
 		let microsoftTtsLastBoundaryTs = 0; // Timestamp of last boundary event
 		let microsoftTtsIsActive = false; // Flag to track if Microsoft TTS lip sync is active
+        let browserSpeechGeneration = 0; // Monotonic token used to ignore stale speechSynthesis callbacks after interruption
 
         // Global VRMA actions
         let vrmLoveVrmaAction = null; // Prepared AnimationAction for love VRMA
@@ -1176,6 +1445,12 @@
         let vrmCryVrmaAction = null; // Prepared AnimationAction for cry VRMA
         let vrmAngryVrmaAction = null; // Prepared AnimationAction for angry VRMA
         let vrmIdleVrmaAction = null; // Prepared AnimationAction for idle VRMA
+        let vrmProcessingThinkLoopActive = false; // Whether the request-processing thinking loop is active
+        let vrmAwaitingTtsStart = false; // Whether we are holding the processing loop until speech playback begins
+        let vrmAwaitingTtsStartTimerId = null; // Safety timer so processing loop cannot get stuck forever
+        let vrmTtsStartHandled = false; // One-shot guard for the first playback event of a TTS session
+        let vrmIdleReplayTimerId = null; // Timer for delayed idle replays
+        let vrmIdleHasPlayedOnce = false; // Tracks whether the initial idle pass has already happened
 
         // Pose configuration (tweak these numbers to adjust poses)
         const POSE_CONFIG = {
@@ -1202,7 +1477,7 @@
             think: {
                 durationMs: 6000, // How long to hold the thinking pose
                 expressionsOnly: true, // If true, only drive facial expressions; skip limb rotations
-                vrmaPath: './model_avatar/Eva/VRMA_06.vrma', // VRMA animation path for thinking pose
+                vrmaPath: './model_avatar/Eva/Thinking.vrma', // VRMA animation path for thinking pose
                 useVrma: true, // Prefer VRMA over manual pose
                 upperArmPitchForward: 0.6, // Additional forward pitch for right upper arm
                 upperArmYawIn: 0.65, // Additional inward yaw for right upper arm
@@ -1231,6 +1506,212 @@
                 browDownGain: 0.8 // Brow down amplitude for angry look
             }
         };
+
+        function clearVrmAwaitingTtsStart() {
+            vrmAwaitingTtsStart = false;
+            if (vrmAwaitingTtsStartTimerId) {
+                try { clearTimeout(vrmAwaitingTtsStartTimerId); } catch (_) {}
+                vrmAwaitingTtsStartTimerId = null;
+            }
+        }
+
+        function resetVrmPoseState() {
+            if (lovePoseTimeoutId) { try { clearTimeout(lovePoseTimeoutId); } catch (_) {} lovePoseTimeoutId = null; }
+            if (thinkPoseTimeoutId) { try { clearTimeout(thinkPoseTimeoutId); } catch (_) {} thinkPoseTimeoutId = null; }
+            if (cryPoseTimeoutId) { try { clearTimeout(cryPoseTimeoutId); } catch (_) {} cryPoseTimeoutId = null; }
+            if (angryPoseTimeoutId) { try { clearTimeout(angryPoseTimeoutId); } catch (_) {} angryPoseTimeoutId = null; }
+
+            vrmLovePoseActive = false;
+            vrmThinkPoseActive = false;
+            vrmCryPoseActive = false;
+            vrmAngryPoseActive = false;
+            lovePoseWeight = 0;
+            thinkPoseWeight = 0;
+            cryPoseWeight = 0;
+            angryPoseWeight = 0;
+            targetLovePoseWeight = 0;
+            targetThinkPoseWeight = 0;
+            targetCryPoseWeight = 0;
+            targetAngryPoseWeight = 0;
+
+            try {
+                if (vrmModel?.expressionManager) {
+                    ['smile','happy','joy','fun','relaxed','heart','love','oh','browUp','browUpLeft','browUpRight','surprised','sad','cry','sorrow','angry']
+                        .forEach(k => { try { vrmModel.expressionManager.setValue(k, 0.0); } catch (_) {} });
+                }
+                if (vrmModel?.blendShapeProxy) {
+                    ['Smile','Joy','Fun','MouthSmile','Relaxed','Heart','Love','O','BrowUp','BrowUp_L','BrowUp_R','Surprised','Sad','Cry','Sorrow','Angry']
+                        .forEach(k => { try { vrmModel.blendShapeProxy.setValue(k, 0.0); } catch (_) {} });
+                }
+            } catch (_) {}
+        }
+
+        function stopVrmAction(action) {
+            if (!action) return;
+            try {
+                if (action.isRunning()) {
+                    action.stop();
+                }
+            } catch (_) {}
+        }
+
+        function clearVrmIdleReplayTimer() {
+            if (vrmIdleReplayTimerId) {
+                try { clearTimeout(vrmIdleReplayTimerId); } catch (_) {}
+                vrmIdleReplayTimerId = null;
+            }
+        }
+
+        function scheduleNextVrmIdlePlayback() {
+            const vrmModeToggle = document.getElementById('vrm-mode');
+            if (!vrmIdleVrmaAction || !vrmModeToggle?.checked || vrmIdleReplayTimerId) {
+                return;
+            }
+            if (vrmProcessingThinkLoopActive || vrmAwaitingTtsStart) {
+                return;
+            }
+
+            const hasActiveAnimation =
+                (vrmLoveVrmaAction && vrmLoveVrmaAction.isRunning()) ||
+                (vrmThinkVrmaAction && vrmThinkVrmaAction.isRunning()) ||
+                (vrmCryVrmaAction && vrmCryVrmaAction.isRunning()) ||
+                (vrmAngryVrmaAction && vrmAngryVrmaAction.isRunning());
+
+            if (hasActiveAnimation) {
+                return;
+            }
+
+            const delayMs = 10000 + Math.floor(Math.random() * 10001);
+            vrmIdleReplayTimerId = setTimeout(() => {
+                vrmIdleReplayTimerId = null;
+                playVrmIdleAction();
+            }, delayMs);
+        }
+
+        function playVrmIdleAction() {
+            const vrmModeToggle = document.getElementById('vrm-mode');
+            if (!vrmIdleVrmaAction || !vrmModeToggle?.checked) {
+                return;
+            }
+            if (vrmProcessingThinkLoopActive || vrmAwaitingTtsStart) {
+                return;
+            }
+
+            const hasActiveAnimation =
+                (vrmLoveVrmaAction && vrmLoveVrmaAction.isRunning()) ||
+                (vrmThinkVrmaAction && vrmThinkVrmaAction.isRunning()) ||
+                (vrmCryVrmaAction && vrmCryVrmaAction.isRunning()) ||
+                (vrmAngryVrmaAction && vrmAngryVrmaAction.isRunning());
+
+            if (hasActiveAnimation) {
+                return;
+            }
+
+            try {
+                clearVrmIdleReplayTimer();
+                vrmIdleVrmaAction.stop();
+                vrmIdleVrmaAction.reset();
+                vrmIdleVrmaAction.clampWhenFinished = false;
+                vrmIdleVrmaAction.loop = window.THREE.LoopOnce;
+                vrmIdleVrmaAction.repetitions = 1;
+                vrmIdleVrmaAction.setEffectiveWeight(1.0);
+                vrmIdleVrmaAction.setEffectiveTimeScale(1.0);
+                vrmIdleVrmaAction.enabled = true;
+                vrmIdleVrmaAction.play();
+                vrmIdleHasPlayedOnce = true;
+            } catch (_) {}
+        }
+
+        function markVrmAwaitingTtsStart() {
+            vrmTtsStartHandled = false;
+            vrmAwaitingTtsStart = true;
+            if (vrmAwaitingTtsStartTimerId) {
+                try { clearTimeout(vrmAwaitingTtsStartTimerId); } catch (_) {}
+            }
+            vrmAwaitingTtsStartTimerId = setTimeout(() => {
+                vrmAwaitingTtsStartTimerId = null;
+                vrmAwaitingTtsStart = false;
+                stopVrmProcessingThinkingLoop({ resumeIdle: true });
+            }, 8000);
+        }
+
+        function startVrmProcessingThinkingLoop() {
+            const vrmModeToggle = document.getElementById('vrm-mode');
+            clearVrmAwaitingTtsStart();
+            vrmTtsStartHandled = false;
+
+            if (!vrmThinkVrmaAction || !vrmModeToggle?.checked) {
+                vrmProcessingThinkLoopActive = false;
+                return;
+            }
+
+            vrmProcessingThinkLoopActive = true;
+            clearVrmIdleReplayTimer();
+            resetVrmPoseState();
+            stopVrmAction(vrmLoveVrmaAction);
+            stopVrmAction(vrmThinkVrmaAction);
+            stopVrmAction(vrmCryVrmaAction);
+            stopVrmAction(vrmAngryVrmaAction);
+            stopVrmAction(vrmIdleVrmaAction);
+
+            try {
+                vrmThinkVrmaAction.reset();
+                vrmThinkVrmaAction.clampWhenFinished = false;
+                vrmThinkVrmaAction.loop = window.THREE.LoopRepeat;
+                vrmThinkVrmaAction.setEffectiveWeight(1.0);
+                vrmThinkVrmaAction.setEffectiveTimeScale(1.0);
+                vrmThinkVrmaAction.enabled = true;
+                vrmThinkVrmaAction.play();
+            } catch (e) {
+                console.warn('Failed to start processing thinking VRMA loop:', e);
+                vrmProcessingThinkLoopActive = false;
+            }
+        }
+
+        function stopVrmProcessingThinkingLoop({ resumeIdle = false } = {}) {
+            clearVrmAwaitingTtsStart();
+            const wasProcessingLoopActive = vrmProcessingThinkLoopActive;
+            vrmProcessingThinkLoopActive = false;
+
+            if (vrmThinkVrmaAction) {
+                try {
+                    vrmThinkVrmaAction.clampWhenFinished = true;
+                    vrmThinkVrmaAction.loop = window.THREE.LoopOnce;
+                    if (wasProcessingLoopActive && vrmThinkVrmaAction.isRunning()) {
+                        vrmThinkVrmaAction.stop();
+                    }
+                } catch (_) {}
+            }
+
+            if (resumeIdle) {
+                playVrmIdleAction();
+            }
+        }
+
+        function handleVrmTtsPlaybackStarted() {
+            if (vrmTtsStartHandled) {
+                return;
+            }
+
+            vrmTtsStartHandled = true;
+            clearVrmAwaitingTtsStart();
+            vrmProcessingThinkLoopActive = false;
+            clearVrmIdleReplayTimer();
+            resetVrmPoseState();
+            stopVrmAction(vrmLoveVrmaAction);
+            stopVrmAction(vrmThinkVrmaAction);
+            stopVrmAction(vrmCryVrmaAction);
+            stopVrmAction(vrmAngryVrmaAction);
+
+            if (vrmThinkVrmaAction) {
+                try {
+                    vrmThinkVrmaAction.clampWhenFinished = true;
+                    vrmThinkVrmaAction.loop = window.THREE.LoopOnce;
+                } catch (_) {}
+            }
+
+            playVrmIdleAction();
+        }
 
 
 
@@ -2164,21 +2645,126 @@
             return null;
         }
 
+        function resetBrowserSpeechMouthState() {
+            const mouthOpenY = 'ParamMouthOpenY';
+            if (live2dModel) {
+                live2dModel.internalModel.coreModel.setParameterValueById(mouthOpenY, 0);
+            }
+            const vrmModeToggle = document.getElementById('vrm-mode');
+            if (vrmModel && vrmModeToggle && vrmModeToggle.checked) {
+                animateVRMLipSync(0);
+            }
+        }
+
+        function startBrowserSpeechLipSyncLoop() {
+            const mouthOpenY = 'ParamMouthOpenY';
+            if (microsoftTtsRafId) return;
+
+            microsoftTtsIsActive = true;
+            microsoftTtsSmoothedAmplitude = 0;
+            microsoftTtsTargetAmplitude = 0.3;
+            microsoftTtsLastBoundaryTs = performance.now();
+
+            const attack = 0.6;
+            const release = 0.15;
+            const threshold = 0.05;
+            const boundaryDecayRate = 0.08;
+            const boundaryDecayDelay = 50;
+
+            const step = () => {
+                if (!microsoftTtsIsActive || !isSpeaking) {
+                    microsoftTtsRafId = 0;
+                    microsoftTtsSmoothedAmplitude = 0;
+                    resetBrowserSpeechMouthState();
+                    return;
+                }
+
+                const now = performance.now();
+                const timeSinceBoundary = now - microsoftTtsLastBoundaryTs;
+
+                if (timeSinceBoundary > boundaryDecayDelay) {
+                    const decayFactor = Math.min(1.0, (timeSinceBoundary - boundaryDecayDelay) / 200);
+                    microsoftTtsTargetAmplitude = Math.max(0, microsoftTtsTargetAmplitude - (boundaryDecayRate * decayFactor));
+                }
+
+                if (microsoftTtsTargetAmplitude > microsoftTtsSmoothedAmplitude) {
+                    microsoftTtsSmoothedAmplitude += (microsoftTtsTargetAmplitude - microsoftTtsSmoothedAmplitude) * attack;
+                } else {
+                    microsoftTtsSmoothedAmplitude += (microsoftTtsTargetAmplitude - microsoftTtsSmoothedAmplitude) * release;
+                }
+
+                const scaled = microsoftTtsSmoothedAmplitude <= threshold ? 0 : Math.min(1, (microsoftTtsSmoothedAmplitude - threshold) * 5.5);
+
+                if (live2dModel) {
+                    live2dModel.internalModel.coreModel.setParameterValueById(mouthOpenY, scaled);
+                }
+
+                const vrmModeToggle = document.getElementById('vrm-mode');
+                if (vrmModel && vrmModeToggle && vrmModeToggle.checked) {
+                    animateVRMLipSync(scaled);
+                }
+
+                if (isSpeaking && microsoftTtsIsActive) {
+                    microsoftTtsRafId = requestAnimationFrame(step);
+                } else {
+                    microsoftTtsRafId = 0;
+                }
+            };
+
+            step();
+        }
+
+        function registerBrowserSpeechBoundary() {
+            const now = performance.now();
+            const timeSinceLastBoundary = now - microsoftTtsLastBoundaryTs;
+            microsoftTtsLastBoundaryTs = now;
+            const amplitudeBoost = Math.min(0.35, 0.15 + (timeSinceLastBoundary / 1000) * 0.08);
+            microsoftTtsTargetAmplitude = Math.min(0.85, microsoftTtsTargetAmplitude + amplitudeBoost);
+        }
+
+        function stopBrowserSpeechLipSync() {
+            isSpeaking = false;
+            microsoftTtsIsActive = false;
+            if (microsoftTtsRafId) {
+                try { cancelAnimationFrame(microsoftTtsRafId); } catch(_) {}
+                microsoftTtsRafId = 0;
+            }
+            if (ttsLipSyncIntervalId) {
+                try { clearInterval(ttsLipSyncIntervalId); } catch(_) {}
+                ttsLipSyncIntervalId = null;
+            }
+            if (ttsRafId) {
+                try { cancelAnimationFrame(ttsRafId); } catch(_) {}
+                ttsRafId = 0;
+            }
+            try { ttsCleanupFns.forEach(fn => { try { fn(); } catch(_){} }); } catch(_){}
+            ttsCleanupFns = [];
+            resetBrowserSpeechMouthState();
+        }
+
         // Update the textToSpeech function
         function textToSpeech(text) {
             if (!text) {
                 console.warn('No text provided for speech');
+                stopVrmProcessingThinkingLoop({ resumeIdle: true });
                 return;
             }
 
             // Check if muted
             if (isMuted) {
                 console.log('TTS is muted, skipping speech');
+                stopVrmProcessingThinkingLoop({ resumeIdle: true });
                 return;
             }
 
             // Sanitize text to remove emojis, bracketed sections, asterisks, and special symbols
             text = sanitizeTTS(text);
+            if (!text) {
+                stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                return;
+            }
+            markVrmAwaitingTtsStart();
+            const browserSpeechSessionId = ++browserSpeechGeneration;
 
 			// Cancel any ongoing speech and active lip-sync loops/graphs
             try { speechSynthesis.cancel(); } catch (_) {}
@@ -2219,80 +2805,10 @@
             const mouthOpenY = "ParamMouthOpenY"; // Live2D mouth open parameter id
             let headMovementInterval; // Interval id for gentle head movement
             
-            // Start smooth amplitude-based lip sync for Microsoft TTS (similar to Chatterbox analyser approach)
-            function startMicrosoftTtsLipSync() { // Start smooth lip sync loop for Microsoft TTS
-                if (microsoftTtsRafId) return; // Avoid spawning duplicate loops
-                
-                microsoftTtsIsActive = true; // Mark lip sync as active
-                microsoftTtsSmoothedAmplitude = 0; // Initialize smoothed amplitude
-                microsoftTtsTargetAmplitude = 0.3; // Start with lower mouth opening to allow natural closing
-                microsoftTtsLastBoundaryTs = performance.now(); // Initialize boundary timestamp
-                
-                const attack = 0.6; // Attack coefficient for rising amplitude (same as Chatterbox)
-                const release = 0.15; // Release coefficient for falling amplitude (same as Chatterbox)
-                const threshold = 0.05; // Minimum amplitude threshold (increased to make mouth close more between words)
-                const boundaryDecayRate = 0.08; // Rate at which amplitude decays between boundaries (increased for faster closing)
-                const boundaryDecayDelay = 50; // Delay before decay starts (reduced from 100ms for more responsive closing)
-                
-                const step = () => { // Per-frame lip sync update callback
-                    if (!microsoftTtsIsActive || !isSpeaking) { // Stop if speech ended or deactivated
-                        microsoftTtsRafId = 0; // Clear RAF id
-                        microsoftTtsSmoothedAmplitude = 0; // Reset amplitude
-                        // Close mouth when speech ends
-                        if (live2dModel) {
-                            live2dModel.internalModel.coreModel.setParameterValueById(mouthOpenY, 0);
-                        }
-                        const vrmModeToggle = document.getElementById('vrm-mode');
-                        if (vrmModel && vrmModeToggle && vrmModeToggle.checked) {
-                            animateVRMLipSync(0);
-                        }
-                        return; // Exit loop
-                    }
-                    
-                    const now = performance.now(); // Get current timestamp
-                    const timeSinceBoundary = now - microsoftTtsLastBoundaryTs; // Calculate time since last boundary
-                    
-                    // Decay target amplitude over time if no recent boundary (simulates natural speech rhythm)
-                    // Use exponential decay for more natural closing between words
-                    if (timeSinceBoundary > boundaryDecayDelay) { // If no boundary for >50ms, start decaying
-                        const decayFactor = Math.min(1.0, (timeSinceBoundary - boundaryDecayDelay) / 200); // Faster decay over 200ms
-                        microsoftTtsTargetAmplitude = Math.max(0, microsoftTtsTargetAmplitude - (boundaryDecayRate * decayFactor));
-                    }
-                    
-                    // Apply attack/release smoothing (same algorithm as Chatterbox analyser)
-                    if (microsoftTtsTargetAmplitude > microsoftTtsSmoothedAmplitude) { // Attack branch
-                        microsoftTtsSmoothedAmplitude += (microsoftTtsTargetAmplitude - microsoftTtsSmoothedAmplitude) * attack;
-                    } else { // Release branch
-                        microsoftTtsSmoothedAmplitude += (microsoftTtsTargetAmplitude - microsoftTtsSmoothedAmplitude) * release;
-                    }
-                    
-                    // Scale amplitude with adjusted threshold for better mouth closing between words
-                    const scaled = microsoftTtsSmoothedAmplitude <= threshold ? 0 : Math.min(1, (microsoftTtsSmoothedAmplitude - threshold) * 5.5);
-                    
-                    // Apply to Live2D model
-                    if (live2dModel) {
-                        live2dModel.internalModel.coreModel.setParameterValueById(mouthOpenY, scaled);
-                    }
-                    
-                    // Apply to VRM model
-                    const vrmModeToggle = document.getElementById('vrm-mode');
-                    if (vrmModel && vrmModeToggle && vrmModeToggle.checked) {
-                        animateVRMLipSync(scaled);
-                    }
-                    
-                    // Continue loop while speech is active
-                    if (isSpeaking && microsoftTtsIsActive) {
-                        microsoftTtsRafId = requestAnimationFrame(step);
-                    } else {
-                        microsoftTtsRafId = 0; // Clear RAF id when done
-                    }
-                }; // End step function
-                
-                step(); // Start the lip sync loop immediately
-            } // End startMicrosoftTtsLipSync
-            
             utterance.onstart = function() { // When speech begins
+                if (browserSpeechSessionId !== browserSpeechGeneration) return;
                 console.log('Speech started'); // Log start of speech
+                handleVrmTtsPlaybackStarted();
                 isSpeaking = true; // Set global speaking flag
                 if (live2dModel) { // If Live2D model is active
                     headMovementInterval = setInterval(() => { // Start periodic head movement
@@ -2303,7 +2819,7 @@
                 microsoftTtsLastBoundaryTs = performance.now(); // Initialize boundary timestamp
                 
                 // Start smooth amplitude-based lip sync (same approach as Chatterbox)
-                startMicrosoftTtsLipSync(); // Start smooth lip sync loop
+                startBrowserSpeechLipSyncLoop(); // Start smooth lip sync loop
 
                 // Kick mouth slightly open at start so it does not appear stuck
                 if (vrmModel && document.getElementById('vrm-mode').checked) { // If VRM active
@@ -2312,30 +2828,17 @@
             }; // End onstart handler
 
             utterance.onboundary = function(event) { // Called on word or sentence boundaries
-                const now = performance.now(); // Get current timestamp
-                const timeSinceLastBoundary = now - microsoftTtsLastBoundaryTs; // Calculate time since last boundary
-                microsoftTtsLastBoundaryTs = now; // Update boundary timestamp
-                // Trigger amplitude increase on boundary (simulates speech activity)
-                // Use smaller, more frequent boosts to allow mouth to close between words
-                const amplitudeBoost = Math.min(0.35, 0.15 + (timeSinceLastBoundary / 1000) * 0.08); // Reduced boost for more natural closing
-                microsoftTtsTargetAmplitude = Math.min(0.85, microsoftTtsTargetAmplitude + amplitudeBoost); // Cap at 0.85 to allow closing
+                if (browserSpeechSessionId !== browserSpeechGeneration) return;
+                registerBrowserSpeechBoundary();
             }; // End onboundary handler
 
             utterance.onend = function() { // When speech ends
+                if (browserSpeechSessionId !== browserSpeechGeneration) return;
                 console.log('Speech ended'); // Log end of speech
-                isSpeaking = false; // Clear speaking flag
-                microsoftTtsIsActive = false; // Stop Microsoft TTS lip sync loop
                 if (headMovementInterval) { // If head movement was running
                     clearInterval(headMovementInterval); // Stop head movement interval
                 } // End head movement cleanup
-                if (microsoftTtsRafId) { // If Microsoft TTS lip sync RAF is running
-                    try { cancelAnimationFrame(microsoftTtsRafId); } catch(_){} // Cancel animation frame
-                    microsoftTtsRafId = 0; // Clear RAF id
-                } // End Microsoft TTS lip sync cleanup
-                if (ttsLipSyncIntervalId) { try { clearInterval(ttsLipSyncIntervalId); } catch(_){} ttsLipSyncIntervalId = null; }
-                if (ttsRafId) { try { cancelAnimationFrame(ttsRafId); } catch(_){} ttsRafId = 0; }
-                try { ttsCleanupFns.forEach(fn => { try { fn(); } catch(_){} }); } catch(_){}
-                ttsCleanupFns = [];
+                stopBrowserSpeechLipSync();
 
                 if (live2dModel) { // If Live2D active
                     live2dModel.internalModel.coreModel.setParameterValueById(mouthOpenY, 0); // Ensure mouth is closed
@@ -2353,7 +2856,12 @@
             }; // End onend handler
 
             utterance.onerror = function(event) {
+                if (browserSpeechSessionId !== browserSpeechGeneration) return;
                 console.error('Speech synthesis error:', event);
+                if (headMovementInterval) {
+                    clearInterval(headMovementInterval);
+                }
+                stopBrowserSpeechLipSync();
             };
 
             utterance.rate = 1.0;
@@ -2363,6 +2871,7 @@
             speechSynthesis.speak(utterance);
             } catch (error) {
                 console.error('Speech synthesis error:', error);
+                stopVrmProcessingThinkingLoop({ resumeIdle: true });
             }
         }
 
@@ -2526,6 +3035,7 @@
                             sourceBuffer.addEventListener('updateend', () => { // When buffer update completes
                                 audio.play().then(() => { // Start audio playback
                                     console.log('🎵 Audio playback started (MSE)'); // Log playback start
+                                    handleVrmTtsPlaybackStarted();
                                     startLipSyncFromAudioElement(audio); // Hook up lip sync
                                 }).catch((e) => { // Catch play errors
                                     console.warn('Audio play error (may be autoplay restriction):', e); // Log warning
@@ -2858,6 +3368,7 @@
             // Keep the same playhead logic (reuse from existing scheduler)
             window.__opus.playhead = Math.max(ctx.currentTime, window.__opus.playhead || 0); // Calculate start time with playhead overlap
             src.start(window.__opus.playhead); // Schedule playback at playhead position
+            handleVrmTtsPlaybackStarted();
             window.__opus.playhead += buf.duration - 0.02; // Update playhead with 20ms overlap to hide seams
             
             console.log('🔊 Scheduled PCM16 chunk:', framesPerChannel, 'frames per channel (', totalSamples, 'total samples ),', sampleRate, 'Hz,', safeChannels, 'channels, duration:', buf.duration.toFixed(3), 's'); // Log playback info
@@ -2921,6 +3432,7 @@
             });
             window.__opus.playhead = Math.max(ctx.currentTime, window.__opus.playhead || 0);
             src.start(window.__opus.playhead);
+            handleVrmTtsPlaybackStarted();
             window.__opus.playhead += buf.duration - 0.02;
         }
         
@@ -3125,6 +3637,7 @@
                                 };
                                 startLipSyncFromAudioElement(audio);
                                 await audio.play();
+                                handleVrmTtsPlaybackStarted();
                                 return;
                             }
                             const channels = Math.max(1, Number(res.headers.get('x-audio-channels') || res.headers.get('x-channels') || reqBody.channels || 1));
@@ -3173,6 +3686,7 @@
                             });
 
                             src.start();
+                            handleVrmTtsPlaybackStarted();
                             console.log('🎵 PCM16 playback started:', sampleRate, 'Hz, channels:', channels, 'frames:', framesPerChannel);
                             return;
                         }
@@ -3218,6 +3732,7 @@
                                                     audio.play().then(() => { // When audio starts playing
                                                         console.log('🎵 Audio playback started (streaming, low latency)'); // Log playback start
                                                         // Start lip sync for binary audio path
+                                                        handleVrmTtsPlaybackStarted();
                                                         startLipSyncFromAudioElement(audio); // Hook up lip sync to this audio element
                                                     }).catch(e => { // Catch play errors
                                                         console.error('Audio play error:', e); // Log error
@@ -3331,6 +3846,7 @@
                             
                             // Play the audio
                             await audio.play(); // Start playback
+                            handleVrmTtsPlaybackStarted();
                             console.log('🎵 Playing binary audio from TTS service (blob mode)'); // Log playback start
                             
                             return; // Exit successfully
@@ -3476,6 +3992,7 @@
                                         audioStarted = true; // Mark as started
                                         audio.play().then(() => { // When audio starts playing
                                             console.log('🎵 Audio playback started (streaming)'); // Log playback start
+                                            handleVrmTtsPlaybackStarted();
                                             startLipSyncFromAudioElement(audio); // Hook up lip sync
                                         }).catch(e => { // Catch play errors
                                             console.error('Audio play error:', e); // Log error
@@ -3566,6 +4083,7 @@
                 
                 // Start playback
                 await audio.play(); // Begin playing audio
+                handleVrmTtsPlaybackStarted();
                 console.log('🎵 Audio playback started'); // Log playback start
             } catch (error) {
                 console.error('Error playing streaming audio:', error); // Log error
@@ -3573,11 +4091,12 @@
         } // End playStreamingAudio
         
         // Browser speech fallback wrapper used when server TTS fails
-        function textToSpeechFallback(text) { // Function to call original SpeechSynthesis path
+        function textToSpeechFallback(text, { preserveThinkingPose = false } = {}) { // Function to call original SpeechSynthesis path
             try { // Begin guard
                 // Sanitize text before creating utterance
                 text = sanitizeTTS(text); // Clean text for browser fallback speech
                 if (!text) return;
+                const browserSpeechSessionId = ++browserSpeechGeneration;
                 const selectedVoice = getSelectedBrowserVoice();
                 const chunkLimit = isIOSDevice ? 160 : 280;
                 const chunks = splitTtsTextChunks(text, chunkLimit);
@@ -3595,7 +4114,7 @@
                 };
 
                 const speakNextChunk = () => {
-                    if (cancelled) return;
+                    if (cancelled || browserSpeechSessionId !== browserSpeechGeneration) return;
                     if (idx >= chunks.length) {
                         finalize();
                         return;
@@ -3605,20 +4124,35 @@
                     if (selectedVoice) utter.voice = selectedVoice;
                     utter.rate = 1.0;
                     utter.pitch = 1.0;
+                    utter.onstart = () => {
+                        if (cancelled || browserSpeechSessionId !== browserSpeechGeneration) return;
+                        if (!preserveThinkingPose) {
+                            handleVrmTtsPlaybackStarted();
+                        }
+                        isSpeaking = true;
+                        microsoftTtsLastBoundaryTs = performance.now();
+                        startBrowserSpeechLipSyncLoop();
+                    };
+                    utter.onboundary = () => {
+                        if (cancelled || browserSpeechSessionId !== browserSpeechGeneration) return;
+                        registerBrowserSpeechBoundary();
+                    };
                     utter.onend = () => {
-                        if (cancelled) return;
+                        if (cancelled || browserSpeechSessionId !== browserSpeechGeneration) return;
                         if (idx < chunks.length) {
                             speakNextChunk();
                         } else {
+                            stopBrowserSpeechLipSync();
                             finalize();
                         }
                     };
                     utter.onerror = (event) => {
-                        if (cancelled) return;
+                        if (cancelled || browserSpeechSessionId !== browserSpeechGeneration) return;
                         console.warn('Browser TTS fallback chunk error:', event);
                         if (idx < chunks.length) {
                             speakNextChunk();
                         } else {
+                            stopBrowserSpeechLipSync();
                             finalize();
                         }
                     };
@@ -3629,6 +4163,9 @@
                 speakNextChunk();
             } catch (e) { // Catch runtime issues
                 console.warn('Browser TTS fallback failed:', e); // Log warning for diagnostics
+                if (!preserveThinkingPose) {
+                    stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                }
             } // End try/catch
         } // End textToSpeechFallback
 
@@ -5978,6 +6515,18 @@ function saveWAVFile(wavBlob) {
                                 type: "boolean",
                                 description: "When true, include nested files/directories.",
                                 default: false
+                            },
+                            offset: {
+                                type: "integer",
+                                description: "Optional zero-based row offset for pagination.",
+                                minimum: 0,
+                                default: 0
+                            },
+                            max_entries: {
+                                type: "integer",
+                                description: "Optional number of rows to return for this page.",
+                                minimum: 1,
+                                maximum: 500
                             }
                         },
                         required: []
@@ -6042,6 +6591,7 @@ function saveWAVFile(wavBlob) {
             'filesystem.list_files',
             'filesystem.read_text',
             'filesystem.write_text',
+            'filesystem.search_files',
         ]);
         const skillToolAliasToQualifiedName = new Map();
         let cachedSkillToolsForLlm = [];
@@ -6264,7 +6814,7 @@ function saveWAVFile(wavBlob) {
         }
 
         // Handler for listing files in the scratch directory
-        async function handleListFiles({ path = '', recursive = false } = {}) {
+        async function handleListFiles({ path = '', recursive = false, offset = 0, max_entries = undefined } = {}) {
             try {
                 const search = new URLSearchParams();
                 if (path && typeof path === 'string' && path.trim()) {
@@ -6272,6 +6822,14 @@ function saveWAVFile(wavBlob) {
                 }
                 if (typeof recursive === 'boolean' ? recursive : String(recursive).trim().toLowerCase() === 'true') {
                     search.set('recursive', 'true');
+                }
+                const numericOffset = Number.parseInt(offset, 10);
+                if (Number.isFinite(numericOffset) && numericOffset > 0) {
+                    search.set('offset', String(numericOffset));
+                }
+                const numericMaxEntries = Number.parseInt(max_entries, 10);
+                if (Number.isFinite(numericMaxEntries) && numericMaxEntries > 0) {
+                    search.set('max_entries', String(numericMaxEntries));
                 }
                 const query = search.toString();
                 const url = query ? `${PROXY_BASE_URL}/v1/files/list?${query}` : `${PROXY_BASE_URL}/v1/files/list`;
@@ -6289,24 +6847,35 @@ function saveWAVFile(wavBlob) {
                 // Return the result
                 if (result.success) {
                     const files = result.files || [];
-                    const count = typeof result.count === 'number' ? result.count : files.length;
+                    const totalCount = typeof result.total_count === 'number'
+                        ? result.total_count
+                        : (typeof result.count === 'number' ? result.count : files.length);
+                    const returnedCount = typeof result.returned_count === 'number' ? result.returned_count : files.length;
+                    const pageOffset = typeof result.offset === 'number' ? result.offset : Math.max(0, numericOffset || 0);
+                    const hasMore = Boolean(result.has_more);
                     const scratchDir = result.scratch_dir;
-                    const content = files.length > 0
+                    const renderedLines = files.length > 0
                         ? files
                             .map((file, index) => {
                                 const isDir = String(file?.type || '').toLowerCase() === 'directory';
                                 return isDir
-                                    ? `${index + 1}. ${file.name}/ [dir]`
-                                    : `${index + 1}. ${file.name} (${file.size ?? 0} bytes)`;
+                                    ? `${pageOffset + index + 1}. ${file.name}/ [dir]`
+                                    : `${pageOffset + index + 1}. ${file.name} (${file.size ?? 0} bytes)`;
                             })
                             .join('\n')
                         : 'No files found in the scratch directory.';
+                    const continuationLine = hasMore && typeof result.next_offset === 'number'
+                        ? `\nMore files available. Call listFiles with offset=${result.next_offset}.`
+                        : '';
+                    const content = `${renderedLines}${continuationLine}`;
 
                     return {
                         success: true,
-                        message: `Found ${count} file${count === 1 ? '' : 's'} in the scratch directory.`,
+                        message: `Found ${totalCount} file${totalCount === 1 ? '' : 's'} in the scratch directory. Returned ${returnedCount}.`,
                         files,
-                        count,
+                        count: totalCount,
+                        returned_count: returnedCount,
+                        total_count: totalCount,
                         scratch_dir: scratchDir,
                         content
                     };
@@ -7233,7 +7802,8 @@ function saveWAVFile(wavBlob) {
                 // Use provided values or fallback to window.location to avoid localhost default
                 const result = await window.runWorkflow(contentPrompt, {
                     hostname: hostname || window.location.hostname,
-                    protocol: protocol || window.location.protocol
+                    protocol: protocol || window.location.protocol,
+                    fullPayload: true
                 });
                 const now = new Date();
                 const pad2 = (value) => value.toString().padStart(2, '0');
@@ -7245,11 +7815,12 @@ function saveWAVFile(wavBlob) {
                     pad2(now.getMinutes()),
                     pad2(now.getSeconds())
                 ].join('-');
-                const filename = `${timestamp}_autogen_response.txt`;
+                const filename = result?.logFile || `${timestamp}_autogen_response.txt`;
+                const transcript = result?.transcript || result?.response || result?.output || '';
 
                 const writeResult = await handleWriteFile({
                     filename,
-                    content: result,
+                    content: transcript,
                     format: 'txt'
                 });
 
@@ -7257,7 +7828,7 @@ function saveWAVFile(wavBlob) {
                     console.warn('Failed to persist AutoGen response:', writeResult.message);
                 }
 
-                return { success: true, message: "The workflow has completed. Please review the output." };
+                return { success: true, message: `The workflow has completed. Full team transcript saved to ${filename}.` };
             } catch (error) {
                 console.error('Workflow error:', error);
                 return { success: false, message: `Error: ${error.message}` };
@@ -8097,6 +8668,7 @@ function saveWAVFile(wavBlob) {
             const chatRequestSignal = chatRequestController.signal;
             activeChatRequest = { controller: chatRequestController, startedAt: Date.now() };
             setChatRequestUiLocked(true);
+            startVrmProcessingThinkingLoop();
 
             try {
             let endpoint = endpointInput.value;
@@ -8113,8 +8685,10 @@ function saveWAVFile(wavBlob) {
                 previousResults: []
             };
 
-            // Start periodic progress updates
-            startProgressUpdates('Analyzing request');
+            // Start periodic progress updates only for request-like turns, not small talk.
+            if (shouldStartProgressUpdatesForPrompt(promptText)) {
+                startProgressUpdates('Analyzing request');
+            }
 
             // Check for tool chaining before proceeding with normal processing
             const hasChaining = promptText.toLowerCase().includes('then') || 
@@ -9398,6 +9972,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 try {
                     window.clearTimeout(chatRequestTimeoutId);
                 } catch (_) {}
+                if (!vrmAwaitingTtsStart) {
+                    stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                }
                 if (activeChatRequest && activeChatRequest.controller === chatRequestController) {
                     activeChatRequest = null;
                 }
@@ -10387,10 +10964,11 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         if (clip) {
                             const boundClip = retargetClipToVRM(clip, vrm) || clip;
                             idleVrmaAction = mixer.clipAction(boundClip, vrm.scene);
-                            idleVrmaAction.clampWhenFinished = false; // Allow looping
+                            idleVrmaAction.clampWhenFinished = false; // Return to base pose between delayed replays
                             idleVrmaAction.setEffectiveWeight(1.0);
                             idleVrmaAction.setEffectiveTimeScale(1.0);
-                            idleVrmaAction.loop = window.THREE.LoopRepeat; // Loop continuously
+                            idleVrmaAction.loop = window.THREE.LoopOnce; // Replay is scheduled manually with a random delay
+                            idleVrmaAction.repetitions = 1;
                             console.log('Idle VRMA clip prepared. Tracks:', Array.isArray(boundClip.tracks) ? boundClip.tracks.length : 'unknown');
                         } else {
                             console.warn('No animation clip found in Idle VRMA');
@@ -10414,6 +10992,8 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 vrmCryVrmaAction = cryVrmaAction;
                 vrmAngryVrmaAction = angryVrmaAction;
                 vrmIdleVrmaAction = idleVrmaAction;
+                clearVrmIdleReplayTimer();
+                vrmIdleHasPlayedOnce = false;
 
                 // Apply initial transforms
                 updateVRMTransform();
@@ -10831,11 +11411,11 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                             // Play idle animation if no other animation is running
                             if (vrmIdleVrmaAction && !hasActiveAnimation) {
                                 if (!vrmIdleVrmaAction.isRunning()) {
-                                    vrmIdleVrmaAction.reset();
-                                    vrmIdleVrmaAction.setEffectiveWeight(1.0);
-                                    vrmIdleVrmaAction.setEffectiveTimeScale(1.0);
-                                    vrmIdleVrmaAction.enabled = true;
-                                    vrmIdleVrmaAction.play();
+                                    if (!vrmIdleHasPlayedOnce) {
+                                        playVrmIdleAction();
+                                    } else {
+                                        scheduleNextVrmIdlePlayback();
+                                    }
                                 }
                             } else if (vrmIdleVrmaAction && hasActiveAnimation) {
                                 // Stop idle animation when other animations are playing
@@ -11605,6 +12185,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             const model = getCurrentModel(); // Dynamically get the current model
 
             try {
+                startVrmProcessingThinkingLoop();
                 const base64Image = await new Promise((resolve) => {
                     const reader = new FileReader();
                     reader.onloadend = () => resolve(reader.result.split(',')[1]);
@@ -11657,6 +12238,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             } catch (error) {
                 console.error('Error processing webcam image:', error);
                 status.textContent = "Failed to process webcam image. Please try again.";
+            } finally {
+                if (!vrmAwaitingTtsStart) {
+                    stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                }
             }
         }
 

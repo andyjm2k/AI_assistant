@@ -18,6 +18,13 @@ def _get_client():
     return TestClient(app)
 
 
+def _auth_headers():
+    """Build Authorization header with a valid JWT so protected proxy routes can be exercised."""
+    from src.servers.proxy_server import create_jwt
+    token = create_jwt({"sub": "andyjm2k"})
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _mock_openai_response(reply_text: str = "Mocked reply"):
     """Build a mock response body for OpenAI-compatible chat."""
     return {
@@ -29,19 +36,10 @@ def _mock_openai_response(reply_text: str = "Mocked reply"):
 class TestTelegramChatEndpoint:
     """Tests for POST /v1/telegram/chat."""
 
-    def test_missing_message_returns_400(self):
-        """POST with empty or missing message returns 400."""
+    def test_small_talk_does_not_create_status_session(self):
+        """Low-intent greetings should not emit Telegram progress/status chatter."""
         client = _get_client()
-        resp = client.post(
-            "/v1/telegram/chat",
-            json={"message": ""},
-        )
-        assert resp.status_code == 400
-        assert "message" in (resp.json().get("detail") or resp.text).lower()
-
-    def test_valid_request_returns_200_and_reply(self):
-        """POST with valid message and mocked OpenAI returns 200 and reply in body."""
-        client = _get_client()
+        request_id = "small-talk-no-status"
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = _mock_openai_response("Hello from CATBot")
@@ -61,12 +59,64 @@ class TestTelegramChatEndpoint:
 
                 resp = client.post(
                     "/v1/telegram/chat",
-                    json={"message": "Hi", "conversation_id": "test-conv"},
+                    json={"message": "Hey how are you?", "conversation_id": "small-talk-conv", "request_id": request_id},
+                )
+        assert resp.status_code == 200, resp.text
+        status_resp = client.get(
+            "/v1/status/latest",
+            params={"conversation_id": "small-talk-conv", "request_id": request_id},
+        )
+        assert status_resp.status_code == 200
+        assert status_resp.json() == {"found": False}
+
+    def test_missing_message_returns_400(self):
+        """POST with empty or missing message returns 400."""
+        client = _get_client()
+        resp = client.post(
+            "/v1/telegram/chat",
+            json={"message": ""},
+        )
+        assert resp.status_code == 400
+        assert "message" in (resp.json().get("detail") or resp.text).lower()
+
+    def test_valid_request_returns_200_and_reply(self):
+        """POST with valid message and mocked OpenAI returns 200 and reply in body."""
+        client = _get_client()
+        request_id = "request-with-status"
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _mock_openai_response("Hello from CATBot")
+
+        def getenv(k, d=None):
+            if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"):
+                return "test-key"
+            return os.environ.get(k, d) if d is not None else os.environ.get(k)
+
+        with patch("src.servers.proxy_server.os.getenv", side_effect=getenv):
+            with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                mock_client_instance = MagicMock()
+                mock_client_instance.post = AsyncMock(return_value=mock_response)
+                mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                mock_aclient.return_value = mock_client_instance
+
+                resp = client.post(
+                    "/v1/telegram/chat",
+                    json={"message": "Search for recent AI news", "conversation_id": "test-conv", "request_id": request_id},
                 )
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data.get("reply") == "Hello from CATBot"
         assert data.get("conversation_id") == "test-conv"
+        status_resp = client.get(
+            "/v1/status/latest",
+            params={"conversation_id": "test-conv", "request_id": request_id},
+        )
+        assert status_resp.status_code == 200
+        status_payload = status_resp.json()
+        assert status_payload.get("found") is True
+        assert status_payload.get("event", {}).get("channel") == "telegram"
+        assert status_payload.get("event", {}).get("request_id") == request_id
 
     def test_valid_request_handles_structured_content_reply(self):
         """POST should coerce list/dict content parts into plain text reply."""
@@ -239,6 +289,15 @@ class TestTelegramSecret:
 class TestTelegramToolsLoop:
     """Tests for Telegram tool loop when TELEGRAM_TOOLS_ENABLED is True."""
 
+    def test_format_telegram_tool_status_uses_human_friendly_copy(self):
+        from src.servers import proxy_server as ps
+
+        assert ps._format_telegram_tool_status("webSearch") == "On it. I'm looking for the best sources now."
+        assert ps._format_telegram_tool_status("runDeepResearch") == "On it. I'm gathering sources and comparing them now."
+        assert ps._format_telegram_tool_status("googleworkspace_cli.gmail_list_unread") == (
+            "On it. I'm checking your Google Workspace data now."
+        )
+
     def test_tool_loop_executes_native_tool_calls_and_returns_final_reply(self):
         """When LLM returns native message.tool_calls, proxy executes tools and returns final reply."""
         client = _get_client()
@@ -271,10 +330,16 @@ class TestTelegramToolsLoop:
             "choices": [{"message": {"content": final_response}}],
             "usage": {"prompt_tokens": 30, "completion_tokens": 10},
         }
-        post_calls = [mock_first, mock_second]
+        mock_third = MagicMock()
+        mock_third.status_code = 200
+        mock_third.json.return_value = {
+            "choices": [{"message": {"content": "All actions are now completed"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        post_calls = [mock_first, mock_second, mock_third]
 
         def next_response(*args, **kwargs):
-            return post_calls.pop(0) if post_calls else mock_second
+            return post_calls.pop(0) if post_calls else mock_third
 
         with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
             try:
@@ -325,10 +390,16 @@ class TestTelegramToolsLoop:
             "choices": [{"message": {"content": final_response}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 10},
         }
-        post_calls = [mock_first, mock_second]
+        mock_third = MagicMock()
+        mock_third.status_code = 200
+        mock_third.json.return_value = {
+            "choices": [{"message": {"content": "All actions are now completed"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        post_calls = [mock_first, mock_second, mock_third]
 
         def next_response(*args, **kwargs):
-            return post_calls.pop(0) if post_calls else mock_second
+            return post_calls.pop(0) if post_calls else mock_third
 
         with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
             try:
@@ -382,10 +453,16 @@ class TestTelegramToolsLoop:
             "choices": [{"message": {"content": final_response}}],
             "usage": {"prompt_tokens": 30, "completion_tokens": 10},
         }
-        post_calls = [mock_first, mock_second]
+        mock_third = MagicMock()
+        mock_third.status_code = 200
+        mock_third.json.return_value = {
+            "choices": [{"message": {"content": "All actions are now completed"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        post_calls = [mock_first, mock_second, mock_third]
 
         def next_response(*args, **kwargs):
-            return post_calls.pop(0) if post_calls else mock_second
+            return post_calls.pop(0) if post_calls else mock_third
 
         with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
             try:
@@ -442,10 +519,16 @@ class TestTelegramToolsLoop:
             ],
             "usage": {"prompt_tokens": 30, "completion_tokens": 10},
         }
-        post_calls = [mock_first, mock_second]
+        mock_third = MagicMock()
+        mock_third.status_code = 200
+        mock_third.json.return_value = {
+            "choices": [{"message": {"content": "All actions are now completed"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        post_calls = [mock_first, mock_second, mock_third]
 
         def next_response(*args, **kwargs):
-            return post_calls.pop(0) if post_calls else mock_second
+            return post_calls.pop(0) if post_calls else mock_third
 
         with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
             try:
@@ -500,10 +583,16 @@ class TestTelegramToolsLoop:
             "choices": [{"message": {"content": mixed_final}}],
             "usage": {"prompt_tokens": 30, "completion_tokens": 10},
         }
-        post_calls = [mock_first, mock_second]
+        mock_third = MagicMock()
+        mock_third.status_code = 200
+        mock_third.json.return_value = {
+            "choices": [{"message": {"content": "All actions are now completed"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        post_calls = [mock_first, mock_second, mock_third]
 
         def next_response(*args, **kwargs):
-            return post_calls.pop(0) if post_calls else mock_second
+            return post_calls.pop(0) if post_calls else mock_third
 
         with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
             try:
@@ -533,6 +622,379 @@ class TestTelegramToolsLoop:
         data = resp.json()
         assert data.get("reply") == "Here are the search results summary."
         assert data.get("reply") != "I wasn't able to get that information just now. Please try again or rephrase your question."
+
+    def test_tool_loop_executes_mixed_planning_reply_that_contains_next_tool(self):
+        """
+        If a chatty model wraps the next real tool call in planning prose, the loop
+        should still execute the tool instead of treating the prose as the final answer.
+        """
+        client = _get_client()
+        tool_response = '<tool>webSearch</tool>\n<parameters>{"query": "test query"}</parameters>'
+        mixed_followup = (
+            "I have the search results and will now scrape the URLs for more detail.\n"
+            "<tool>scrapeWebsite</tool>\n"
+            '<parameters>{"urls":["https://example.com/1","https://example.com/2"]}</parameters>'
+        )
+        final_response = "Here is the scraped summary."
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [{"message": {"content": tool_response}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [{"message": {"content": mixed_followup}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 15},
+        }
+        mock_third = MagicMock()
+        mock_third.status_code = 200
+        mock_third.json.return_value = {
+            "choices": [{"message": {"content": final_response}}],
+            "usage": {"prompt_tokens": 25, "completion_tokens": 12},
+        }
+        mock_fourth = MagicMock()
+        mock_fourth.status_code = 200
+        mock_fourth.json.return_value = {
+            "choices": [{"message": {"content": "All actions are now completed"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        post_calls = [mock_first, mock_second, mock_third, mock_fourth]
+
+        def next_response(*args, **kwargs):
+            return post_calls.pop(0) if post_calls else mock_fourth
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            try:
+                from src.servers import proxy_server as ps
+                if getattr(ps, "_telegram_tools", None) is None:
+                    pytest.skip("telegram_tools module not available")
+            except ImportError:
+                pytest.skip("telegram_tools not importable")
+            with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search, patch(
+                "src.servers.proxy_server._do_proxy_fetch", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_search.return_value = {
+                    "results": [
+                        {"title": "Result 1", "snippet": "Snippet 1", "url": "https://example.com/1"},
+                        {"title": "Result 2", "snippet": "Snippet 2", "url": "https://example.com/2"},
+                    ]
+                }
+                mock_fetch.return_value = {
+                    "success": True,
+                    "url": "https://example.com/1",
+                    "title": "Example",
+                    "content": "Scraped content",
+                }
+                with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                    m_getenv.side_effect = lambda k, d=None: (
+                        "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                    )
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(side_effect=next_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={"message": "Search for test", "conversation_id": "tools-mixed-planning-next-tool"},
+                        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("reply") == final_response
+        mock_search.assert_awaited_once()
+        mock_fetch.assert_awaited_once()
+
+    def test_tool_loop_does_not_infer_next_tool_from_planning_text(self):
+        """
+        The backend should not infer the next tool from planning text alone.
+        It should stop on the last concrete tool result unless the model emits
+        the next tool call explicitly.
+        """
+        client = _get_client()
+        tool_response = '<tool>webSearch</tool>\n<parameters>{"query": "test query"}</parameters>'
+        planning_reply = "I have the search results. Now I will use those URLs to scrape the content from each one."
+        scrape_tool_response = (
+            "<tool>scrapeWebsite</tool>\n"
+            '<parameters>{"urls":["https://example.com/1","https://example.com/2"]}</parameters>'
+        )
+        final_response = "Here is the scraped summary."
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [{"message": {"content": tool_response}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [{"message": {"content": planning_reply}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10},
+        }
+        mock_third = MagicMock()
+        mock_third.status_code = 200
+        mock_third.json.return_value = {
+            "choices": [{"message": {"content": scrape_tool_response}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 15},
+        }
+        mock_fourth = MagicMock()
+        mock_fourth.status_code = 200
+        mock_fourth.json.return_value = {
+            "choices": [{"message": {"content": final_response}}],
+            "usage": {"prompt_tokens": 25, "completion_tokens": 12},
+        }
+        mock_fifth = MagicMock()
+        mock_fifth.status_code = 200
+        mock_fifth.json.return_value = {
+            "choices": [{"message": {"content": "All actions are now completed"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        post_calls = [mock_first, mock_second, mock_third, mock_fourth, mock_fifth]
+
+        def next_response(*args, **kwargs):
+            return post_calls.pop(0) if post_calls else mock_fifth
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            try:
+                from src.servers import proxy_server as ps
+                if getattr(ps, "_telegram_tools", None) is None:
+                    pytest.skip("telegram_tools module not available")
+            except ImportError:
+                pytest.skip("telegram_tools not importable")
+            with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search, patch(
+                "src.servers.proxy_server._do_proxy_fetch", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_search.return_value = {
+                    "results": [
+                        {"title": "Result 1", "snippet": "Snippet 1", "url": "https://example.com/1"},
+                        {"title": "Result 2", "snippet": "Snippet 2", "url": "https://example.com/2"},
+                    ]
+                }
+                mock_fetch.return_value = {
+                    "success": True,
+                    "url": "https://example.com/1",
+                    "title": "Example",
+                    "content": "Scraped content",
+                }
+                with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                    m_getenv.side_effect = lambda k, d=None: (
+                        "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                    )
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(side_effect=next_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={"message": "Search for test", "conversation_id": "tools-followup-auto-continue"},
+                        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("reply", "").startswith("Here's what I found:")
+        assert "Search results:" in data.get("reply", "")
+        mock_search.assert_awaited_once()
+        mock_fetch.assert_not_awaited()
+
+    def test_tool_loop_uses_last_tool_result_when_followup_is_only_planning(self):
+        """
+        If the follow-up model reply is only planning chatter, the backend should
+        stop and return the last concrete tool result instead of continuing to self-prompt.
+        """
+        client = _get_client()
+        tool_response = '<tool>webSearch</tool>\n<parameters>{"query": "test query"}</parameters>'
+        planning_reply = "Thank you for the search results. I will now scrape the content from the URLs provided."
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [{"message": {"content": tool_response}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [{"message": {"content": planning_reply}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10},
+        }
+        responses = [mock_first, mock_second]
+
+        def next_response(*args, **kwargs):
+            return responses.pop(0) if responses else mock_second
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            try:
+                from src.servers import proxy_server as ps
+                if getattr(ps, "_telegram_tools", None) is None:
+                    pytest.skip("telegram_tools module not available")
+            except ImportError:
+                pytest.skip("telegram_tools not importable")
+            with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search, patch(
+                "src.servers.proxy_server._do_proxy_fetch", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_search.return_value = {
+                    "results": [
+                        {"title": "Result 1", "snippet": "Snippet 1", "url": "https://example.com/1"},
+                        {"title": "Result 2", "snippet": "Snippet 2", "url": "https://example.com/2"},
+                    ]
+                }
+                with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                    m_getenv.side_effect = lambda k, d=None: (
+                        "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                    )
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(side_effect=next_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={"message": "Search for test", "conversation_id": "tools-no-self-check-fallback"},
+                        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("reply", "").startswith("Here's what I found:")
+        assert "Search results:" in data.get("reply", "")
+        mock_search.assert_awaited_once()
+        mock_fetch.assert_not_awaited()
+
+    def test_tool_loop_followup_prompt_includes_direct_answer_rules_and_latest_tool_result(self):
+        """
+        The follow-up prompt should tell the model to return one tool call or a final answer,
+        and it should include the latest tool result in the working message history.
+        """
+        client = _get_client()
+        tool_response = '<tool>webSearch</tool>\n<parameters>{"query": "employee redundancy headlines"}</parameters>'
+        final_response = "Here are the redundancy headlines."
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [{"message": {"content": tool_response}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [{"message": {"content": final_response}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10},
+        }
+        responses = [mock_first, mock_second]
+        captured_payloads = []
+
+        def next_response(*args, **kwargs):
+            captured_payloads.append(kwargs.get("json"))
+            return responses.pop(0) if responses else mock_second
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            try:
+                from src.servers import proxy_server as ps
+                if getattr(ps, "_telegram_tools", None) is None:
+                    pytest.skip("telegram_tools module not available")
+            except ImportError:
+                pytest.skip("telegram_tools not importable")
+            with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search:
+                mock_search.return_value = {
+                    "results": [
+                        {"title": "Headline 1", "snippet": "Snippet 1", "url": "https://example.com/1"},
+                        {"title": "Headline 2", "snippet": "Snippet 2", "url": "https://example.com/2"},
+                    ]
+                }
+                with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                    m_getenv.side_effect = lambda k, d=None: (
+                        "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                    )
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(side_effect=next_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={
+                                "message": "Search the web for employee redundancy headlines",
+                                "conversation_id": "tools-followup-controller-prompt",
+                            },
+                        )
+        assert resp.status_code == 200, resp.text
+        assert len(captured_payloads) >= 2
+        followup_payload = captured_payloads[1]
+        followup_messages = followup_payload.get("messages") or []
+        followup_text = "\n".join(str(msg.get("content") or "") for msg in followup_messages if isinstance(msg, dict))
+        assert "Return exactly one of these two outputs" in followup_text
+        assert "Do not narrate plans, next steps, or intentions." in followup_text
+        assert "If the latest tool result already answers the request, summarize it directly for the user." in followup_text
+        assert "https://example.com/1" in followup_text
+        assert "https://example.com/2" in followup_text
+
+    def test_tool_loop_does_not_issue_extra_self_check_roundtrip(self):
+        """
+        Planning chatter after a tool result should not trigger an extra backend
+        self-check request. The loop should stop after the normal follow-up turn.
+        """
+        client = _get_client()
+        tool_response = '<tool>webSearch</tool>\n<parameters>{"query": "employee redundancy headlines"}</parameters>'
+        planning_reply = "I found the search results and will gather the URLs I need next."
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [{"message": {"content": tool_response}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [{"message": {"content": planning_reply}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10},
+        }
+        responses = [mock_first, mock_second]
+        captured_payloads = []
+
+        def next_response(*args, **kwargs):
+            captured_payloads.append(kwargs.get("json"))
+            return responses.pop(0) if responses else mock_second
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            try:
+                from src.servers import proxy_server as ps
+                if getattr(ps, "_telegram_tools", None) is None:
+                    pytest.skip("telegram_tools module not available")
+            except ImportError:
+                pytest.skip("telegram_tools not importable")
+            with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search:
+                mock_search.return_value = {
+                    "results": [
+                        {"title": "Headline 1", "snippet": "Snippet 1", "url": "https://example.com/1"},
+                        {"title": "Headline 2", "snippet": "Snippet 2", "url": "https://example.com/2"},
+                    ]
+                }
+                with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                    m_getenv.side_effect = lambda k, d=None: (
+                        "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                    )
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(side_effect=next_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={
+                                "message": "Search the web for employee redundancy headlines",
+                                "conversation_id": "tools-no-self-check-extra-roundtrip",
+                            },
+                        )
+        assert resp.status_code == 200, resp.text
+        assert len(captured_payloads) == 2
 
     def test_tool_loop_replaces_planning_chatter_with_last_tool_result(self):
         """
@@ -717,10 +1179,16 @@ class TestTelegramToolsLoop:
             "choices": [{"message": {"content": final_response}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 10},
         }
-        post_calls = [mock_first, mock_second]
+        mock_third = MagicMock()
+        mock_third.status_code = 200
+        mock_third.json.return_value = {
+            "choices": [{"message": {"content": "All actions are now completed"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        post_calls = [mock_first, mock_second, mock_third]
 
         def next_response(*args, **kwargs):
-            return post_calls.pop(0) if post_calls else mock_second
+            return post_calls.pop(0) if post_calls else mock_third
 
         with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
             try:
@@ -1131,6 +1599,7 @@ class TestPhilosopherFileTools:
         assert "read_file" in names
         assert "write_file" in names
         assert "list_files" in names
+        assert "search_files" in names
         assert "delete_file" in names
 
     @pytest.mark.asyncio
@@ -1142,6 +1611,7 @@ class TestPhilosopherFileTools:
             {"name": "filesystem.list_files", "description": "list"},
             {"name": "filesystem.read_text", "description": "read"},
             {"name": "filesystem.write_text", "description": "write"},
+            {"name": "filesystem.search_files", "description": "search"},
             {"name": "core.ping", "description": "ping"},
         ]
         with patch.object(ps, "FILE_OPS_AVAILABLE", True):
@@ -1151,6 +1621,7 @@ class TestPhilosopherFileTools:
         assert "filesystem.list_files" not in names
         assert "filesystem.read_text" not in names
         assert "filesystem.write_text" not in names
+        assert "filesystem.search_files" not in names
 
     @pytest.mark.asyncio
     async def test_execute_list_files_returns_string(self):
@@ -1183,13 +1654,14 @@ class TestPhilosopherFileTools:
         assert "images/ [dir]" in result
         assert "a.txt (1 bytes)" in result
         assert "b.txt (2 bytes)" in result
-        assert "... and 2 more files." in result
+        assert "... and 2 more files in this page." in result
+        assert "Continue with offset=3" in result
         assert "c.txt (3 bytes)" not in result
         assert "d.txt (4 bytes)" not in result
 
     @pytest.mark.asyncio
-    async def test_execute_list_files_forwards_path_and_recursive(self):
-        """execute_tool_for_philosopher list_files forwards path/recursive to backend list helper."""
+    async def test_execute_list_files_forwards_pagination_arguments(self):
+        """execute_tool_for_philosopher list_files forwards path/recursive/pagination to backend list helper."""
         from src.servers import proxy_server as ps
 
         fake_result = {
@@ -1200,11 +1672,47 @@ class TestPhilosopherFileTools:
         with patch.object(ps, "_list_files_internal", new=AsyncMock(return_value=fake_result)) as mock_list:
             result = await ps.execute_tool_for_philosopher(
                 "list_files",
-                {"path": "images", "recursive": "true"},
+                {"path": "images", "recursive": "true", "offset": 2, "max_entries": 5},
             )
-        mock_list.assert_awaited_once_with(path="images", recursive=True)
+        mock_list.assert_awaited_once_with(path="images", recursive=True, offset=2, max_entries=5)
         assert isinstance(result, str)
         assert "images/a.png (10 bytes)" in result
+
+    @pytest.mark.asyncio
+    async def test_execute_search_files_forwards_arguments(self):
+        """execute_tool_for_philosopher search_files forwards search arguments and formats matches."""
+        from src.servers import proxy_server as ps
+
+        fake_result = {
+            "success": True,
+            "query": "alpha",
+            "matches": [
+                {
+                    "relative_path": "docs/notes.txt",
+                    "match_types": ["content"],
+                    "line_number": 3,
+                    "excerpt": "...alpha topic...",
+                }
+            ],
+        }
+
+        with patch.object(ps, "_search_files_internal", new=AsyncMock(return_value=fake_result)) as mock_search:
+            result = await ps.execute_tool_for_philosopher(
+                "search_files",
+                {"query": "alpha", "path": "docs", "recursive": False, "offset": 2, "max_results": 5},
+            )
+        mock_search.assert_awaited_once_with(
+            "alpha",
+            path="docs",
+            recursive=False,
+            offset=2,
+            max_results=5,
+            case_sensitive=False,
+            filename_only=False,
+        )
+        assert isinstance(result, str)
+        assert "docs/notes.txt" in result
+        assert "alpha" in result
 
     @pytest.mark.asyncio
     async def test_run_workflow_tool_included_when_autogen_available(self):
@@ -1283,6 +1791,7 @@ class TestProxyFetchUrls:
             resp = client.post(
                 "/v1/proxy/fetch",
                 json={"urls": ["https://fail.first/page", "https://ok.second/page"]},
+                headers=_auth_headers(),
             )
         assert resp.status_code == 200, resp.text
         data = resp.json()
@@ -1303,6 +1812,7 @@ class TestProxyFetchUrls:
             resp = client.post(
                 "/v1/proxy/fetch",
                 json={"urls": ["https://fail.first/page", "https://ok.second/page"]},
+                headers=_auth_headers(),
             )
         assert resp.status_code == 200, resp.text
         assert resp.json().get("content") == "Content from https://ok.second/page"
@@ -1312,7 +1822,7 @@ class TestProxyFetchUrls:
         from src.servers import proxy_server as ps
         client = _get_client()
         with patch.object(ps, "_do_proxy_fetch", new=AsyncMock(return_value={"content": "Hello"})):
-            resp = client.post("/v1/proxy/fetch", json={"url": "https://example.com"})
+            resp = client.post("/v1/proxy/fetch", json={"url": "https://example.com"}, headers=_auth_headers())
         assert resp.status_code == 200
         assert resp.json().get("content") == "Hello"
 
@@ -1333,6 +1843,7 @@ class TestProxyFetchUrls:
                     "wait_for_selector": ".status-table",
                     "js_wait_ms": 3500,
                 },
+                headers=_auth_headers(),
             )
         assert resp.status_code == 200, resp.text
         mock_fetch.assert_awaited_once_with(
@@ -1349,8 +1860,28 @@ class TestProxyFetchUrls:
     def test_fetch_no_url_no_urls_returns_400(self):
         """POST without url or urls returns 400."""
         client = _get_client()
-        resp = client.post("/v1/proxy/fetch", json={})
+        resp = client.post("/v1/proxy/fetch", json={}, headers=_auth_headers())
         assert resp.status_code == 400
+
+    def test_fetch_requires_auth(self):
+        """POST /v1/proxy/fetch without auth or agent secret returns 401."""
+        client = _get_client()
+        resp = client.post("/v1/proxy/fetch", json={"url": "https://example.com"})
+        assert resp.status_code == 401
+
+    def test_fetch_accepts_agent_secret(self):
+        """POST /v1/proxy/fetch accepts the internal AutoGen team secret."""
+        from src.servers import proxy_server as ps
+        client = _get_client()
+        with patch.object(ps, "AUTOGEN_TEAM_SECRET", "agent-secret"), patch.object(
+            ps, "_do_proxy_fetch", new=AsyncMock(return_value={"content": "Hello"})
+        ):
+            resp = client.post(
+                "/v1/proxy/fetch",
+                json={"url": "https://example.com"},
+                headers={"X-Agent-Secret": "agent-secret"},
+            )
+        assert resp.status_code == 200, resp.text
 
 
 class TestBrowserHealthProxy:
@@ -1366,8 +1897,72 @@ class TestBrowserHealthProxy:
             "result": {"status": "healthy", "running_tasks": 0, "tasks": []},
         }
         with patch.object(ps, "_do_browser_health_check", new=AsyncMock(return_value=fake)):
-            resp = client.post("/v1/proxy/browser-health", json={})
+            resp = client.post("/v1/proxy/browser-health", json={}, headers=_auth_headers())
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data.get("success") is True
         assert data.get("result", {}).get("status") == "healthy"
+
+    def test_browser_health_requires_auth(self):
+        """POST /v1/proxy/browser-health without auth or agent secret returns 401."""
+        client = _get_client()
+        resp = client.post("/v1/proxy/browser-health", json={})
+        assert resp.status_code == 401
+
+
+class TestDeepResearchProxy:
+    """Tests for deep-research proxy body normalization and forwarding."""
+
+    def test_normalize_deep_research_body_maps_camel_case_aliases(self):
+        from src.servers import proxy_server as ps
+
+        out = ps._normalize_deep_research_body(
+            {"researchTask": "Find competitor pricing", "maxParallelBrowsers": 4, "topic": "ignored"}
+        )
+
+        assert out["research_task"] == "Find competitor pricing"
+        assert out["max_parallel_browsers"] == 4
+        assert "researchTask" not in out
+        assert "maxParallelBrowsers" not in out
+
+    @pytest.mark.asyncio
+    async def test_do_deep_research_forwards_snake_case_body(self):
+        from src.servers import proxy_server as ps
+
+        captured = {}
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"success": True, "message": "ok"}
+        mock_response.headers = {"content-type": "application/json"}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def post(self, url, json=None, headers=None):
+                captured["url"] = url
+                captured["json"] = json
+                captured["headers"] = headers
+                return mock_response
+
+        with patch.object(ps, "_monitor_run_start", return_value="deep-research-test"), patch.object(
+            ps, "_monitor_run_note"
+        ), patch.object(ps, "_monitor_run_finish"), patch.object(ps.os, "getenv") as mock_getenv, patch.object(
+            ps.httpx, "AsyncClient", return_value=_Client()
+        ):
+            mock_getenv.side_effect = lambda key, default=None: (
+                "http://127.0.0.1:5001" if key == "MCP_BROWSER_SERVER_URL" else os.environ.get(key, default)
+            )
+            result = await ps._do_deep_research(
+                {"researchTask": "Find competitor pricing", "maxParallelBrowsers": 4}
+            )
+
+        assert result == {"success": True, "message": "ok"}
+        assert captured["url"] == "http://127.0.0.1:5001/api/deep-research"
+        assert captured["json"] == {
+            "research_task": "Find competitor pricing",
+            "max_parallel_browsers": 4,
+        }

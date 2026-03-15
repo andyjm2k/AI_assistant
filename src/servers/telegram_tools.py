@@ -30,6 +30,11 @@ _TOOL_CALL_BLOCK_RE = (
     r"<parameters>[\s\S]*?</parameters>"
 )
 _TOOL_CALL_BLOCK_PATTERN = re.compile(_TOOL_CALL_BLOCK_RE, re.IGNORECASE)
+_TOOL_CALL_CAPTURE_PATTERN = re.compile(
+    r"<(?:tool|tool_call)>(?P<name>(?:(?!<(?:tool|tool_call)\b)[\s\S])*?)</(?:tool|tool_call)>\s*"
+    r"<parameters>(?P<parameters>[\s\S]*?)</parameters>",
+    re.IGNORECASE,
+)
 _STANDALONE_TOOL_CALL_PATTERN = re.compile(rf"^\s*(?:{_TOOL_CALL_BLOCK_RE})\s*$", re.IGNORECASE)
 _THINK_BLOCK_PATTERN = re.compile(r"<think\b[^>]*>[\s\S]*?</think>", re.IGNORECASE)
 
@@ -37,6 +42,7 @@ _TELEGRAM_TOOL_NAME_ALIASES = {
     "read_file": "readFile",
     "write_file": "writeFile",
     "list_files": "listFiles",
+    "search_files": "searchFiles",
     "save_to_file": "writeFile",
     "saveToFile": "writeFile",
     "health_check": "healthCheck",
@@ -64,12 +70,41 @@ def _get_list_files_tool_max_entries() -> int:
     return max(1, parsed)
 
 
-def _format_list_files_message(files: List[Dict[str, Any]]) -> str:
-    """Render a bounded file list to reduce token pressure in chat loops."""
+def _coerce_bounded_int(
+    value: Any,
+    *,
+    default: int,
+    minimum: int = 0,
+    maximum: Optional[int] = None,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if maximum is not None:
+        parsed = min(parsed, maximum)
+    return max(minimum, parsed)
+
+
+def _format_list_files_message(
+    files: List[Dict[str, Any]],
+    *,
+    total_count: Optional[Any] = None,
+    offset: Optional[Any] = None,
+    has_more: Optional[Any] = None,
+    next_offset: Optional[Any] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """Render a bounded file list with explicit pagination metadata."""
     if not files:
         return "No files."
-    limit = _get_list_files_tool_max_entries()
-    shown = files[:limit]
+    render_limit = _coerce_bounded_int(
+        limit,
+        default=_get_list_files_tool_max_entries(),
+        minimum=1,
+        maximum=500,
+    )
+    shown = files[:render_limit]
     lines = []
     for item in shown:
         name = str(item.get("name", ""))
@@ -78,10 +113,61 @@ def _format_list_files_message(files: List[Dict[str, Any]]) -> str:
             lines.append(f"- {name}/ [dir]")
         else:
             lines.append(f"- {name}")
-    remaining = max(0, len(files) - len(shown))
-    if remaining > 0:
-        lines.append(f"- ... and {remaining} more files.")
-    return "Files:\n" + "\n".join(lines)
+    parsed_total = _coerce_bounded_int(total_count, default=len(files), minimum=0)
+    parsed_offset = _coerce_bounded_int(offset, default=0, minimum=0)
+    inferred_remaining = max(0, parsed_total - (parsed_offset + len(shown)))
+    parsed_has_more = bool(has_more) if has_more is not None else inferred_remaining > 0
+    header = "Files:"
+    if parsed_total > len(shown) or parsed_offset > 0:
+        header += f" (showing {parsed_offset + 1}-{parsed_offset + len(shown)} of {parsed_total})"
+    if len(files) > len(shown):
+        lines.append(f"- ... and {len(files) - len(shown)} more files in this page.")
+    if parsed_has_more:
+        continuation_offset = _coerce_bounded_int(
+            next_offset,
+            default=parsed_offset + len(shown),
+            minimum=0,
+        )
+        lines.append(f"- ... more files available. Continue with offset={continuation_offset}.")
+    return header + "\n" + "\n".join(lines)
+
+
+def _format_search_files_message(
+    matches: List[Dict[str, Any]],
+    *,
+    query: str,
+    total_matches: Optional[Any] = None,
+    offset: Optional[Any] = None,
+    has_more: Optional[Any] = None,
+    next_offset: Optional[Any] = None,
+) -> str:
+    if not matches:
+        return f'No matching files found for "{query}".'
+    parsed_total = _coerce_bounded_int(total_matches, default=len(matches), minimum=0)
+    parsed_offset = _coerce_bounded_int(offset, default=0, minimum=0)
+    lines = [f'Search results for "{query}":']
+    if parsed_total > len(matches) or parsed_offset > 0:
+        lines[0] += f" (showing {parsed_offset + 1}-{parsed_offset + len(matches)} of {parsed_total})"
+    for index, item in enumerate(matches, start=parsed_offset + 1):
+        rel_path = str(item.get("relative_path") or item.get("name") or "?")
+        match_types = ",".join(item.get("match_types") or []) or "unknown"
+        line_number = item.get("line_number")
+        excerpt = str(item.get("excerpt") or "").strip()
+        suffix = f" line {line_number}" if isinstance(line_number, int) and line_number > 0 else ""
+        if excerpt:
+            lines.append(f"- {index}. {rel_path} [{match_types}]{suffix}: {excerpt}")
+        else:
+            lines.append(f"- {index}. {rel_path} [{match_types}]")
+    parsed_has_more = bool(has_more) if has_more is not None else False
+    if parsed_has_more:
+        continuation_offset = _coerce_bounded_int(
+            next_offset,
+            default=parsed_offset + len(matches),
+            minimum=0,
+        )
+        lines.append(f"- More results available. Continue with offset={continuation_offset}.")
+    lines.append("- Use readFile with filename and optional start_line/end_line for more context.")
+    return "\n".join(lines)
 
 
 def _log_tool_invocation(name: str, arguments: Dict[str, Any], conversation_id: str) -> None:
@@ -91,6 +177,17 @@ def _log_tool_invocation(name: str, arguments: Dict[str, Any], conversation_id: 
     except Exception:
         args_text = str(arguments)
     print(f"[TOOL][telegram:{conversation_id}] name={name} args={args_text}", flush=True)
+
+
+def format_telegram_tool_call(name: Any, arguments: Any) -> str:
+    """Render a canonical Telegram XML tool call for loop history."""
+    tool_name = str(name or "").strip()
+    args = arguments if isinstance(arguments, dict) else {}
+    try:
+        params_text = json.dumps(args, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        params_text = "{}"
+    return f"<tool>{tool_name}</tool>\n<parameters>{params_text}</parameters>"
 
 
 def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
@@ -107,40 +204,22 @@ def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
         return None
     # Strip fenced code blocks to avoid executing examples
     content_without_code = re.sub(r"```[\s\S]*?```", "", content)
-    # XML format: support both <tool> and <tool_call> tags (handle malformed XML where opening/closing tags differ)
-    # Try <tool> first (preferred format)
-    tool_match = re.search(r"<tool>(.*?)</tool>", content_without_code)
-    if not tool_match:
-        # Fallback to <tool_call> if <tool> not found
-        tool_match = re.search(r"<tool_call>(.*?)</tool_call>", content_without_code)
-    if not tool_match:
-        # Also try mixed format: <tool_call>...</tool> (handle malformed XML)
-        tool_match = re.search(r"<tool_call>(.*?)</tool>", content_without_code)
-    if not tool_match:
-        # Or <tool>...</tool_call>
-        tool_match = re.search(r"<tool>(.*?)</tool_call>", content_without_code)
-    
-    params_match = re.search(r"<parameters>([\s\S]*?)</parameters>", content_without_code)
-    if tool_match and params_match:
+    # XML format: pair tool name and parameters from the same matched block so
+    # chatty surrounding text cannot cross-wire one tool with another block's args.
+    block_match = _TOOL_CALL_CAPTURE_PATTERN.search(content_without_code)
+    if block_match:
         try:
-            # Extract tool call even if there's some surrounding text
-            # This handles cases where LLM outputs tool calls as text after task execution
-            tool_name = tool_match.group(1).strip()
-            params_str = params_match.group(1).strip()
-            # Validate that we have a valid tool name and parameters
+            tool_name = block_match.group("name").strip()
+            params_str = block_match.group("parameters").strip()
             if not tool_name:
                 return None
             params = json.loads(params_str)
-            # Return the parsed tool call regardless of surrounding text
-            # The strict leading/trailing check was too restrictive and prevented
-            # tool calls from being executed when LLM outputs them as text
             return {"name": tool_name, "arguments": json.dumps(params) if isinstance(params, dict) else params_str}
         except (json.JSONDecodeError, ValueError) as e:
-            # Log parsing errors for debugging
             print(f"[TELEGRAM_TOOLS] Error parsing tool call: {e}")
             pass
     # JSON-style: content is JSON object
-    trimmed = content.strip()
+    trimmed = content_without_code.strip()
     if trimmed.startswith("{") or trimmed.startswith("["):
         try:
             obj = json.loads(trimmed)
@@ -205,6 +284,71 @@ def strip_tool_call_markup(content: str) -> str:
     return cleaned.strip()
 
 
+def reply_looks_like_tool_planning(content: str) -> bool:
+    """
+    Return True for planning chatter that should not win over a valid next tool call.
+    This is used only when mixed text also contains executable tool XML.
+    """
+    if not content or not isinstance(content, str):
+        return False
+    cleaned = strip_tool_call_markup(content)
+    lowered = re.sub(r"\s+", " ", cleaned.strip().lower())
+    if not lowered:
+        return False
+    if lowered == "all actions are now completed":
+        return False
+    planning_starters = (
+        "let me ",
+        "i'll ",
+        "i will ",
+        "now i'll ",
+        "now i will ",
+        "next i'll ",
+        "next i will ",
+        "first i'll ",
+        "first i will ",
+        "thank you for ",
+        "thanks for ",
+        "i have ",
+        "i found ",
+        "i can ",
+    )
+    planning_verbs = (
+        " use ",
+        " scrape ",
+        " fetch ",
+        " check ",
+        " open ",
+        " read ",
+        " search ",
+        " inspect ",
+        " send ",
+        " list ",
+        " gather ",
+        " pull ",
+        " continue ",
+        " proceed ",
+        " look up ",
+    )
+    if lowered.endswith(":") and any(marker in lowered for marker in ("let me ", "i'll ", "i will ", "next ", "now ")):
+        return True
+    if lowered.startswith(planning_starters):
+        return True
+    if any(starter in lowered for starter in planning_starters) and any(verb in lowered for verb in planning_verbs):
+        return True
+    return any(
+        marker in lowered
+        for marker in (
+            "next step",
+            "i will now",
+            "i'll now",
+            "will now ",
+            "going to ",
+            "proceed to ",
+        )
+    )
+
+
 def tool_result_looks_like_error(message: str) -> bool:
     """
     Return True if a tool result message looks like an error and should not be shown raw to the user.
@@ -220,49 +364,6 @@ def tool_result_looks_like_error(message: str) -> bool:
     if "http status" in lower or "connection error" in lower or "timeout" in lower:
         return True
     return False
-
-
-def reply_looks_like_tool_planning(content: str) -> bool:
-    """
-    Return True for meta/planning chatter that should not be sent as a final reply
-    after tool execution (for example: "let me see what gmail commands are available").
-    """
-    if not content or not isinstance(content, str):
-        return False
-    lowered = re.sub(r"\s+", " ", content.strip().lower())
-    if not any(marker in lowered for marker in ("let me ", "i'll ", "i will ", "checking ")):
-        return False
-
-    if any(
-        marker in lowered
-        for marker in (
-            "let me check",
-            "let me see",
-            "let me fetch",
-            "let me find",
-            "let me verify",
-            "i'll check",
-            "i will check",
-            "available command",
-            "commands are available",
-            "what commands",
-        )
-    ):
-        return True
-
-    # A trailing colon after planning language often indicates an unfinished handoff.
-    if lowered.endswith(":") and "let me " in lowered:
-        return True
-
-    return any(
-        marker in lowered
-        for marker in (
-            "to show you",
-            "first.",
-            "first,",
-        )
-    )
-
 
 def _get_conversation_gmail_state(memory_cache_store: Dict[str, Any], conversation_id: str) -> Dict[str, Any]:
     if not isinstance(memory_cache_store, dict):
@@ -1049,8 +1150,12 @@ async def execute_telegram_tool(
     # --- manageMemoryCache ---
     if name == "manageMemoryCache":
         action = (arguments.get("action") or "").strip().lower()
-        mem_id = arguments.get("memId")
-        mem_description = (arguments.get("memDescription") or "").strip()
+        mem_id = arguments.get("memoryId", arguments.get("memId"))
+        mem_description = (
+            arguments.get("memoryDescription")
+            or arguments.get("memDescription")
+            or ""
+        ).strip()
         items = mem_cache()
         if action == "list":
             if not items:
@@ -1064,18 +1169,21 @@ async def execute_telegram_tool(
             return {"success": True, "message": f"Added to memory cache: {mem_description}"}
         if action == "update":
             if mem_id is None or not mem_description:
-                return {"success": False, "message": "Both memId and memDescription are required."}
+                return {
+                    "success": False,
+                    "message": "Both memoryId and memoryDescription are required.",
+                }
             idx = int(mem_id) if isinstance(mem_id, (int, float)) else None
             if idx is None or idx < 1 or idx > len(items):
-                return {"success": False, "message": "Invalid memId."}
+                return {"success": False, "message": "Invalid memoryId."}
             items[idx - 1] = mem_description
             return {"success": True, "message": "Updated memory cache entry."}
         if action == "delete":
             if mem_id is None:
-                return {"success": False, "message": "memId is required."}
+                return {"success": False, "message": "memoryId is required."}
             idx = int(mem_id) if isinstance(mem_id, (int, float)) else None
             if idx is None or idx < 1 or idx > len(items):
-                return {"success": False, "message": "Invalid memId."}
+                return {"success": False, "message": "Invalid memoryId."}
             items.pop(idx - 1)
             return {"success": True, "message": "Deleted from memory cache."}
         if action == "clear":
@@ -1249,6 +1357,8 @@ async def execute_telegram_tool(
             return {"success": False, "message": "News or file write is not available."}
         search_term = (arguments.get("searchTerm") or arguments.get("query") or "").strip()
         filename = (arguments.get("filename") or "news.csv").strip() or "news.csv"
+        if not os.path.splitext(filename)[1]:
+            filename = f"{filename}.csv"
         if not search_term:
             return {"success": False, "message": "searchTerm is required."}
         data = await do_news(search_term)
@@ -1261,7 +1371,7 @@ async def execute_telegram_tool(
             url = a.get("url") or ""
             csv_lines.append(f'"{title}","{url}"')
         csv_content = "\n".join(csv_lines)
-        wr = await write_internal(filename, csv_content, "txt")
+        wr = await write_internal(filename, csv_content, "csv")
         if isinstance(wr, dict) and not wr.get("success"):
             return {"success": False, "message": wr.get("message", "Failed to write file.")}
         return {"success": True, "message": f"Saved {len(articles)} news articles to {filename}."}
@@ -1271,10 +1381,25 @@ async def execute_telegram_tool(
         read_internal = context.get("read_file_internal")
         if not read_internal:
             return {"success": False, "message": "File read is not available."}
-        filename = (arguments.get("filename") or "").strip()
+        filename = (
+            str(arguments.get("filename") or arguments.get("path") or arguments.get("file") or "").strip()
+        )
         if not filename:
             return {"success": False, "message": "filename is required."}
-        out = await read_internal(filename)
+        max_chars = arguments.get("max_chars")
+        start_line = arguments.get("start_line")
+        end_line = arguments.get("end_line")
+        include_line_numbers = str(arguments.get("include_line_numbers", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
+        try:
+            out = await read_internal(
+                filename,
+                max_chars=max_chars,
+                start_line=start_line,
+                end_line=end_line,
+                include_line_numbers=include_line_numbers,
+            )
+        except TypeError:
+            out = await read_internal(filename)
         if isinstance(out, dict) and not out.get("success"):
             return {"success": False, "message": out.get("message", "Read failed.")}
         data = out.get("data") or {}
@@ -1286,12 +1411,23 @@ async def execute_telegram_tool(
         write_internal = context.get("write_file_internal")
         if not write_internal:
             return {"success": False, "message": "File write is not available."}
-        filename = (arguments.get("filename") or "").strip()
-        content = arguments.get("content", "")
-        fmt = (arguments.get("format") or "txt").strip().lower() or "txt"
+        filename = (
+            str(arguments.get("filename") or arguments.get("path") or arguments.get("file") or "").strip()
+        )
+        content = arguments.get("content", arguments.get("text", arguments.get("body", "")))
+        fmt = (
+            str(arguments.get("format") or arguments.get("ext") or arguments.get("extension") or "txt")
+            .strip()
+            .lower()
+            or "txt"
+        )
+        append = str(arguments.get("append", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
         if not filename:
             return {"success": False, "message": "filename is required."}
-        out = await write_internal(filename, str(content), fmt)
+        try:
+            out = await write_internal(filename, str(content), fmt, append=append)
+        except TypeError:
+            out = await write_internal(filename, str(content), fmt)
         if isinstance(out, dict) and not out.get("success"):
             return {"success": False, "message": out.get("message", "Write failed.")}
         return {"success": True, "message": out.get("message", "Write OK.")}
@@ -1315,19 +1451,38 @@ async def execute_telegram_tool(
             recursive = bool(recursive_raw)
         else:
             recursive = str(recursive_raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+        offset = _coerce_bounded_int(arguments.get("offset", 0), default=0, minimum=0)
+        requested_limit = arguments.get("max_entries")
+        render_limit = _coerce_bounded_int(
+            requested_limit,
+            default=_get_list_files_tool_max_entries(),
+            minimum=1,
+            maximum=500,
+        )
 
         try:
-            out = await list_internal(path=path, recursive=recursive)
+            out = await list_internal(
+                path=path,
+                recursive=recursive,
+                offset=offset,
+                max_entries=render_limit,
+            )
         except TypeError:
             # Backward compatibility for older callback signatures in tests/custom integrations.
-            if path or recursive:
+            if path or recursive or offset or requested_limit is not None:
                 try:
-                    out = await list_internal(path, recursive)
+                    out = await list_internal(path, recursive, offset, render_limit)
                 except TypeError:
-                    return {
-                        "success": False,
-                        "message": "File list backend does not support path or recursive arguments.",
-                    }
+                    if path or recursive or offset or requested_limit is not None:
+                        try:
+                            out = await list_internal(path, recursive)
+                        except TypeError:
+                            return {
+                                "success": False,
+                                "message": "File list backend does not support path, recursive, offset, or max_entries arguments.",
+                            }
+                    else:
+                        out = await list_internal()
             else:
                 out = await list_internal()
         if isinstance(out, dict) and not out.get("success"):
@@ -1337,7 +1492,17 @@ async def execute_telegram_tool(
         files = out.get("files")
         if not isinstance(files, list):
             files = []
-        message = _format_list_files_message(files)
+        total_count = out.get("total_count")
+        if total_count is None:
+            total_count = out.get("count")
+        message = _format_list_files_message(
+            files,
+            total_count=total_count,
+            offset=out.get("offset", offset),
+            has_more=out.get("has_more"),
+            next_offset=out.get("next_offset"),
+            limit=render_limit,
+        )
         skipped_count_raw = out.get("skipped_count", 0)
         try:
             skipped_count = int(skipped_count_raw or 0)
@@ -1345,6 +1510,49 @@ async def execute_telegram_tool(
             skipped_count = 0
         if skipped_count > 0:
             message += f"\n- ... skipped {skipped_count} inaccessible or unsafe entries."
+        return {"success": True, "message": message, "data": out}
+
+    # --- searchFiles ---
+    if name == "searchFiles":
+        search_internal = context.get("search_files_internal")
+        if not search_internal:
+            return {"success": False, "message": "File search is not available."}
+        query = str(arguments.get("query") or arguments.get("text") or arguments.get("pattern") or "").strip()
+        if not query:
+            return {"success": False, "message": "query is required."}
+        path = str(arguments.get("path") or arguments.get("subdir") or arguments.get("directory") or "").strip()
+        recursive_raw = arguments.get("recursive", True)
+        if isinstance(recursive_raw, bool):
+            recursive = recursive_raw
+        elif isinstance(recursive_raw, (int, float)):
+            recursive = bool(recursive_raw)
+        else:
+            recursive = str(recursive_raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+        offset = _coerce_bounded_int(arguments.get("offset", 0), default=0, minimum=0)
+        max_results = _coerce_bounded_int(arguments.get("max_results", 20), default=20, minimum=1, maximum=100)
+        case_sensitive = str(arguments.get("case_sensitive", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
+        filename_only = str(arguments.get("filename_only", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
+        out = await search_internal(
+            query,
+            path=path,
+            recursive=recursive,
+            offset=offset,
+            max_results=max_results,
+            case_sensitive=case_sensitive,
+            filename_only=filename_only,
+        )
+        if isinstance(out, dict) and not out.get("success"):
+            return {"success": False, "message": out.get("message", "Search failed.")}
+        if not isinstance(out, dict):
+            return {"success": False, "message": "File search backend returned an invalid response."}
+        message = _format_search_files_message(
+            out.get("matches") or [],
+            query=query,
+            total_matches=out.get("total_matches"),
+            offset=out.get("offset"),
+            has_more=out.get("has_more"),
+            next_offset=out.get("next_offset"),
+        )
         return {"success": True, "message": message, "data": out}
 
     # --- sendTelegramFile ---

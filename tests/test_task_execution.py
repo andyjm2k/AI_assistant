@@ -329,3 +329,73 @@ async def test_call_llm_returns_none_when_fallback_not_configured(monkeypatch):
     assert result is None
     assert post_mock.await_count == 1
     assert "LLM error 400" in (executor.last_error or "")
+
+
+def test_initial_messages_tell_model_to_call_tools_immediately():
+    executor = TodoTaskExecutor(
+        api_key="test-key",
+        task_id=45,
+        task_description="Inspect notes and summarize",
+        get_tools_func=AsyncMock(return_value=[]),
+    )
+
+    system_text = "\n".join(
+        str(item.get("content") or "")
+        for item in executor.messages
+        if item.get("role") == "system"
+    )
+    assert "call the tool immediately instead of narrating the next step" in system_text
+    assert "Do not say you will use a tool later" in system_text
+    assert "Do not ask the user to repeat filenames, URLs, search results" in system_text
+
+
+@pytest.mark.asyncio
+async def test_run_loop_does_not_inject_followup_prompt_after_planning_text():
+    tool_executor = AsyncMock()
+    executor = TodoTaskExecutor(
+        api_key="test-key",
+        task_id=46,
+        task_description="Inspect generated files",
+        tool_executor=tool_executor,
+        get_tools_func=AsyncMock(
+            return_value=[
+                {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "inputSchema": {"type": "object", "properties": {"filename": {"type": "string"}}},
+                },
+            ]
+        ),
+        max_iterations=2,
+    )
+
+    captured_messages = []
+    responses = [
+        {"content": "I will use the read_file tool now to inspect notes.txt.", "tool_calls": None},
+        {"content": "Still preparing to inspect the file.", "tool_calls": None},
+    ]
+
+    async def _mock_llm(messages, **kwargs):
+        captured_messages.append(
+            [
+                {
+                    "role": item.get("role"),
+                    "content": item.get("content"),
+                    "tool_calls": item.get("tool_calls"),
+                }
+                for item in messages
+            ]
+        )
+        return responses.pop(0)
+
+    with patch.object(executor, "_call_llm", side_effect=_mock_llm):
+        status, message = await executor.run_loop()
+
+    assert status == STATUS_AWAITING_CONFIRMATION
+    assert "Still preparing" in message
+    tool_executor.assert_not_awaited()
+    assert not any(
+        msg.get("role") == "user" and "Continue automatically." in str(msg.get("content"))
+        for batch in captured_messages
+        for msg in batch
+    )

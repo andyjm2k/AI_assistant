@@ -121,6 +121,15 @@ class TestResolveScratchPath:
             assert result.suffix.lower() == ext
             result.resolve().relative_to(SCRATCH_DIR.resolve())
 
+    def test_csv_extension_allowed_for_read_and_write(self):
+        """Scratch directory allows .csv for read/write so fetchNews exports work in Telegram."""
+        read_result = resolve_scratch_path("news.csv", READ_ALLOWED_EXTENSIONS)
+        write_result = resolve_scratch_path("news.csv", WRITE_ALLOWED_EXTENSIONS)
+        assert read_result.suffix.lower() == ".csv"
+        assert write_result.suffix.lower() == ".csv"
+        read_result.resolve().relative_to(SCRATCH_DIR.resolve())
+        write_result.resolve().relative_to(SCRATCH_DIR.resolve())
+
     def test_resolve_without_extension_allowlist_allows_any_extension(self):
         """When allowed_extensions is None, any extension is accepted (containment still enforced)."""
         # Still reject traversal
@@ -228,6 +237,51 @@ class TestListFilesInternal:
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 
+    @pytest.mark.asyncio
+    async def test_listing_uses_stable_order_and_supports_pagination(self, monkeypatch):
+        """_list_files_internal should sort by relative path and support deterministic paging."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-list-test-{uuid.uuid4().hex}"
+        try:
+            (scratch / "folder").mkdir(parents=True, exist_ok=True)
+            (scratch / "b.txt").write_text("b", encoding="utf-8")
+            (scratch / "a.txt").write_text("a", encoding="utf-8")
+
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            out = await ps._list_files_internal(path="", recursive=False, offset=1, max_entries=2)
+            assert out.get("success") is True
+            assert out.get("total_count") == 3
+            assert out.get("returned_count") == 2
+            assert out.get("has_more") is False
+            assert out.get("offset") == 1
+            assert [item.get("name") for item in out.get("files", [])] == ["a.txt", "b.txt"]
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    @pytest.mark.asyncio
+    async def test_search_files_internal_finds_content_matches(self, monkeypatch):
+        """_search_files_internal should search file names and text content."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-search-test-{uuid.uuid4().hex}"
+        try:
+            (scratch / "docs").mkdir(parents=True, exist_ok=True)
+            (scratch / "docs" / "notes.txt").write_text("alpha roadmap\nbeta\n", encoding="utf-8")
+            (scratch / "docs" / "other.txt").write_text("gamma\n", encoding="utf-8")
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            out = await ps._search_files_internal("alpha", path="docs", recursive=True, max_results=10)
+            assert out.get("success") is True
+            assert out.get("total_matches") == 1
+            match = out.get("matches", [])[0]
+            assert match.get("relative_path") == "docs/notes.txt"
+            assert match.get("line_number") == 1
+            assert "alpha" in match.get("excerpt", "").lower()
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------------
 # API tests (traversal and valid request)
@@ -304,6 +358,184 @@ class TestFileApiSecurity:
         finally:
             if test_file.exists():
                 test_file.unlink()
+
+    def test_read_api_supports_line_ranges(self, client_with_auth):
+        """POST /v1/files/read should support partial reads with line numbers."""
+        scratch = PROJECT_ROOT / "scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        test_file = scratch / "security_test_partial.txt"
+        test_file.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+        try:
+            response = client_with_auth.post(
+                "/v1/files/read",
+                json={
+                    "path": "security_test_partial.txt",
+                    "start_line": 2,
+                    "end_line": 3,
+                    "include_line_numbers": True,
+                },
+                headers=_auth_headers(),
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data.get("success") is True
+            assert data.get("data", {}).get("content") == "2: two\n3: three"
+        finally:
+            if test_file.exists():
+                test_file.unlink()
+
+    def test_write_and_read_csv_file_succeeds(self, client_with_auth):
+        """POST /v1/files/write and /v1/files/read should support CSV scratch files."""
+        scratch = PROJECT_ROOT / "scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        test_file = scratch / "security_test_news.csv"
+        csv_content = 'Title,URL\n"One","https://example.com/one"'
+        try:
+            write_response = client_with_auth.post(
+                "/v1/files/write",
+                json={"filename": "security_test_news.csv", "content": csv_content, "format": "csv"},
+                headers=_auth_headers(),
+            )
+            assert write_response.status_code == 200
+            write_data = write_response.json()
+            assert write_data.get("success") is True
+            assert test_file.exists()
+
+            read_response = client_with_auth.post(
+                "/v1/files/read",
+                json={"filename": "security_test_news.csv"},
+                headers=_auth_headers(),
+            )
+            assert read_response.status_code == 200
+            read_data = read_response.json()
+            assert read_data.get("success") is True
+            assert read_data.get("data", {}).get("content") == csv_content
+        finally:
+            if test_file.exists():
+                test_file.unlink()
+
+    def test_list_files_api_accepts_scratch_prefixed_paths(self, client_with_auth, monkeypatch):
+        """GET /v1/files/list should accept scratch/ and scratch\\ path prefixes."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-list-api-{uuid.uuid4().hex}"
+        try:
+            (scratch / "images").mkdir(parents=True, exist_ok=True)
+            (scratch / "images" / "a.png").write_text("a", encoding="utf-8")
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            unix_response = client_with_auth.get(
+                "/v1/files/list",
+                params={"path": "scratch/images"},
+                headers=_auth_headers(),
+            )
+            windows_response = client_with_auth.get(
+                "/v1/files/list",
+                params={"path": r"scratch\images"},
+                headers=_auth_headers(),
+            )
+
+            assert unix_response.status_code == 200
+            assert windows_response.status_code == 200
+            unix_data = unix_response.json()
+            windows_data = windows_response.json()
+            assert unix_data.get("success") is True
+            assert windows_data.get("success") is True
+            assert {item.get("name") for item in unix_data.get("files", [])} == {"images/a.png"}
+            assert {item.get("name") for item in windows_data.get("files", [])} == {"images/a.png"}
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_list_files_api_recursive_mode_includes_nested_files(self, client_with_auth, monkeypatch):
+        """GET /v1/files/list should honor recursive=true for nested directories."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-list-api-{uuid.uuid4().hex}"
+        try:
+            (scratch / "images" / "2026").mkdir(parents=True, exist_ok=True)
+            (scratch / "images" / "a.png").write_text("a", encoding="utf-8")
+            (scratch / "images" / "2026" / "b.png").write_text("b", encoding="utf-8")
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            non_recursive_response = client_with_auth.get(
+                "/v1/files/list",
+                params={"path": "images"},
+                headers=_auth_headers(),
+            )
+            recursive_response = client_with_auth.get(
+                "/v1/files/list",
+                params={"path": "images", "recursive": "true"},
+                headers=_auth_headers(),
+            )
+
+            assert non_recursive_response.status_code == 200
+            assert recursive_response.status_code == 200
+            non_recursive_data = non_recursive_response.json()
+            recursive_data = recursive_response.json()
+            assert non_recursive_data.get("success") is True
+            assert recursive_data.get("success") is True
+
+            non_recursive_names = {item.get("name") for item in non_recursive_data.get("files", [])}
+            recursive_names = {item.get("name") for item in recursive_data.get("files", [])}
+            assert "images/a.png" in non_recursive_names
+            assert "images/2026" in non_recursive_names
+            assert "images/2026/b.png" not in non_recursive_names
+            assert "images/2026/b.png" in recursive_names
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_list_files_api_supports_offset_and_max_entries(self, client_with_auth, monkeypatch):
+        """GET /v1/files/list should expose deterministic pagination metadata."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-list-api-{uuid.uuid4().hex}"
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+            (scratch / "c.txt").write_text("c", encoding="utf-8")
+            (scratch / "a.txt").write_text("a", encoding="utf-8")
+            (scratch / "b.txt").write_text("b", encoding="utf-8")
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            response = client_with_auth.get(
+                "/v1/files/list",
+                params={"offset": "1", "max_entries": "1"},
+                headers=_auth_headers(),
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data.get("success") is True
+            assert data.get("total_count") == 3
+            assert data.get("returned_count") == 1
+            assert data.get("has_more") is True
+            assert data.get("next_offset") == 2
+            assert [item.get("name") for item in data.get("files", [])] == ["b.txt"]
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_search_files_api_returns_matches(self, client_with_auth, monkeypatch):
+        """GET /v1/files/search should return matching files and snippets."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-search-api-{uuid.uuid4().hex}"
+        try:
+            (scratch / "docs").mkdir(parents=True, exist_ok=True)
+            (scratch / "docs" / "notes.txt").write_text("alpha roadmap\n", encoding="utf-8")
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            response = client_with_auth.get(
+                "/v1/files/search",
+                params={"query": "alpha", "path": "docs"},
+                headers=_auth_headers(),
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data.get("success") is True
+            assert data.get("total_matches") == 1
+            assert data.get("matches", [])[0].get("relative_path") == "docs/notes.txt"
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

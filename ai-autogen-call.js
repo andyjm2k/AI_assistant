@@ -56,17 +56,27 @@ window.runWorkflow = async function(contentPrompt, options = {}) {
                 const data = await response.json();
                 console.log('Autogen API response:', data);
 
-                if (data.response) {
-                    return data.response;
-                } else if (data.output) {
-                    return data.output;
-                } else if (data.result) {
-                    return data.result;
-                } else if (data.message) {
-                    return data.message;
+                const transcript =
+                    data.log_content ||
+                    data.response ||
+                    data.output ||
+                    data.result ||
+                    data.message ||
+                    JSON.stringify(data, null, 2);
+
+                if (options.fullPayload) {
+                    return {
+                        transcript,
+                        response: data.response || transcript,
+                        output: data.output || transcript,
+                        summary: data.summary || '',
+                        logFile: data.log_file || data.logFile || '',
+                        messages: Array.isArray(data.messages) ? data.messages : [],
+                        raw: data
+                    };
                 }
 
-                return JSON.stringify(data, null, 2);
+                return transcript;
             } catch (error) {
                 lastError = error;
                 console.warn('ai-autogen-call.js - Request failed for URL:', targetUrl, error);

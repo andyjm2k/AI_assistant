@@ -71,6 +71,7 @@ def test_skills_openai_tools_hide_overlapping_filesystem_tools_by_default() -> N
     assert "filesystem.list_files" not in default_names
     assert "filesystem.read_text" not in default_names
     assert "filesystem.write_text" not in default_names
+    assert "filesystem.search_files" not in default_names
 
     include_resp = client.get(
         "/v1/skills/tools/openai?qualified_names=true&include_overlapping_file_tools=true",
@@ -86,6 +87,7 @@ def test_skills_openai_tools_hide_overlapping_filesystem_tools_by_default() -> N
     assert "filesystem.list_files" in include_names
     assert "filesystem.read_text" in include_names
     assert "filesystem.write_text" in include_names
+    assert "filesystem.search_files" in include_names
 
 
 def test_skills_package_export_and_import_endpoints() -> None:

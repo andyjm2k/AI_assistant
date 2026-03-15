@@ -18,6 +18,7 @@ OVERLAPPING_FILE_TOOL_QUALIFIED_NAMES = {
     "filesystem.list_files",
     "filesystem.read_text",
     "filesystem.write_text",
+    "filesystem.search_files",
 }
 
 

@@ -14,6 +14,13 @@ if not VENV_PYTHON.exists():
 if not VENV_PYTHON.exists():
     VENV_PYTHON = "python"  # Use system Python
 
+# Keep AutoGen Studio's JSON input in sync with the Python source of truth.
+subprocess.run(
+    [str(VENV_PYTHON), str(PROJECT_ROOT / "scripts" / "export_autogen_team_config.py")],
+    cwd=str(PROJECT_ROOT),
+    check=False,
+)
+
 # Commands to run (each in a new cmd window; cd to project root first)
 commands = [
     f'start cmd /k "cd /d {PROJECT_ROOT} && {VENV_PYTHON} -m src.servers.https_server"',

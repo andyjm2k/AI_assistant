@@ -4,6 +4,7 @@ The assistant asks itself questions, reasons through answers, and forms conclusi
 These contemplations are stored in memory to influence future sessions.
 """
 
+import inspect
 import os
 import re
 from typing import List, Dict, Optional, Any
@@ -36,6 +37,7 @@ class PhilosopherMode:
         tool_executor=None,
         get_tools_func=None,
         diversification_threshold: int = None,
+        progress_callback=None,
     ):
         """
         Initialize PhilosopherMode instance.
@@ -70,6 +72,7 @@ class PhilosopherMode:
         # Tool support
         self.tool_executor = tool_executor
         self.get_tools_func = get_tools_func
+        self.progress_callback = progress_callback
         self._available_tools = None
         self._max_token_limit = get_max_token_limit()
         
@@ -86,6 +89,17 @@ Your role is to:
 You have access to all your memories, including previous contemplations and user interactions. Use these to inform your thinking, but don't be constrained by them - allow your perspective to evolve.
 
 When contemplating, you should use tools to gather information to inform your own reasoning and reflection."""
+
+    async def _emit_progress(self, event: str, **payload: Any) -> None:
+        """Forward philosopher progress to an optional observer."""
+        if not self.progress_callback:
+            return
+        try:
+            maybe_awaitable = self.progress_callback(event, payload)
+            if inspect.isawaitable(maybe_awaitable):
+                await maybe_awaitable
+        except Exception as e:
+            print(f"[PHILOSOPHER] Progress callback error: {e}")
 
     async def get_relevant_memories(self, query: str, exclude_category: Optional[str] = None) -> List[Dict]:
         """
@@ -406,12 +420,29 @@ When contemplating, you should use tools to gather information to inform your ow
         Returns:
             String containing any gathered information, or empty string if none was gathered
         """
+        await self._emit_progress(
+            "gather_information_start",
+            question=question,
+            phase="gather_information",
+            message="Checking whether more information is needed before contemplation.",
+            current_step=0,
+            total_steps=self.max_cycles,
+        )
+
         # Get available tools (force refresh to ensure we have latest tools)
         tools = await self._get_available_tools(force_refresh=True)
         
         if not tools or not self.tool_executor:
             # No tools available, skip information gathering
             print(f"[PHILOSOPHER] No tools available for information gathering (tools: {len(tools) if tools else 0}, executor: {self.tool_executor is not None})")
+            await self._emit_progress(
+                "gather_information_skipped",
+                question=question,
+                phase="gather_information",
+                message="No tools available for information gathering.",
+                current_step=0,
+                total_steps=self.max_cycles,
+            )
             return ""
         
         print(f"[PHILOSOPHER] Starting information gathering with {len(tools)} tools available")
@@ -456,6 +487,15 @@ ACTION REQUIRED: If I need information, I MUST use the appropriate tools NOW to 
         
         if tool_calls and self.tool_executor:
             print(f"[PHILOSOPHER] Executing {len(tool_calls)} tool calls for information gathering")
+            await self._emit_progress(
+                "gather_information_tools",
+                question=question,
+                phase="gather_information",
+                message=f"Gathering information with {len(tool_calls)} tool call(s).",
+                current_step=0,
+                total_steps=self.max_cycles,
+                tool_call_count=len(tool_calls),
+            )
             # Execute tool calls
             tool_messages = []
             tool_messages.append({
@@ -503,9 +543,25 @@ ACTION REQUIRED: If I need information, I MUST use the appropriate tools NOW to 
             
             summary_response = await self._call_llm(summary_messages, temperature=0.5, max_tokens=1000)
             if summary_response and summary_response.get("content"):
+                await self._emit_progress(
+                    "gather_information_complete",
+                    question=question,
+                    phase="gather_information",
+                    message="Information gathering completed.",
+                    current_step=0,
+                    total_steps=self.max_cycles,
+                )
                 return summary_response.get("content")
         
         # If no tools were called, return empty (LLM decided no information gathering needed)
+        await self._emit_progress(
+            "gather_information_complete",
+            question=question,
+            phase="gather_information",
+            message="No additional information was gathered before contemplation.",
+            current_step=0,
+            total_steps=self.max_cycles,
+        )
         return "\n\n".join(gathered_info) if gathered_info else ""
 
     async def generate_contemplation_question(self) -> Optional[str]:
@@ -517,6 +573,13 @@ ACTION REQUIRED: If I need information, I MUST use the appropriate tools NOW to 
             Generated question string or None if error
         """
         try:
+            await self._emit_progress(
+                "generate_question_start",
+                phase="question_generation",
+                message="Generating a philosopher workflow question.",
+                current_step=0,
+                total_steps=self.max_cycles,
+            )
             # Retrieve relevant memories to influence question generation
             # Use a broad query to get diverse memories
             memories = await self.get_relevant_memories("contemplation philosophy existence")
@@ -563,6 +626,15 @@ ACTION REQUIRED: If I need information, I MUST use the appropriate tools NOW to 
             
             if llm_response:
                 question = llm_response.get("content")
+                await self._emit_progress(
+                    "generate_question_complete",
+                    phase="question_generation",
+                    message="Generated philosopher workflow question.",
+                    workflow_name=question,
+                    question=question,
+                    current_step=0,
+                    total_steps=self.max_cycles,
+                )
                 return question
             return None
         except Exception as e:
@@ -699,6 +771,16 @@ ACTION REQUIRED: If I need information, I MUST use the appropriate tools NOW to 
         Returns:
             Dictionary with question, contemplation steps, and conclusion
         """
+        await self._emit_progress(
+            "workflow_start",
+            question=question,
+            workflow_name=question,
+            phase="preparation",
+            message="Preparing philosopher contemplation workflow.",
+            current_step=0,
+            total_steps=self.max_cycles,
+        )
+
         # Retrieve relevant memories for this question
         memories = await self.get_relevant_memories(question)
         memory_context = self._build_memory_context(memories)
@@ -715,6 +797,15 @@ ACTION REQUIRED: If I need information, I MUST use the appropriate tools NOW to 
         # Contemplation loop
         while cycle_count < self.max_cycles:
             cycle_count += 1
+            await self._emit_progress(
+                "cycle_start",
+                question=question,
+                workflow_name=question,
+                phase="contemplation",
+                message=f"Running contemplation step {cycle_count} of {self.max_cycles}.",
+                current_step=cycle_count,
+                total_steps=self.max_cycles,
+            )
             
             # Build messages for this contemplation step
             messages = [
@@ -795,6 +886,17 @@ IMPORTANT: If at any point during your contemplation you realize you need additi
                 # Limit tool iterations to prevent infinite loops
                 if tool_iteration_count >= max_tool_iterations:
                     print(f"[PHILOSOPHER] Reached max tool iterations ({max_tool_iterations}), forcing content response")
+                    await self._emit_progress(
+                        "tool_iteration_limit",
+                        question=question,
+                        workflow_name=question,
+                        phase="contemplation",
+                        message=f"Reached tool iteration limit in step {cycle_count}; requesting direct reflection.",
+                        current_step=cycle_count,
+                        total_steps=self.max_cycles,
+                        tool_iteration=tool_iteration_count,
+                        max_tool_iterations=max_tool_iterations,
+                    )
                     # Force content by removing tools and asking for a response
                     messages.append({
                         "role": "user",
@@ -805,6 +907,18 @@ IMPORTANT: If at any point during your contemplation you realize you need additi
                 
                 tool_iteration_count += 1
                 print(f"[PHILOSOPHER] Executing {len(tool_calls)} tool calls in contemplation cycle {cycle_count} (iteration {tool_iteration_count})")
+                await self._emit_progress(
+                    "tool_iteration",
+                    question=question,
+                    workflow_name=question,
+                    phase="contemplation",
+                    message=f"Executing tool round {tool_iteration_count} in step {cycle_count}.",
+                    current_step=cycle_count,
+                    total_steps=self.max_cycles,
+                    tool_iteration=tool_iteration_count,
+                    max_tool_iterations=max_tool_iterations,
+                    tool_call_count=len(tool_calls),
+                )
                 
                 # Execute tool calls
                 tool_results = []
@@ -865,6 +979,16 @@ IMPORTANT: If at any point during your contemplation you realize you need additi
             # Add step to contemplation
             contemplation_steps.append(step_response)
             current_contemplation = "\n\n".join(contemplation_steps)
+            await self._emit_progress(
+                "cycle_complete",
+                question=question,
+                workflow_name=question,
+                phase="contemplation",
+                message=f"Completed contemplation step {cycle_count} of {self.max_cycles}.",
+                current_step=cycle_count,
+                total_steps=self.max_cycles,
+                completed_steps=len(contemplation_steps),
+            )
             
             # Check if satisfied with answer
             # Use the most recent step for satisfaction check, as it's more reliable
@@ -880,6 +1004,16 @@ IMPORTANT: If at any point during your contemplation you realize you need additi
         
         # Form final conclusion from actual contemplation steps
         conclusion = current_contemplation
+        await self._emit_progress(
+            "workflow_complete",
+            question=question,
+            workflow_name=question,
+            phase="completed",
+            message=f"Completed philosopher workflow in {cycle_count} step(s).",
+            current_step=cycle_count,
+            total_steps=self.max_cycles,
+            completed_steps=len(contemplation_steps),
+        )
         
         return {
             "question": question,

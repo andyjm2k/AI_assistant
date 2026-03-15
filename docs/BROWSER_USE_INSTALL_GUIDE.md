@@ -97,10 +97,10 @@ GOOGLE_API_KEY=your_actual_api_key_here
 
 # LLM Configuration
 MCP_LLM_PROVIDER=google
-MCP_LLM_MODEL_NAME=gemini-2.0-flash-exp
+MCP_LLM_MODEL_NAME=gemini-3-flash-preview
 
-# Research output directory (REQUIRED)
-MCP_RESEARCH_TOOL_SAVE_DIR=./research_output
+# Optional: save deep research reports to disk
+MCP_RESEARCH_SAVE_DIRECTORY=./research_output
 
 # Browser settings
 MCP_BROWSER_HEADLESS=true
@@ -118,11 +118,20 @@ PORT=5001
 HOST=127.0.0.1
 
 # Agent configuration
-MCP_AGENT_TOOL_MAX_STEPS=100
-MCP_AGENT_TOOL_USE_VISION=true
+MCP_AGENT_MAX_STEPS=100
+MCP_AGENT_USE_VISION=true
+
+# Optional browser settings
+# MCP_BROWSER_USER_DATA_DIR=./scratch/chrome-profile
+# MCP_BROWSER_CDP_URL=http://localhost:9222
 
 # Research configuration
-MCP_RESEARCH_TOOL_MAX_PARALLEL_BROWSERS=3
+MCP_RESEARCH_MAX_SEARCHES=5
+# MCP_RESEARCH_SEARCH_TIMEOUT=120
+
+# MCP server configuration
+# MCP_SERVER_PORT=8383
+# MCP_SERVER_HOST=127.0.0.1
 ```
 
 ### Load environment variables
@@ -148,9 +157,7 @@ export $(cat .env | xargs)
 mkdir research_output
 
 # Create directories for optional features (if enabled)
-# mkdir recordings       # If MCP_AGENT_TOOL_ENABLE_RECORDING=true
-# mkdir agent_history    # If MCP_AGENT_TOOL_HISTORY_PATH is set
-# mkdir traces          # If MCP_BROWSER_TRACE_PATH is set
+# mkdir scratch\\chrome-profile   # If MCP_BROWSER_USER_DATA_DIR is set
 ```
 
 ## Step 6: Verify Installation
@@ -185,17 +192,22 @@ python start_mcp_browser_server.py
 Expected output:
 ```
 Loading environment from: .env
-Using LLM Provider: google, Model: gemini-2.0-flash-exp
+Using LLM Provider: google, Model: gemini-3-flash-preview
 Research output directory: ./research_output
 
 ==================================================
 MCP Browser HTTP Server Configuration
 ==================================================
 LLM Provider: google
-Model: gemini-2.0-flash-exp
+Model: gemini-3-flash-preview
+Base URL: (provider default)
 Browser Headless: true
-Keep Browser Open: false
-Max Parallel Browsers: 3
+Browser CDP URL: (not set)
+Browser User Data Dir: (not set)
+Agent Max Steps: 100
+Agent Use Vision: true
+Research Save Directory: ./research_output
+Research Max Searches: 5
 Server Port: 5001
 Server Host: 127.0.0.1
 ==================================================
@@ -217,7 +229,7 @@ curl http://127.0.0.1:5001/api/health
 
 Expected response:
 ```json
-{"status": "healthy", "mcp_connected": false}
+{"status": "healthy", "mcp_available": true}
 ```
 
 ### Test 6: Simple Browser Task

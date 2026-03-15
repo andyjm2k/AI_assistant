@@ -5,323 +5,805 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>CATBot Monitoring Dashboard</title>
   <style>
-    :root {
-      --bg: #0b0f14;
-      --panel: #121924;
-      --panel-2: #0f1520;
-      --accent: #3dd6a5;
-      --accent-2: #5aa9ff;
-      --text: #e6edf3;
-      --muted: #93a4b8;
-      --warning: #ffb454;
-      --danger: #ff6b6b;
-      --grid: rgba(255, 255, 255, 0.06);
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      background: radial-gradient(1200px 800px at 10% -10%, #1b2636 0%, transparent 60%),
-                  radial-gradient(1200px 800px at 110% 0%, #1a1f2b 0%, transparent 55%),
-                  var(--bg);
-      color: var(--text);
-      font-family: "Space Grotesk", "Manrope", "Segoe UI", sans-serif;
-      min-height: 100vh;
-      letter-spacing: 0.2px;
-    }
-
-    header {
-      padding: 32px 40px 12px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 24px;
-    }
-
-    header h1 {
-      margin: 0;
-      font-size: 28px;
-      font-weight: 600;
-    }
-
-    header .subtitle {
-      color: var(--muted);
-      font-size: 14px;
-    }
-
-    .pill {
-      background: rgba(61, 214, 165, 0.12);
-      border: 1px solid rgba(61, 214, 165, 0.35);
-      color: var(--accent);
-      padding: 6px 12px;
-      border-radius: 999px;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-
-    .grid {
-      display: grid;
-      gap: 20px;
-      padding: 12px 40px 40px;
-      grid-template-columns: repeat(12, 1fr);
-    }
-
-    .card {
-      background: linear-gradient(160deg, rgba(255,255,255,0.02) 0%, rgba(255,255,255,0.01) 100%), var(--panel);
-      border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 16px;
-      padding: 18px 20px;
-      box-shadow: 0 12px 40px rgba(0,0,0,0.25);
-    }
-
-    .card h2 {
-      font-size: 14px;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: var(--muted);
-      margin: 0 0 12px 0;
-    }
-
-    .stat {
-      font-size: 22px;
-      font-weight: 600;
-      margin: 8px 0;
-    }
-
-    .stat-sub {
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .status-grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    }
-
-    .status-chip {
-      border-radius: 12px;
-      padding: 10px 12px;
-      background: var(--panel-2);
-      border: 1px solid var(--grid);
-      font-size: 13px;
-    }
-
-    .status-chip strong {
-      display: block;
-      font-size: 14px;
-      margin-bottom: 4px;
-    }
-
-    .events-list,
-    .logs-list {
-      max-height: 360px;
-      overflow: auto;
-      background: rgba(9, 12, 18, 0.6);
-      border-radius: 12px;
-      border: 1px solid var(--grid);
-      padding: 12px;
-      font-family: "JetBrains Mono", "SF Mono", Consolas, monospace;
-      font-size: 12px;
-      line-height: 1.5;
-    }
-
-    .events-list .event {
-      padding: 8px 10px;
-      border-radius: 10px;
-      background: rgba(255,255,255,0.02);
-      border: 1px solid rgba(255,255,255,0.04);
-      margin-bottom: 10px;
-    }
-
-    .event .meta {
-      color: var(--muted);
-      font-size: 11px;
-      margin-bottom: 6px;
-    }
-
-    .event .state {
-      color: var(--accent);
-      font-weight: 600;
-    }
-
-    .logs-list {
-      white-space: pre-wrap;
-    }
-
-    .log-line {
-      border-bottom: 1px dashed rgba(255,255,255,0.04);
-      padding: 4px 0;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: rgba(90, 169, 255, 0.12);
-      color: var(--accent-2);
-      font-size: 11px;
-      border: 1px solid rgba(90, 169, 255, 0.4);
-    }
-
-    .row-span-6 { grid-column: span 6; }
-    .row-span-4 { grid-column: span 4; }
-    .row-span-8 { grid-column: span 8; }
-    .row-span-12 { grid-column: span 12; }
-
-    @media (max-width: 1100px) {
-      .grid { grid-template-columns: repeat(6, 1fr); }
-      .row-span-6 { grid-column: span 6; }
-      .row-span-4 { grid-column: span 6; }
-      .row-span-8 { grid-column: span 6; }
-    }
-
-    @media (max-width: 720px) {
-      header { flex-direction: column; align-items: flex-start; }
-      .grid { grid-template-columns: repeat(2, 1fr); padding: 12px 20px 30px; }
-      .row-span-6, .row-span-4, .row-span-8, .row-span-12 { grid-column: span 2; }
-    }
+    :root{--bg:#07111c;--panel:#0c1827;--panel2:#102033;--line:rgba(165,188,211,.16);--text:#edf4fb;--muted:#98adc3;--cyan:#5bd3ff;--mint:#67efc2;--gold:#ffc86e;--rose:#ff7c90;--violet:#a88fff;--shadow:0 22px 60px rgba(0,0,0,.3)}
+    *{box-sizing:border-box}html{color-scheme:dark}body{margin:0;min-height:100vh;color:var(--text);font-family:"Space Grotesk","IBM Plex Sans","Segoe UI Variable",sans-serif;background:radial-gradient(circle at top left,rgba(91,211,255,.18),transparent 28%),radial-gradient(circle at top right,rgba(168,143,255,.18),transparent 30%),linear-gradient(180deg,#06101a 0%,#07111c 100%)}
+    body:before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:26px 26px;mask-image:radial-gradient(circle at center,black 40%,transparent 100%);opacity:.45}
+    header{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;padding:32px 34px 10px}.eyebrow{display:inline-flex;padding:7px 12px;border-radius:999px;background:rgba(91,211,255,.1);border:1px solid rgba(91,211,255,.24);color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}
+    h1{margin:10px 0 0;font-size:clamp(34px,6vw,56px);line-height:.94;letter-spacing:-.05em}.subtitle{max-width:760px;color:var(--muted);font-size:15px;line-height:1.6}.refresh{display:inline-flex;gap:10px;align-items:center;padding:10px 14px;border-radius:999px;border:1px solid rgba(103,239,194,.28);background:rgba(103,239,194,.12);color:var(--mint);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.dot{width:10px;height:10px;border-radius:999px;background:currentColor;box-shadow:0 0 0 0 rgba(103,239,194,.6);animation:pulse 2s infinite}.top-meta{max-width:420px;margin-top:12px;color:var(--muted);font-size:12px;text-align:right;line-height:1.6;overflow-wrap:anywhere}
+    @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(103,239,194,.55)}70%{box-shadow:0 0 0 14px rgba(103,239,194,0)}100%{box-shadow:0 0 0 0 rgba(103,239,194,0)}}
+    .layout{display:grid;grid-template-columns:1.08fr .92fr;gap:20px;padding:8px 34px 34px}.col{display:flex;flex-direction:column;gap:20px;min-width:0}.panel{position:relative;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,.02),transparent 120%),var(--panel);border:1px solid var(--line);border-radius:24px;box-shadow:var(--shadow)}.panel:after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.05),transparent 30%,transparent 70%,rgba(255,255,255,.02))}.inner{position:relative;z-index:1;padding:20px}
+    .section{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:14px}.section h2{margin:0;font-size:15px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#c6d6e8}.note{color:var(--muted);font-size:12px}.title{display:flex;align-items:center;gap:12px}.icon{width:36px;height:36px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;background:rgba(91,211,255,.1);border:1px solid rgba(91,211,255,.22);color:var(--cyan);flex:0 0 auto}.icon svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+    .hero{display:grid;grid-template-columns:minmax(220px,.78fr) minmax(420px,1.22fr);gap:16px;align-items:start}.uptime-label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em}.uptime{font-size:clamp(32px,5vw,54px);font-weight:700;line-height:.92;letter-spacing:-.05em;margin-top:10px}.uptime-sub{margin-top:12px;color:#c0d2e4;font-size:13px;line-height:1.6}
+    .chips{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr))}.chip{background:linear-gradient(160deg,rgba(255,255,255,.035),rgba(255,255,255,.015)),var(--panel2);border:1px solid rgba(165,188,211,.12);border-radius:18px;padding:14px;display:flex;flex-direction:column;gap:10px;min-height:112px}.chip-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.chip-title{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px;letter-spacing:.08em;text-transform:uppercase}.chip-title strong{font-size:14px;text-transform:none;letter-spacing:0;color:#d8e4ef}.chip-value{font-size:28px;font-weight:700;letter-spacing:-.04em}.chip-sub{min-height:33px;color:var(--muted);font-size:12px;line-height:1.45}
+    .badge{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:7px 11px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05)}.badge:before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor;box-shadow:0 0 12px currentColor}.idle{color:var(--muted)}.running{color:var(--cyan);background:rgba(91,211,255,.12);border-color:rgba(91,211,255,.28)}.done{color:var(--mint);background:rgba(103,239,194,.12);border-color:rgba(103,239,194,.28)}.warn{color:var(--gold);background:rgba(255,200,110,.12);border-color:rgba(255,200,110,.24)}.error{color:var(--rose);background:rgba(255,124,144,.12);border-color:rgba(255,124,144,.24)}
+    .meter{width:100%;height:7px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden}.meter>span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,rgba(91,211,255,.55),rgba(103,239,194,.95));box-shadow:0 0 22px rgba(91,211,255,.35);transition:width .22s ease}
+    .cols2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.stack{display:flex;flex-direction:column;gap:14px;min-height:220px;max-height:690px;overflow:auto;padding-right:2px}.health{padding:14px 16px;border-radius:18px;border:1px solid rgba(91,211,255,.14);background:radial-gradient(circle at right top,rgba(91,211,255,.12),transparent 40%),rgba(255,255,255,.025);color:#d7e7f7;font-size:13px;line-height:1.55;margin-bottom:12px}
+    .card{background:linear-gradient(160deg,rgba(255,255,255,.035),rgba(255,255,255,.012));border:1px solid rgba(165,188,211,.14);border-radius:20px;padding:16px;display:flex;flex-direction:column;gap:14px}.top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.left{display:flex;gap:12px;min-width:0}.run-icon{width:42px;height:42px;border-radius:14px;display:inline-flex;align-items:center;justify-content:center;background:rgba(91,211,255,.1);border:1px solid rgba(91,211,255,.18);color:var(--cyan)}.run-icon svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.run-title{margin:0;font-size:16px;font-weight:700;line-height:1.3;word-break:break-word}.run-sub{margin-top:4px;color:var(--muted);font-size:12px;line-height:1.55}.summary{color:#d7e4ef;font-size:13px;line-height:1.55}
+    .metrics{display:flex;flex-wrap:wrap;gap:8px}.pill{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:var(--muted);font-size:11px}.pill strong{color:#e6f1fb}.p-head{display:flex;justify-content:space-between;gap:12px;align-items:center;font-size:12px;color:var(--muted)}.track{height:10px;border-radius:999px;overflow:hidden;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.06)}.track>span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--violet),var(--cyan),var(--mint));box-shadow:0 0 24px rgba(91,211,255,.24)}
+    .stages{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.stage{position:relative;padding-top:18px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;text-align:center}.stage:before{content:"";position:absolute;top:0;left:50%;transform:translateX(-50%);width:11px;height:11px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.05)}.stage:after{content:"";position:absolute;top:5px;left:calc(50% + 12px);width:calc(100% - 24px);height:1px;background:rgba(255,255,255,.08)}.stage:last-child:after{display:none}.stage.on,.stage.done{color:#edf4fb}.stage.done:before{background:var(--mint);border-color:rgba(103,239,194,.6);box-shadow:0 0 16px rgba(103,239,194,.4)}.stage.on:before{background:var(--cyan);border-color:rgba(91,211,255,.7);box-shadow:0 0 18px rgba(91,211,255,.5)}
+    .timeline{display:flex;flex-direction:column;gap:8px;padding-left:16px;border-left:1px solid rgba(255,255,255,.08)}.t-item{position:relative;color:#c9d8e6;font-size:12px;line-height:1.55}.t-item:before{content:"";position:absolute;left:-22px;top:6px;width:9px;height:9px;border-radius:999px;background:rgba(91,211,255,.8);box-shadow:0 0 12px rgba(91,211,255,.28)}.t-time{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px}
+    .run-log-tools{display:flex;flex-wrap:wrap;align-items:center;gap:10px}.run-log-btn{appearance:none;border:1px solid rgba(91,211,255,.24);background:rgba(91,211,255,.1);color:var(--cyan);border-radius:999px;padding:8px 12px;font:inherit;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;transition:background .18s ease,border-color .18s ease}.run-log-btn:hover{background:rgba(91,211,255,.16);border-color:rgba(91,211,255,.34)}.run-log-path{color:var(--muted);font-size:11px;overflow-wrap:anywhere}.run-log-box{border:1px solid rgba(255,255,255,.08);border-radius:16px;background:rgba(4,10,18,.6);overflow:hidden}.run-log-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02)}.run-log-title{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#d7e4ef}.run-log-meta{color:var(--muted);font-size:11px}.run-log-content{margin:0;max-height:380px;overflow:auto;white-space:pre-wrap;font-family:"IBM Plex Mono","JetBrains Mono",Consolas,monospace;font-size:12px;line-height:1.6;padding:14px;color:#cfe0f2}.run-log-empty{padding:14px;color:var(--muted);font-size:12px}
+    .event-list{display:flex;flex-direction:column;gap:14px;max-height:480px;overflow:auto;padding-right:4px}.event{display:grid;grid-template-columns:60px 1fr;gap:14px;align-items:start}.e-time{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;padding-top:2px}.e-card{position:relative;border-radius:18px;padding:14px 14px 14px 18px;background:linear-gradient(160deg,rgba(255,255,255,.035),rgba(255,255,255,.012));border:1px solid rgba(165,188,211,.12)}.e-card:before{content:"";position:absolute;left:-7px;top:18px;width:12px;height:12px;border-radius:999px;background:var(--violet);box-shadow:0 0 18px rgba(168,143,255,.35)}.e-meta{color:var(--muted);font-size:11px;margin-bottom:6px}.e-state{color:#eef6ff;font-size:13px;line-height:1.5;font-weight:600}
+    .logbox{background:rgba(5,10,18,.74);border:1px solid rgba(255,255,255,.06);border-radius:20px;overflow:hidden}.loghead{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02)}.logtitle{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#ccdae9}.logstatus{color:var(--muted);font-size:11px}.logs{max-height:360px;overflow:auto;white-space:pre-wrap;font-family:"IBM Plex Mono","JetBrains Mono",Consolas,monospace;font-size:12px;line-height:1.6;padding:16px;color:#cfe0f2}.logline{display:block;padding:4px 0;border-bottom:1px dashed rgba(255,255,255,.05)}
+    .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;min-height:180px;text-align:center;color:var(--muted);padding:24px;border:1px dashed rgba(165,188,211,.16);border-radius:18px;background:rgba(255,255,255,.02)}.empty svg{width:34px;height:34px;stroke:currentColor;fill:none;stroke-width:1.6}
+    .refresh.fail{color:var(--rose);border-color:rgba(255,124,144,.28);background:rgba(255,124,144,.12)}.refresh.fail .dot{box-shadow:0 0 0 0 rgba(255,124,144,.6)}.refresh.warn{color:var(--gold);border-color:rgba(255,200,110,.24);background:rgba(255,200,110,.12)}
+    @media (max-width:1480px){.layout{grid-template-columns:1fr}.hero{grid-template-columns:minmax(220px,.75fr) minmax(0,1.25fr)}}@media (max-width:920px){header{flex-direction:column;align-items:flex-start;padding:28px 20px 8px}.top-meta{text-align:left}.layout{padding:8px 20px 28px}.hero,.chips,.cols2{grid-template-columns:1fr}}@media (max-width:640px){.inner{padding:18px}.event{grid-template-columns:1fr;gap:8px}.top,.p-head,.section{flex-direction:column;align-items:flex-start}.stages{grid-template-columns:repeat(2,minmax(0,1fr))}.stage:after{display:none}}
   </style>
 </head>
 <body>
   <header>
     <div>
-      <h1>CATBot System Monitor</h1>
-      <div class="subtitle">Live health, status events, and proxy output at a glance.</div>
-    </div>
-    <div class="pill" id="refresh-indicator">Refreshing…</div>
-  </header>
-
-  <section class="grid">
-    <div class="card row-span-4">
-      <h2>System Snapshot</h2>
-      <div class="stat" id="uptime">--</div>
-      <div class="stat-sub">Proxy uptime</div>
-      <div class="status-grid">
-        <div class="status-chip">
-          <strong>Memory</strong>
-          <span id="memory-status">--</span>
-        </div>
-        <div class="status-chip">
-          <strong>Telegram Tools</strong>
-          <span id="telegram-tools-status">--</span>
-        </div>
-        <div class="status-chip">
-          <strong>OpenAI Key</strong>
-          <span id="openai-key-status">--</span>
-        </div>
-        <div class="status-chip">
-          <strong>Active Sessions</strong>
-          <span id="active-sessions">--</span>
-        </div>
+      <div class="eyebrow">CATBot Monitor</div>
+      <h1>System Pulse</h1>
+      <div class="subtitle">
+        Live status for proxy services, agent workflows, reflective loops, and browser automation. Each lane shows what is running, how far it has progressed, and where attention is needed.
       </div>
     </div>
+    <div>
+      <div class="refresh">
+        <span class="dot"></span>
+        <span id="refresh-indicator">Polling every 15s</span>
+      </div>
+      <div class="top-meta" id="top-meta">Waiting for monitor data.</div>
+    </div>
+  </header>
 
-    <div class="card row-span-8">
-      <h2>Recent Status Events</h2>
-      <div class="events-list" id="events-list">Loading events…</div>
+  <main class="layout">
+    <div class="col">
+      <section class="panel">
+        <div class="inner">
+          <div class="section">
+            <div class="title">
+              <span class="icon" id="overview-icon"></span>
+              <h2>System Overview</h2>
+            </div>
+            <div class="note" id="uptime-caption">Live infrastructure snapshot</div>
+          </div>
+          <div class="hero">
+            <div>
+              <div class="uptime-label">Proxy Uptime</div>
+              <div class="uptime" id="uptime">--</div>
+              <div class="uptime-sub">
+                <div id="memory-status">Memory: --</div>
+                <div id="telegram-tools-status">Telegram tools: --</div>
+                <div id="openai-key-status">Model key: --</div>
+                <div id="active-sessions">Sessions: --</div>
+              </div>
+            </div>
+            <div class="chips">
+              <div class="chip">
+                <div class="chip-head">
+                  <div class="chip-title" id="memory-title"><strong>Memory</strong></div>
+                  <div class="badge idle" id="memory-badge">Unknown</div>
+                </div>
+                <div class="chip-value" id="memory-value">--</div>
+                <div class="chip-sub" id="memory-sub">Checking memory tools.</div>
+                <div class="meter"><span id="memory-meter" style="width:32%"></span></div>
+              </div>
+              <div class="chip">
+                <div class="chip-head">
+                  <div class="chip-title" id="telegram-title"><strong>Telegram Tools</strong></div>
+                  <div class="badge idle" id="telegram-badge">Unknown</div>
+                </div>
+                <div class="chip-value" id="telegram-value">--</div>
+                <div class="chip-sub" id="telegram-sub">Checking integrations.</div>
+                <div class="meter"><span id="telegram-meter" style="width:32%"></span></div>
+              </div>
+              <div class="chip">
+                <div class="chip-head">
+                  <div class="chip-title" id="openai-title"><strong>Model Key</strong></div>
+                  <div class="badge idle" id="openai-badge">Unknown</div>
+                </div>
+                <div class="chip-value" id="openai-value">--</div>
+                <div class="chip-sub" id="openai-sub">Checking API configuration.</div>
+                <div class="meter"><span id="openai-meter" style="width:32%"></span></div>
+              </div>
+              <div class="chip">
+                <div class="chip-head">
+                  <div class="chip-title" id="session-title"><strong>Sessions</strong></div>
+                  <div class="badge idle" id="session-badge">Idle</div>
+                </div>
+                <div class="chip-value" id="session-value">--</div>
+                <div class="chip-sub" id="session-sub">No session activity yet.</div>
+                <div class="meter"><span id="session-meter" style="width:12%"></span></div>
+              </div>
+              <div class="chip">
+                <div class="chip-head">
+                  <div class="chip-title" id="autogen-title"><strong>AutoGen</strong></div>
+                  <div class="badge idle" id="autogen-badge">Idle</div>
+                </div>
+                <div class="chip-value" id="autogen-active-runs">0</div>
+                <div class="chip-sub" id="autogen-sub">No active orchestration runs.</div>
+                <div class="meter"><span id="autogen-meter" style="width:0%"></span></div>
+              </div>
+              <div class="chip">
+                <div class="chip-head">
+                  <div class="chip-title" id="browser-title"><strong>Browser-use</strong></div>
+                  <div class="badge idle" id="browser-badge">Idle</div>
+                </div>
+                <div class="chip-value" id="browser-use-active-runs">0</div>
+                <div class="chip-sub" id="browser-sub">Browser automation ready.</div>
+                <div class="meter"><span id="browser-meter" style="width:0%"></span></div>
+              </div>
+              <div class="chip">
+                <div class="chip-head">
+                  <div class="chip-title" id="philosopher-title"><strong>Philosopher</strong></div>
+                  <div class="badge idle" id="philosopher-badge">Idle</div>
+                </div>
+                <div class="chip-value" id="philosopher-active-runs">0</div>
+                <div class="chip-sub" id="philosopher-sub">Reflective loop standing by.</div>
+                <div class="meter"><span id="philosopher-meter" style="width:0%"></span></div>
+              </div>
+              <div class="chip">
+                <div class="chip-head">
+                  <div class="chip-title" id="task-title"><strong>Task Execution</strong></div>
+                  <div class="badge idle" id="task-badge">Idle</div>
+                </div>
+                <div class="chip-value" id="task-execution-active-runs">0</div>
+                <div class="chip-sub" id="task-sub">Task loop waiting for work.</div>
+                <div class="meter"><span id="task-meter" style="width:0%"></span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="inner">
+          <div class="section">
+            <div class="title">
+              <span class="icon" id="event-icon"></span>
+              <h2>Status Event Timeline</h2>
+            </div>
+            <div class="note">Recent status broadcasts from the proxy event stream</div>
+          </div>
+          <div class="event-list" id="events-list"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="inner">
+          <div class="section">
+            <div class="title">
+              <span class="icon" id="proxy-log-icon"></span>
+              <h2>Proxy Runtime Log</h2>
+            </div>
+            <div class="note" id="logs-hint">Last lines from `PROXY_LOG_FILE` when configured</div>
+          </div>
+          <div class="logbox">
+            <div class="loghead">
+              <div class="logtitle">
+                <span class="icon" id="log-icon"></span>
+                Proxy log tail
+              </div>
+              <div class="logstatus" id="proxy-log-status">Waiting for log configuration</div>
+            </div>
+            <div class="logs" id="logs-list"></div>
+          </div>
+        </div>
+      </section>
     </div>
 
-    <div class="card row-span-12">
-      <h2>Proxy Server Output</h2>
-      <div class="logs-list" id="logs-list">Waiting for logs…</div>
-      <div class="stat-sub" id="logs-hint">Configure PROXY_LOG_FILE to expose logs.</div>
-    </div>
-  </section>
+    <div class="col">
+      <section class="panel">
+        <div class="inner">
+          <div class="section">
+            <div class="title">
+              <span class="icon" id="workflow-icon"></span>
+              <h2>Workflow Systems</h2>
+            </div>
+            <div class="note">Operational lanes for orchestration and browser automation</div>
+          </div>
+          <div class="cols2">
+            <div>
+              <div class="section">
+                <div class="title">
+                  <span class="icon" id="autogen-lane-icon"></span>
+                  <h2>AutoGen</h2>
+                </div>
+                <div class="note">Planner and team execution</div>
+              </div>
+              <div class="stack" id="autogen-runs-list"></div>
+            </div>
+            <div>
+              <div class="section">
+                <div class="title">
+                  <span class="icon" id="browser-lane-icon"></span>
+                  <h2>Browser-use</h2>
+                </div>
+                <div class="note">Browser tasks and deep research</div>
+              </div>
+              <div class="health" id="browser-health-summary">Waiting for browser health.</div>
+              <div class="stack" id="browser-runs-list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
 
+      <section class="panel">
+        <div class="inner">
+          <div class="section">
+            <div class="title">
+              <span class="icon" id="mind-icon"></span>
+              <h2>Reflective And Task Loops</h2>
+            </div>
+            <div class="note">Step-aware monitoring for internal reasoning systems</div>
+          </div>
+          <div class="cols2">
+            <div>
+              <div class="section">
+                <div class="title">
+                  <span class="icon" id="philosopher-lane-icon"></span>
+                  <h2>Philosopher</h2>
+                </div>
+                <div class="note">Contemplation workflow</div>
+              </div>
+              <div class="stack" id="philosopher-runs-list"></div>
+            </div>
+            <div>
+              <div class="section">
+                <div class="title">
+                  <span class="icon" id="task-lane-icon"></span>
+                  <h2>Task Execution</h2>
+                </div>
+                <div class="note">Loop state and iteration count</div>
+              </div>
+              <div class="stack" id="task-execution-runs-list"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="inner">
+          <div class="section">
+            <div class="title">
+              <span class="icon" id="browser-log-lane-icon"></span>
+              <h2>Browser-use Log Tail</h2>
+            </div>
+            <div class="note" id="browser-logs-hint">Last lines from `BROWSER_USE_LOG_FILE` when configured</div>
+          </div>
+          <div class="logbox">
+            <div class="loghead">
+              <div class="logtitle">
+                <span class="icon" id="browser-log-icon"></span>
+                Browser-use log tail
+              </div>
+              <div class="logstatus" id="browser-log-status">Waiting for log configuration</div>
+            </div>
+            <div class="logs" id="browser-logs-list"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
   <script>
-    const summaryEl = {
-      uptime: document.getElementById('uptime'),
-      memory: document.getElementById('memory-status'),
-      telegramTools: document.getElementById('telegram-tools-status'),
-      openaiKey: document.getElementById('openai-key-status'),
-      sessions: document.getElementById('active-sessions')
+    const POLL_MS = 15000;
+    let latestWorkflows = null;
+    const openRunLogs = new Set();
+    const runLogCache = new Map();
+    const ICONS = {
+      activity: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h3l2.2-5 4.1 10 2.2-5H20"/></svg>',
+      chip: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/><path d="M9 6V4M15 6V4M9 20v-2M15 20v-2"/></svg>',
+      telegram: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 4L3 11l6 2 2 6 10-15z"/><path d="M9 13l4-4"/></svg>',
+      key: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="3"/><path d="M10.5 13.5L20 4m-3 0h3v3"/></svg>',
+      session: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18h10"/><path d="M6 6h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z"/></svg>',
+      autogen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 4v10l-7 4-7-4V7l7-4z"/><path d="M12 7v10M8 9l8 6M16 9l-8 6"/></svg>',
+      browser: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 18 0A9 9 0 0 0 3 12z"/><path d="M3.6 9h16.8M3.6 15h16.8M12 3.4c2.3 2.3 3.6 5.4 3.6 8.6S14.3 18.3 12 20.6C9.7 18.3 8.4 15.2 8.4 12S9.7 5.7 12 3.4z"/></svg>',
+      philosopher: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a5 5 0 0 1 5 5c0 1.8-.8 3.1-2.1 4.3-.9.8-1.4 1.5-1.4 2.7h-3c0-1.6.7-3 1.8-4 1-.9 1.7-1.6 1.7-3A2 2 0 0 0 10 8"/><path d="M9 19h6"/><path d="M10 22h4"/></svg>',
+      task: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h11"/></svg>',
+      timeline: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v18"/><circle cx="6" cy="7" r="2"/><circle cx="18" cy="12" r="2"/><circle cx="10" cy="18" r="2"/><path d="M8 7h8m-6 11h6"/></svg>',
+      logs: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18h10"/><path d="M7 14h10"/><path d="M7 10h10"/><path d="M7 6h10"/><rect x="4" y="3" width="16" height="18" rx="2"/></svg>',
+      pulse: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h4l2-4 4 8 2-4h4"/></svg>',
+      empty: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5h.01M14.5 9.5h.01"/><path d="M9 15c1-.8 1.9-1.2 3-1.2s2 .4 3 1.2"/></svg>'
     };
-    const eventsList = document.getElementById('events-list');
-    const logsList = document.getElementById('logs-list');
-    const logsHint = document.getElementById('logs-hint');
-    const refreshIndicator = document.getElementById('refresh-indicator');
 
-    function formatDuration(seconds) {
-      const hrs = Math.floor(seconds / 3600);
-      const mins = Math.floor((seconds % 3600) / 60);
-      const secs = Math.floor(seconds % 60);
-      return `${hrs}h ${mins}m ${secs}s`;
+    function esc(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
-    async function fetchSummary() {
-      const resp = await fetch('/monitor/summary');
-      if (!resp.ok) return;
-      const data = await resp.json();
-      summaryEl.uptime.textContent = formatDuration(data.uptime_seconds || 0);
-      summaryEl.memory.textContent = data.memory_available ? 'Available' : 'Unavailable';
-      summaryEl.telegramTools.textContent = data.telegram_tools_enabled ? 'Enabled' : 'Disabled';
-      summaryEl.openaiKey.textContent = data.openai_api_key_configured ? 'Configured' : 'Missing';
-      summaryEl.sessions.textContent = data.status_sessions_active ?? 0;
+    function icon(id, name) {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = ICONS[name] || ICONS.pulse;
+    }
+
+    function titleIcon(id, name, label) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.innerHTML = `<span class="icon">${ICONS[name] || ICONS.chip}</span><strong>${esc(label)}</strong>`;
+    }
+
+    function fmtDur(seconds) {
+      if (!Number.isFinite(seconds) || seconds < 1) return "<1s";
+      const total = Math.round(seconds);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h) return `${h}h ${m}m`;
+      if (m) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    function timeLabel(value) {
+      if (!value) return "Unknown time";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return esc(value);
+      return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    }
+
+    function stamp(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    }
+
+    function statusInfo(status) {
+      const s = String(status || "").toLowerCase();
+      if (s === "running") return { cls: "running", label: "Running" };
+      if (s === "completed") return { cls: "done", label: "Completed" };
+      if (s.includes("paused") || s.includes("feedback")) return { cls: "warn", label: "Awaiting input" };
+      if (s.includes("error") || s === "failed") return { cls: "error", label: "Error" };
+      return { cls: "idle", label: "Idle" };
+    }
+
+    function progressPct(run) {
+      const meta = run.metadata || {};
+      const current = Number(meta.current_step);
+      const total = Number(meta.total_steps);
+      if (Number.isFinite(current) && Number.isFinite(total) && total > 0) {
+        return Math.max(0, Math.min(100, (current / total) * 100));
+      }
+      if ((run.status || "") === "running") return 38;
+      if ((run.status || "") === "completed") return 100;
+      if (String(run.status || "").includes("paused")) return 72;
+      return 12;
+    }
+
+    function progressLabel(run) {
+      const meta = run.metadata || {};
+      const current = meta.current_step;
+      const total = meta.total_steps;
+      if (current != null && total != null) return `Step ${current}/${total}`;
+      if (run.duration_ms != null) return `Elapsed ${fmtDur(run.duration_ms / 1000)}`;
+      return run.kind || "Workflow";
+    }
+
+    function stageIndex(run) {
+      const status = String(run.status || "").toLowerCase();
+      if (status === "completed") return 3;
+      if (status.includes("paused") || status.includes("feedback")) return 2;
+      if (status === "running") return 1;
+      return 0;
+    }
+
+    function stageHtml(run) {
+      const labels = ["Queued", "Active", "Review", "Done"];
+      const index = stageIndex(run);
+      return labels.map((label, i) => {
+        const cls = i < index ? "stage done" : i === index ? "stage on" : "stage";
+        return `<div class="${cls}">${label}</div>`;
+      }).join("");
+    }
+
+    function runTitle(run) {
+      const meta = run.metadata || {};
+      return meta.workflow_name || run.input_preview || run.kind || "Workflow run";
+    }
+
+    function runSub(run) {
+      const meta = run.metadata || {};
+      const parts = [];
+      if (meta.phase) parts.push(meta.phase);
+      if (meta.task_id != null) parts.push(`Task ${meta.task_id}`);
+      if (meta.conversation_id) parts.push(`Conversation ${meta.conversation_id}`);
+      if (meta.user_key) parts.push(`User ${meta.user_key}`);
+      if (run.started_at) parts.push(`Started ${stamp(run.started_at)}`);
+      return parts.join(" | ") || "No extra metadata";
+    }
+
+    function metrics(run) {
+      const meta = run.metadata || {};
+      const items = [];
+      if (meta.current_step != null && meta.total_steps != null) items.push(`Step <strong>${esc(meta.current_step)}/${esc(meta.total_steps)}</strong>`);
+      if (run.kind) items.push(`Kind <strong>${esc(run.kind)}</strong>`);
+      if (meta.tool_call_count != null) items.push(`Tools <strong>${esc(meta.tool_call_count)}</strong>`);
+      if (run.duration_ms != null) items.push(`Duration <strong>${esc(fmtDur(run.duration_ms / 1000))}</strong>`);
+      if (items.length === 0) items.push(`Status <strong>${esc(statusInfo(run.status).label)}</strong>`);
+      return items.map((item) => `<span class="pill">${item}</span>`).join("");
+    }
+
+    function emptyState(message) {
+      return `<div class="empty">${ICONS.empty}<div>${esc(message)}</div></div>`;
+    }
+
+    function setRefreshState(state, text) {
+      const wrap = document.querySelector(".refresh");
+      const indicator = document.getElementById("refresh-indicator");
+      if (wrap) wrap.className = `refresh${state ? ` ${state}` : ""}`;
+      if (indicator && text) indicator.textContent = text;
+    }
+
+    function runIconName(agent) {
+      if (agent === "browser_use") return "browser";
+      if (agent === "philosopher") return "philosopher";
+      if (agent === "task_execution") return "task";
+      return "autogen";
+    }
+
+    function runLogMetaText(logData) {
+      if (!logData) return "Waiting for log data.";
+      if (!logData.available) return "Log file is not available.";
+      const parts = [];
+      if (logData.path) parts.push(logData.path);
+      if (logData.truncated) parts.push("truncated for dashboard response");
+      return parts.join(" | ") || "Scratch log available.";
+    }
+
+    function renderRunLogViewer(run) {
+      const hasKnownLog = Boolean(run.log_file);
+      const isOpen = openRunLogs.has(run.id);
+      if (!hasKnownLog && !isOpen) return "";
+      const logData = runLogCache.get(run.id) || null;
+      const buttonLabel = isOpen ? "Hide conversation" : "View conversation";
+      const meta = logData && logData.available
+        ? `<div class="run-log-box">
+            <div class="run-log-head">
+              <div class="run-log-title">Full team conversation</div>
+              <div class="run-log-meta">${esc(runLogMetaText(logData))}</div>
+            </div>
+            <pre class="run-log-content">${esc(logData.content || "")}</pre>
+          </div>`
+        : isOpen
+          ? `<div class="run-log-box">
+              <div class="run-log-head">
+                <div class="run-log-title">Full team conversation</div>
+                <div class="run-log-meta">${esc(runLogMetaText(logData))}</div>
+              </div>
+              <div class="run-log-empty">${esc(logData && logData.error ? logData.error : "Loading conversation log...")}</div>
+            </div>`
+          : "";
+      return `
+        <div class="run-log-tools">
+          <button type="button" class="run-log-btn" data-run-log-toggle="${esc(run.id)}">${esc(buttonLabel)}</button>
+          ${run.log_file ? `<span class="run-log-path">${esc(run.log_file)}</span>` : ""}
+        </div>
+        ${meta}
+      `;
+    }
+
+    function renderWorkflowRuns() {
+      const data = latestWorkflows || {};
+      renderRuns("autogen-runs-list", data.autogen || {}, "autogen");
+      renderRuns("browser-runs-list", data.browser_use || {}, "browser_use");
+      renderRuns("philosopher-runs-list", data.philosopher || {}, "philosopher");
+      renderRuns("task-execution-runs-list", data.task_execution || {}, "task_execution");
+    }
+
+    function renderRuns(targetId, payload, agent) {
+      const el = document.getElementById(targetId);
+      if (!el) return;
+      const recent = Array.isArray(payload && payload.recent) ? payload.recent : [];
+      if (!recent.length) {
+        el.innerHTML = emptyState(`No recent ${agent.replace("_", " ")} activity.`);
+        return;
+      }
+      el.innerHTML = recent.map((run) => {
+        const stat = statusInfo(run.status);
+        const width = progressPct(run);
+        const summary = run.summary || "No summary available yet.";
+        const logPreview = Array.isArray(run.log_excerpt) && run.log_excerpt.length
+          ? `<div class="timeline">${run.log_excerpt.slice(-3).map((line) => `<div class="t-item">${esc(line)}</div>`).join("")}</div>`
+          : "";
+        return `
+          <article class="card">
+            <div class="top">
+              <div class="left">
+                <div class="run-icon">${ICONS[runIconName(agent)] || ICONS.autogen}</div>
+                <div>
+                  <h3 class="run-title">${esc(runTitle(run))}</h3>
+                  <div class="run-sub">${esc(runSub(run))}</div>
+                </div>
+              </div>
+              <div class="badge ${stat.cls}">${esc(stat.label)}</div>
+            </div>
+            <div class="summary">${esc(summary)}</div>
+            <div class="metrics">${metrics(run)}</div>
+            <div>
+              <div class="p-head">
+                <span>${esc(progressLabel(run))}</span>
+                <span>${Math.round(width)}%</span>
+              </div>
+              <div class="track"><span style="width:${width}%"></span></div>
+            </div>
+            <div class="stages">${stageHtml(run)}</div>
+            ${logPreview}
+            ${renderRunLogViewer(run)}
+          </article>
+        `;
+      }).join("");
     }
 
     function renderEvents(events) {
-      if (!events.length) {
-        eventsList.textContent = 'No status events yet.';
+      const el = document.getElementById("events-list");
+      if (!el) return;
+      if (!Array.isArray(events) || !events.length) {
+        el.innerHTML = emptyState("No recent status events have been published.");
         return;
       }
-      eventsList.innerHTML = '';
-      events.slice().reverse().forEach(ev => {
-        const item = document.createElement('div');
-        item.className = 'event';
-        const meta = document.createElement('div');
-        meta.className = 'meta';
-        const iso = ev.iso || new Date((ev.ts || 0) * 1000).toISOString();
-        meta.textContent = `${iso} • ${ev.channel || 'unknown'} • ${ev.request_id || 'n/a'}`;
-        const state = document.createElement('div');
-        state.className = 'state';
-        state.textContent = ev.state || '(no state)';
-        item.appendChild(meta);
-        item.appendChild(state);
-        eventsList.appendChild(item);
-      });
+      el.innerHTML = [...events].reverse().map((event) => {
+        const text = event.status_text || event.message || event.status || event.state || "Status event";
+        const source = event.source || event.type || event.channel || "proxy";
+        const detail = [source, event.user || event.user_key || null].filter(Boolean).join(" | ");
+        return `
+          <div class="event">
+            <div class="e-time">${esc(timeLabel(event.iso || event.ts || event.timestamp))}</div>
+            <div class="e-card">
+              <div class="e-meta">${esc(detail || "system event")}</div>
+              <div class="e-state">${esc(text)}</div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderLogs(targetId, hintId, statusId, payload, emptyMessage) {
+      const el = document.getElementById(targetId);
+      const hint = document.getElementById(hintId);
+      const status = document.getElementById(statusId);
+      if (!el) return;
+      if (!payload || !payload.available) {
+        el.innerHTML = emptyState(emptyMessage);
+        if (status) status.textContent = "Unavailable";
+        if (hint && payload && payload.path) hint.textContent = payload.path;
+        return;
+      }
+      const lines = Array.isArray(payload.lines) ? payload.lines : [];
+      el.innerHTML = lines.length
+        ? lines.map((line) => `<span class="logline">${esc(line)}</span>`).join("")
+        : emptyState("Log file is configured but currently empty.");
+      if (status) status.textContent = `${lines.length} lines loaded`;
+      if (hint && payload.path) hint.textContent = payload.path;
+    }
+
+    function setChip(idPrefix, value, sub, badgeText, badgeCls, meterPct, headline) {
+      const valueEl = document.getElementById(`${idPrefix}-value`) || document.getElementById(`${idPrefix}`);
+      const subEl = document.getElementById(`${idPrefix}-sub`);
+      const badgeEl = document.getElementById(`${idPrefix}-badge`);
+      const meterEl = document.getElementById(`${idPrefix}-meter`);
+      const headEl =
+        document.getElementById(`${idPrefix}-status`) ||
+        document.getElementById(idPrefix === "telegram" ? "telegram-tools-status" : "") ||
+        document.getElementById(idPrefix === "openai" ? "openai-key-status" : "") ||
+        document.getElementById(idPrefix === "session" ? "active-sessions" : "");
+      if (valueEl) valueEl.textContent = value;
+      if (subEl) subEl.textContent = sub;
+      if (badgeEl) {
+        badgeEl.className = `badge ${badgeCls}`;
+        badgeEl.textContent = badgeText;
+      }
+      if (meterEl) meterEl.style.width = `${Math.max(0, Math.min(100, meterPct))}%`;
+      if (headEl) headEl.textContent = headline;
+    }
+
+    async function fetchJson(url) {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) throw new Error(`${url} failed with ${response.status}`);
+      return response.json();
+    }
+
+    async function fetchSummary() {
+      const data = await fetchJson("/monitor/summary");
+      document.getElementById("uptime").textContent = fmtDur(data.uptime_seconds || 0);
+      document.getElementById("uptime-caption").textContent = `Last refresh ${timeLabel(Date.now())}`;
+      document.getElementById("top-meta").textContent =
+        `Events file: ${data.status_events_file || "unknown"} | Browser log file ${data.browser_use_log_file_configured ? "configured" : "not configured"}`;
+
+      setChip(
+        "memory",
+        data.memory_available ? "Online" : "Offline",
+        data.memory_available ? "Memory features are available to the proxy." : "Memory tooling is disabled or unavailable.",
+        data.memory_available ? "Ready" : "Unavailable",
+        data.memory_available ? "done" : "error",
+        data.memory_available ? 100 : 8,
+        `Memory: ${data.memory_available ? "available" : "unavailable"}`
+      );
+      setChip(
+        "telegram",
+        data.telegram_tools_enabled ? "Enabled" : "Disabled",
+        data.telegram_tools_enabled ? "Telegram tools can be invoked by the proxy." : "Telegram tooling is currently disabled.",
+        data.telegram_tools_enabled ? "Enabled" : "Disabled",
+        data.telegram_tools_enabled ? "done" : "idle",
+        data.telegram_tools_enabled ? 100 : 10,
+        `Telegram tools: ${data.telegram_tools_enabled ? "enabled" : "disabled"}`
+      );
+      setChip(
+        "openai",
+        data.openai_api_key_configured ? "Configured" : "Missing",
+        data.openai_api_key_configured ? "Primary model key is configured." : "No API key was detected in the current environment.",
+        data.openai_api_key_configured ? "Ready" : "Missing",
+        data.openai_api_key_configured ? "done" : "error",
+        data.openai_api_key_configured ? 100 : 6,
+        `Model key: ${data.openai_api_key_configured ? "configured" : "missing"}`
+      );
+
+      const sessions = Number(data.status_sessions_active || 0);
+      setChip(
+        "session",
+        String(sessions),
+        sessions ? `${sessions} active status session${sessions === 1 ? "" : "s"} connected.` : "No active status sessions right now.",
+        sessions ? "Active" : "Idle",
+        sessions ? "running" : "idle",
+        Math.min(100, sessions * 18),
+        `Sessions: ${sessions}`
+      );
+
+      const agents = [
+        ["autogen", Number(data.autogen_active_runs || 0), "AutoGen orchestration"],
+        ["browser", Number(data.browser_use_active_runs || 0), "Browser automation"],
+        ["philosopher", Number(data.philosopher_active_runs || 0), "Reflective workflow"],
+        ["task", Number(data.task_execution_active_runs || 0), "Task execution"]
+      ];
+      for (const [key, count, label] of agents) {
+        const isActive = count > 0;
+        const base = key === "browser" ? "browser" : key;
+        const valueId = key === "browser" ? "browser-use-active-runs" : key === "task" ? "task-execution-active-runs" : `${key}-active-runs`;
+        const valueEl = document.getElementById(valueId);
+        if (valueEl) valueEl.textContent = String(count);
+        const subEl = document.getElementById(`${base}-sub`);
+        if (subEl) subEl.textContent = isActive ? `${count} active run${count === 1 ? "" : "s"} in progress.` : `${label} is idle.`;
+        const badgeEl = document.getElementById(`${base}-badge`);
+        if (badgeEl) {
+          badgeEl.className = `badge ${isActive ? "running" : "idle"}`;
+          badgeEl.textContent = isActive ? "Active" : "Idle";
+        }
+        const meterEl = document.getElementById(`${base}-meter`);
+        if (meterEl) meterEl.style.width = `${isActive ? Math.min(100, 28 + count * 18) : 0}%`;
+      }
     }
 
     async function fetchEvents() {
-      const resp = await fetch('/monitor/status?limit=50');
-      if (!resp.ok) return;
-      const data = await resp.json();
-      renderEvents(Array.isArray(data.events) ? data.events : []);
+      const data = await fetchJson("/monitor/status?limit=24");
+      renderEvents(data.events || []);
     }
 
     async function fetchLogs() {
-      const resp = await fetch('/monitor/logs?limit=200');
-      if (!resp.ok) return;
-      const data = await resp.json();
-      if (!data.available) {
-        logsList.textContent = 'Proxy log file not configured.';
-        logsHint.style.display = 'block';
-        return;
+      const data = await fetchJson("/monitor/logs?limit=120");
+      renderLogs("logs-list", "logs-hint", "proxy-log-status", data, "Proxy log file is not configured.");
+    }
+
+    async function fetchBrowserLogs() {
+      const data = await fetchJson("/monitor/logs/browser-use?limit=120");
+      renderLogs("browser-logs-list", "browser-logs-hint", "browser-log-status", data, "Browser-use log file is not configured or not present.");
+    }
+
+    async function fetchRunLogData(runId) {
+      try {
+        runLogCache.set(runId, { available: false, content: "", truncated: false, path: "", loading: true });
+        const data = await fetchJson(`/monitor/workflows/log/${encodeURIComponent(runId)}`);
+        runLogCache.set(runId, data);
+      } catch (error) {
+        runLogCache.set(runId, {
+          available: false,
+          content: "",
+          truncated: false,
+          path: "",
+          error: error && error.message ? error.message : "Failed to load workflow log.",
+        });
       }
-      logsHint.style.display = 'none';
-      logsList.innerHTML = '';
-      data.lines.forEach(line => {
-        const div = document.createElement('div');
-        div.className = 'log-line';
-        div.textContent = line;
-        logsList.appendChild(div);
-      });
+    }
+
+    async function fetchWorkflows() {
+      const data = await fetchJson("/monitor/workflows");
+      latestWorkflows = data;
+      renderWorkflowRuns();
+
+      if (openRunLogs.size) {
+        await Promise.all([...openRunLogs].map((runId) => fetchRunLogData(runId)));
+        renderWorkflowRuns();
+      }
+
+      const health = data.browser_use && data.browser_use.health ? data.browser_use.health : null;
+      const healthEl = document.getElementById("browser-health-summary");
+      if (healthEl) {
+        if (health) {
+          const checked = health.checked_at ? `Checked ${stamp(health.checked_at)}` : "Not checked yet";
+          const result = health.result ? `Status: ${health.result.status || "unknown"}${health.result.running_tasks != null ? ` | Running tasks: ${health.result.running_tasks}` : ""}` : "No result payload.";
+          healthEl.textContent = `${health.message || "Browser-use health snapshot available."} ${result} ${checked}`;
+        } else {
+          healthEl.textContent = "Browser-use health has not been checked yet.";
+        }
+      }
+    }
+
+    function seedEmptyPanels() {
+      latestWorkflows = {
+        autogen: { recent: [] },
+        browser_use: { recent: [] },
+        philosopher: { recent: [] },
+        task_execution: { recent: [] }
+      };
+      renderWorkflowRuns();
+      renderEvents([]);
+      renderLogs("logs-list", "logs-hint", "proxy-log-status", { available: false, lines: [] }, "Proxy log file is not configured.");
+      renderLogs("browser-logs-list", "browser-logs-hint", "browser-log-status", { available: false, lines: [] }, "Browser-use log file is not configured or not present.");
     }
 
     async function refreshAll() {
-      refreshIndicator.textContent = 'Refreshing…';
-      await Promise.all([fetchSummary(), fetchEvents(), fetchLogs()]);
-      refreshIndicator.textContent = 'Live';
+      setRefreshState("", "Refreshing");
+      const jobs = [
+        ["summary", fetchSummary()],
+        ["events", fetchEvents()],
+        ["logs", fetchLogs()],
+        ["workflows", fetchWorkflows()],
+        ["browserLogs", fetchBrowserLogs()]
+      ];
+      const results = await Promise.allSettled(jobs.map(([, promise]) => promise));
+      const failed = [];
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          failed.push(jobs[index][0]);
+          console.error(`${jobs[index][0]} refresh failed`, result.reason);
+        }
+      });
+      if (!failed.length) {
+        setRefreshState("", `Updated ${timeLabel(Date.now())}`);
+      } else if (failed.length < jobs.length) {
+        setRefreshState("warn", `Partial update | ${failed.join(", ")} unavailable`);
+      } else {
+        setRefreshState("fail", "Refresh failed");
+      }
     }
 
+    function initIcons() {
+      icon("overview-icon", "activity");
+      icon("event-icon", "timeline");
+      icon("workflow-icon", "autogen");
+      icon("mind-icon", "philosopher");
+      icon("proxy-log-icon", "logs");
+      icon("log-icon", "logs");
+      icon("browser-log-lane-icon", "browser");
+      icon("browser-log-icon", "logs");
+      icon("autogen-lane-icon", "autogen");
+      icon("browser-lane-icon", "browser");
+      icon("philosopher-lane-icon", "philosopher");
+      icon("task-lane-icon", "task");
+
+      titleIcon("memory-title", "chip", "Memory");
+      titleIcon("telegram-title", "telegram", "Telegram Tools");
+      titleIcon("openai-title", "key", "Model Key");
+      titleIcon("session-title", "session", "Sessions");
+      titleIcon("autogen-title", "autogen", "AutoGen");
+      titleIcon("browser-title", "browser", "Browser-use");
+      titleIcon("philosopher-title", "philosopher", "Philosopher");
+      titleIcon("task-title", "task", "Task Execution");
+    }
+
+    document.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-run-log-toggle]");
+      if (!button) return;
+      const runId = button.getAttribute("data-run-log-toggle");
+      if (!runId) return;
+      if (openRunLogs.has(runId)) {
+        openRunLogs.delete(runId);
+        renderWorkflowRuns();
+        return;
+      }
+      openRunLogs.add(runId);
+      renderWorkflowRuns();
+      await fetchRunLogData(runId);
+      renderWorkflowRuns();
+    });
+
+    initIcons();
+    seedEmptyPanels();
     refreshAll();
-    setInterval(refreshAll, 15000);
+    setInterval(refreshAll, POLL_MS);
   </script>
 </body>
 </html>

@@ -1,6 +1,6 @@
 {
   "name": "filesystem",
-  "description": "Root-sandboxed file listing and text file operations.",
+  "description": "Root-sandboxed file listing, reading, writing, and search operations.",
   "enabled": true,
   "module": "src.skills.builtin.filesystem_skill:create_skill",
   "settings": {

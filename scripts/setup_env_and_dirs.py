@@ -21,12 +21,10 @@ EXAMPLE_PREFIX_POSIX = "/home/user/AI_assistant"
 
 # Env vars that contain paths we substitute with project root
 PATH_ENV_VARS = frozenset({
-    "MCP_RESEARCH_TOOL_SAVE_DIR",
-    "MCP_AGENT_TOOL_SAVE_RECORDING_PATH",
-    "MCP_AGENT_TOOL_HISTORY_PATH",
-    "MCP_PATHS_DOWNLOADS",
-    "MCP_SERVER_LOG_FILE",
-    "MCP_BROWSER_TRACE_PATH",
+    "MCP_RESEARCH_SAVE_DIRECTORY",
+    "MCP_BROWSER_USER_DATA_DIR",
+    "MCP_SERVER_RESULTS_DIR",
+    "MCP_SKILLS_DIRECTORY",
 })
 
 # Directories to create under project root (align with proxy and .env)

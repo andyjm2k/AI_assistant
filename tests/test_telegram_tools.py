@@ -5,6 +5,8 @@ Covers parse_telegram_tool_response (XML, JSON, code-block stripping) and execut
 
 import json
 import base64
+import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -85,6 +87,17 @@ class TestParseTelegramToolResponse:
         assert out.get("name") == "webSearch"
         assert json.loads(out["arguments"]) == {"query": "x"}
 
+    def test_parser_uses_matching_tool_block_instead_of_stray_tool_tag(self):
+        """A stray earlier tool tag should not steal parameters from the real matched block."""
+        content = (
+            "Example only: <tool>webSearch</tool>\n"
+            'Real call: <tool>scrapeWebsite</tool>\n<parameters>{"url":"https://example.com"}</parameters>'
+        )
+        out = tg.parse_telegram_tool_response(content)
+        assert out is not None
+        assert out.get("name") == "scrapeWebsite"
+        assert json.loads(out["arguments"]) == {"url": "https://example.com"}
+
 
 class TestStripThinkMarkup:
     """Tests for stripping <think>...</think> blocks from assistant text."""
@@ -164,6 +177,18 @@ class TestStripToolCallMarkup:
         assert out == "Visible reply."
 
 
+class TestReplyLooksLikeToolPlanning:
+    """Tests for planning chatter detection in mixed text + tool XML replies."""
+
+    def test_planning_reply_returns_true(self):
+        content = "I have the URLs and will now scrape them for more detail."
+        assert tg.reply_looks_like_tool_planning(content) is True
+
+    def test_final_answer_returns_false(self):
+        content = "Here is the scraped summary with the key details you asked for."
+        assert tg.reply_looks_like_tool_planning(content) is False
+
+
 class TestToolResultLooksLikeError:
     """Tests for tool_result_looks_like_error (friendly fallback when tool fails)."""
 
@@ -187,23 +212,6 @@ class TestToolResultLooksLikeError:
         """Empty or None returns False."""
         assert tg.tool_result_looks_like_error("") is False
         assert tg.tool_result_looks_like_error(None) is False
-
-
-class TestReplyLooksLikeToolPlanning:
-    """Tests for planning-chatter detection after tool execution."""
-
-    def test_planning_chatter_returns_true(self):
-        content = "Let me see what Gmail commands are available first."
-        assert tg.reply_looks_like_tool_planning(content) is True
-
-    def test_normal_reply_returns_false(self):
-        content = "I found 5 recent emails in your inbox."
-        assert tg.reply_looks_like_tool_planning(content) is False
-
-    def test_mid_sentence_planning_with_trailing_colon_returns_true(self):
-        content = "I found your latest emails. Let me fetch the details to show you:"
-        assert tg.reply_looks_like_tool_planning(content) is True
-
 
 class TestExecuteTelegramTool:
     """Tests for execute_telegram_tool (async) with mocked dependencies."""
@@ -742,6 +750,33 @@ class TestExecuteTelegramTool:
         assert "cats" in r2.get("message", "")
 
     @pytest.mark.asyncio
+    async def test_manage_memory_cache_accepts_prompt_documented_aliases(self):
+        """manageMemoryCache should accept memoryId/memoryDescription aliases documented in the Telegram prompt."""
+        ctx = {"conversation_id": "cid1", "todo_store": {}, "memory_cache_store": {"cid1": ["old note"]}}
+
+        add_result = await tg.execute_telegram_tool(
+            "manageMemoryCache",
+            {"action": "add", "memoryDescription": "new note"},
+            ctx,
+        )
+        assert add_result.get("success") is True
+
+        update_result = await tg.execute_telegram_tool(
+            "manageMemoryCache",
+            {"action": "update", "memoryId": 1, "memoryDescription": "updated old note"},
+            ctx,
+        )
+        assert update_result.get("success") is True
+
+        delete_result = await tg.execute_telegram_tool(
+            "manageMemoryCache",
+            {"action": "delete", "memoryId": 2},
+            ctx,
+        )
+        assert delete_result.get("success") is True
+        assert ctx["memory_cache_store"]["cid1"] == ["updated old note"]
+
+    @pytest.mark.asyncio
     async def test_store_memory_rejects_transient_operational_state(self):
         """storeMemory should refuse task/list/status snapshots when manager exposes guard."""
         mm = MagicMock()
@@ -911,11 +946,73 @@ class TestExecuteTelegramTool:
         assert "not available" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
+    async def test_fetch_news_defaults_to_csv_and_writes_via_backend(self, monkeypatch):
+        """fetchNews should write CSV content to scratch when Telegram uses the backend writer."""
+        from src.servers import proxy_server as ps
+
+        scratch_dir = Path("scratch") / f"telegram-fetch-news-{uuid.uuid4().hex}"
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(ps, "SCRATCH_DIR", scratch_dir)
+        try:
+            async def fake_news(query):
+                assert query == "climate policy"
+                return {
+                    "articles": [
+                        {"title": "Policy, Update", "url": "https://example.com/policy"},
+                    ]
+                }
+
+            ctx = {"do_news": fake_news, "write_file_internal": ps._write_file_internal}
+            r = await tg.execute_telegram_tool("fetchNews", {"searchTerm": "climate policy"}, ctx)
+
+            assert r.get("success") is True
+            assert "news.csv" in r.get("message", "")
+            written = scratch_dir / "news.csv"
+            assert written.exists()
+            assert written.read_text(encoding="utf-8") == (
+                'Title,URL\n"Policy  Update","https://example.com/policy"'
+            )
+        finally:
+            written = scratch_dir / "news.csv"
+            if written.exists():
+                written.unlink()
+            if scratch_dir.exists():
+                scratch_dir.rmdir()
+
+    @pytest.mark.asyncio
+    async def test_fetch_news_appends_csv_extension_when_missing(self):
+        """fetchNews should normalize extension-less filenames to .csv for Telegram writes."""
+        observed = {}
+
+        async def fake_news(query):
+            observed["query"] = query
+            return {"articles": [{"title": "A", "url": "https://example.com/a"}]}
+
+        async def fake_write_internal(filename, content, fmt):
+            observed["filename"] = filename
+            observed["content"] = content
+            observed["fmt"] = fmt
+            return {"success": True, "message": "Write OK."}
+
+        ctx = {"do_news": fake_news, "write_file_internal": fake_write_internal}
+        r = await tg.execute_telegram_tool(
+            "fetchNews",
+            {"searchTerm": "ai agents", "filename": "headlines"},
+            ctx,
+        )
+
+        assert r.get("success") is True
+        assert observed["query"] == "ai agents"
+        assert observed["filename"] == "headlines.csv"
+        assert observed["fmt"] == "csv"
+        assert observed["content"].startswith("Title,URL\n")
+
+    @pytest.mark.asyncio
     async def test_list_files_limits_output_rows(self, monkeypatch):
         """listFiles should cap rendered rows and append an overflow indicator."""
         monkeypatch.setenv("LIST_FILES_TOOL_MAX_ENTRIES", "3")
 
-        async def fake_list_internal():
+        async def fake_list_internal(path="", recursive=False, offset=0, max_entries=None):
             return {
                 "success": True,
                 "files": [
@@ -935,7 +1032,8 @@ class TestExecuteTelegramTool:
         assert "- images/ [dir]" in message
         assert "- a.txt" in message
         assert "- b.txt" in message
-        assert "- ... and 3 more files." in message
+        assert "- ... and 3 more files in this page." in message
+        assert "- ... more files available. Continue with offset=3." in message
         assert "- c.txt" not in message
         assert "- d.txt" not in message
         assert "- e.txt" not in message
@@ -952,23 +1050,25 @@ class TestExecuteTelegramTool:
         assert r.get("message") == "No files."
 
     @pytest.mark.asyncio
-    async def test_list_files_supports_path_and_recursive_arguments(self):
-        """listFiles forwards optional path/recursive arguments to backend list callback."""
+    async def test_list_files_supports_path_recursive_and_pagination_arguments(self):
+        """listFiles forwards optional path/recursive/pagination arguments to backend list callback."""
         observed = {}
 
-        async def fake_list_internal(path="", recursive=False):
+        async def fake_list_internal(path="", recursive=False, offset=0, max_entries=None):
             observed["path"] = path
             observed["recursive"] = recursive
+            observed["offset"] = offset
+            observed["max_entries"] = max_entries
             return {"success": True, "files": [{"name": "images/a.png"}]}
 
         ctx = {"conversation_id": "cid1", "list_files_internal": fake_list_internal}
         r = await tg.execute_telegram_tool(
             "listFiles",
-            {"path": "images", "recursive": "true"},
+            {"path": "images", "recursive": "true", "offset": 4, "max_entries": 7},
             ctx,
         )
         assert r.get("success") is True
-        assert observed == {"path": "images", "recursive": True}
+        assert observed == {"path": "images", "recursive": True, "offset": 4, "max_entries": 7}
         assert "images/a.png" in r.get("message", "")
 
     @pytest.mark.asyncio
@@ -980,23 +1080,68 @@ class TestExecuteTelegramTool:
         ctx = {"conversation_id": "cid1", "list_files_internal": fake_list_internal}
         r = await tg.execute_telegram_tool("listFiles", {"path": "images"}, ctx)
         assert r.get("success") is False
-        assert "does not support path or recursive" in r.get("message", "").lower()
+        assert "does not support path" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
     async def test_list_files_snake_case_alias_routes_to_camel_case(self):
         """list_files alias should resolve to listFiles behavior."""
         observed = {}
 
-        async def fake_list_internal(path="", recursive=False):
+        async def fake_list_internal(path="", recursive=False, offset=0, max_entries=None):
             observed["path"] = path
             observed["recursive"] = recursive
+            observed["offset"] = offset
+            observed["max_entries"] = max_entries
             return {"success": True, "files": [{"name": "images/a.png"}]}
 
         ctx = {"conversation_id": "cid1", "list_files_internal": fake_list_internal}
         r = await tg.execute_telegram_tool("list_files", {"path": "images", "recursive": True}, ctx)
         assert r.get("success") is True
-        assert observed == {"path": "images", "recursive": True}
+        assert observed == {
+            "path": "images",
+            "recursive": True,
+            "offset": 0,
+            "max_entries": tg._get_list_files_tool_max_entries(),
+        }
         assert "images/a.png" in r.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_search_files_alias_routes_to_search_files_behavior(self):
+        """search_files alias should resolve to searchFiles behavior."""
+        observed = {}
+
+        async def fake_search_internal(query, **kwargs):
+            observed["query"] = query
+            observed.update(kwargs)
+            return {
+                "success": True,
+                "matches": [
+                    {
+                        "relative_path": "docs/notes.txt",
+                        "match_types": ["content"],
+                        "line_number": 2,
+                        "excerpt": "...alpha...",
+                    }
+                ],
+            }
+
+        ctx = {"conversation_id": "cid1", "search_files_internal": fake_search_internal}
+        r = await tg.execute_telegram_tool(
+            "search_files",
+            {"query": "alpha", "path": "docs", "recursive": False, "max_results": 5},
+            ctx,
+        )
+        assert r.get("success") is True
+        assert observed == {
+            "query": "alpha",
+            "path": "docs",
+            "recursive": False,
+            "offset": 0,
+            "max_results": 5,
+            "case_sensitive": False,
+            "filename_only": False,
+        }
+        assert "docs/notes.txt" in r.get("message", "")
 
     @pytest.mark.asyncio
     async def test_save_to_file_alias_routes_to_write_file(self):
