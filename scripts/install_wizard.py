@@ -20,6 +20,7 @@ if str(DEFAULT_PROJECT_ROOT) not in sys.path:
 LLM_PROVIDERS = [
     ("ollama", "Ollama (local)"),
     ("openai", "OpenAI (GPT)"),
+    ("minimax", "Minimax (OpenAI-compatible)"),
     ("google", "Google (Gemini)"),
     ("anthropic", "Anthropic (Claude)"),
     ("azure_openai", "Azure OpenAI"),
@@ -32,6 +33,7 @@ LLM_PROVIDERS = [
 DEFAULT_MODELS = {
     "ollama": "llama3.2",
     "openai": "gpt-4o-mini",
+    "minimax": "MiniMax-M2.5",
     "google": "gemini-3-flash-preview",
     "anthropic": "claude-3-5-sonnet-20241022",
     "azure_openai": "gpt-4o",
@@ -43,6 +45,7 @@ DEFAULT_MODELS = {
 PROVIDER_API_KEY_VAR = {
     "ollama": None,
     "openai": "MCP_LLM_OPENAI_API_KEY",
+    "minimax": "MCP_LLM_MINIMAX_API_KEY",
     "google": "MCP_LLM_GOOGLE_API_KEY",
     "anthropic": "MCP_LLM_ANTHROPIC_API_KEY",
     "azure_openai": "MCP_LLM_AZURE_OPENAI_API_KEY",
@@ -176,6 +179,11 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     api_key = ""
     if provider == "ollama":
         endpoint = _prompt("3) Ollama base URL (leave blank for localhost:11434)", "http://localhost:11434")
+    elif provider == "minimax":
+        endpoint = _prompt("3) Minimax base URL", "https://api.minimax.io/v1")
+        api_key = _prompt("4) API key for minimax", "", secret=True)
+        if not api_key:
+            print("   (You can add it later in .env)")
     else:
         endpoint = ""
         api_key = _prompt("3) API key for " + provider, "", secret=True)
@@ -183,11 +191,11 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
             print("   (You can add it later in .env)")
 
     # 4. Brave Search (web search)
-    brave = _prompt("4) Brave Search API key (optional; press Enter to skip)", "", secret=True)
-    news = _prompt("5) News API key (optional; press Enter to skip)", "", secret=True)
+    brave = _prompt("5) Brave Search API key (optional; press Enter to skip)", "", secret=True)
+    news = _prompt("6) News API key (optional; press Enter to skip)", "", secret=True)
 
     # 5. Codex CLI tool
-    use_codex = _prompt_yes_no("6) Enable Codex CLI tool?", True)
+    use_codex = _prompt_yes_no("7) Enable Codex CLI tool?", True)
     codex_path = ""
     codex_search = True
     codex_timeout = "1800"
@@ -197,7 +205,7 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         codex_timeout = _prompt("   Codex timeout seconds", "1800")
 
     # 6. Telegram
-    use_telegram = _prompt_yes_no("7) Enable Telegram bot?", False)
+    use_telegram = _prompt_yes_no("8) Enable Telegram bot?", False)
     telegram_token = ""
     telegram_admins = ""
     telegram_allow_all = "false"
@@ -224,12 +232,12 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
                 telegram_secret = _prompt("   TELEGRAM_SECRET value (same on bot and proxy)", "", secret=True)
 
     # 7. Web UI TTS defaults (optional)
-    tts_endpoint = _prompt("8) Default TTS endpoint for web UI (optional; press Enter to skip)", "")
-    tts_model = _prompt("9) Default TTS model for web UI (optional; used as UI fallback on voice-fetch failure)", "")
-    tts_voice = _prompt("10) Default TTS voice for web UI (optional; used as UI fallback on voice-fetch failure)", "")
+    tts_endpoint = _prompt("9) Default TTS endpoint for web UI (optional; press Enter to skip)", "")
+    tts_model = _prompt("10) Default TTS model for web UI (optional; used as UI fallback on voice-fetch failure)", "")
+    tts_voice = _prompt("11) Default TTS voice for web UI (optional; used as UI fallback on voice-fetch failure)", "")
 
     # 8. HTTPS certificate hostname (for LAN access; used by https_server and proxy_server)
-    https_hostname = _prompt("11) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
+    https_hostname = _prompt("12) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
     if not https_hostname.strip():
         https_hostname = "anton.local"
     else:

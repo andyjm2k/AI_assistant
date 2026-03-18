@@ -174,6 +174,58 @@ def test_builder_can_export_team_config():
         export_path.unlink(missing_ok=True)
 
 
+def test_build_model_client_enables_minimax_name_compat(monkeypatch):
+    from src.autogen.team_builder import _build_model_client
+
+    monkeypatch.setenv("AUTOGEN_MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+    monkeypatch.setenv("AUTOGEN_TEAM_MODEL", "MiniMax-M2.5")
+    monkeypatch.setenv("AUTOGEN_MINIMAX_API_KEY", "test-key")
+    monkeypatch.setenv("AUTOGEN_PROVIDER", "minimax")
+
+    client = _build_model_client(temperature=0.0)
+
+    assert getattr(client, "_include_name_in_message", None) is False
+    assert getattr(client, "_add_name_prefixes", None) is True
+
+
+def test_patch_autogen_team_config_applies_minimax_name_compat():
+    from src.servers.proxy_server import _patch_autogen_team_config_for_model_compatibility
+
+    team_config = {
+        "config": {
+            "model_client": {
+                "provider": "autogen_ext.models.openai.OpenAIChatCompletionClient",
+                "config": {"base_url": "https://api.minimax.io/v1", "model": "MiniMax-M2.5"},
+            },
+            "participants": [
+                {
+                    "label": "ceo_agent",
+                    "config": {
+                        "name": "ceo_agent",
+                        "reflect_on_tool_use": False,
+                        "model_client": {
+                            "provider": "autogen_ext.models.openai.OpenAIChatCompletionClient",
+                            "config": {"base_url": "https://api.minimax.io/v1", "model": "MiniMax-M2.5"},
+                        },
+                    },
+                }
+            ],
+        }
+    }
+
+    patched = _patch_autogen_team_config_for_model_compatibility(team_config)
+
+    selector_model_client = team_config["config"]["model_client"]["config"]
+    participant_model_client = team_config["config"]["participants"][0]["config"]["model_client"]["config"]
+
+    assert "selector_model_client" in patched
+    assert "ceo_agent:minimax_name_compat" in patched
+    assert selector_model_client["include_name_in_message"] is False
+    assert selector_model_client["add_name_prefixes"] is True
+    assert participant_model_client["include_name_in_message"] is False
+    assert participant_model_client["add_name_prefixes"] is True
+
+
 @pytest.mark.asyncio
 async def test_start_stop_code_executors_no_raise():
     try:

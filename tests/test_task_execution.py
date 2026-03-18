@@ -123,8 +123,8 @@ class TestTodoTaskExecutorCancel:
                         "id": "call_1",
                         "type": "function",
                         "function": {
-                            "name": "write_file",
-                            "arguments": "{\"filename\":\"done.txt\",\"content\":\"ok\"}",
+                            "name": "filesystem.write_text",
+                            "arguments": "{\"path\":\"done.txt\",\"content\":\"ok\"}",
                         },
                     }
                 ],
@@ -135,8 +135,8 @@ class TestTodoTaskExecutorCancel:
 
         assert status == STATUS_AWAITING_CONFIRMATION
         tool_executor.assert_awaited_once_with(
-            "write_file",
-            {"filename": "done.txt", "content": "ok"},
+            "filesystem.write_text",
+            {"path": "done.txt", "content": "ok"},
         )
 
 
@@ -331,6 +331,52 @@ async def test_call_llm_returns_none_when_fallback_not_configured(monkeypatch):
     assert "LLM error 400" in (executor.last_error or "")
 
 
+@pytest.mark.asyncio
+async def test_call_llm_minimax_adds_reasoning_split_and_strips_visible_content():
+    executor = TodoTaskExecutor(
+        api_key="minimax-key",
+        api_base="https://api.minimax.io/v1",
+        model="MiniMax-M2.5",
+        task_id=45,
+        task_description="Test Minimax compatibility",
+        get_tools_func=AsyncMock(return_value=[]),
+    )
+
+    mock_response = _FakeResponse(
+        200,
+        payload={
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>private reasoning</think>\nVisible answer",
+                        "reasoning_details": [{"type": "reasoning.text", "text": "private reasoning"}],
+                    }
+                }
+            ]
+        },
+    )
+
+    with patch("src.features.task_execution.httpx.AsyncClient") as mock_client:
+        mock_instance = MagicMock()
+        mock_instance.post = AsyncMock(return_value=mock_response)
+        mock_instance.__aenter__ = AsyncMock(return_value=mock_instance)
+        mock_instance.__aexit__ = AsyncMock(return_value=None)
+        mock_client.return_value = mock_instance
+
+        result = await executor._call_llm(
+            [{"role": "user", "content": "hello"}],
+            allow_summarize=False,
+            temperature=0,
+        )
+
+    assert result is not None
+    assert result["content"] == "Visible answer"
+    assert result["message"]["reasoning_details"][0]["text"] == "private reasoning"
+    sent_payload = mock_instance.post.await_args.kwargs["json"]
+    assert sent_payload["extra_body"]["reasoning_split"] is True
+    assert sent_payload["temperature"] == 0.01
+
+
 def test_initial_messages_tell_model_to_call_tools_immediately():
     executor = TodoTaskExecutor(
         api_key="test-key",
@@ -360,9 +406,9 @@ async def test_run_loop_does_not_inject_followup_prompt_after_planning_text():
         get_tools_func=AsyncMock(
             return_value=[
                 {
-                    "name": "read_file",
+                    "name": "filesystem.read_text",
                     "description": "Read a file",
-                    "inputSchema": {"type": "object", "properties": {"filename": {"type": "string"}}},
+                    "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}},
                 },
             ]
         ),
@@ -371,7 +417,7 @@ async def test_run_loop_does_not_inject_followup_prompt_after_planning_text():
 
     captured_messages = []
     responses = [
-        {"content": "I will use the read_file tool now to inspect notes.txt.", "tool_calls": None},
+        {"content": "I will use the filesystem.read_text tool now to inspect notes.txt.", "tool_calls": None},
         {"content": "Still preparing to inspect the file.", "tool_calls": None},
     ]
 

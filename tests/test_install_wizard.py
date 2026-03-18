@@ -25,12 +25,14 @@ def test_llm_providers_include_ollama_and_openai():
     keys = [p[0] for p in LLM_PROVIDERS]
     assert "ollama" in keys
     assert "openai" in keys
+    assert "minimax" in keys
     assert "google" in keys
 
 
 def test_provider_api_key_var_mapping():
     """PROVIDER_API_KEY_VAR has correct env var names."""
     assert PROVIDER_API_KEY_VAR["openai"] == "MCP_LLM_OPENAI_API_KEY"
+    assert PROVIDER_API_KEY_VAR["minimax"] == "MCP_LLM_MINIMAX_API_KEY"
     assert PROVIDER_API_KEY_VAR["google"] == "MCP_LLM_GOOGLE_API_KEY"
     assert PROVIDER_API_KEY_VAR["ollama"] is None
 
@@ -81,34 +83,27 @@ def test_wizard_skip_wizard_exits_zero():
 
 def test_run_wizard_writes_https_cert_hostname():
     """run_wizard writes HTTPS_CERT_HOSTNAME to .env with prompted or default value."""
-    tmp_path = Path(tempfile.mkdtemp(prefix="test_wizard_", dir=str(Path(__file__).resolve().parent.parent)))
+    scratch_root = DEFAULT_PROJECT_ROOT / "scratch"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    env_path = scratch_root / f"test_wizard_{next(tempfile._get_candidate_names())}.env"
     try:
-        env_path = tmp_path / ".env"
-        # Mock input: provider/model/endpoint/search/news/codex/telegram + TTS defaults + HTTPS hostname
         with patch("builtins.input", side_effect=["1", "", "", "", "", "n", "n", "", "", "", "mylan.local"]):
-            run_wizard(Path(tmp_path), env_path)
+            run_wizard(scratch_root, env_path)
         content = env_path.read_text(encoding="utf-8")
         assert "HTTPS_CERT_HOSTNAME=mylan.local" in content
     finally:
-        try:
-            tmp_path.joinpath(".env").unlink(missing_ok=True)
-            tmp_path.rmdir()
-        except Exception:
-            pass
+        env_path.unlink(missing_ok=True)
 
 
 def test_run_wizard_uses_default_https_hostname_when_empty():
     """run_wizard uses default anton.local when HTTPS hostname prompt is empty."""
-    tmp_path = Path(tempfile.mkdtemp(prefix="test_wizard_", dir=str(Path(__file__).resolve().parent.parent)))
+    scratch_root = DEFAULT_PROJECT_ROOT / "scratch"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    env_path = scratch_root / f"test_wizard_{next(tempfile._get_candidate_names())}.env"
     try:
-        env_path = tmp_path / ".env"
         with patch("builtins.input", side_effect=["1", "", "", "", "", "n", "n", "", "", "", ""]):
-            run_wizard(Path(tmp_path), env_path)
+            run_wizard(scratch_root, env_path)
         content = env_path.read_text(encoding="utf-8")
         assert "HTTPS_CERT_HOSTNAME=anton.local" in content
     finally:
-        try:
-            tmp_path.joinpath(".env").unlink(missing_ok=True)
-            tmp_path.rmdir()
-        except Exception:
-            pass
+        env_path.unlink(missing_ok=True)

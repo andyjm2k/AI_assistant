@@ -336,7 +336,8 @@ async def test_image_generation_writes_output_file(monkeypatch: pytest.MonkeyPat
         "usage": {"total_tokens": 5},
     }
 
-    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("IMAGE_GENERATION_OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     try:
         with patch("src.skills.builtin.image_generation_skill.httpx.AsyncClient") as mock_client_cls:
@@ -373,11 +374,35 @@ async def test_image_generation_writes_output_file(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-async def test_image_generation_requires_openai_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_image_generation_requires_openrouter_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = SkillManager.from_manifest_directory("src/skills/manifests")
+    monkeypatch.delenv("IMAGE_GENERATION_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("IMAGE_GENERATION_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("MCP_LLM_OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("openai_api_key", raising=False)
     monkeypatch.delenv("MCP_LLM_OPENAI_API_KEY", raising=False)
+
+    result = await manager.execute_tool(
+        "image_generation.generate_image",
+        {"prompt": "test prompt"},
+    )
+
+    assert result.success is False
+    assert result.error_code == "framework_error"
+
+
+@pytest.mark.asyncio
+async def test_image_generation_does_not_fall_back_to_core_openai_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+    monkeypatch.delenv("IMAGE_GENERATION_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("IMAGE_GENERATION_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("MCP_LLM_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "core-openai-key")
 
     result = await manager.execute_tool(
         "image_generation.generate_image",

@@ -1,6 +1,6 @@
 """
-Tests for the refactored index (index-refactor.html) and its extracted assets.
-Verifies that the refactored page references external CSS/JS and that asset files exist.
+Tests for the main index page and its extracted assets.
+Verifies that the page references external CSS/JS and that asset files exist.
 """
 import pytest
 from pathlib import Path
@@ -10,16 +10,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class TestIndexRefactorAssets:
-    """Test that index-refactor.html and its extracted assets exist and are valid."""
+    """Test that index.html and its extracted assets exist and are valid."""
 
     def test_index_refactor_html_exists(self):
-        """Refactored HTML file must exist at project root."""
-        path = PROJECT_ROOT / "index-refactor.html"
-        assert path.exists(), "index-refactor.html should exist"
+        """Main HTML file must exist at project root."""
+        path = PROJECT_ROOT / "index.html"
+        assert path.exists(), "index.html should exist"
 
     def test_index_refactor_contains_css_link(self):
-        """Refactored HTML must link to external catbot.css."""
-        path = PROJECT_ROOT / "index-refactor.html"
+        """Main HTML must link to external catbot.css."""
+        path = PROJECT_ROOT / "index.html"
         content = path.read_text(encoding="utf-8")
         assert '/css/catbot.css' in content, "HTML should reference /css/catbot.css"
         assert 'href="/css/catbot.css"' in content or 'href=\"/css/catbot.css\"' in content, (
@@ -27,8 +27,8 @@ class TestIndexRefactorAssets:
         )
 
     def test_index_refactor_contains_app_script(self):
-        """Refactored HTML must load external app.js."""
-        path = PROJECT_ROOT / "index-refactor.html"
+        """Main HTML must load external app.js."""
+        path = PROJECT_ROOT / "index.html"
         content = path.read_text(encoding="utf-8")
         assert '/js/app.js' in content, "HTML should reference /js/app.js"
         assert 'src="/js/app.js"' in content or 'src=\"/js/app.js\"' in content, (
@@ -36,8 +36,8 @@ class TestIndexRefactorAssets:
         )
 
     def test_index_refactor_single_body_and_html_close(self):
-        """Refactored HTML must have exactly one </body> and one </html> (no duplicate)."""
-        path = PROJECT_ROOT / "index-refactor.html"
+        """Main HTML must have exactly one </body> and one </html> (no duplicate)."""
+        path = PROJECT_ROOT / "index.html"
         content = path.read_text(encoding="utf-8")
         assert content.count("</body>") == 1, "HTML should have exactly one </body>"
         assert content.count("</html>") == 1, "HTML should have exactly one </html>"

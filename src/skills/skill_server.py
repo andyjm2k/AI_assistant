@@ -14,14 +14,6 @@ from .manager import SkillManager
 from .models import SkillContext, SkillSpec, ToolExecutionResult, ToolSpec
 
 
-OVERLAPPING_FILE_TOOL_QUALIFIED_NAMES = {
-    "filesystem.list_files",
-    "filesystem.read_text",
-    "filesystem.write_text",
-    "filesystem.search_files",
-}
-
-
 class SkillSpecPayload(BaseModel):
     name: str
     description: str = ""
@@ -162,21 +154,7 @@ def _filter_overlapping_file_tools(
     openai_schema: bool,
     include_overlapping_file_tools: bool,
 ) -> List[Dict[str, Any]]:
-    if include_overlapping_file_tools:
-        return tools
-    filtered: List[Dict[str, Any]] = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if openai_schema:
-            fn = tool.get("function")
-            name = str(fn.get("name") if isinstance(fn, dict) else "").strip()
-        else:
-            name = str(tool.get("name") or "").strip()
-        if name in OVERLAPPING_FILE_TOOL_QUALIFIED_NAMES:
-            continue
-        filtered.append(tool)
-    return filtered
+    return [tool for tool in tools if isinstance(tool, dict)]
 
 
 def _raise_framework_http_error(exc: SkillFrameworkError) -> None:

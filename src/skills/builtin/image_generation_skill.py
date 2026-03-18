@@ -21,10 +21,19 @@ DEFAULT_OPENROUTER_MODEL = "bytedance-seed/seedream-4.5"
 
 def _resolve_api_key() -> Optional[str]:
     return (
-        os.getenv("OPENAI_API_KEY")
-        or os.getenv("openai_api_key")
-        or os.getenv("MCP_LLM_OPENAI_API_KEY")
+        os.getenv("IMAGE_GENERATION_OPENROUTER_API_KEY")
+        or os.getenv("IMAGE_GENERATION_API_KEY")
+        or os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("MCP_LLM_OPENROUTER_API_KEY")
     )
+
+
+def _resolve_openrouter_base() -> str:
+    return (
+        os.getenv("IMAGE_GENERATION_OPENROUTER_API_BASE")
+        or os.getenv("OPENROUTER_API_BASE")
+        or DEFAULT_OPENROUTER_BASE
+    ).strip()
 
 
 def _resolve_output_dir(root_dir: Path, output_dir: str) -> Path:
@@ -152,7 +161,9 @@ class GenerateImageTool(BaseTool):
 
         api_key = _resolve_api_key()
         if not api_key:
-            raise SkillValidationError("OPENAI_API_KEY is not configured.")
+            raise SkillValidationError(
+                "IMAGE_GENERATION_OPENROUTER_API_KEY or OPENROUTER_API_KEY is not configured."
+            )
 
         model = str(arguments.get("model", DEFAULT_OPENROUTER_MODEL)).strip()
         if not model:
@@ -178,7 +189,7 @@ class GenerateImageTool(BaseTool):
         if image_config:
             payload["image_config"] = image_config
 
-        openrouter_base = (os.getenv("OPENROUTER_API_BASE") or DEFAULT_OPENROUTER_BASE).strip()
+        openrouter_base = _resolve_openrouter_base()
         endpoint = f"{openrouter_base.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",

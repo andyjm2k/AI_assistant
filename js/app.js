@@ -125,11 +125,25 @@
 
 
         // Auto-resize textarea
+        function syncUserInputUi() {
+            if (!userInput) return;
+
+            if (userInput.value.length === 0) {
+                userInput.style.height = '';
+            } else {
+                userInput.style.height = 'auto';
+                userInput.style.height = Math.min(userInput.scrollHeight, 120) + 'px';
+            }
+
+            if (sendBtnMobile) {
+                const hasText = userInput.value.trim().length > 0;
+                sendBtnMobile.style.display = hasText ? 'flex' : 'none';
+                if (startRecordBtn) startRecordBtn.style.display = hasText ? 'none' : 'flex';
+            }
+        }
+
         if (userInput) {
-            userInput.addEventListener('input', function() {
-                this.style.height = 'auto';
-                this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-            });
+            userInput.addEventListener('input', syncUserInputUi);
         }
 
         // Attach button (placeholder - can be extended)
@@ -160,17 +174,6 @@
         // Send button mobile - show/hide based on input
         const sendBtnMobile = document.getElementById('send-btn-mobile');
         if (userInput && sendBtnMobile) {
-            // Handle input event - show send button when text is entered
-            userInput.addEventListener('input', function() {
-                if (this.value.trim().length > 0) {
-                    sendBtnMobile.style.display = 'flex';
-                    if (startRecordBtn) startRecordBtn.style.display = 'none';
-                } else {
-                    sendBtnMobile.style.display = 'none';
-                    if (startRecordBtn) startRecordBtn.style.display = 'flex';
-                }
-            });
-
             // Handle blur event - switch back to microphone button when input loses focus
             userInput.addEventListener('blur', function() {
                 sendBtnMobile.style.display = 'none';
@@ -179,13 +182,7 @@
 
             // Handle focus event - show send button if there's text when input regains focus
             userInput.addEventListener('focus', function() {
-                if (this.value.trim().length > 0) {
-                    sendBtnMobile.style.display = 'flex';
-                    if (startRecordBtn) startRecordBtn.style.display = 'none';
-                } else {
-                    sendBtnMobile.style.display = 'none';
-                    if (startRecordBtn) startRecordBtn.style.display = 'flex';
-                }
+                syncUserInputUi();
             });
 
             // Send on button click - call shared handler directly (iOS Safari ignores programmatic sendBtn.click() on display:none)
@@ -202,6 +199,7 @@
                 }
             }, { passive: false });
         }
+        syncUserInputUi();
         const userNameInput = document.getElementById('user-name'); // User name input
         const assistantNameInput = document.getElementById('assistant-name'); // Assistant name input
         const status = document.getElementById('status');
@@ -376,7 +374,16 @@
 
                 envToolDefaults = await fetchClientToolDefaults();
                 // Load persisted tool settings (User Name, Assistant Name, etc.)
-                loadToolSettings();
+                const persistedToolSettings = (() => {
+                    try {
+                        const rawSettings = localStorage.getItem('toolSettings');
+                        return rawSettings ? JSON.parse(rawSettings) : null;
+                    } catch (error) {
+                        console.warn('Could not read persisted tool settings during initialization:', error);
+                        return null;
+                    }
+                })();
+                loadToolSettings(persistedToolSettings);
                 // Ensure VRM version is initialized (default to 1.0 if not set)
                 const vrmVersionDropdown = document.getElementById('vrm-version-dropdown');
                 if (vrmVersionDropdown && !vrmVersion) {
@@ -390,7 +397,8 @@
                 }
 
                 // Fetch available models based on current tool settings (also sets VRM list and currentVRMModelPath)
-                await fetchAvailableModels();
+                await fetchAvailableModels(persistedToolSettings);
+                await scanAndMergeModelAvatarLists({ silent: true });
                 await initAudioRecording();
                 // Initialize avatar based on mode preference (default to Live2D)
                 const avatarMode = localStorage.getItem('avatarMode') || 'live2d';
@@ -412,8 +420,11 @@
                         collapsibleContent.classList.toggle('active');
                         const isExpanded = this.classList.contains('active');
                         this.setAttribute('aria-expanded', isExpanded);
+                        if (isExpanded) setActiveToolSettingsPanel(activeToolSettingsPanelId, { scrollIntoView: false });
                     });
                 }
+
+                setupToolSettingsBuilderUI();
 
                 // Add event listeners to save tool settings when they change
                 setupToolSettingsPersistence();
@@ -1374,16 +1385,22 @@
         let recorderNode;
         let audioData = [];
         let live2dModel;
+        let live2dApp = null;
         let live2dTickerRegistered = false; // Ensures we only register the Live2D ticker once
         let live2dOffsets = {}; // Persisted map of modelPath -> vertical offset in px
+        let live2dScales = {}; // Persisted map of modelPath -> size multiplier
+        let live2dResizeHandler = null;
+        let live2dLoadGeneration = 0;
+        let live2dActiveModelPath = '';
         // Live2D model configuration (selector-driven)
-        let modelPath = './model_avatar/RACOON01/RACOON01.model3.json';
+        let modelPath = '';
 
         // VRM model variables
         let vrmModel;
         let vrmScene;
         let vrmCamera;
         let vrmRenderer;
+        let vrmResizeHandler = null;
         let vrmMixer;
         let vrmClock;
         let vrmLipSyncMorphTarget;
@@ -1719,13 +1736,12 @@
         let webcamEnabled = false;
         const webcamToggle = document.getElementById('webcam-toggle');
         const currentModelSpan = document.getElementById('current-model');
-        // Storage keys for Live2D model list and selection persistence
-        const L2D_LIST_KEY = 'live2dModelList';
+        // Storage keys for Live2D selection persistence
         const L2D_SELECTED_KEY = 'live2dSelectedModelPath';
         const L2D_OFFSETS_KEY = 'live2dVerticalOffsets'; // Map modelPath -> offset px
+        const L2D_SCALES_KEY = 'live2dSizeMultipliers'; // Map modelPath -> size multiplier
 
-        // Storage keys for VRM model list and selection persistence
-        const VRM_LIST_KEY = 'vrmModelList';
+        // Storage keys for VRM selection persistence
         const VRM_SELECTED_KEY = 'vrmSelectedModelPath';
         const VRM_POSITIONS_KEY = 'vrmPositions'; // Map modelPath -> {scale, positionX, positionY, rotation}
 
@@ -1811,9 +1827,18 @@
         endpointInput.addEventListener('change', fetchAvailableModels);
 
         // Add this function to fetch available models
-        async function fetchAvailableModels() {
+        async function fetchAvailableModels(preferredSettings = null) {
             const originalEndpoint = endpointInput.value.replace('/chat/completions', '/models');
             const apiKey = apiKeyInput.value.trim();
+            const desiredBaseModel = hasMeaningfulValue(preferredSettings?.baseModel)
+                ? preferredSettings.baseModel
+                : (baseModelDropdown ? baseModelDropdown.value : (baseModel || defaultBaseModel));
+            const desiredToolModel = hasMeaningfulValue(preferredSettings?.toolModel)
+                ? preferredSettings.toolModel
+                : (toolModelDropdown ? toolModelDropdown.value : (toolModel || defaultToolModel));
+            const desiredVisionModel = hasMeaningfulValue(preferredSettings?.visionModel)
+                ? preferredSettings.visionModel
+                : (visionModelDropdown ? visionModelDropdown.value : (visionModel || defaultVisionModel));
             
             // Route through proxy server to avoid mixed content issues with HTTPS
             const endpoint = `${PROXY_BASE_URL}/v1/proxy/models?endpoint=${encodeURIComponent(originalEndpoint)}`;
@@ -1846,38 +1871,36 @@
                 
                 // Update tool model dropdown
                 if (toolModelDropdown) {
-                    toolModelDropdown.innerHTML = availableModels
-                        .map(model => `<option value="${model.id}" ${model.id === defaultToolModel ? 'selected' : ''}>${model.id}</option>`)
-                        .join('');
-                    if (!toolModelDropdown.value) {
-                        toolModelDropdown.value = defaultToolModel;
-                    }
-                    toolModel = toolModelDropdown.value || defaultToolModel;
+                    toolModel = populateModelDropdown(
+                        toolModelDropdown,
+                        availableModels,
+                        desiredToolModel,
+                        defaultToolModel
+                    ) || defaultToolModel;
+                    defaultToolModel = toolModel;
                 }
 
                 // Update base model dropdown
                 if (baseModelDropdown) {
-                    baseModelDropdown.innerHTML = availableModels
-                        .map(model => `<option value="${model.id}" ${model.id === defaultBaseModel ? 'selected' : ''}>${model.id}</option>`)
-                        .join('');
-                    if (!baseModelDropdown.value) {
-                        baseModelDropdown.value = defaultBaseModel;
-                    }
-                    baseModel = baseModelDropdown.value || defaultBaseModel;
+                    baseModel = populateModelDropdown(
+                        baseModelDropdown,
+                        availableModels,
+                        desiredBaseModel,
+                        defaultBaseModel
+                    ) || defaultBaseModel;
+                    defaultBaseModel = baseModel;
                 }
 
-                // Populate Live2D model list dropdown from persisted storage or textarea
+                // Populate Live2D model controls from scanned textarea data plus persisted selection
                 const live2dList = document.getElementById('live2d-model-list');
                 const live2dDropdown = document.getElementById('live2d-model-dropdown');
                 const live2dOffsetRange = document.getElementById('live2d-offset-range');
                 const live2dOffsetValue = document.getElementById('live2d-offset-value');
+                const live2dScaleRange = document.getElementById('live2d-scale-range');
+                const live2dScaleValue = document.getElementById('live2d-scale-value');
                 if (live2dList && live2dDropdown) {
-                    // Load any persisted list
+                    // Load persisted selection and offsets; list contents are scan-driven
                     try {
-                        const savedList = localStorage.getItem(L2D_LIST_KEY);
-                        if (savedList) {
-                            live2dList.value = JSON.parse(savedList).join('\n');
-                        }
                         const savedSelected = localStorage.getItem(L2D_SELECTED_KEY);
                         if (savedSelected) {
                             modelPath = savedSelected;
@@ -1886,114 +1909,86 @@
                         if (savedOffsets) {
                             live2dOffsets = JSON.parse(savedOffsets);
                         }
+                        const savedScales = localStorage.getItem(L2D_SCALES_KEY);
+                        if (savedScales) {
+                            live2dScales = JSON.parse(savedScales);
+                        }
                     } catch (e) {
                         console.warn('Unable to read persisted Live2D model list/selection:', e);
                     }
-
-                    const lines = live2dList.value
-                        .split(/\r?\n/)
-                        .map(l => l.trim())
-                        .filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
-
-                    // Build dropdown options showing only the file name
-                    live2dDropdown.innerHTML = lines
-                        .map(path => {
-                            const fileName = path.split('/').pop();
-                            const selected = path === modelPath ? 'selected' : '';
-                            return `<option value="${path}" ${selected}>${fileName}</option>`;
-                        })
-                        .join('');
-
-                    // If current modelPath is not in list, append it
-                    if (lines.indexOf(modelPath) === -1) {
-                        const fileName = modelPath.split('/').pop();
-                        const opt = document.createElement('option');
-                        opt.value = modelPath;
-                        opt.textContent = fileName;
-                        opt.selected = true;
-                        live2dDropdown.appendChild(opt);
-                    }
+                    syncLive2DModelControls();
 
                     // Update modelPath when user selects a new one and persist selection
                     live2dDropdown.onchange = async () => {
                         modelPath = live2dDropdown.value;
                         try { localStorage.setItem(L2D_SELECTED_KEY, modelPath); } catch {}
                         // Set the offset UI to stored value (default 0)
-                        const currentOffset = live2dOffsets[modelPath] ?? 0;
+                        const currentOffset = getLive2DOffset(modelPath);
+                        const currentScale = getLive2DScale(modelPath);
                         if (live2dOffsetRange && live2dOffsetValue) {
-                            live2dOffsetRange.value = currentOffset;
+                            live2dOffsetRange.value = String(currentOffset);
                             live2dOffsetValue.textContent = String(currentOffset);
                         }
-                        // Optionally reinitialize Live2D with the new model
-                        try {
-                            cleanupLive2D();
-                        } catch (e) {
-                            console.warn('Error destroying previous Live2D model (safe to ignore):', e);
+                        if (live2dScaleRange && live2dScaleValue) {
+                            live2dScaleRange.value = String(currentScale);
+                            live2dScaleValue.textContent = formatLive2DScale(currentScale);
                         }
-                        await initLive2D();
-                    };
-
-                    // Rebuild dropdown when the list changes (user adds new lines) and persist list
-                    live2dList.addEventListener('input', () => {
-                        const updated = live2dList.value
-                            .split(/\r?\n/)
-                            .map(l => l.trim())
-                            .filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
-                        try { localStorage.setItem(L2D_LIST_KEY, JSON.stringify(updated)); } catch {}
-
-                        // Keep current selection if still present, otherwise select the last added entry
-                        const selectedPath = updated.includes(modelPath)
-                            ? modelPath
-                            : (updated.length > 0 ? updated[updated.length - 1] : '');
-
-                        live2dDropdown.innerHTML = updated
-                            .map(path => {
-                                const fileName = path.split('/').pop();
-                                const selected = path === selectedPath ? 'selected' : '';
-                                return `<option value="${path}" ${selected}>${fileName}</option>`;
-                            })
-                            .join('');
-
-                        if (selectedPath && selectedPath !== modelPath) {
-                            modelPath = selectedPath;
-                            live2dDropdown.value = modelPath;
-                            try { localStorage.setItem(L2D_SELECTED_KEY, modelPath); } catch {}
-                            // Update offset UI to new model's stored offset
-                            const currentOffset = live2dOffsets[modelPath] ?? 0;
-                            if (live2dOffsetRange && live2dOffsetValue) {
-                                live2dOffsetRange.value = currentOffset;
-                                live2dOffsetValue.textContent = String(currentOffset);
-                            }
-                            // Reinitialize the model with the new selection
+                        saveToolSettings();
+                        if (document.getElementById('live2d-mode')?.checked) {
                             try {
                                 cleanupLive2D();
                             } catch (e) {
                                 console.warn('Error destroying previous Live2D model (safe to ignore):', e);
                             }
-                            initLive2D();
+                            await initLive2D();
+                        }
+                    };
+
+                    // Rebuild dropdown if the scanned list changes programmatically
+                    live2dList.addEventListener('input', async () => {
+                        const previousModelPath = modelPath;
+                        syncLive2DModelControls();
+
+                        if (modelPath && modelPath !== previousModelPath) {
+                            try { localStorage.setItem(L2D_SELECTED_KEY, modelPath); } catch {}
+                            saveToolSettings();
+                            if (document.getElementById('live2d-mode')?.checked) {
+                                try {
+                                    cleanupLive2D();
+                                } catch (e) {
+                                    console.warn('Error destroying previous Live2D model (safe to ignore):', e);
+                                }
+                                await initLive2D();
+                            }
                         }
                     });
 
-                    // Offset range change -> update persisted offset and apply immediately
-                    if (live2dOffsetRange && live2dOffsetValue) {
-                        const applyOffset = (offsetPx) => {
-                            if (live2dModel) {
-                                // Apply vertical offset to current model
-                                live2dModel.y += offsetPx - (live2dOffsets[modelPath] ?? 0);
-                            }
-                        };
+                    // Offset and size changes -> update persisted values and apply immediately
+                    if (live2dOffsetRange && live2dOffsetValue && live2dScaleRange && live2dScaleValue) {
                         // Initialize UI with current offset
-                        const initialOffset = live2dOffsets[modelPath] ?? 0;
-                        live2dOffsetRange.value = initialOffset;
+                        const initialOffset = getLive2DOffset(modelPath);
+                        const initialScale = getLive2DScale(modelPath);
+                        live2dOffsetRange.value = String(initialOffset);
                         live2dOffsetValue.textContent = String(initialOffset);
+                        live2dScaleRange.value = String(initialScale);
+                        live2dScaleValue.textContent = formatLive2DScale(initialScale);
                         live2dOffsetRange.addEventListener('input', () => {
+                            if (!modelPath) return;
                             const newOffset = parseInt(live2dOffsetRange.value, 10) || 0;
                             live2dOffsetValue.textContent = String(newOffset);
-                            // Apply delta offset
-                            applyOffset(newOffset);
-                            // Persist offset map
                             live2dOffsets[modelPath] = newOffset;
                             try { localStorage.setItem(L2D_OFFSETS_KEY, JSON.stringify(live2dOffsets)); } catch {}
+                            applyCurrentLive2DLayout();
+                            saveToolSettings();
+                        });
+                        live2dScaleRange.addEventListener('input', () => {
+                            if (!modelPath) return;
+                            const newScale = Math.min(3.0, Math.max(0.4, parseFloat(live2dScaleRange.value) || 1.0));
+                            live2dScaleValue.textContent = formatLive2DScale(newScale);
+                            live2dScales[modelPath] = newScale;
+                            try { localStorage.setItem(L2D_SCALES_KEY, JSON.stringify(live2dScales)); } catch {}
+                            applyCurrentLive2DLayout();
+                            saveToolSettings();
                         });
                     }
                 }
@@ -2002,12 +1997,8 @@
                 const vrmList = document.getElementById('vrm-model-list');
                 const vrmDropdown = document.getElementById('vrm-model-dropdown');
                 if (vrmList && vrmDropdown) {
-                    // Load any persisted list
+                    // Load persisted selection and transforms; list contents are scan-driven
                     try {
-                        const savedList = localStorage.getItem(VRM_LIST_KEY);
-                        if (savedList) {
-                            vrmList.value = JSON.parse(savedList).join('\n');
-                        }
                         const savedSelected = localStorage.getItem(VRM_SELECTED_KEY);
                         if (savedSelected) {
                             currentVRMModelPath = savedSelected;
@@ -2019,29 +2010,7 @@
                     } catch (e) {
                         console.warn('Unable to read persisted VRM model list/selection:', e);
                     }
-
-                    let lines = vrmList.value
-                        .split('\n')
-                        .map(l => l.trim())
-                        .filter(l => l.length > 0 && l.toLowerCase().endsWith('.vrm'));
-                    // If no VRM entries are provided, keep list empty and wait for user input
-
-                    // Populate dropdown with model paths
-                    vrmDropdown.innerHTML = '';
-                    lines.forEach(line => {
-                        const opt = document.createElement('option');
-                        opt.value = line;
-                        opt.textContent = line.split('/').pop();
-                        vrmDropdown.appendChild(opt);
-                    });
-
-                    // Set initial selection
-                    if (lines.includes(currentVRMModelPath)) {
-                        vrmDropdown.value = currentVRMModelPath;
-                    } else if (lines.length > 0) {
-                        currentVRMModelPath = lines[0];
-                        vrmDropdown.value = currentVRMModelPath;
-                    }
+                    syncVRMModelControls();
 
                     vrmDropdown.onchange = async () => {
                         currentVRMModelPath = vrmDropdown.value;
@@ -2054,30 +2023,10 @@
                     };
 
                     vrmList.addEventListener('input', async () => {
-                        const updated = vrmList.value
-                            .split('\n')
-                            .map(l => l.trim())
-                            .filter(l => l.length > 0 && l.toLowerCase().endsWith('.vrm'));
+                        const previousModelPath = currentVRMModelPath;
+                        syncVRMModelControls();
 
-                        try { localStorage.setItem(VRM_LIST_KEY, JSON.stringify(updated)); } catch {}
-
-                        // Keep current selection if still present, otherwise select the last added entry
-                        vrmDropdown.innerHTML = '';
-                        updated.forEach(line => {
-                            const opt = document.createElement('option');
-                            opt.value = line;
-                            opt.textContent = line.split('/').pop();
-                            vrmDropdown.appendChild(opt);
-                        });
-
-                        let selectedPath = currentVRMModelPath;
-                        if (!updated.includes(currentVRMModelPath)) {
-                            selectedPath = updated[updated.length - 1] || '';
-                        }
-
-                        if (selectedPath) {
-                            currentVRMModelPath = selectedPath;
-                            vrmDropdown.value = currentVRMModelPath;
+                        if (currentVRMModelPath && currentVRMModelPath !== previousModelPath) {
                             try { localStorage.setItem(VRM_SELECTED_KEY, currentVRMModelPath); } catch {}
                             if (document.getElementById('vrm-mode').checked) {
                                 cleanupVRM();
@@ -2154,35 +2103,56 @@
                     live2dModeRadio.addEventListener('change', async () => {
                         if (live2dModeRadio.checked) {
                             await switchToLive2D();
+                            saveToolSettings();
                         }
                     });
 
                     vrmModeRadio.addEventListener('change', async () => {
                         if (vrmModeRadio.checked) {
                             await switchToVRM();
+                            saveToolSettings();
                         }
                     });
                 }
 
                 // Update vision model dropdown (filter to models that look multimodal if desired)
                 if (visionModelDropdown) {
-                    visionModelDropdown.innerHTML = availableModels
-                        .map(model => `<option value="${model.id}" ${model.id === defaultVisionModel ? 'selected' : ''}>${model.id}</option>`)
-                        .join('');
-                    if (!visionModelDropdown.value) {
-                        visionModelDropdown.value = defaultVisionModel;
-                    }
-                    visionModel = visionModelDropdown.value || defaultVisionModel;
+                    visionModel = populateModelDropdown(
+                        visionModelDropdown,
+                        availableModels,
+                        desiredVisionModel,
+                        defaultVisionModel
+                    ) || defaultVisionModel;
+                    defaultVisionModel = visionModel;
                 }
             } catch (error) {
                 console.error('Error fetching models:', error);
                 if (toolModelDropdown) {
-                    toolModelDropdown.innerHTML = `<option value="${defaultToolModel}" selected>${defaultToolModel}</option>`;
-                    toolModel = defaultToolModel;
+                    toolModel = populateModelDropdown(
+                        toolModelDropdown,
+                        [],
+                        desiredToolModel,
+                        defaultToolModel
+                    ) || defaultToolModel;
+                    defaultToolModel = toolModel;
                 }
                 if (baseModelDropdown) {
-                    baseModelDropdown.innerHTML = `<option value="${defaultBaseModel}" selected>${defaultBaseModel}</option>`;
-                    baseModel = defaultBaseModel;
+                    baseModel = populateModelDropdown(
+                        baseModelDropdown,
+                        [],
+                        desiredBaseModel,
+                        defaultBaseModel
+                    ) || defaultBaseModel;
+                    defaultBaseModel = baseModel;
+                }
+                if (visionModelDropdown) {
+                    visionModel = populateModelDropdown(
+                        visionModelDropdown,
+                        [],
+                        desiredVisionModel,
+                        defaultVisionModel
+                    ) || defaultVisionModel;
+                    defaultVisionModel = visionModel;
                 }
             }
         }
@@ -2252,6 +2222,47 @@
                 endpointInput.value = 'http://localhost:1234/v1/chat/completions';
             }
             return baseModel;
+        }
+
+        function populateModelDropdown(dropdown, models, preferredValue, fallbackValue) {
+            if (!dropdown) return '';
+
+            const normalizedPreferred = hasMeaningfulValue(preferredValue) ? String(preferredValue).trim() : '';
+            const normalizedFallback = hasMeaningfulValue(fallbackValue) ? String(fallbackValue).trim() : '';
+            const seenValues = new Set();
+            dropdown.innerHTML = '';
+
+            if (Array.isArray(models)) {
+                models.forEach(model => {
+                    const modelId = typeof model?.id === 'string' ? model.id.trim() : '';
+                    if (!modelId || seenValues.has(modelId)) return;
+                    seenValues.add(modelId);
+                    const option = document.createElement('option');
+                    option.value = modelId;
+                    option.textContent = modelId;
+                    dropdown.appendChild(option);
+                });
+            }
+
+            [normalizedPreferred, normalizedFallback].forEach(value => {
+                if (!value || seenValues.has(value)) return;
+                seenValues.add(value);
+                const option = document.createElement('option');
+                option.value = value;
+                option.textContent = value;
+                dropdown.appendChild(option);
+            });
+
+            const desiredValue = normalizedPreferred || normalizedFallback;
+            if (desiredValue) {
+                dropdown.value = desiredValue;
+            }
+
+            if (!dropdown.value && dropdown.options.length > 0) {
+                dropdown.selectedIndex = 0;
+            }
+
+            return dropdown.value || desiredValue || '';
         }
 
         function applyEnvDefaultTtsVoiceOnFetchFailure() {
@@ -2520,6 +2531,85 @@
 	function stripThinkTags(text = '') {
     		return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 	}
+
+        function coerceMessageText(content) {
+            if (content == null) return '';
+            if (typeof content === 'string') return content;
+            if (Array.isArray(content)) {
+                return content.map(item => {
+                    if (typeof item === 'string') return item.trim();
+                    if (!item || typeof item !== 'object') return '';
+                    let candidate = item.text;
+                    if (candidate && typeof candidate === 'object') {
+                        candidate = candidate.value || candidate.content;
+                    }
+                    if (typeof candidate !== 'string') {
+                        candidate = item.content || item.output_text || '';
+                    }
+                    return typeof candidate === 'string' ? candidate.trim() : '';
+                }).filter(Boolean).join('\n').trim();
+            }
+            if (typeof content === 'object') {
+                let candidate = content.text;
+                if (candidate && typeof candidate === 'object') {
+                    candidate = candidate.value || candidate.content;
+                }
+                if (typeof candidate !== 'string') {
+                    candidate = content.content || content.output_text || '';
+                }
+                return typeof candidate === 'string' ? candidate.trim() : '';
+            }
+            return String(content).trim();
+        }
+
+        function isMinimaxCompatibleRequest(endpoint = '', model = '') {
+            let hostname = '';
+            try {
+                const parsed = new URL(endpoint, window.location.href);
+                const proxiedEndpoint = parsed.searchParams.get('endpoint');
+                const resolved = proxiedEndpoint ? new URL(proxiedEndpoint) : parsed;
+                hostname = resolved.hostname.toLowerCase();
+            } catch (_) {
+                hostname = '';
+            }
+            return hostname.endsWith('minimax.io') || hostname.endsWith('minimaxi.com') || /\bminimax\b|^MiniMax-/i.test(String(model || '').trim());
+        }
+
+        function normalizeMinimaxTemperature(value) {
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed)) return value;
+            if (parsed <= 0) return 0.01;
+            if (parsed > 1) return 1;
+            return parsed;
+        }
+
+        function buildCompatibleChatBody(endpoint, payload = {}) {
+            const body = { ...payload };
+            if (isMinimaxCompatibleRequest(endpoint, body.model)) {
+                if (Object.prototype.hasOwnProperty.call(body, 'temperature')) {
+                    body.temperature = normalizeMinimaxTemperature(body.temperature);
+                }
+                body.extra_body = {
+                    ...(body.extra_body || {}),
+                    reasoning_split: true
+                };
+            }
+            return body;
+        }
+
+        function buildAssistantHistoryMessage(message = {}) {
+            const out = { role: message.role || 'assistant' };
+            ['content', 'tool_calls', 'name', 'function_call', 'refusal', 'reasoning_details'].forEach((key) => {
+                if (message && Object.prototype.hasOwnProperty.call(message, key) && message[key] != null) {
+                    out[key] = message[key];
+                }
+            });
+            return out;
+        }
+
+        function getVisibleAssistantText(message = {}) {
+            return stripThinkTags(coerceMessageText(message?.content || ''));
+        }
 	
         // Function to create smooth head movement
         async function animateHeadMovement(model, duration) {
@@ -4293,6 +4383,161 @@
             requestAnimationFrame(animateMouth);
         }
 
+        function getLive2DOffset(path = modelPath) {
+            const value = Number(live2dOffsets?.[path]);
+            return Number.isFinite(value) ? value : 0;
+        }
+
+        function getLive2DScale(path = modelPath) {
+            const value = Number(live2dScales?.[path]);
+            if (!Number.isFinite(value)) return 1.0;
+            return Math.min(3.0, Math.max(0.4, value));
+        }
+
+        function formatLive2DScale(value) {
+            const numericValue = Math.min(3.0, Math.max(0.4, Number(value) || 1.0));
+            return `${numericValue.toFixed(2)}x`;
+        }
+
+        function clearLive2DResizeHandler() {
+            if (live2dResizeHandler) {
+                window.removeEventListener('resize', live2dResizeHandler);
+                live2dResizeHandler = null;
+            }
+        }
+
+        function destroyLive2DModelInstance(model) {
+            if (!model) return;
+            try { model.removeAllListeners?.(); } catch (_) {}
+            try {
+                if (model.parent) {
+                    model.parent.removeChild(model);
+                }
+            } catch (_) {}
+            try {
+                if (typeof model.destroy === 'function') {
+                    model.destroy({ children: true, texture: true, baseTexture: true });
+                }
+            } catch (_) {}
+        }
+
+        function ensureLive2DApp(container, canvas) {
+            const width = Math.max(container?.clientWidth || 0, 1);
+            const height = Math.max(container?.clientHeight || 0, 1);
+            if (!live2dApp) {
+                live2dApp = new PIXI.Application({
+                    view: canvas,
+                    transparent: true,
+                    autoStart: true,
+                    width,
+                    height
+                });
+            } else {
+                live2dApp.renderer.resize(width, height);
+            }
+            return live2dApp;
+        }
+
+        function getLive2DIntrinsicSize(model) {
+            try {
+                const bounds = model.getLocalBounds?.();
+                const width = Math.abs(bounds?.width || 0);
+                const height = Math.abs(bounds?.height || 0);
+                if (width > 0 && height > 0) {
+                    return { width, height };
+                }
+            } catch (_) {}
+
+            const scaleX = Math.abs(model?.scale?.x || 1) || 1;
+            const scaleY = Math.abs(model?.scale?.y || 1) || 1;
+            const width = Math.abs((model?.width || 0) / scaleX);
+            const height = Math.abs((model?.height || 0) / scaleY);
+            return {
+                width: width > 0 ? width : 1,
+                height: height > 0 ? height : 1
+            };
+        }
+
+        function applyCurrentLive2DLayout(targetModel = live2dModel, path = live2dActiveModelPath || modelPath) {
+            const container = document.getElementById('live2d-container');
+            if (!container || !targetModel || !live2dApp) return;
+
+            const width = Math.max(container.clientWidth || 0, 1);
+            const height = Math.max(container.clientHeight || 0, 1);
+            live2dApp.renderer.resize(width, height);
+
+            const intrinsic = getLive2DIntrinsicSize(targetModel);
+            const baseScale = Math.min(
+                width / (intrinsic.width * 1.5),
+                height / (intrinsic.height * 1.5)
+            ) * 2.5;
+            const scale = baseScale * getLive2DScale(path);
+
+            targetModel.scale.set(scale);
+            targetModel.x = width / 2;
+            targetModel.y = (height / 1.4) + getLive2DOffset(path);
+        }
+
+        function disposeLive2DModel() {
+            clearLive2DResizeHandler();
+            if (live2dApp?.stage) {
+                try { live2dApp.stage.removeChildren(); } catch (_) {}
+                try { live2dApp.renderer.render(live2dApp.stage); } catch (_) {}
+            }
+            destroyLive2DModelInstance(live2dModel);
+            live2dModel = null;
+            live2dActiveModelPath = '';
+        }
+
+        function attachLive2DResizeHandler(path) {
+            clearLive2DResizeHandler();
+            let rafId = 0;
+            live2dResizeHandler = () => {
+                if (rafId) cancelAnimationFrame(rafId);
+                rafId = requestAnimationFrame(() => {
+                    rafId = 0;
+                    applyCurrentLive2DLayout(live2dModel, path);
+                });
+            };
+            window.addEventListener('resize', live2dResizeHandler);
+        }
+
+        function clearVRMResizeHandler() {
+            if (vrmResizeHandler) {
+                window.removeEventListener('resize', vrmResizeHandler);
+                vrmResizeHandler = null;
+            }
+        }
+
+        function resizeVRMViewport() {
+            const container = document.getElementById('vrm-container');
+            if (!container || !vrmRenderer || !vrmCamera) return;
+
+            const width = Math.max(container.clientWidth || 0, 1);
+            const height = Math.max(container.clientHeight || 0, 1);
+
+            vrmRenderer.setSize(width, height, false);
+            vrmCamera.aspect = width / height;
+            vrmCamera.updateProjectionMatrix();
+
+            if (vrmScene) {
+                try { vrmRenderer.render(vrmScene, vrmCamera); } catch (_) {}
+            }
+        }
+
+        function attachVRMResizeHandler() {
+            clearVRMResizeHandler();
+            let rafId = 0;
+            vrmResizeHandler = () => {
+                if (rafId) cancelAnimationFrame(rafId);
+                rafId = requestAnimationFrame(() => {
+                    rafId = 0;
+                    resizeVRMViewport();
+                });
+            };
+            window.addEventListener('resize', vrmResizeHandler);
+        }
+
         // Build full tool settings object from DOM (single source of truth for companion snapshot and localStorage)
         function getToolSettingsFromDOM() {
             const vrmVersionDropdown = document.getElementById('vrm-version-dropdown');
@@ -4300,6 +4545,7 @@
             const live2dDropdown = document.getElementById('live2d-model-dropdown');
             const live2dList = document.getElementById('live2d-model-list');
             const live2dOffsetRange = document.getElementById('live2d-offset-range');
+            const live2dScaleRange = document.getElementById('live2d-scale-range');
             const vrmDropdown = document.getElementById('vrm-model-dropdown');
             const vrmList = document.getElementById('vrm-model-list');
             const vrmScaleRange = document.getElementById('vrm-scale-range');
@@ -4331,6 +4577,7 @@
                 live2dModel: live2dDropdown ? live2dDropdown.value : '',
                 live2dModelList: live2dList ? live2dList.value : '',
                 live2dOffset: live2dOffsetRange ? parseFloat(live2dOffsetRange.value) || 0 : 0,
+                live2dScale: live2dScaleRange ? parseFloat(live2dScaleRange.value) || 1.0 : 1.0,
                 vrmModel: vrmDropdown ? vrmDropdown.value : '',
                 vrmModelList: vrmList ? vrmList.value : '',
                 vrmScale: vrmScaleRange ? parseFloat(vrmScaleRange.value) || 1.0 : 1.0,
@@ -4338,15 +4585,19 @@
                 vrmPositionY: vrmPositionYRange ? parseFloat(vrmPositionYRange.value) || 0 : 0,
                 vrmRotation: vrmRotationRange ? parseInt(vrmRotationRange.value, 10) || 0 : 0,
                 live2dOffsets: live2dOffsets || {},
+                live2dScales: live2dScales || {},
                 vrmPositions: vrmPositions || {}
             };
         }
 
         // Function to save tool settings to localStorage (uses getToolSettingsFromDOM as single source)
-        function saveToolSettings() {
+        function saveToolSettings(options = {}) {
             try {
                 const settings = getToolSettingsFromDOM();
                 localStorage.setItem('toolSettings', JSON.stringify(settings));
+                if (!options.skipCompanionRefresh) {
+                    updateCompanionDraftUI(settings, { syncDirtyState: options.syncDirtyState !== false });
+                }
             } catch (error) {
                 console.warn('Error saving tool settings:', error);
             }
@@ -4467,6 +4718,7 @@
             if (settings.live2dModelList !== undefined && live2dListEl) live2dListEl.value = settings.live2dModelList;
             if (settings.live2dModel !== undefined) modelPath = settings.live2dModel;
             if (settings.live2dOffsets !== undefined && typeof settings.live2dOffsets === 'object') live2dOffsets = settings.live2dOffsets;
+            if (settings.live2dScales !== undefined && typeof settings.live2dScales === 'object') live2dScales = settings.live2dScales;
             if (live2dListEl && live2dDropdownEl) {
                 const lines = (live2dListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
                 live2dDropdownEl.innerHTML = lines.map(path => {
@@ -4484,9 +4736,22 @@
             }
             const live2dOffsetRangeEl = document.getElementById('live2d-offset-range');
             const live2dOffsetValueEl = document.getElementById('live2d-offset-value');
-            const offsetVal = settings.live2dOffset !== undefined ? Number(settings.live2dOffset) : (live2dOffsets[modelPath] ?? 0);
-            if (live2dOffsetRangeEl) live2dOffsetRangeEl.value = offsetVal;
+            const live2dScaleRangeEl = document.getElementById('live2d-scale-range');
+            const live2dScaleValueEl = document.getElementById('live2d-scale-value');
+            if (settings.live2dOffset !== undefined && modelPath) {
+                live2dOffsets[modelPath] = Number(settings.live2dOffset) || 0;
+            }
+            if (settings.live2dScale !== undefined && modelPath) {
+                live2dScales[modelPath] = Math.min(3.0, Math.max(0.4, Number(settings.live2dScale) || 1.0));
+            }
+            const offsetVal = settings.live2dOffset !== undefined ? (Number(settings.live2dOffset) || 0) : getLive2DOffset(modelPath);
+            const scaleVal = settings.live2dScale !== undefined
+                ? Math.min(3.0, Math.max(0.4, Number(settings.live2dScale) || 1.0))
+                : getLive2DScale(modelPath);
+            if (live2dOffsetRangeEl) live2dOffsetRangeEl.value = String(offsetVal);
             if (live2dOffsetValueEl) live2dOffsetValueEl.textContent = String(offsetVal);
+            if (live2dScaleRangeEl) live2dScaleRangeEl.value = String(scaleVal);
+            if (live2dScaleValueEl) live2dScaleValueEl.textContent = formatLive2DScale(scaleVal);
             // Avatar: VRM list and selection
             const vrmListEl = document.getElementById('vrm-model-list');
             const vrmDropdownEl = document.getElementById('vrm-model-dropdown');
@@ -4593,12 +4858,76 @@
             return (p || '').trim().replace(/^\.\//, '').replace(/\/$/, '');
         }
 
-        // Call scan endpoint, merge discovered paths into Live2D/VRM lists, rebuild dropdowns, persist
-        async function scanAndMergeModelAvatarLists() {
+        function parseModelList(value, extension) {
+            return (value || '')
+                .split(/\r?\n/)
+                .map(line => line.trim())
+                .filter(line => line.length > 0 && line.toLowerCase().endsWith(extension));
+        }
+
+        function setModelListValue(textarea, paths) {
+            if (!textarea) return;
+            textarea.value = paths.join('\n');
+        }
+
+        function syncLive2DModelControls() {
             const live2dListEl = document.getElementById('live2d-model-list');
             const live2dDropdownEl = document.getElementById('live2d-model-dropdown');
+            const live2dOffsetRangeEl = document.getElementById('live2d-offset-range');
+            const live2dOffsetValueEl = document.getElementById('live2d-offset-value');
+            const live2dScaleRangeEl = document.getElementById('live2d-scale-range');
+            const live2dScaleValueEl = document.getElementById('live2d-scale-value');
+            if (!live2dListEl || !live2dDropdownEl) return [];
+
+            const lines = parseModelList(live2dListEl.value, '.model3.json');
+            if (!lines.includes(modelPath)) {
+                modelPath = lines[0] || '';
+                try { localStorage.setItem(L2D_SELECTED_KEY, modelPath); } catch {}
+            }
+
+            live2dDropdownEl.innerHTML = lines.map(path => {
+                const fileName = path.split('/').pop();
+                const selected = path === modelPath ? ' selected' : '';
+                return `<option value="${path}"${selected}>${fileName}</option>`;
+            }).join('');
+
+            if (modelPath) {
+                live2dDropdownEl.value = modelPath;
+            }
+
+            const currentOffset = modelPath ? getLive2DOffset(modelPath) : 0;
+            const currentScale = modelPath ? getLive2DScale(modelPath) : 1.0;
+            if (live2dOffsetRangeEl) live2dOffsetRangeEl.value = String(currentOffset);
+            if (live2dOffsetValueEl) live2dOffsetValueEl.textContent = String(currentOffset);
+            if (live2dScaleRangeEl) live2dScaleRangeEl.value = String(currentScale);
+            if (live2dScaleValueEl) live2dScaleValueEl.textContent = formatLive2DScale(currentScale);
+            return lines;
+        }
+
+        function syncVRMModelControls() {
             const vrmListEl = document.getElementById('vrm-model-list');
             const vrmDropdownEl = document.getElementById('vrm-model-dropdown');
+            if (!vrmListEl || !vrmDropdownEl) return [];
+
+            const lines = parseModelList(vrmListEl.value, '.vrm');
+            if (!lines.includes(currentVRMModelPath)) {
+                currentVRMModelPath = lines[0] || '';
+                try { localStorage.setItem(VRM_SELECTED_KEY, currentVRMModelPath); } catch {}
+            }
+
+            vrmDropdownEl.innerHTML = lines.map(path => `<option value="${path}">${path.split('/').pop()}</option>`).join('');
+
+            if (currentVRMModelPath) {
+                vrmDropdownEl.value = currentVRMModelPath;
+            }
+            return lines;
+        }
+
+        // Call scan endpoint and refresh discovered Live2D/VRM paths from model_avatar/
+        async function scanAndMergeModelAvatarLists(options = {}) {
+            const { silent = false } = options;
+            const live2dListEl = document.getElementById('live2d-model-list');
+            const vrmListEl = document.getElementById('vrm-model-list');
             if (!live2dListEl || !vrmListEl) return;
             const scanBtn = document.getElementById('scan-model-avatar-btn');
             if (scanBtn) {
@@ -4613,74 +4942,41 @@
                     const msg = res.status === 401
                         ? 'Scan failed. Sign in or start the server.'
                         : (res.statusText || 'Scan failed. Is the server running?');
-                    if (typeof showToast === 'function') showToast(msg); else console.warn(msg);
+                    if (!silent && typeof showToast === 'function') showToast(msg); else console.warn(msg);
                     return;
                 }
                 const data = await res.json();
                 const scannedLive2d = Array.isArray(data.live2d) ? data.live2d : [];
                 const scannedVrm = Array.isArray(data.vrm) ? data.vrm : [];
-                // Merge Live2D: existing lines first (dedupe by normalized path), then append new from scan
-                const live2dLines = (live2dListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
-                const live2dNorm = new Set(live2dLines.map(normalizeModelPath));
-                const origLive2dCount = live2dLines.length;
+                const uniqueLive2d = [];
+                const live2dSeen = new Set();
                 scannedLive2d.forEach(path => {
-                    if (!live2dNorm.has(normalizeModelPath(path))) {
-                        live2dLines.push(path);
-                        live2dNorm.add(normalizeModelPath(path));
-                    }
+                    const normalized = normalizeModelPath(path);
+                    if (!normalized || live2dSeen.has(normalized)) return;
+                    live2dSeen.add(normalized);
+                    uniqueLive2d.push(path);
                 });
-                live2dListEl.value = live2dLines.join('\n');
-                // Merge VRM: same
-                const vrmLines = (vrmListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.vrm'));
-                const vrmNorm = new Set(vrmLines.map(normalizeModelPath));
-                const origVrmCount = vrmLines.length;
+                const uniqueVrm = [];
+                const vrmSeen = new Set();
                 scannedVrm.forEach(path => {
-                    if (!vrmNorm.has(normalizeModelPath(path))) {
-                        vrmLines.push(path);
-                        vrmNorm.add(normalizeModelPath(path));
-                    }
+                    const normalized = normalizeModelPath(path);
+                    if (!normalized || vrmSeen.has(normalized)) return;
+                    vrmSeen.add(normalized);
+                    uniqueVrm.push(path);
                 });
-                vrmListEl.value = vrmLines.join('\n');
-                // Rebuild Live2D dropdown from merged list
-                if (live2dDropdownEl) {
-                    const lines = (live2dListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
-                    live2dDropdownEl.innerHTML = lines.map(path => {
-                        const fileName = path.split('/').pop();
-                        const selected = path === modelPath ? ' selected' : '';
-                        return `<option value="${path}"${selected}>${fileName}</option>`;
-                    }).join('');
-                    if (modelPath && lines.indexOf(modelPath) === -1) {
-                        const opt = document.createElement('option');
-                        opt.value = modelPath;
-                        opt.textContent = modelPath.split('/').pop();
-                        opt.selected = true;
-                        live2dDropdownEl.appendChild(opt);
-                    } else if (modelPath) live2dDropdownEl.value = modelPath;
-                }
-                // Rebuild VRM dropdown from merged list
-                if (vrmDropdownEl) {
-                    const vrmLinesFinal = (vrmListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.vrm'));
-                    vrmDropdownEl.innerHTML = vrmLinesFinal.map(path => `<option value="${path}">${path.split('/').pop()}</option>`).join('');
-                    if (currentVRMModelPath) {
-                        if (vrmLinesFinal.indexOf(currentVRMModelPath) !== -1) vrmDropdownEl.value = currentVRMModelPath;
-                        else {
-                            const opt = document.createElement('option');
-                            opt.value = currentVRMModelPath;
-                            opt.textContent = currentVRMModelPath.split('/').pop();
-                            opt.selected = true;
-                            vrmDropdownEl.appendChild(opt);
-                            vrmDropdownEl.value = currentVRMModelPath;
-                        }
-                    }
-                }
+
+                setModelListValue(live2dListEl, uniqueLive2d);
+                setModelListValue(vrmListEl, uniqueVrm);
+                syncLive2DModelControls();
+                syncVRMModelControls();
                 saveToolSettings();
-                const addedLive2d = live2dLines.length - origLive2dCount;
-                const addedVrmCount = vrmLines.length - origVrmCount;
-                const feedback = (addedLive2d || addedVrmCount) ? `Added ${addedLive2d} Live2D, ${addedVrmCount} VRM model(s).` : 'No new models found.';
-                if (typeof showToast === 'function') showToast(feedback); else console.log(feedback);
+                const feedback = (uniqueLive2d.length || uniqueVrm.length)
+                    ? `Found ${uniqueLive2d.length} Live2D and ${uniqueVrm.length} VRM model(s).`
+                    : 'No avatar models found in model_avatar.';
+                if (!silent && typeof showToast === 'function') showToast(feedback); else console.log(feedback);
             } catch (err) {
                 const msg = 'Scan failed. Is the server running?';
-                if (typeof showToast === 'function') showToast(msg); else console.warn(msg, err);
+                if (!silent && typeof showToast === 'function') showToast(msg); else console.warn(msg, err);
             } finally {
                 if (scanBtn) {
                     scanBtn.disabled = false;
@@ -4698,33 +4994,272 @@
         }
 
         let activeCompanionId = null;
+        let activeCompanionName = '';
+        let activeCompanionSignature = '';
+        let companionHasUnsavedChanges = false;
+        let latestSavedCompanionId = null;
+        let latestSavedCompanionName = '';
+        let latestSavedCompanionSignature = '';
+        let activeToolSettingsPanelId = 'connection-settings-panel';
+
+        function setActiveToolSettingsPanel(panelId, options = {}) {
+            const panels = Array.from(document.querySelectorAll('[data-tool-settings-panel]'));
+            if (!panels.length) return;
+
+            const nextPanel = panels.find((panel) => panel.id === panelId) || panels[0];
+            activeToolSettingsPanelId = nextPanel.id;
+
+            panels.forEach((panel) => {
+                panel.classList.toggle('tool-settings-screen-active', panel.id === activeToolSettingsPanelId);
+            });
+
+            document.querySelectorAll('[data-tool-settings-target]').forEach((control) => {
+                const isActive = control.getAttribute('data-tool-settings-target') === activeToolSettingsPanelId;
+                control.classList.toggle('is-active', isActive);
+                control.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+            });
+
+            if (options.scrollIntoView) {
+                nextPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+        }
+
+        function showToolSettingsBuilderPanel(panelId = activeToolSettingsPanelId, options = {}) {
+            const collapsible = document.querySelector('.collapsible');
+            const content = collapsible && collapsible.querySelector('.collapsible-content');
+            const btn = collapsible && collapsible.querySelector('.collapsible-btn');
+
+            if (content && btn) {
+                content.classList.add('active');
+                btn.classList.add('active');
+                btn.setAttribute('aria-expanded', 'true');
+                if (options.expandScrollIntoView !== false) {
+                    content.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                }
+            }
+
+            setActiveToolSettingsPanel(panelId, { scrollIntoView: options.scrollIntoView === true });
+        }
+
+        function setupToolSettingsBuilderUI() {
+            const controls = Array.from(document.querySelectorAll('[data-tool-settings-target]'));
+            if (!controls.length) return;
+
+            controls.forEach((control) => {
+                control.addEventListener('click', () => {
+                    setActiveToolSettingsPanel(control.getAttribute('data-tool-settings-target'), { scrollIntoView: false });
+                });
+            });
+
+            setActiveToolSettingsPanel(activeToolSettingsPanelId, { scrollIntoView: false });
+        }
+
+        function escapeHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function getSettingsSignature(settings) {
+            try {
+                return JSON.stringify(settings || {});
+            } catch (error) {
+                console.warn('Settings signature error:', error);
+                return '';
+            }
+        }
+
+        function getBasenameFromPath(path) {
+            const normalized = String(path || '').trim().replace(/\\/g, '/');
+            if (!normalized) return '';
+            const segments = normalized.split('/').filter(Boolean);
+            return segments.length ? segments[segments.length - 1] : normalized;
+        }
+
+        function truncateLabel(value, maxLength = 28) {
+            const text = String(value || '').trim();
+            if (!text || text.length <= maxLength) return text;
+            return `${text.slice(0, maxLength - 1)}...`;
+        }
+
+        function getEndpointLabel(endpoint) {
+            const raw = String(endpoint || '').trim();
+            if (!raw) return '';
+            try {
+                const parsed = new URL(raw);
+                if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return 'Local endpoint';
+                return truncateLabel(parsed.hostname, 24);
+            } catch (error) {
+                return truncateLabel(raw.replace(/^https?:\/\//i, ''), 24);
+            }
+        }
+
+        function summarizeCompanionSettings(settings) {
+            const safeSettings = (settings && typeof settings === 'object') ? settings : {};
+            const assistant = String(safeSettings.assistantName || '').trim() || 'Assistant';
+            const avatarMode = safeSettings.avatarMode === 'vrm' ? 'VRM' : 'Live2D';
+            const avatarFile = getBasenameFromPath(
+                safeSettings.avatarMode === 'vrm' ? safeSettings.vrmModel : safeSettings.live2dModel
+            );
+            const primaryModel = safeSettings.baseModel || safeSettings.toolModel || safeSettings.visionModel || '';
+            const voiceLabel = safeSettings.ttsService === 'openai'
+                ? (safeSettings.ttsVoice || safeSettings.ttsModel || 'OpenAI-compatible TTS')
+                : 'Browser voice';
+            const endpointLabel = getEndpointLabel(safeSettings.endpoint);
+            const activeModes = [];
+            if (safeSettings.webcamMode) activeModes.push('Webcam');
+            if (safeSettings.clipboardMode) activeModes.push('Clipboard vision');
+            if (safeSettings.muteMode) activeModes.push('Muted');
+
+            const descriptionParts = [`${assistant} using ${avatarMode}`];
+            if (avatarFile) descriptionParts.push(`avatar ${avatarFile}`);
+            if (primaryModel) descriptionParts.push(`chat model ${truncateLabel(primaryModel, 24)}`);
+
+            const tags = [];
+            if (primaryModel) tags.push(`Chat ${truncateLabel(primaryModel, 24)}`);
+            if (voiceLabel) tags.push(`Voice ${truncateLabel(voiceLabel, 22)}`);
+            if (endpointLabel) tags.push(endpointLabel);
+            tags.push(activeModes.length ? activeModes.join(' + ') : 'Standard chat');
+
+            return {
+                title: assistant,
+                description: descriptionParts.join(' | '),
+                tags
+            };
+        }
+
+        function suggestCompanionName(settings) {
+            const summary = summarizeCompanionSettings(settings);
+            const primaryModel = String(settings?.baseModel || settings?.toolModel || settings?.visionModel || '').trim();
+            const endpointLabel = getEndpointLabel(settings?.endpoint);
+            const avatarFile = getBasenameFromPath(
+                settings?.avatarMode === 'vrm' ? settings?.vrmModel : settings?.live2dModel
+            ).replace(/\.[^.]+$/g, '');
+            const detail = truncateLabel(primaryModel || endpointLabel || avatarFile || '', 22);
+            return detail ? `${summary.title} ${detail}` : summary.title;
+        }
+
+        function renderCompanionTags(container, tags) {
+            if (!container) return;
+            const safeTags = Array.isArray(tags) ? tags.filter(Boolean) : [];
+            container.innerHTML = safeTags
+                .map((tag) => `<span class="companion-tag">${escapeHtml(tag)}</span>`)
+                .join('');
+        }
+
+        function setCompanionFeedback(message = '', type = 'info') {
+            const feedbackEl = document.getElementById('companion-feedback');
+            if (!feedbackEl) return;
+            feedbackEl.textContent = message;
+            feedbackEl.classList.remove('is-error', 'is-success');
+            if (type === 'error') feedbackEl.classList.add('is-error');
+            if (type === 'success') feedbackEl.classList.add('is-success');
+        }
+
+        function updateCompanionDraftUI(optionalSettings, options = {}) {
+            const settings = (optionalSettings && typeof optionalSettings === 'object')
+                ? optionalSettings
+                : getToolSettingsFromDOM();
+            const summary = summarizeCompanionSettings(settings);
+            const currentSignature = getSettingsSignature(settings);
+            const previousDirtyState = companionHasUnsavedChanges;
+
+            if (options.syncDirtyState !== false && activeCompanionId && activeCompanionSignature) {
+                companionHasUnsavedChanges = currentSignature !== activeCompanionSignature;
+            }
+
+            const nameEl = document.getElementById('companion-current-name');
+            const stateEl = document.getElementById('companion-current-state');
+            const summaryEl = document.getElementById('companion-current-summary');
+            const tagsEl = document.getElementById('companion-current-tags');
+            const modalPreviewText = document.getElementById('companion-modal-preview-text');
+            const modalTagsEl = document.getElementById('companion-modal-tags');
+
+            if (nameEl) nameEl.textContent = summary.title;
+
+            let stateLabel = 'Not saved';
+            let summaryText = summary.description;
+
+            if (activeCompanionId) {
+                if (companionHasUnsavedChanges) {
+                    stateLabel = 'Unsaved changes';
+                    summaryText = `${summary.description}. This no longer matches "${activeCompanionName || 'the active companion'}".`;
+                } else {
+                    stateLabel = 'Active companion';
+                    summaryText = `${summary.description}. Saved as "${activeCompanionName || summary.title}".`;
+                }
+            } else if (latestSavedCompanionSignature && currentSignature === latestSavedCompanionSignature) {
+                stateLabel = 'Saved snapshot';
+                summaryText = `${summary.description}. Saved as "${latestSavedCompanionName || summary.title}".`;
+            }
+
+            if (stateEl) stateEl.textContent = stateLabel;
+            if (summaryEl) summaryEl.textContent = summaryText;
+            renderCompanionTags(tagsEl, summary.tags);
+
+            if (modalPreviewText) modalPreviewText.textContent = summary.description;
+            renderCompanionTags(modalTagsEl, summary.tags);
+
+            if (previousDirtyState !== companionHasUnsavedChanges && activeCompanionId) {
+                renderCompanionList();
+            }
+        }
 
         function renderCompanionList() {
             const listEl = document.getElementById('companion-list');
             if (!listEl) return;
             listEl.innerHTML = '';
             fetchCompanionsList().then(companions => {
-                if (!Array.isArray(companions)) return;
+                if (!Array.isArray(companions) || companions.length === 0) {
+                    listEl.innerHTML = '<li class="companion-empty-state">No saved companions yet. Save the current setup to reuse it later.</li>';
+                    return;
+                }
+                const currentSignature = getSettingsSignature(getToolSettingsFromDOM());
                 companions.forEach(c => {
                     const li = document.createElement('li');
                     li.setAttribute('data-companion-id', c.id);
-                    if (c.id === activeCompanionId) li.classList.add('companion-active');
+                    const isActive = c.id === activeCompanionId;
+                    if (isActive) li.classList.add('companion-active');
+                    if (isActive && companionHasUnsavedChanges) li.classList.add('companion-active-dirty');
+
+                    const copy = document.createElement('div');
+                    copy.className = 'companion-list-copy';
+
                     const nameSpan = document.createElement('span');
                     nameSpan.textContent = c.name || c.id;
                     nameSpan.className = 'companion-name';
-                    li.appendChild(nameSpan);
+                    copy.appendChild(nameSpan);
+
+                    const subtitle = document.createElement('span');
+                    subtitle.className = 'companion-subtitle';
+                    if (isActive && companionHasUnsavedChanges) subtitle.textContent = 'Active companion with unsaved changes';
+                    else if (isActive) subtitle.textContent = 'Active companion';
+                    else if (!activeCompanionId && c.id === latestSavedCompanionId && currentSignature === latestSavedCompanionSignature) subtitle.textContent = 'Matches the current setup';
+                    else subtitle.textContent = 'Click to load this setup';
+                    copy.appendChild(subtitle);
+
+                    li.appendChild(copy);
                     const delBtn = document.createElement('button');
                     delBtn.type = 'button';
                     delBtn.className = 'companion-delete-btn';
                     delBtn.setAttribute('aria-label', 'Delete companion');
                     delBtn.innerHTML = '<i class="fas fa-trash-alt"></i>';
-                    delBtn.addEventListener('click', (e) => { e.stopPropagation(); deleteCompanion(c.id); });
+                    delBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        deleteCompanion(c.id, c.name || c.id).catch((error) => {
+                            console.warn('Delete companion failed:', error);
+                            setCompanionFeedback(`Failed to delete companion: ${error.message}`, 'error');
+                        });
+                    });
                     li.appendChild(delBtn);
                     listEl.appendChild(li);
                 });
             }).catch(err => {
                 console.warn('Companions list failed:', err);
-                listEl.innerHTML = '<li style="color:#888;">Unable to load companions</li>';
+                listEl.innerHTML = '<li class="companion-empty-state">Unable to load companions</li>';
             });
         }
 
@@ -4735,29 +5270,66 @@
             const data = await res.json();
             if (data.settings) {
                 applyToolSettingsToDOM(data.settings);
-                saveToolSettings();
+                await fetchAvailableModels(data.settings);
                 activeCompanionId = id;
+                activeCompanionName = data.name || id;
+                activeCompanionSignature = getSettingsSignature(getToolSettingsFromDOM());
+                companionHasUnsavedChanges = false;
+                latestSavedCompanionId = id;
+                latestSavedCompanionName = data.name || id;
+                latestSavedCompanionSignature = activeCompanionSignature;
+                saveToolSettings({ syncDirtyState: false });
+                updateCompanionDraftUI(data.settings, { syncDirtyState: false });
                 renderCompanionList();
+                setCompanionFeedback(`Loaded companion "${activeCompanionName}".`, 'success');
             }
         }
 
-        async function deleteCompanion(id) {
+        async function deleteCompanion(id, name) {
+            if (!window.confirm(`Delete companion "${name || id}"?`)) return;
             const url = `${PROXY_BASE_URL}/v1/companions/${encodeURIComponent(id)}`;
             const res = await fetch(url, { method: 'DELETE', headers: { 'Authorization': `Bearer ${authToken}` } });
             if (!res.ok) throw new Error(res.statusText || 'Delete failed');
-            if (activeCompanionId === id) activeCompanionId = null;
+            if (activeCompanionId === id) {
+                activeCompanionId = null;
+                activeCompanionName = '';
+                activeCompanionSignature = '';
+                companionHasUnsavedChanges = false;
+            }
+            if (latestSavedCompanionId === id) {
+                latestSavedCompanionId = null;
+                latestSavedCompanionName = '';
+                latestSavedCompanionSignature = '';
+            }
             renderCompanionList();
+            updateCompanionDraftUI(undefined, { syncDirtyState: false });
+            setCompanionFeedback(`Deleted companion "${name || id}".`, 'success');
         }
 
         function setupCompanionsUI() {
             const listEl = document.getElementById('companion-list');
             const addBtn = document.getElementById('companion-add-btn');
             const modalOverlay = document.getElementById('companion-modal-overlay');
-            const modal = document.getElementById('companion-modal');
             const nameInput = document.getElementById('companion-name-input');
             const saveBtn = document.getElementById('companion-modal-save');
             const cancelBtn = document.getElementById('companion-modal-cancel');
+            const activateCheckbox = document.getElementById('companion-activate-checkbox');
+            const modalError = document.getElementById('companion-modal-error');
             if (!listEl || !addBtn || !modalOverlay || !saveBtn || !cancelBtn) return;
+
+            function openToolSettingsPanel(targetPanelId = activeToolSettingsPanelId, options = {}) {
+                showToolSettingsBuilderPanel(targetPanelId, options);
+            }
+
+            function setModalError(message) {
+                if (!modalError) return;
+                modalError.textContent = message || '';
+            }
+
+            function updateSaveState() {
+                if (!saveBtn) return;
+                saveBtn.disabled = !nameInput || !nameInput.value.trim();
+            }
 
             // Click on list item (excluding delete button): load companion
             listEl.addEventListener('click', (e) => {
@@ -4765,45 +5337,69 @@
                 const li = t && t.closest ? t.closest('li[data-companion-id]') : null;
                 if (!li || (t && t.closest && t.closest('.companion-delete-btn'))) return;
                 const id = li.getAttribute('data-companion-id');
-                if (id) loadCompanion(id).catch(err => console.warn('Load companion failed:', err));
+                if (id) {
+                    loadCompanion(id).catch(err => {
+                        console.warn('Load companion failed:', err);
+                        setCompanionFeedback(`Failed to load companion: ${err.message}`, 'error');
+                    });
+                }
             });
 
             addBtn.addEventListener('click', () => {
-                if (nameInput) nameInput.value = '';
+                const settings = getToolSettingsFromDOM();
+                openToolSettingsPanel(activeToolSettingsPanelId, { expandScrollIntoView: false });
+                if (nameInput) nameInput.value = suggestCompanionName(settings);
+                if (activateCheckbox) activateCheckbox.checked = true;
+                setModalError('');
+                updateCompanionDraftUI(settings, { syncDirtyState: false });
+                updateSaveState();
                 modalOverlay.style.display = 'flex';
                 modalOverlay.setAttribute('aria-hidden', 'false');
                 if (nameInput) nameInput.focus();
-                renderCompanionList();
             });
 
             function closeCompanionModal() {
                 modalOverlay.style.display = 'none';
                 modalOverlay.setAttribute('aria-hidden', 'true');
+                setModalError('');
             }
 
             cancelBtn.addEventListener('click', closeCompanionModal);
             modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeCompanionModal(); });
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape' && modalOverlay.style.display !== 'none') closeCompanionModal();
+            });
+
+            if (nameInput) {
+                nameInput.addEventListener('input', () => {
+                    updateSaveState();
+                    setModalError('');
+                });
+                nameInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' && !saveBtn.disabled) {
+                        e.preventDefault();
+                        saveBtn.click();
+                    }
+                });
+            }
 
             const editSettingsLink = document.getElementById('companion-edit-settings-link');
             if (editSettingsLink) {
                 editSettingsLink.addEventListener('click', () => {
                     closeCompanionModal();
-                    const collapsible = document.querySelector('.collapsible');
-                    const content = collapsible && collapsible.querySelector('.collapsible-content');
-                    const btn = collapsible && collapsible.querySelector('.collapsible-btn');
-                    if (content && btn) {
-                        content.classList.add('active');
-                        btn.classList.add('active');
-                        btn.setAttribute('aria-expanded', 'true');
-                        content.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-                    }
+                    openToolSettingsPanel(activeToolSettingsPanelId, { scrollIntoView: true });
                 });
             }
 
             saveBtn.addEventListener('click', async () => {
                 const name = (nameInput && nameInput.value || '').trim();
-                if (!name) return;
+                if (!name) {
+                    setModalError('Give this companion a name before saving.');
+                    return;
+                }
                 const settings = getToolSettingsFromDOM();
+                saveBtn.disabled = true;
+                setModalError('');
                 try {
                     const res = await fetch(`${PROXY_BASE_URL}/v1/companions`, {
                         method: 'POST',
@@ -4814,12 +5410,38 @@
                         body: JSON.stringify({ name, settings })
                     });
                     if (!res.ok) throw new Error(await res.text() || 'Save failed');
+                    const created = await res.json();
+                    latestSavedCompanionId = created.id;
+                    latestSavedCompanionName = created.name || name;
+                    latestSavedCompanionSignature = getSettingsSignature(settings);
+                    if (!activateCheckbox || activateCheckbox.checked) {
+                        activeCompanionId = created.id;
+                        activeCompanionName = created.name || name;
+                        activeCompanionSignature = latestSavedCompanionSignature;
+                        companionHasUnsavedChanges = false;
+                    }
+                    saveToolSettings({ syncDirtyState: false });
+                    updateCompanionDraftUI(settings, { syncDirtyState: false });
                     closeCompanionModal();
                     renderCompanionList();
+                    setCompanionFeedback(
+                        !activateCheckbox || activateCheckbox.checked
+                            ? `Saved and activated companion "${created.name || name}".`
+                            : `Saved companion "${created.name || name}".`,
+                        'success'
+                    );
                 } catch (err) {
                     console.warn('Save companion failed:', err);
+                    setModalError(err.message || 'Could not save the companion.');
+                    setCompanionFeedback(`Failed to save companion: ${err.message}`, 'error');
+                } finally {
+                    updateSaveState();
                 }
             });
+
+            renderCompanionList();
+            updateCompanionDraftUI(undefined, { syncDirtyState: false });
+            updateSaveState();
         }
 
         // Function to setup event listeners for persisting tool settings
@@ -4884,6 +5506,10 @@
             if (scanModelAvatarBtn) {
                 scanModelAvatarBtn.addEventListener('click', () => scanAndMergeModelAvatarLists());
             }
+
+            window.addEventListener('pagehide', () => {
+                saveToolSettings({ skipCompanionRefresh: true });
+            });
             
             console.log('Tool settings persistence enabled');
         }
@@ -5059,6 +5685,7 @@
                 
                 // Clear the text areas (keep message history intact)
                 userInput.value = '';
+                syncUserInputUi();
                 responseOutput.value = '';
                 // clearMessageHistory(); // Commented out to preserve chat history when using STT
 
@@ -5378,6 +6005,7 @@ function saveWAVFile(wavBlob) {
                     console.log('Calling fetchOpenAIResponse with transcribed text:', transcribedText); // Debug log
                     fetchOpenAIResponse(transcribedText);
                     userInput.value = ''; // Clear input field after submission
+                    syncUserInputUi();
                 } else {
                     // Response format is unexpected - log the full response for debugging
                     console.error('Unexpected response format - no text field found:', data);
@@ -6460,82 +7088,6 @@ function saveWAVFile(wavBlob) {
             {
                 type: "function",
                 function: {
-                    name: "readFile",
-                    description: "Reads content from a file",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            filename: {
-                                type: "string",
-                                description: "The name of the file to read"
-                            }
-                        },
-                        required: ["filename"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "writeFile",
-                    description: "Writes content to a file with an optional format",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            filename: {
-                                type: "string",
-                                description: "The name of the file to write"
-                            },
-                            content: {
-                                type: "string",
-                                description: "The content to write to the file"
-                            },
-                            format: {
-                                type: "string",
-                                description: "Optional format of the content (e.g., 'text', 'json')"
-                            }
-                        },
-                        required: ["filename", "content"]
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
-                    name: "listFiles",
-                    description: "Lists files and directories in the scratch directory (optionally under a subdirectory).",
-                    parameters: {
-                        type: "object",
-                        properties: {
-                            path: {
-                                type: "string",
-                                description: "Optional subdirectory path under scratch (e.g. images or reports/2026)."
-                            },
-                            recursive: {
-                                type: "boolean",
-                                description: "When true, include nested files/directories.",
-                                default: false
-                            },
-                            offset: {
-                                type: "integer",
-                                description: "Optional zero-based row offset for pagination.",
-                                minimum: 0,
-                                default: 0
-                            },
-                            max_entries: {
-                                type: "integer",
-                                description: "Optional number of rows to return for this page.",
-                                minimum: 1,
-                                maximum: 500
-                            }
-                        },
-                        required: []
-                    }
-                }
-            },
-            {
-                type: "function",
-                function: {
                     name: "runBrowserAgent",
                     description: "Executes browser automation tasks using natural language. Can navigate websites, fill forms, click buttons, extract information, and perform complex multi-step web interactions.",
                     parameters: {
@@ -6587,12 +7139,6 @@ function saveWAVFile(wavBlob) {
 
         const SKILL_TOOL_ALIAS_PREFIX = 'skill__';
         const SKILL_TOOL_CACHE_MS = 120000;
-        const OVERLAPPING_SKILL_FILE_TOOLS = new Set([
-            'filesystem.list_files',
-            'filesystem.read_text',
-            'filesystem.write_text',
-            'filesystem.search_files',
-        ]);
         const skillToolAliasToQualifiedName = new Map();
         let cachedSkillToolsForLlm = [];
         let cachedSkillPromptLines = [];
@@ -6645,8 +7191,6 @@ function saveWAVFile(wavBlob) {
                 const fn = tool?.function;
                 const qualifiedName = typeof fn?.name === 'string' ? fn.name.trim() : '';
                 if (!qualifiedName) continue;
-                if (OVERLAPPING_SKILL_FILE_TOOLS.has(qualifiedName)) continue;
-
                 const alias = createSkillToolAlias(qualifiedName, usedNames);
                 usedNames.add(alias);
                 nextAliasMap.set(alias, qualifiedName);
@@ -6732,167 +7276,31 @@ function saveWAVFile(wavBlob) {
 
         // Handler for reading files from the scratch directory
         async function handleReadFile({ filename }) {
-            try {
-                // Call the proxy server to read the file
-                const response = await fetch(`${PROXY_BASE_URL}/v1/files/read`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ filename })
-                });
-
-                // Parse the response
-                const result = await response.json();
-
-                // Return the result
-                if (result.success) {
-                    return {
-                        success: true,
-                        message: result.message,
-                        content: result.data.content,
-                        type: result.data.type
-                    };
-                } else {
-                    return {
-                        success: false,
-                        message: result.message
-                    };
-                }
-            } catch (error) {
-                // Handle network or parsing errors
-                console.error('Read file error:', error);
-                return {
-                    success: false,
-                    message: `Error reading file: ${error.message}. Make sure the proxy server is running on port 8002.`
-                };
-            }
+            return await handleSkillFrameworkTool('filesystem.read_text', {
+                path: filename
+            });
         }
 
         // Handler for writing files to the scratch directory
         async function handleWriteFile({ filename, content, format }) {
-            try {
-                // Default format to txt if not specified
-                if (!format) {
-                    format = 'txt';
-                }
-
-                // Call the proxy server to write the file
-                const response = await fetch(`${PROXY_BASE_URL}/v1/files/write`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ filename, content, format })
-                });
-
-                // Parse the response
-                const result = await response.json();
-
-                // Return the result
-                if (result.success) {
-                    return {
-                        success: true,
-                        message: result.message,
-                        filepath: result.data?.filepath,
-                        size: result.data?.size
-                    };
-                } else {
-                    return {
-                        success: false,
-                        message: result.message
-                    };
-                }
-            } catch (error) {
-                // Handle network or parsing errors
-                console.error('Write file error:', error);
-                return {
-                    success: false,
-                    message: `Error writing file: ${error.message}. Make sure the proxy server is running on port 8002.`
-                };
+            let path = String(filename || '').trim();
+            if (path && !/[\\/]/.test(path) && !/\.[^.\\/]+$/.test(path) && format) {
+                path = `${path}.${String(format).trim().toLowerCase()}`;
             }
+            return await handleSkillFrameworkTool('filesystem.write_text', {
+                path,
+                content: content ?? ''
+            });
         }
 
         // Handler for listing files in the scratch directory
         async function handleListFiles({ path = '', recursive = false, offset = 0, max_entries = undefined } = {}) {
-            try {
-                const search = new URLSearchParams();
-                if (path && typeof path === 'string' && path.trim()) {
-                    search.set('path', path.trim());
-                }
-                if (typeof recursive === 'boolean' ? recursive : String(recursive).trim().toLowerCase() === 'true') {
-                    search.set('recursive', 'true');
-                }
-                const numericOffset = Number.parseInt(offset, 10);
-                if (Number.isFinite(numericOffset) && numericOffset > 0) {
-                    search.set('offset', String(numericOffset));
-                }
-                const numericMaxEntries = Number.parseInt(max_entries, 10);
-                if (Number.isFinite(numericMaxEntries) && numericMaxEntries > 0) {
-                    search.set('max_entries', String(numericMaxEntries));
-                }
-                const query = search.toString();
-                const url = query ? `${PROXY_BASE_URL}/v1/files/list?${query}` : `${PROXY_BASE_URL}/v1/files/list`;
-                // Call the proxy server to list files
-                const response = await fetch(url, {
-                    method: 'GET',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    }
-                });
-
-                // Parse the response
-                const result = await response.json();
-
-                // Return the result
-                if (result.success) {
-                    const files = result.files || [];
-                    const totalCount = typeof result.total_count === 'number'
-                        ? result.total_count
-                        : (typeof result.count === 'number' ? result.count : files.length);
-                    const returnedCount = typeof result.returned_count === 'number' ? result.returned_count : files.length;
-                    const pageOffset = typeof result.offset === 'number' ? result.offset : Math.max(0, numericOffset || 0);
-                    const hasMore = Boolean(result.has_more);
-                    const scratchDir = result.scratch_dir;
-                    const renderedLines = files.length > 0
-                        ? files
-                            .map((file, index) => {
-                                const isDir = String(file?.type || '').toLowerCase() === 'directory';
-                                return isDir
-                                    ? `${pageOffset + index + 1}. ${file.name}/ [dir]`
-                                    : `${pageOffset + index + 1}. ${file.name} (${file.size ?? 0} bytes)`;
-                            })
-                            .join('\n')
-                        : 'No files found in the scratch directory.';
-                    const continuationLine = hasMore && typeof result.next_offset === 'number'
-                        ? `\nMore files available. Call listFiles with offset=${result.next_offset}.`
-                        : '';
-                    const content = `${renderedLines}${continuationLine}`;
-
-                    return {
-                        success: true,
-                        message: `Found ${totalCount} file${totalCount === 1 ? '' : 's'} in the scratch directory. Returned ${returnedCount}.`,
-                        files,
-                        count: totalCount,
-                        returned_count: returnedCount,
-                        total_count: totalCount,
-                        scratch_dir: scratchDir,
-                        content
-                    };
-                }
-
-                return {
-                    success: false,
-                    message: result.message
-                };
-            } catch (error) {
-                // Handle network or parsing errors
-                console.error('List files error:', error);
-                return {
-                    success: false,
-                    message: `Error listing files: ${error.message}. Make sure the proxy server is running on port 8002.`
-                };
-            }
+            return await handleSkillFrameworkTool('filesystem.list_files', {
+                path,
+                recursive,
+                offset,
+                max_entries
+            });
         }
 
         async function handleSkillFrameworkTool(toolName, args) {
@@ -6917,12 +7325,99 @@ function saveWAVFile(wavBlob) {
                     const detail = result?.detail || result?.message || `HTTP ${response.status}`;
                     return { success: false, message: `Skill tool error: ${detail}` };
                 }
+                const normalizedToolName = result.tool_name || toolName;
+                const data = (result && typeof result.data === 'object' && result.data)
+                    ? result.data
+                    : null;
+                if (normalizedToolName === 'filesystem.read_text' && data) {
+                    return {
+                        success: result.success !== false,
+                        message: result.message || `Read ${data.path || args?.path || args?.filename || 'file'}.`,
+                        content: typeof data.content === 'string' ? data.content : '',
+                        type: 'text',
+                        data,
+                        tool_name: normalizedToolName
+                    };
+                }
+                if (normalizedToolName === 'filesystem.write_text' && data) {
+                    return {
+                        success: result.success !== false,
+                        message: result.message || `Wrote ${data.path || args?.path || args?.filename || 'file'}.`,
+                        filepath: data.path,
+                        size: data.size_bytes,
+                        data,
+                        tool_name: normalizedToolName
+                    };
+                }
+                if (normalizedToolName === 'filesystem.list_files' && data) {
+                    const items = Array.isArray(data.items) ? data.items : [];
+                    const files = items.map((item) => ({
+                        name: item?.relative_path || item?.name || '',
+                        size: item?.size_bytes,
+                        type: item?.type || ''
+                    }));
+                    const offsetValue = Number.isFinite(Number(data.offset)) ? Number(data.offset) : 0;
+                    const renderedLines = files.length > 0
+                        ? files.map((file, index) => {
+                            const isDir = String(file?.type || '').toLowerCase() === 'directory';
+                            return isDir
+                                ? `${offsetValue + index + 1}. ${file.name}/ [dir]`
+                                : `${offsetValue + index + 1}. ${file.name} (${file.size ?? 0} bytes)`;
+                        }).join('\n')
+                        : 'No files found in the scratch directory.';
+                    const continuationLine = data.has_more && typeof data.next_offset === 'number'
+                        ? `\nMore files available. Call skill__filesystem_list_files with offset=${data.next_offset}.`
+                        : '';
+                    return {
+                        success: result.success !== false,
+                        message: result.message || `Found ${data.total_count ?? files.length} file${(data.total_count ?? files.length) === 1 ? '' : 's'}.`,
+                        files,
+                        count: data.total_count ?? files.length,
+                        returned_count: data.returned_count ?? files.length,
+                        total_count: data.total_count ?? files.length,
+                        scratch_dir: data.root,
+                        content: `${renderedLines}${continuationLine}`,
+                        data,
+                        tool_name: normalizedToolName
+                    };
+                }
+                if (normalizedToolName === 'filesystem.search_files' && data) {
+                    const items = Array.isArray(data.items) ? data.items : [];
+                    const offsetValue = Number.isFinite(Number(data.offset)) ? Number(data.offset) : 0;
+                    const renderedLines = items.length > 0
+                        ? items.map((item, index) => {
+                            const relPath = item?.relative_path || item?.name || '?';
+                            const matchTypes = Array.isArray(item?.match_types) && item.match_types.length
+                                ? item.match_types.join(',')
+                                : 'unknown';
+                            const lineSuffix = Number.isFinite(Number(item?.line_number)) && Number(item.line_number) > 0
+                                ? ` line ${item.line_number}`
+                                : '';
+                            const excerpt = String(item?.excerpt || '').trim();
+                            return excerpt
+                                ? `${offsetValue + index + 1}. ${relPath} [${matchTypes}]${lineSuffix}: ${excerpt}`
+                                : `${offsetValue + index + 1}. ${relPath} [${matchTypes}]`;
+                        }).join('\n')
+                        : `No matching files found for "${data.query || args?.query || ''}".`;
+                    const continuationLine = data.has_more && typeof data.next_offset === 'number'
+                        ? `\nMore results available. Call skill__filesystem_search_files with offset=${data.next_offset}.`
+                        : '';
+                    return {
+                        success: result.success !== false,
+                        message: result.message || `Found ${data.total_matches ?? items.length} matching file result${(data.total_matches ?? items.length) === 1 ? '' : 's'}.`,
+                        matches: items,
+                        total_matches: data.total_matches ?? items.length,
+                        content: `${renderedLines}${continuationLine}`,
+                        data,
+                        tool_name: normalizedToolName
+                    };
+                }
                 return {
                     success: result.success !== false,
                     message: result.message || `Skill tool '${toolName}' executed.`,
                     data: result.data,
                     error_code: result.error_code,
-                    tool_name: result.tool_name || toolName
+                    tool_name: normalizedToolName
                 };
             } catch (error) {
                 console.error('Skill framework tool error:', error);
@@ -7981,7 +8476,7 @@ function saveWAVFile(wavBlob) {
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${apiKeyInput.value}`
                     },
-                    body: JSON.stringify({
+                    body: JSON.stringify(buildCompatibleChatBody(summaryEndpoint, {
                         model: getCurrentModel(),
                         messages: [
                             {
@@ -7995,7 +8490,7 @@ function saveWAVFile(wavBlob) {
                         ],
                         max_tokens: 500,
                         temperature: 0.7
-                    })
+                    }))
                 });
 
                 const summaryData = await summaryResponse.json();
@@ -8082,6 +8577,108 @@ function saveWAVFile(wavBlob) {
             }
         }
 
+        function normalizeToolParametersText(rawText) {
+            const text = typeof rawText === 'string' ? rawText.trim() : String(rawText || '').trim();
+            const cdataText = text.startsWith('<![CDATA[') && text.endsWith(']]>')
+                ? text.slice(9, -3).trim()
+                : text;
+            return cdataText
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/[“”]/g, '"')
+                .replace(/[‘’]/g, "'");
+        }
+
+        function extractBalancedJsonCandidate(text) {
+            if (typeof text !== 'string' || !text) return null;
+            const startIndex = text.search(/[\[{]/);
+            if (startIndex === -1) return null;
+            const opening = text[startIndex];
+            const closing = opening === '{' ? '}' : ']';
+            let depth = 0;
+            let inString = false;
+            let escapeNext = false;
+
+            for (let i = startIndex; i < text.length; i += 1) {
+                const ch = text[i];
+                if (inString) {
+                    if (escapeNext) {
+                        escapeNext = false;
+                        continue;
+                    }
+                    if (ch === '\\') {
+                        escapeNext = true;
+                        continue;
+                    }
+                    if (ch === '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+                if (ch === '"') {
+                    inString = true;
+                    continue;
+                }
+                if (ch === opening) {
+                    depth += 1;
+                    continue;
+                }
+                if (ch === closing) {
+                    depth -= 1;
+                    if (depth === 0) {
+                        return text.slice(startIndex, i + 1);
+                    }
+                }
+            }
+            return null;
+        }
+
+        function parseLenientJsonObject(rawText) {
+            const normalized = normalizeToolParametersText(rawText);
+            if (!normalized) return null;
+            const candidates = [normalized];
+            const balanced = extractBalancedJsonCandidate(normalized);
+            if (balanced && !candidates.includes(balanced)) {
+                candidates.push(balanced);
+            }
+
+            for (const candidate of candidates) {
+                try {
+                    return JSON.parse(candidate);
+                } catch (error) {
+                    // Try simpler recovery passes below.
+                }
+            }
+
+            for (const candidate of candidates) {
+                try {
+                    const repaired = candidate
+                        .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_-]*)(\s*:)/g, '$1"$2"$3')
+                        .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
+                        .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ': "$1"');
+                    return JSON.parse(repaired);
+                } catch (error) {
+                    // Keep trying.
+                }
+            }
+
+            try {
+                const xmlMatches = Array.from(normalized.matchAll(/<([A-Za-z_][A-Za-z0-9_-]*)>([\s\S]*?)<\/\1>/g));
+                if (xmlMatches.length > 0) {
+                    const parsed = {};
+                    for (const [, key, value] of xmlMatches) {
+                        const nested = parseLenientJsonObject(value.trim());
+                        parsed[key] = nested !== null ? nested : value.trim();
+                    }
+                    return parsed;
+                }
+            } catch (error) {
+                console.error('Error parsing XML parameter map:', error);
+            }
+
+            return null;
+        }
+
         // Add this function to parse both XML-style and JSON tool responses
         function parseToolResponse(content) {
             console.log('Parsing tool response:', content);
@@ -8098,9 +8695,9 @@ function saveWAVFile(wavBlob) {
             const paramsMatch = contentWithoutCode.match(/<parameters>([\s\S]*?)<\/parameters>/);
             
             if (toolMatch && paramsMatch) {
-                try {
-                    const toolName = toolMatch[1].trim();
-                    const parameters = JSON.parse(paramsMatch[1].trim());
+                const toolName = toolMatch[1].trim();
+                const parameters = parseLenientJsonObject(paramsMatch[1]);
+                if (parameters !== null) {
                     console.log('Successfully parsed XML format:', { toolName, parameters });
                     return {
                         function: {
@@ -8108,9 +8705,8 @@ function saveWAVFile(wavBlob) {
                             arguments: JSON.stringify(parameters)
                         }
                     };
-                } catch (error) {
-                    console.error('Error parsing XML tool response:', error);
                 }
+                console.error('Error parsing XML tool response:', paramsMatch[1]);
             }
 
             // Try parsing as direct JSON, but only if the content looks like JSON
@@ -8346,7 +8942,7 @@ function saveWAVFile(wavBlob) {
                                     'Content-Type': 'application/json',
                                     'Authorization': `Bearer ${apiKeyInput.value}`
                                 },
-                                body: JSON.stringify({
+                                body: JSON.stringify(buildCompatibleChatBody(endpointInput.value, {
                                     model: getCurrentModel(),
                                     messages: [
                                         {
@@ -8358,7 +8954,7 @@ function saveWAVFile(wavBlob) {
                                             content: 'What happened to Pompeii?'
                                         }
                                     ]
-                                })
+                                }))
                             });
                             const data = await response.json();
                             content = data.choices[0].message.content;
@@ -8856,28 +9452,11 @@ Parameters:
     "fileName": "string (optional custom name for the file in Drive)"
 }
 
-14. readFile
-Description: Reads a file from the scratch directory. Supports txt, docx, xlsx, pdf, png, py, js, and html formats.
+14. Dynamic filesystem skill tools
+Description: File operations are provided by dynamic skill aliases such as 'skill__filesystem_read_text', 'skill__filesystem_list_files', 'skill__filesystem_write_text', and 'skill__filesystem_search_files'. Use the exact alias listed in the dynamic skill section for reading, listing, writing, and searching scratch files.
 Parameters:
 {
-    "filename": "string (name of the file to read from the scratch directory)"
-}
-
-15. listFiles
-Description: Lists files and directories in the scratch directory. Optional parameters allow scoped listing under a subdirectory.
-Parameters:
-{
-    "path": "string (optional subdirectory under scratch, e.g. images or reports/2026)",
-    "recursive": "boolean (optional, default false; when true includes nested files/directories)",
-}
-
-16. writeFile
-Description: Writes content to a file in the scratch directory. Supports txt, docx, xlsx, pdf, py, js, and html formats.
-Parameters:
-{
-    "filename": "string (name of the file to write)",
-    "content": "string (content to write to the file)",
-    "format": "string (optional: txt|docx|xlsx|pdf, defaults to txt)"
+    "Refer to the dynamic skill schema for the specific alias": "filesystem read/list/write/search tools are loaded at runtime"
 }
 
 Examples:
@@ -8941,27 +9520,26 @@ Assistant: <tool>fetchNews</tool>
 </parameters>
 
 User: "Read the content from report.txt"
-Assistant: <tool>readFile</tool>
+Assistant: <tool>skill__filesystem_read_text</tool>
 <parameters>
 {
-    "filename": "report.txt"
+    "path": "report.txt"
 }
 </parameters>
 
 User: "List the files in the scratch directory"
-Assistant: <tool>listFiles</tool>
+Assistant: <tool>skill__filesystem_list_files</tool>
 <parameters>
 {
 }
 </parameters>
 
 User: "Write a summary to summary.docx"
-Assistant: <tool>writeFile</tool>
+Assistant: <tool>skill__filesystem_write_text</tool>
 <parameters>
 {
-    "filename": "summary.docx",
-    "content": "This is a comprehensive summary of the report...",
-    "format": "docx"
+    "path": "summary.docx",
+    "content": "This is a comprehensive summary of the report..."
 }
 </parameters>
 
@@ -9129,7 +9707,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 messages[messages.length - 1].content = `[Clipboard content: ${clipboardData}]\n\n${originalPrompt}`;
             }
 
-            const body = {
+            const body = buildCompatibleChatBody(endpoint, {
                 model: getCurrentModel(),
                 messages: messages,
                 max_tokens: 4096,
@@ -9138,7 +9716,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 // Provide tools per LM Studio tool-use docs
                 tools: tools,
                 tool_choice: 'auto'
-            };
+            });
 
             // Add user message to history before sending
             console.log('Adding user message to history with content:', promptText); // Debug log
@@ -9172,12 +9750,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 if (data.choices && data.choices.length > 0) {
                     const message = data.choices[0].message;
                     console.log('Processing message:', message);
+                    const initialAssistantMessage = buildAssistantHistoryMessage(message);
 
                     // Handle LM Studio/OpenAI function/tool calling first
                     if (message.tool_calls && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
                         try {
                             // Add the assistant's tool call turn to messages
-                            messages.push({ role: 'assistant', tool_calls: message.tool_calls });
+                            messages.push(initialAssistantMessage);
 
                             let lastToolSummary = '';
 
@@ -9205,26 +9784,27 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     'Authorization': `Bearer ${apiKey}`
                                 },
                                 signal: chatRequestSignal,
-                                body: JSON.stringify({
+                                body: JSON.stringify(buildCompatibleChatBody(endpoint, {
                                     model: getCurrentModel(),
                                     messages: messages,
                                     max_tokens: 4096,
                                     temperature: 0.7,
                                     tools: tools,
                                     tool_choice: 'auto'
-                                })
+                                }))
                             });
                             const followupData = await followupResponse.json();
                             let finalMessage = followupData?.choices?.[0]?.message || {};
-                            let finalContent = stripThinkTags(finalMessage?.content || '');
+                            let finalContent = getVisibleAssistantText(finalMessage);
                             let followupToolIterations = 0;
 
                             while (followupToolIterations < 4) {
                                 const nativeFollowupCalls = Array.isArray(finalMessage?.tool_calls)
                                     ? finalMessage.tool_calls
                                     : [];
-                                const xmlFollowupCall = (!nativeFollowupCalls.length && finalContent)
-                                    ? parseToolResponse(finalContent)
+                                const finalRawContent = coerceMessageText(finalMessage?.content || '');
+                                const xmlFollowupCall = (!nativeFollowupCalls.length && finalRawContent)
+                                    ? parseToolResponse(finalRawContent)
                                     : null;
 
                                 if (!nativeFollowupCalls.length && !xmlFollowupCall) {
@@ -9232,7 +9812,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 }
 
                                 if (nativeFollowupCalls.length) {
-                                    messages.push({ role: 'assistant', tool_calls: nativeFollowupCalls });
+                                    messages.push(buildAssistantHistoryMessage(finalMessage));
                                     for (const tc of nativeFollowupCalls) {
                                         const toolName = tc?.function?.name || tc?.name || 'tool';
                                         updateProgressState(`Executing tool: ${toolName}`);
@@ -9252,7 +9832,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     const xmlToolResultContent = formatToolResultForModel(xmlToolResult);
                                     lastToolSummary = extractToolResultSummary(xmlToolResult);
 
-                                    messages.push({ role: 'assistant', content: finalContent });
+                                    messages.push(buildAssistantHistoryMessage(finalMessage));
                                     messages.push({ role: 'user', content: `Tool result: ${xmlToolResultContent}` });
                                 }
 
@@ -9264,18 +9844,18 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                         'Authorization': `Bearer ${apiKey}`
                                     },
                                     signal: chatRequestSignal,
-                                    body: JSON.stringify({
+                                    body: JSON.stringify(buildCompatibleChatBody(endpoint, {
                                         model: getCurrentModel(),
                                         messages: messages,
                                         max_tokens: 4096,
                                         temperature: 0.7,
                                         tools: tools,
                                         tool_choice: 'auto'
-                                    })
+                                    }))
                                 });
                                 const chainedFollowupData = await chainedFollowupResponse.json();
                                 finalMessage = chainedFollowupData?.choices?.[0]?.message || {};
-                                finalContent = stripThinkTags(finalMessage?.content || '');
+                                finalContent = getVisibleAssistantText(finalMessage);
                                 followupToolIterations += 1;
                             }
 
@@ -9564,11 +10144,11 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         }
                     }
 
-                    const rawContent = message.content || '';
+                    const rawContent = coerceMessageText(message.content || '');
                     const cleanContent = stripThinkTags(rawContent);
                     if (cleanContent) {
                         // Check for tool calls in Qwen's XML format
-                        const toolCall = parseToolResponse(cleanContent);
+                        const toolCall = parseToolResponse(rawContent);
                         if (toolCall) {
                             console.log('Tool call detected:', toolCall);
                             try {
@@ -9590,7 +10170,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                         const toolName = toolCall.function?.name || toolCall.name;
                                         
                                         // Create a follow-up message that includes the file content for the LLM to process
-                                        const contentMessage = `File content from ${toolName === 'readFile' ? 'reading the file' : 'the operation'}:\n\n${result.content}\n\nBased on this content, please respond to the user's request.`;
+                                        const contentMessage = `File content from the file operation:\n\n${result.content}\n\nBased on this content, please respond to the user's request.`;
                                         
                                         // Add tool result to chat history
                                         chatHistory.push({
@@ -9608,17 +10188,17 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                                     'Authorization': `Bearer ${apiKey}`
                                                 },
                                                 signal: chatRequestSignal,
-                                                body: JSON.stringify({
+                                                body: JSON.stringify(buildCompatibleChatBody(endpoint, {
                                                     model: getCurrentModel(),
                                                     messages: buildModelHistoryWindow(),
                                                     temperature: 0.7
-                                                })
+                                                }))
                                             });
                                             
                                             const followupData = await followupResponse.json();
                                             if (followupData.choices && followupData.choices.length > 0) {
                                                 const followupMessage = followupData.choices[0].message;
-                                                const followupContent = stripThinkTags(followupMessage.content || '');
+                                                const followupContent = getVisibleAssistantText(followupMessage);
                                                 
                                                 if (followupContent) {
                                                     responseOutput.value = followupContent;
@@ -9989,6 +10569,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             if (promptText && detectPhilosopherModeTrigger(promptText)) {
                 await startPhilosopherMode();
                 userInput.value = ''; // Clear input
+                syncUserInputUi();
                 return; // Don't send as regular message
             }
 
@@ -10018,6 +10599,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 addMessageToHistory('assistant', 'Philosopher Mode deactivated.');
             }
             userInput.value = ''; // Clear input field
+            syncUserInputUi();
         };
         sendBtn.addEventListener('click', function () { // Handle send button click
             if (window.submitUserMessage) window.submitUserMessage();
@@ -10041,6 +10623,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 if (userText.trim() && detectPhilosopherModeTrigger(userText)) {
                     await startPhilosopherMode();
                     userInput.value = ''; // Clear input
+                    syncUserInputUi();
                     return; // Don't send as regular message
                 }
 
@@ -10066,6 +10649,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     }
                     
                     userInput.value = ''; // Clear input field
+                    syncUserInputUi();
                 } else { // If input is empty
                     alert('Please enter some text or record your voice.'); // Show alert
                 } // End empty check
@@ -10083,6 +10667,8 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
 
         // Update the initLive2D function
         async function initLive2D() {
+            const requestedGeneration = ++live2dLoadGeneration;
+            const requestedModelPath = modelPath;
             try {
                 // Wait for the document to be fully loaded
                 if (document.readyState !== 'complete') {
@@ -10095,15 +10681,11 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     console.warn('Live2D container/canvas not found. Skipping init.');
                     return;
                 }
-                
-                // Ensure the canvas stays in DOM; create PIXI Application with responsive dimensions
-                const app = new PIXI.Application({
-                    view: canvas,
-                    transparent: true,
-                    autoStart: true,
-                    width: container.clientWidth,
-                    height: container.clientHeight
-                });
+
+                if (!requestedModelPath || !requestedModelPath.toLowerCase().endsWith('.model3.json')) {
+                    console.warn('No Live2D model is currently available from the scanned model list.');
+                    return;
+                }
 
                 // Initialize Live2D
                 // Register ticker only once to avoid duplicate RAF workloads
@@ -10112,56 +10694,34 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     live2dTickerRegistered = true;
                 }
 
+                const app = ensureLive2DApp(container, canvas);
+                disposeLive2DModel();
+
                 // Resolve model path to absolute URL for remote access
-                const resolvedModelPath = resolveModelPath(modelPath);
-                console.log(`Loading Live2D model from: ${resolvedModelPath} (original: ${modelPath})`);
+                const resolvedModelPath = resolveModelPath(requestedModelPath);
+                console.log(`Loading Live2D model from: ${resolvedModelPath} (original: ${requestedModelPath})`);
                 
                 // Load model
                 const model = await PIXI.live2d.Live2DModel.from(resolvedModelPath, {
                     autoInteract: false,
                     focus: false
                 });
+
+                if (
+                    requestedGeneration !== live2dLoadGeneration ||
+                    requestedModelPath !== modelPath ||
+                    document.getElementById('vrm-mode')?.checked
+                ) {
+                    destroyLive2DModelInstance(model);
+                    return;
+                }
                 
                 // Clear stage and add the fresh model to stage
                 app.stage.removeChildren();
                 app.stage.addChild(model);
 
-                // Function to resize model
-                const resizeModel = () => {
-                    app.renderer.resize(container.clientWidth, container.clientHeight);
-                    
-                    // Increase scale for a closer view
-                    const scale = Math.min(
-                        container.clientWidth / (model.width * 1.5),  // Changed from 1.2 to 0.8
-                        container.clientHeight / (model.height * 1.5)  // Changed from 1.2 to 0.8
-                    ) * 2.5;  // Multiply by 1.5 to make it 50% larger
-                    
-                    model.scale.set(scale);
-                    model.x = container.clientWidth / 2;
-                    // Base vertical placement (upper body focus), then apply per-model offset (px)
-                    const baseY = container.clientHeight / 1.4;
-                    const offsetPx = live2dOffsets[modelPath] ?? 0;
-                    model.y = baseY + offsetPx;
-                };
-
                 // Center the model
                 model.anchor.set(0.5, 0.4);
-                
-                // Initial resize
-                resizeModel();
-
-                // Add resize handler (debounced) and store app on model instance for cleanup
-                const debouncedResize = (() => {
-                    let raf = null;
-                    return () => {
-                        if (raf) cancelAnimationFrame(raf);
-                        raf = requestAnimationFrame(resizeModel);
-                    };
-                })();
-                window.addEventListener('resize', debouncedResize);
-                // Store references for proper cleanup when switching models
-                model.__app = app;
-                model.__resizeHandler = debouncedResize;
 
                 // Rest of your model setup...
                 model.draggable = false;
@@ -10179,48 +10739,35 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 }
 
                 live2dModel = model;
+                live2dActiveModelPath = requestedModelPath;
+                attachLive2DResizeHandler(requestedModelPath);
+                applyCurrentLive2DLayout(model, requestedModelPath);
                 console.log('Live2D model loaded successfully');
                 
-                // Initialize and test expressions
+                // Prime expression metadata without running a slow expression test loop on every swap
                 await initializeLive2DExpressions(model);
 
             } catch (error) {
-                console.error('Failed to load Live2D model:', error);
+                if (requestedGeneration === live2dLoadGeneration) {
+                    console.error('Failed to load Live2D model:', error);
+                }
             }
         }
 
         // Helper to safely cleanup existing Live2D resources before switching models
         function cleanupLive2D() {
             try {
-                if (!live2dModel) return;
-                // Remove resize listener if present
-                if (live2dModel.__resizeHandler) {
-                    window.removeEventListener('resize', live2dModel.__resizeHandler);
-                }
-                // Destroy PIXI application if stored
-                if (live2dModel.__app) {
-                    // Guard against undefined destroy options inside PIXI
-                    try {
-                        // Do NOT remove the canvas view from the DOM; keep removeView=false
-                        live2dModel.__app.destroy(false, { children: true, texture: true, baseTexture: true });
-                    } catch {}
-                }
-                // Destroy Live2D model if possible
-                if (typeof live2dModel.destroy === 'function') {
-                    try {
-                        live2dModel.destroy({ children: true, texture: true, baseTexture: true });
-                    } catch {}
-                }
+                live2dLoadGeneration += 1;
+                disposeLive2DModel();
             } catch (err) {
                 console.warn('cleanupLive2D encountered an issue:', err);
-            } finally {
-                live2dModel = null;
             }
         }
 
         // VRM Functions
         function cleanupVRM() {
             try {
+                clearVRMResizeHandler();
                 if (!vrmModel) return;
 
             // Stop and uncache animation bindings
@@ -10994,6 +11541,8 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 vrmIdleVrmaAction = idleVrmaAction;
                 clearVrmIdleReplayTimer();
                 vrmIdleHasPlayedOnce = false;
+                attachVRMResizeHandler();
+                resizeVRMViewport();
 
                 // Apply initial transforms
                 updateVRMTransform();
@@ -11876,7 +12425,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             cleanupVRM();
 
             // Initialize Live2D if needed
-            if (!live2dModel) {
+            if (!live2dModel || live2dActiveModelPath !== modelPath) {
                 await initLive2D();
             }
 
@@ -12301,24 +12850,14 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
         // Add this function to initialize expressions when the model loads
         async function initializeLive2DExpressions(model) {
             try {
-                // Log available expressions
                 const expressions = await model.expressions;
-                console.log('Available expressions:', expressions);
-                
-                // Test each expression
-                if (expressions) {
-                    for (const exp of expressions) {
-                        console.log(`Testing expression: ${exp}`);
-                        try {
-                            await model.expression(exp);
-                            console.log(`Successfully set expression: ${exp}`);
-                        } catch (error) {
-                            console.error(`Error setting expression ${exp}:`, error);
-                        }
-                        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between expressions
-                    }
-                    // Reset to default
+                if (Array.isArray(expressions) && expressions.length > 0) {
+                    console.log('Available expressions:', expressions);
+                }
+                try {
                     await model.expression(null);
+                } catch (_) {
+                    // Some models do not expose expressions or reject reset calls; that is non-fatal.
                 }
             } catch (error) {
                 console.error('Error initializing expressions:', error);
@@ -12373,14 +12912,14 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${apiKey}`
                     },
-                    body: JSON.stringify({
+                    body: JSON.stringify(buildCompatibleChatBody(endpoint, {
                         model: getCurrentModel(),
                         messages: subMessages,
                         temperature: 0.7,
                         // Provide tools so the model can decide to call them here as well
                         tools: tools,
                         tool_choice: 'auto'
-                    })
+                    }))
                 });
 
                 const data = await response.json();
@@ -12391,7 +12930,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         try {
                             let lastToolSummary = '';
                             // Add assistant tool calls
-                            subMessages.push({ role: 'assistant', tool_calls: msg.tool_calls });
+                            subMessages.push(buildAssistantHistoryMessage(msg));
                             // Execute and add tool results
                             for (const tc of msg.tool_calls) {
                                 const toolResult = await executeToolCall(tc, context);
@@ -12414,26 +12953,27 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                         'Content-Type': 'application/json',
                                         'Authorization': `Bearer ${apiKey}`
                                     },
-                                    body: JSON.stringify({
+                                    body: JSON.stringify(buildCompatibleChatBody(endpoint, {
                                         model: getCurrentModel(),
                                         messages: subMessages,
                                         temperature: 0.7,
                                         tools: tools,
                                         tool_choice: 'auto'
-                                    })
+                                    }))
                                 });
                                 const followJson = await follow.json();
                                 finalMessage = followJson?.choices?.[0]?.message || {};
                                 const nativeCalls = Array.isArray(finalMessage.tool_calls) ? finalMessage.tool_calls : [];
-                                const finalText = stripThinkTags(finalMessage.content || '').trim();
-                                const xmlCall = (!nativeCalls.length && finalText) ? parseToolResponse(finalText) : null;
+                                const finalRawText = coerceMessageText(finalMessage.content || '').trim();
+                                const finalText = stripThinkTags(finalRawText).trim();
+                                const xmlCall = (!nativeCalls.length && finalRawText) ? parseToolResponse(finalRawText) : null;
 
                                 if (!nativeCalls.length && !xmlCall) {
                                     return { success: true, message: finalText || lastToolSummary };
                                 }
 
                                 if (nativeCalls.length) {
-                                    subMessages.push({ role: 'assistant', tool_calls: nativeCalls });
+                                    subMessages.push(buildAssistantHistoryMessage(finalMessage));
                                     for (const tc of nativeCalls) {
                                         const toolResult = await executeToolCall(tc, context);
                                         const toolResultContent = formatToolResultForModel(toolResult);
@@ -12448,7 +12988,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     const xmlResult = await executeToolCall(xmlCall, context);
                                     const xmlResultContent = formatToolResultForModel(xmlResult);
                                     lastToolSummary = extractToolResultSummary(xmlResult);
-                                    subMessages.push({ role: 'assistant', content: finalText });
+                                    subMessages.push(buildAssistantHistoryMessage(finalMessage));
                                     subMessages.push({ role: 'user', content: `Tool result: ${xmlResultContent}` });
                                 }
                                 loopCount += 1;
@@ -12460,8 +13000,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         }
                     }
 
-                    const plain = stripThinkTags(msg.content || '').trim();
-                    const xmlToolCall = plain ? parseToolResponse(plain) : null;
+                    const rawPlain = coerceMessageText(msg.content || '').trim();
+                    const plain = stripThinkTags(rawPlain).trim();
+                    const xmlToolCall = rawPlain ? parseToolResponse(rawPlain) : null;
                     if (xmlToolCall) {
                         const xmlResult = await executeToolCall(xmlToolCall, context);
                         return {

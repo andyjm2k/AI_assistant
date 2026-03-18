@@ -222,189 +222,270 @@
             <!-- Companions: saved tool-setting configs (server-stored) -->
             <div class="companions-block">
                 <div class="companions-header">
-                    <h3 class="companions-heading">Companions</h3>
-                    <button type="button" class="companion-add-btn" id="companion-add-btn" title="Add new companion from current settings" aria-label="Add companion">
+                    <div>
+                        <span class="companion-builder-kicker">Character Builder</span>
+                        <h3 class="companions-heading">Character profiles</h3>
+                        <p class="companions-description">Build and save reusable character presets from the current tool, voice, model, and avatar setup.</p>
+                    </div>
+                    <button type="button" class="companion-add-btn" id="companion-add-btn" title="Save the current setup as a companion" aria-label="Create companion">
                         <i class="fas fa-plus"></i>
+                        <span>Create Profile</span>
                     </button>
+                </div>
+                <div class="companion-current-card" id="companion-current-card">
+                    <div class="companion-current-header">
+                        <div class="companion-current-copy">
+                            <span class="companion-current-label">Current setup</span>
+                            <strong class="companion-current-name" id="companion-current-name">Assistant</strong>
+                        </div>
+                        <span class="companion-current-state" id="companion-current-state">Not saved</span>
+                    </div>
+                    <p class="companion-current-summary" id="companion-current-summary">Review your active tool configuration before saving it as a companion.</p>
+                    <div class="companion-tag-list" id="companion-current-tags" aria-label="Current setup summary"></div>
                 </div>
                 <ul class="companion-list" id="companion-list" aria-label="Saved companions">
                     <!-- Populated by JS from GET /v1/companions -->
                 </ul>
+                <p class="companion-feedback" id="companion-feedback" aria-live="polite"></p>
             </div>
             <!-- Tool Settings in Settings Menu -->
             <div class="collapsible">
-                <button type="button" class="collapsible-btn">Tool Settings</button>
-                <div class="collapsible-content">
-                    <label for="api-key">OpenAI API Key:</label>
-                    <input type="password" id="api-key" value="X">
-                    
-                    <label for="endpoint-url">OpenAI API Endpoint:</label>
-                    <input type="text" id="endpoint-url" value="http://localhost:1234/v1/chat/completions">
-                    
-                    <label for="news-api-key">News API Key:</label>
-                    <input type="password" id="news-api-key" placeholder="Enter your News API key">
-                    <span class="helper-text">Get your key from https://newsapi.org</span>
-                    
-                    <div class="toggle-container">
-                        <label for="webcam-toggle">Webcam Mode:</label>
-                        <label class="switch">
-                            <input type="checkbox" id="webcam-toggle">
-                            <span class="slider round"></span>
-                        </label>
+                <button type="button" class="collapsible-btn" aria-expanded="false">Tool Settings</button>
+                <div class="collapsible-content" id="tool-settings-panel">
+                    <div class="tool-settings-shell">
+                        <div class="tool-settings-rail" aria-label="Tool settings categories">
+                            <button type="button" class="tool-settings-nav-btn is-active" data-tool-settings-target="connection-settings-panel" aria-pressed="true" title="Connection">
+                                <i class="fas fa-plug" aria-hidden="true"></i>
+                                <span>Link</span>
+                            </button>
+                            <button type="button" class="tool-settings-nav-btn" data-tool-settings-target="identity-settings-panel" aria-pressed="false" title="Identity">
+                                <i class="fas fa-id-badge" aria-hidden="true"></i>
+                                <span>Name</span>
+                            </button>
+                            <button type="button" class="tool-settings-nav-btn" data-tool-settings-target="voice-settings-panel" aria-pressed="false" title="Voice">
+                                <i class="fas fa-volume-up" aria-hidden="true"></i>
+                                <span>Voice</span>
+                            </button>
+                            <button type="button" class="tool-settings-nav-btn" data-tool-settings-target="models-settings-panel" aria-pressed="false" title="Models">
+                                <i class="fas fa-microchip" aria-hidden="true"></i>
+                                <span>Models</span>
+                            </button>
+                            <button type="button" class="tool-settings-nav-btn" data-tool-settings-target="avatar-settings-panel" aria-pressed="false" title="Avatar">
+                                <i class="fas fa-user-astronaut" aria-hidden="true"></i>
+                                <span>Avatar</span>
+                            </button>
+                        </div>
+                        <div class="tool-settings-workspace">
+                            <div class="tool-settings-top-tabs" aria-label="Tool settings tabs">
+                                <button type="button" class="tool-settings-tab is-active" data-tool-settings-target="connection-settings-panel" aria-pressed="true">Connection</button>
+                                <button type="button" class="tool-settings-tab" data-tool-settings-target="identity-settings-panel" aria-pressed="false">Identity</button>
+                                <button type="button" class="tool-settings-tab" data-tool-settings-target="voice-settings-panel" aria-pressed="false">Voice</button>
+                                <button type="button" class="tool-settings-tab" data-tool-settings-target="models-settings-panel" aria-pressed="false">Models</button>
+                                <button type="button" class="tool-settings-tab" data-tool-settings-target="avatar-settings-panel" aria-pressed="false">Avatar</button>
+                            </div>
+                            <div class="tool-settings-stage">
+                    <div class="settings-section tool-settings-screen tool-settings-screen-active" id="connection-settings-panel" data-tool-settings-panel>
+                        <div class="settings-section-header">
+                            <h4>Connection</h4>
+                            <p>Set the model endpoint, keys, and base instructions CATBot should use.</p>
+                        </div>
+
+                        <label for="api-key">OpenAI API Key:</label>
+                        <input type="password" id="api-key" value="X">
+                        
+                        <label for="endpoint-url">OpenAI API Endpoint:</label>
+                        <input type="text" id="endpoint-url" value="http://localhost:1234/v1/chat/completions">
+                        
+                        <label for="news-api-key">News API Key:</label>
+                        <input type="password" id="news-api-key" placeholder="Enter your News API key">
+                        <span class="helper-text">Get your key from https://newsapi.org</span>
+
+                        <label for="system-prompt">System Prompt:</label>
+                        <textarea id="system-prompt" placeholder="You are a friendly AI assistant called EVA."></textarea>
                     </div>
 
-                    <div class="toggle-container">
-                        <label for="clipboard-toggle">Clipboard Vision Mode:</label>
-                        <label class="switch">
-                            <input type="checkbox" id="clipboard-toggle">
-                            <span class="slider round"></span>
-                        </label>
+                    <div class="settings-section tool-settings-screen" id="identity-settings-panel" data-tool-settings-panel>
+                        <div class="settings-section-header">
+                            <h4>Identity and runtime</h4>
+                            <p>Choose how the chat is labeled and which live input modes are active.</p>
+                        </div>
+
+                        <label for="user-name">User Name:</label>
+                        <input type="text" id="user-name" value="User" placeholder="Your name">
+                        <span class="helper-text">Your name shown in message history</span>
+                        
+                        <label for="assistant-name">Assistant Name:</label>
+                        <input type="text" id="assistant-name" value="EVA" placeholder="Assistant name">
+                        <span class="helper-text">Assistant name shown in message history</span>
+
+                        <div class="toggle-container">
+                            <label for="webcam-toggle">Webcam Mode:</label>
+                            <label class="switch">
+                                <input type="checkbox" id="webcam-toggle">
+                                <span class="slider round"></span>
+                            </label>
+                        </div>
+
+                        <div class="toggle-container">
+                            <label for="clipboard-toggle">Clipboard Vision Mode:</label>
+                            <label class="switch">
+                                <input type="checkbox" id="clipboard-toggle">
+                                <span class="slider round"></span>
+                            </label>
+                        </div>
+
+                        <div class="toggle-container">
+                            <label for="mute-toggle">Mute TTS:</label>
+                            <label class="switch">
+                                <input type="checkbox" id="mute-toggle">
+                                <span class="slider round"></span>
+                            </label>
+                        </div>
+
+                        <div id="webcam-preview-container" style="display: none;">
+                            <label>Webcam Preview:</label>
+                            <video id="webcam-preview" style="width: 100%; border-radius: 10px;" autoplay playsinline></video>
+                        </div>
                     </div>
 
-                    <div class="toggle-container">
-                        <label for="mute-toggle">Mute TTS:</label>
-                        <label class="switch">
-                            <input type="checkbox" id="mute-toggle">
-                            <span class="slider round"></span>
-                        </label>
-                    </div>
+                    <div class="settings-section tool-settings-screen" id="voice-settings-panel" data-tool-settings-panel>
+                        <div class="settings-section-header">
+                            <h4>Voice and speech</h4>
+                            <p>Pick the browser voice or switch to the OpenAI-compatible TTS stack.</p>
+                        </div>
 
-                    <label for="system-prompt">System Prompt:</label>
-                    <textarea id="system-prompt" placeholder="You are a friendly AI assistant called EVA."></textarea>
-                    
-                    <label for="user-name">User Name:</label>
-                    <input type="text" id="user-name" value="User" placeholder="Your name">
-                    <span class="helper-text">Your name shown in message history</span>
-                    
-                    <label for="assistant-name">Assistant Name:</label>
-                    <input type="text" id="assistant-name" value="EVA" placeholder="Assistant name">
-                    <span class="helper-text">Assistant name shown in message history</span>
-                    
-                    <label for="voice-dropdown">Select Voice:</label>
-                    <select id="voice-dropdown">
-                        <option value="">Loading voices...</option>
-                    </select>
-
-                    <hr style="margin: 20px 0; border: 0; border-top: 1px solid #ddd;">
-
-                    <label for="tts-service-toggle">TTS Service:</label>
-                    <div class="toggle-container">
-                        <input type="radio" id="tts-service-microsoft" name="tts-service" value="microsoft" checked>
-                        <label for="tts-service-microsoft">Microsoft</label>
-                        <input type="radio" id="tts-service-openai" name="tts-service" value="openai">
-                        <label for="tts-service-openai">OpenAI-compatible (Chatterbox)</label>
-                    </div>
-                    <span class="helper-text">Choose between Microsoft browser TTS or local Chatterbox TTS API</span>
-
-                    <label for="tts-endpoint-url">TTS API Endpoint:</label>
-                    <input type="text" id="tts-endpoint-url" value="http://localhost:4123/v1" placeholder="http://localhost:4123/v1">
-                    <span class="helper-text">Endpoint for OpenAI-compatible TTS service (Chatterbox default: http://localhost:4123/v1)</span>
-
-                    <label for="tts-model-dropdown">TTS Model:</label>
-                    <select id="tts-model-dropdown">
-                        <option value="tts-1">tts-1</option>
-                        <option value="tts-1-hd">tts-1-hd</option>
-                    </select>
-                    <span class="helper-text">Model for OpenAI-compatible TTS (tts-1 is faster, tts-1-hd is higher quality)</span>
-
-                    <label for="tts-voice-dropdown">TTS Voice:</label>
-                    <div style="display: flex; gap: 10px; align-items: center;">
-                        <select id="tts-voice-dropdown" style="flex: 1;">
-                            <option value="Empress">Empress</option>
+                        <label for="voice-dropdown">Select Voice:</label>
+                        <select id="voice-dropdown">
+                            <option value="">Loading voices...</option>
                         </select>
-                        <button type="button" id="refresh-tts-voices-btn" style="width: auto; margin: 0; padding: 8px 12px;" title="Refresh voices from TTS endpoint">
-                            <i class="fas fa-sync-alt"></i>
-                        </button>
+
+                        <label for="tts-service-toggle">TTS Service:</label>
+                        <div class="toggle-container">
+                            <input type="radio" id="tts-service-microsoft" name="tts-service" value="microsoft" checked>
+                            <label for="tts-service-microsoft">Microsoft</label>
+                            <input type="radio" id="tts-service-openai" name="tts-service" value="openai">
+                            <label for="tts-service-openai">OpenAI-compatible (Chatterbox)</label>
+                        </div>
+                        <span class="helper-text">Choose between Microsoft browser TTS or local Chatterbox TTS API</span>
+
+                        <label for="tts-endpoint-url">TTS API Endpoint:</label>
+                        <input type="text" id="tts-endpoint-url" value="http://localhost:4123/v1" placeholder="http://localhost:4123/v1">
+                        <span class="helper-text">Endpoint for OpenAI-compatible TTS service (Chatterbox default: http://localhost:4123/v1)</span>
+
+                        <label for="tts-model-dropdown">TTS Model:</label>
+                        <select id="tts-model-dropdown">
+                            <option value="tts-1">tts-1</option>
+                            <option value="tts-1-hd">tts-1-hd</option>
+                        </select>
+                        <span class="helper-text">Model for OpenAI-compatible TTS (tts-1 is faster, tts-1-hd is higher quality)</span>
+
+                        <label for="tts-voice-dropdown">TTS Voice:</label>
+                        <div class="settings-inline-field">
+                            <select id="tts-voice-dropdown">
+                                <option value="Empress">Empress</option>
+                            </select>
+                            <button type="button" id="refresh-tts-voices-btn" class="settings-inline-action" title="Refresh voices from TTS endpoint">
+                                <i class="fas fa-sync-alt"></i>
+                            </button>
+                        </div>
+                        <span class="helper-text">Voice for OpenAI-compatible TTS. Use refresh to pull voices from the configured TTS endpoint.</span>
                     </div>
-                    <span class="helper-text">Voice for OpenAI-compatible TTS (or your cloned voices from Chatterbox). Click refresh to load voices from the TTS endpoint.</span>
 
-                    <div id="webcam-preview-container" style="display: none;">
-                        <label>Webcam Preview:</label>
-                        <video id="webcam-preview" style="width: 100%; border-radius: 10px;" autoplay playsinline></video>
+                    <div class="settings-section tool-settings-screen" id="models-settings-panel" data-tool-settings-panel>
+                        <div class="settings-section-header">
+                            <h4>Models</h4>
+                            <p>Separate model roles so chat, tools, and vision requests can be tuned independently.</p>
+                        </div>
+
+                        <label for="base-model-dropdown">Base Chat Model:</label>
+                        <select id="base-model-dropdown">
+                            <option value="">Loading models...</option>
+                        </select>
+                        <span class="helper-text">Model used for regular chat (default model)</span>
+
+                        <label for="tool-model-dropdown">Tool Processing Model:</label>
+                        <select id="tool-model-dropdown">
+                            <option value="">Loading models...</option>
+                        </select>
+                        <span class="helper-text">Model used for processing tool requests (e.g., website navigation)</span>
+
+                        <label for="vision-model-dropdown">Vision Model (Clipboard/Webcam):</label>
+                        <select id="vision-model-dropdown">
+                            <option value="">Loading models...</option>
+                        </select>
+                        <span class="helper-text">Model used when webcam mode or clipboard image mode is enabled</span>
                     </div>
 
-                    <label for="base-model-dropdown">Base Chat Model:</label>
-                    <select id="base-model-dropdown">
-                        <option value="">Loading models...</option>
-                    </select>
-                    <span class="helper-text">Model used for regular chat (default model)</span>
+                    <div class="settings-section settings-section-avatar tool-settings-screen" id="avatar-settings-panel" data-tool-settings-panel>
+                        <div class="settings-section-header">
+                            <h4>Avatar</h4>
+                            <p>Choose the avatar mode, asset, and positioning details that belong to this companion.</p>
+                        </div>
 
-                    <label for="tool-model-dropdown">Tool Processing Model:</label>
-                    <select id="tool-model-dropdown">
-                        <option value="">Loading models...</option>
-                    </select>
-                    <span class="helper-text">Model used for processing tool requests (e.g., website navigation)</span>
+                        <label for="avatar-mode-toggle">Avatar Mode:</label>
+                        <div class="toggle-container">
+                            <input type="radio" id="live2d-mode" name="avatar-mode" value="live2d" checked>
+                            <label for="live2d-mode">Live2D</label>
+                            <input type="radio" id="vrm-mode" name="avatar-mode" value="vrm">
+                            <label for="vrm-mode">VRM</label>
+                        </div>
+                        <span class="helper-text">Switch between 2D Live2D and 3D VRM avatar modes</span>
 
-                    <label for="vision-model-dropdown">Vision Model (Clipboard/Webcam):</label>
-                    <select id="vision-model-dropdown">
-                        <option value="">Loading models...</option>
-                    </select>
-                    <span class="helper-text">Model used when webcam mode or clipboard image mode is enabled</span>
+                        <label for="live2d-model-dropdown">Live2D Model:</label>
+                        <select id="live2d-model-dropdown">
+                            <option value="">Loading models...</option>
+                        </select>
+                        <span class="helper-text">Select which Live2D model to use (shows file name)</span>
 
-                    <label for="live2d-model-dropdown">Live2D Model:</label>
-                    <select id="live2d-model-dropdown">
-                        <option value="">Loading models...</option>
-                    </select>
-                    <span class="helper-text">Select which Live2D model to use (shows file name)</span>
+                        <label for="live2d-model-list">Live2D Model Paths (scanned):</label>
+                        <textarea id="live2d-model-list" rows="4" placeholder="Scanned from ./model_avatar on startup and when you click scan" readonly></textarea>
+                        <span class="helper-text">This list is filled automatically from the `model_avatar` folder scan.</span>
 
-                    <label for="live2d-model-list">Live2D Model Paths (one per line):</label>
-                    <textarea id="live2d-model-list" rows="4" placeholder="./model_avatar/NAME/FILE.model3.json">./model_avatar/KITU17/KITU17.model3.json
-./model_avatar/NVPU-demo/NVPU.model3.json
-./model_avatar/RACOON01/RACOON01.model3.json</textarea>
-                    <span class="helper-text">Add new model paths on new lines to make them available in the selector</span>
+                        <label for="live2d-offset-range">Live2D Vertical Offset (px): <span id="live2d-offset-value">0</span></label>
+                        <input type="range" id="live2d-offset-range" min="-400" max="400" step="5" value="0" />
+                        <span class="helper-text">Fine-tune the model's vertical position in the view</span>
 
-                    <label for="live2d-offset-range">Live2D Vertical Offset (px): <span id="live2d-offset-value">0</span></label>
-                    <input type="range" id="live2d-offset-range" min="-400" max="400" step="5" value="0" />
-                    <span class="helper-text">Fine-tune the model's vertical position in the view</span>
+                        <label for="live2d-scale-range">Live2D Size: <span id="live2d-scale-value">1.00x</span></label>
+                        <input type="range" id="live2d-scale-range" min="0.4" max="3.0" step="0.05" value="1.0" />
+                        <span class="helper-text">Adjust the 2D model's size without changing the container</span>
 
-                    <label for="avatar-mode-toggle">Avatar Mode:</label>
-                    <div class="toggle-container">
-                        <input type="radio" id="live2d-mode" name="avatar-mode" value="live2d" checked>
-                        <label for="live2d-mode">Live2D</label>
-                        <input type="radio" id="vrm-mode" name="avatar-mode" value="vrm">
-                        <label for="vrm-mode">VRM</label>
+                        <label for="vrm-version-dropdown">VRM Version:</label>
+                        <select id="vrm-version-dropdown">
+                            <option value="1.0">VRM 1.0</option>
+                            <option value="0.0">VRM 0.0</option>
+                        </select>
+                        <span class="helper-text">Select VRM format version (1.0 is newer, 0.0 is legacy)</span>
+
+                        <label for="vrm-model-dropdown">VRM Model:</label>
+                        <select id="vrm-model-dropdown">
+                            <option value="">Loading models...</option>
+                        </select>
+                        <span class="helper-text">Select which VRM model to use (shows file name)</span>
+
+                        <label for="vrm-model-list">VRM Model Paths (scanned):</label>
+                        <textarea id="vrm-model-list" rows="4" placeholder="Scanned from ./model_avatar on startup and when you click scan" readonly></textarea>
+                        <span class="helper-text">This list is filled automatically from the `model_avatar` folder scan.</span>
+                        <button type="button" id="scan-model-avatar-btn" class="scan-models-btn">Scan for new models</button>
+
+                        <label for="vrm-scale-range">VRM Scale: <span id="vrm-scale-value">1.0</span></label>
+                        <input type="range" id="vrm-scale-range" min="0.1" max="6.0" step="0.1" value="1.0" />
+                        <span class="helper-text">Adjust the 3D model's scale in the view</span>
+
+                        <label for="vrm-position-x-range">VRM Position X: <span id="vrm-position-x-value">0</span></label>
+                        <input type="range" id="vrm-position-x-range" min="-10" max="10" step="0.1" value="0" />
+                        <span class="helper-text">Adjust the 3D model's horizontal position</span>
+
+                        <label for="vrm-position-y-range">VRM Position Y: <span id="vrm-position-y-value">0</span></label>
+                        <input type="range" id="vrm-position-y-range" min="-10" max="10" step="0.1" value="0" />
+                        <span class="helper-text">Adjust the 3D model's vertical position</span>
+
+                        <label for="vrm-rotation-range">VRM Rotation: <span id="vrm-rotation-value">0</span></label>
+                        <input type="range" id="vrm-rotation-range" min="-180" max="180" step="1" value="0" />
+                        <span class="helper-text">Rotate the 3D model (degrees)</span>
                     </div>
-                    <span class="helper-text">Switch between 2D Live2D and 3D VRM avatar modes</span>
-
-                    <label for="vrm-version-dropdown">VRM Version:</label>
-                    <select id="vrm-version-dropdown">
-                        <option value="1.0">VRM 1.0</option>
-                        <option value="0.0">VRM 0.0</option>
-                    </select>
-                    <span class="helper-text">Select VRM format version (1.0 is newer, 0.0 is legacy)</span>
-
-                    <label for="vrm-model-dropdown">VRM Model:</label>
-                    <select id="vrm-model-dropdown">
-                        <option value="">Loading models...</option>
-                    </select>
-                    <span class="helper-text">Select which VRM model to use (shows file name)</span>
-
-                    <label for="vrm-model-list">VRM Model Paths (one per line):</label>
-                    <textarea id="vrm-model-list" rows="4" placeholder="./model_avatar/NAME/FILE.vrm
-Example: ./model_avatar/MyVRM/MyModel.vrm
-Get VRM files from VRoid Studio or other 3D avatar creators">./model_avatar/Eva/Eva.vrm
-./model_avatar/Greyson/Greyson.vrm
-./model_avatar/Bianca/Bianca.vrm
-./model_avatar/Esme/Esme.vrm</textarea>
-                    <span class="helper-text">Add new VRM model paths on new lines to make them available in the selector</span>
-                    <button type="button" id="scan-model-avatar-btn" class="scan-models-btn">Scan for new models</button>
-
-                    <label for="vrm-scale-range">VRM Scale: <span id="vrm-scale-value">1.0</span></label>
-                    <input type="range" id="vrm-scale-range" min="0.1" max="6.0" step="0.1" value="1.0" />
-                    <span class="helper-text">Adjust the 3D model's scale in the view</span>
-
-                    <label for="vrm-position-x-range">VRM Position X: <span id="vrm-position-x-value">0</span></label>
-                    <input type="range" id="vrm-position-x-range" min="-10" max="10" step="0.1" value="0" />
-                    <span class="helper-text">Adjust the 3D model's horizontal position</span>
-
-                    <label for="vrm-position-y-range">VRM Position Y: <span id="vrm-position-y-value">0</span></label>
-                    <input type="range" id="vrm-position-y-range" min="-10" max="10" step="0.1" value="0" />
-                    <span class="helper-text">Adjust the 3D model's vertical position</span>
-
-                    <label for="vrm-rotation-range">VRM Rotation: <span id="vrm-rotation-value">0</span></label>
-                    <input type="range" id="vrm-rotation-range" min="-180" max="180" step="1" value="0" />
-                    <span class="helper-text">Rotate the 3D model (degrees)</span>
-
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -412,15 +493,25 @@ Get VRM files from VRoid Studio or other 3D avatar creators">./model_avatar/Eva/
 
     <!-- Add Companion modal (pops up when user clicks + Companion) -->
     <div class="companion-modal-overlay" id="companion-modal-overlay" aria-hidden="true" style="display: none;">
-        <div class="companion-modal" id="companion-modal" role="dialog" aria-labelledby="companion-modal-title">
-            <h2 id="companion-modal-title">New companion</h2>
+        <div class="companion-modal" id="companion-modal" role="dialog" aria-modal="true" aria-labelledby="companion-modal-title">
+            <h2 id="companion-modal-title">Create character profile</h2>
+            <p class="companion-modal-hint">This saves the current CATBot setup as a reusable character profile from the left-side builder.</p>
             <label for="companion-name-input">Companion name</label>
             <input type="text" id="companion-name-input" placeholder="e.g. Work EVA" maxlength="128">
-            <p class="companion-modal-hint">Current tool settings will be saved as this companion. You can load it later from the list.</p>
-            <p class="companion-modal-edit-hint"><button type="button" class="companion-edit-settings-link" id="companion-edit-settings-link">Edit current settings</button> in Tool Settings below, then return here to save.</p>
+            <div class="companion-modal-preview">
+                <span class="companion-modal-preview-label">Snapshot preview</span>
+                <p class="companion-modal-preview-text" id="companion-modal-preview-text">The current tool configuration will be saved with this companion.</p>
+                <div class="companion-tag-list" id="companion-modal-tags" aria-label="Companion snapshot summary"></div>
+            </div>
+            <label class="companion-modal-checkbox" for="companion-activate-checkbox">
+                <input type="checkbox" id="companion-activate-checkbox" checked>
+                <span>Mark this as the active companion after saving</span>
+            </label>
+            <p class="companion-modal-error" id="companion-modal-error" aria-live="polite"></p>
             <div class="companion-modal-actions">
+                <button type="button" class="companion-modal-secondary" id="companion-edit-settings-link">Review settings</button>
                 <button type="button" class="companion-modal-cancel" id="companion-modal-cancel">Cancel</button>
-                <button type="button" class="companion-modal-save" id="companion-modal-save">Save</button>
+                <button type="button" class="companion-modal-save" id="companion-modal-save">Save companion</button>
             </div>
         </div>
     </div>

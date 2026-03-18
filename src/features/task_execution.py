@@ -19,6 +19,11 @@ from src.utils.token_budget import (
     get_chars_per_token,
     is_context_limit_error,
 )
+from src.utils.openai_compat import (
+    is_minimax_chat_request,
+    normalize_chat_completion_message,
+    prepare_openai_compatible_chat_payload,
+)
 
 
 # Status values for execution state
@@ -42,6 +47,12 @@ DONE_PHRASES = [
 _NO_KEY_LLM_PROVIDERS = frozenset({"ollama", "bedrock"})
 _MCP_PROVIDER_API_KEY_ENV_CANDIDATES: Dict[str, List[str]] = {
     "openai": ["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"],
+    "minimax": [
+        "MINIMAX_API_KEY",
+        "MCP_LLM_MINIMAX_API_KEY",
+        "MCP_LLM_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+    ],
     "anthropic": ["ANTHROPIC_API_KEY", "MCP_LLM_ANTHROPIC_API_KEY"],
     "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "MCP_LLM_GOOGLE_API_KEY"],
     "azure_openai": ["AZURE_OPENAI_API_KEY", "MCP_LLM_AZURE_OPENAI_API_KEY"],
@@ -225,8 +236,13 @@ class TodoTaskExecutor:
         payload: Dict[str, Any],
         timeout_seconds: float = 60.0,
     ) -> httpx.Response:
+        prepared_payload = prepare_openai_compatible_chat_payload(
+            payload,
+            api_base=endpoint,
+            model=payload.get("model"),
+        )
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            return await client.post(endpoint, headers=headers, json=payload)
+            return await client.post(endpoint, headers=headers, json=prepared_payload)
 
     async def _attempt_mcp_fallback(
         self,
@@ -431,10 +447,10 @@ class TodoTaskExecutor:
             "Do not say you will use a tool later; either emit the tool call now or give a substantive progress update/result. "
             "Do not ask the user to repeat filenames, URLs, search results, or prior tool output already available in the conversation. "
             "Tool selection: For CATBot codebase changes or new tool capabilities, prefer runCodexCli with a clear prompt. "
-            "For other coding tasks (building apps, generating code, creating scripts), prefer runWorkflow with a clear contentPrompt rather than writing code manually with write_file. "
+            "For other coding tasks (building apps, generating code, creating scripts), prefer runWorkflow with a clear contentPrompt rather than writing code manually with filesystem.write_text. "
             "For web tasks that need browser actions (navigate, click, fill forms, automate a site), use run_browser_agent with an instruction. "
             "For in-depth research (compare sources, gather information across many pages, produce a research report), use run_deep_research with a research_task. "
-            "Before finishing: always write the final output (report, summary, code, or results) to a file using the write_file tool so the user has a persistent copy; then say you have finished the work for this task."
+            "Before finishing: always write the final output (report, summary, code, or results) to a file using the filesystem.write_text tool so the user has a persistent copy; then say you have finished the work for this task."
         )
         self.messages = [{"role": "system", "content": system}]
         if self.experience_guidance:
@@ -631,8 +647,11 @@ class TodoTaskExecutor:
             choices = data.get("choices", [])
             if not choices:
                 return None
-            msg = choices[0].get("message", {})
-            return {"content": msg.get("content"), "tool_calls": msg.get("tool_calls")}
+            normalized = normalize_chat_completion_message(
+                choices[0].get("message", {}),
+                preserve_reasoning_details=is_minimax_chat_request(url, self.model),
+            )
+            return normalized
         except Exception as e:
             print(f"[TASK_EXEC] Failed to parse LLM response: {e}")
             self.last_error = f"Failed to parse LLM response: {e}"
@@ -707,11 +726,13 @@ class TodoTaskExecutor:
             tool_calls = llm_response.get("tool_calls")
             pending_status: Optional[str] = None
             # If the model returns done/pause text with tool_calls, execute tool_calls first
-            # so final side effects (e.g. write_file) are not skipped.
+            # so final side effects (e.g. filesystem.write_text) are not skipped.
             if content:
                 status = self._check_pause_or_done(content)
                 if status and not tool_calls:
-                    self.messages.append({"role": "assistant", "content": content})
+                    self.messages.append(
+                        llm_response.get("message") or {"role": "assistant", "content": content}
+                    )
                     print(f"[TASK_EXEC] Detected {status} in assistant message (iteration {self.iteration_count})")
                     await self._emit_progress(
                         "status_detected",
@@ -735,11 +756,13 @@ class TodoTaskExecutor:
                     total_steps=self.max_iterations,
                     tool_call_count=len(tool_calls),
                 )
-                self.messages.append({
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": tool_calls,
-                })
+                self.messages.append(
+                    llm_response.get("message") or {
+                        "role": "assistant",
+                        "content": content or None,
+                        "tool_calls": tool_calls,
+                    }
+                )
                 for tc in tool_calls:
                     fn = tc.get("function", {})
                     name = fn.get("name")
@@ -750,8 +773,11 @@ class TodoTaskExecutor:
                             args = json.loads(args)
                         except json.JSONDecodeError:
                             args = {}
-                    # Log raw arguments when empty or when write_file lacks filename (debug LLM tool-call issues)
-                    if not args or (name == "write_file" and not (args.get("filename") or args.get("content"))):
+                    # Log raw arguments when empty or when file-write calls lack a target path.
+                    if not args or (
+                        name in {"write_file", "filesystem.write_text"}
+                        and not (args.get("filename") or args.get("path") or args.get("content"))
+                    ):
                         print(f"[TASK_EXEC] Tool {name!r} raw arguments: {raw_args!r}", flush=True)
                     try:
                         result = await self.tool_executor(name, args)

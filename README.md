@@ -388,7 +388,7 @@ Key environment variables (see `.env.example` for complete list):
 #### Context Window Controls
 - `MAX_TOKEN_LIMIT`: Max total tokens (input + output) per LLM request. The proxy preflights, summarizes, and retries when exceeded.
 - `TOKEN_ESTIMATE_CHARS_PER_TOKEN`: Heuristic for token estimation when no tokenizer is available (default 4).
-- `LIST_FILES_TOOL_MAX_ENTRIES`: Max number of rows returned by LLM-facing file-list tools (`listFiles`/`list_files`, default 60). `listFiles` supports optional `path` and `recursive` arguments for subdirectory listing.
+- `LIST_FILES_TOOL_MAX_ENTRIES`: Max number of rows returned by LLM-facing file-list tools (`filesystem.list_files`, plus Telegram `listFiles`, default 60). Supports optional `path` and `recursive` arguments for subdirectory listing.
  
 #### Large Payload Fallback
 - `LARGE_PAYLOAD_MODEL`: Optional model to retry with when context window exhaustion occurs.

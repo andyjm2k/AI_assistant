@@ -98,6 +98,53 @@ class TestParseTelegramToolResponse:
         assert out.get("name") == "scrapeWebsite"
         assert json.loads(out["arguments"]) == {"url": "https://example.com"}
 
+    def test_xml_with_single_quoted_parameters_is_salvaged(self):
+        """Parser should accept Python-style dict literals that some OpenAI-compatible models emit."""
+        content = "<tool>webSearch</tool>\n<parameters>{'query': 'MiniMax coupons'}</parameters>"
+        out = tg.parse_telegram_tool_response(content)
+        assert out is not None
+        assert out.get("name") == "webSearch"
+        assert json.loads(out["arguments"]) == {"query": "MiniMax coupons"}
+
+    def test_xml_with_extra_text_inside_parameters_uses_balanced_json_object(self):
+        """Parser should recover the leading JSON object even if the model appends stray prose inside <parameters>."""
+        content = (
+            "<tool>scrapeWebsite</tool>\n"
+            "<parameters>{\"url\": \"https://example.com\"}\nUse that page.</parameters>"
+        )
+        out = tg.parse_telegram_tool_response(content)
+        assert out is not None
+        assert out.get("name") == "scrapeWebsite"
+        assert json.loads(out["arguments"]) == {"url": "https://example.com"}
+
+    def test_xml_with_js_style_object_literal_is_salvaged(self):
+        """Parser should recover simple JS object literals with bare keys."""
+        content = (
+            "<tool>runBrowserAgent</tool>\n"
+            '<parameters>{task: "Check the page", url: "https://example.com"}</parameters>'
+        )
+        out = tg.parse_telegram_tool_response(content)
+        assert out is not None
+        assert out.get("name") == "runBrowserAgent"
+        assert json.loads(out["arguments"]) == {
+            "task": "Check the page",
+            "url": "https://example.com",
+        }
+
+    def test_xml_with_nested_parameter_tags_is_salvaged(self):
+        """Parser should accept models that emit XML child tags inside <parameters> instead of JSON."""
+        content = (
+            "<tool>runBrowserAgent</tool>\n"
+            "<parameters><task>Check the page</task><url>https://example.com</url></parameters>"
+        )
+        out = tg.parse_telegram_tool_response(content)
+        assert out is not None
+        assert out.get("name") == "runBrowserAgent"
+        assert json.loads(out["arguments"]) == {
+            "task": "Check the page",
+            "url": "https://example.com",
+        }
+
 
 class TestStripThinkMarkup:
     """Tests for stripping <think>...</think> blocks from assistant text."""

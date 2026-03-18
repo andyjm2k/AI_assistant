@@ -39,7 +39,7 @@ from typing import Dict, Optional
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Audio, Update, Voice
+from telegram import Audio, Message, Update, Voice
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     AIORateLimiter,
@@ -76,7 +76,6 @@ BACKEND_VERIFY_SSL = os.getenv("TELEGRAM_BACKEND_VERIFY_SSL", "true").lower() !=
 SEND_TRANSCRIPT = os.getenv("TELEGRAM_SEND_TRANSCRIPT", "true").lower() != "false"
 VOICE_IN_ENABLED = os.getenv("TELEGRAM_VOICE_IN", "true").lower() != "false"
 VOICE_OUT_ENABLED = os.getenv("TELEGRAM_VOICE_OUT", "false").lower() == "true"
-STATUS_UPDATE_INTERVAL = 60.0
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESTART_WORKER_SCRIPT = PROJECT_ROOT / "scripts" / "restart_all.py"
 BACKUP_WORKER_SCRIPT = PROJECT_ROOT / "scripts" / "backup_all.py"
@@ -124,20 +123,68 @@ def _parse_max_voice_seconds() -> int:
         return 300
 
 
+def _parse_status_update_interval() -> float:
+    try:
+        raw = float(os.getenv("TELEGRAM_STATUS_POLL_INTERVAL", "2"))
+    except ValueError:
+        logger.warning("Invalid TELEGRAM_STATUS_POLL_INTERVAL; using 2 seconds")
+        return 2.0
+    return max(0.2, raw)
+
+
 ADMIN_IDS = _parse_admin_ids()
 CHAT_TIMEOUT = _parse_chat_timeout()
 MAX_VOICE_SECONDS = _parse_max_voice_seconds()
+STATUS_UPDATE_INTERVAL = _parse_status_update_interval()
+TELEGRAM_TEXT_MESSAGE_LIMIT = 4000
 
 # Track successful user message turns (text or voice transcript)
 message_counts: Dict[int, int] = {}
 _backend_http_client: Optional[httpx.AsyncClient] = None
 _backend_http_client_lock = asyncio.Lock()
+_background_tasks: set[asyncio.Task] = set()
 
 
 def _build_backend_url(path_or_url: str) -> str:
     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
         return path_or_url
     return f"{BACKEND_BASE_URL.rstrip('/')}{path_or_url}"
+
+
+def _split_telegram_text_reply(text: str, max_chars: int = TELEGRAM_TEXT_MESSAGE_LIMIT) -> list[str]:
+    normalized = str(text or "")
+    if not normalized:
+        return [""]
+    if max_chars < 1:
+        max_chars = TELEGRAM_TEXT_MESSAGE_LIMIT
+
+    chunks: list[str] = []
+    remaining = normalized
+    while len(remaining) > max_chars:
+        split_at = remaining.rfind("\n", 0, max_chars + 1)
+        if split_at > 0:
+            split_at += 1
+        else:
+            split_at = remaining.rfind(" ", 0, max_chars + 1)
+            if split_at > 0:
+                split_at += 1
+        if split_at <= 0:
+            split_at = max_chars
+        chunk = remaining[:split_at]
+        if not chunk:
+            chunk = remaining[:max_chars]
+            split_at = len(chunk)
+        chunks.append(chunk)
+        remaining = remaining[split_at:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks or [normalized]
+
+
+async def _send_telegram_text_reply(message, text: str) -> None:
+    chunks = _split_telegram_text_reply(text)
+    for chunk in chunks:
+        await message.reply_text(chunk)
 
 
 def build_chat_url() -> str:
@@ -172,6 +219,21 @@ async def _close_backend_http_client() -> None:
         await client.aclose()
 
 
+def _track_background_task(task: asyncio.Task) -> asyncio.Task:
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _cancel_background_tasks() -> None:
+    if not _background_tasks:
+        return
+    tasks = tuple(_background_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def is_authorized(user_id: int) -> bool:
     if ALLOW_ALL_USERS:
         return True
@@ -192,39 +254,45 @@ async def _poll_status_updates(
     last_state_sent = ""
     url = _build_backend_url("/v1/status/latest")
     headers = _backend_headers()
+
+    async def _fetch_once() -> tuple[int, str]:
+        nonlocal last_seq, last_state_sent
+        try:
+            client = await _get_backend_http_client()
+            resp = await client.get(
+                url,
+                params={"conversation_id": conversation_id, "request_id": request_id},
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                return last_seq, last_state_sent
+            payload = resp.json()
+            if not payload.get("found"):
+                return last_seq, last_state_sent
+            event = payload.get("event") or {}
+            seq = int(event.get("seq") or 0)
+            state_text = (event.get("state") or "").strip()
+            event_type = str(event.get("type") or "").strip().lower()
+            if seq <= last_seq or not state_text:
+                return last_seq, last_state_sent
+            if event_type == "heartbeat" and state_text == last_state_sent:
+                last_seq = seq
+                return last_seq, last_state_sent
+            last_seq = seq
+            last_state_sent = state_text
+            await bot.send_message(chat_id=chat_id, text=state_text)
+        except Exception:
+            logger.debug("Status polling failed for chat_id=%s", chat_id, exc_info=True)
+        return last_seq, last_state_sent
+
+    await _fetch_once()
+
     while True:
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=STATUS_UPDATE_INTERVAL)
             break
         except asyncio.TimeoutError:
-            try:
-                client = await _get_backend_http_client()
-                resp = await client.get(
-                    url,
-                    params={"conversation_id": conversation_id, "request_id": request_id},
-                    headers=headers,
-                )
-                if resp.status_code != 200:
-                    continue
-                payload = resp.json()
-                if not payload.get("found"):
-                    continue
-                event = payload.get("event") or {}
-                seq = int(event.get("seq") or 0)
-                state_text = (event.get("state") or "").strip()
-                event_type = str(event.get("type") or "").strip().lower()
-                if seq <= last_seq or not state_text:
-                    continue
-                # Heartbeats repeat the same state every minute. Suppress duplicates
-                # so users only receive meaningful progress transitions.
-                if event_type == "heartbeat" and state_text == last_state_sent:
-                    last_seq = seq
-                    continue
-                last_seq = seq
-                last_state_sent = state_text
-                await bot.send_message(chat_id=chat_id, text=state_text)
-            except Exception:
-                logger.debug("Status polling failed for chat_id=%s", chat_id, exc_info=True)
+            await _fetch_once()
 
 
 async def _stop_status_updates(stop_event: asyncio.Event, status_task: asyncio.Task) -> None:
@@ -396,6 +464,11 @@ async def _ensure_telegram_voice_note_audio(
 
 _BRACKET_CONTENT_PATTERN = re.compile(r"\([^()]*\)|\[[^\[\]]*\]")
 _TTS_ALLOWED_PUNCTUATION = set(".,!?;:'\"-")
+_TRANSIENT_REPLY_PATTERNS = [
+    re.compile(r"^(?:on it|working on it|let me|i'll|i will|i am going to|now i will)\b", re.IGNORECASE),
+    re.compile(r"\b(?:let me check|let me see|let me fetch|let me verify|i'll check|i will check|i'll use|i will use)\b", re.IGNORECASE),
+    re.compile(r"\b(?:next step|after that|then i'll|then i will|now i'll|now i will)\b", re.IGNORECASE),
+]
 
 
 def _sanitize_tts_text(text: str) -> str:
@@ -416,6 +489,27 @@ def _sanitize_tts_text(text: str) -> str:
     ]
     normalized = "".join(filtered_chars)
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _looks_like_transient_reply(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    if not normalized:
+        return False
+    if "<tool>" in normalized.lower() or "<parameters>" in normalized.lower():
+        return True
+    if len(normalized) > 280:
+        return False
+    return any(pattern.search(normalized) for pattern in _TRANSIENT_REPLY_PATTERNS)
+
+
+def _should_send_voice_reply(text: str) -> bool:
+    """Only voice substantive user-facing replies, not transient planning/progress text."""
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    if _looks_like_transient_reply(normalized):
+        return False
+    return True
 
 
 async def call_backend_tts(text: str) -> tuple[bytes, str]:
@@ -450,6 +544,39 @@ async def call_backend_tts(text: str) -> tuple[bytes, str]:
 
     content_type = response.headers.get("content-type", "audio/mpeg")
     return response.content, content_type
+
+
+async def _send_voice_reply(message: Message, reply: str) -> None:
+    try:
+        await message.chat.send_action(action=ChatAction.RECORD_VOICE)
+        audio_bytes, content_type = await call_backend_tts(reply)
+        audio_bytes, content_type, was_converted = await _ensure_telegram_voice_note_audio(
+            audio_bytes, content_type
+        )
+        filename = _guess_audio_filename(content_type)
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = filename
+        is_ogg_opus = _is_ogg_opus(content_type, audio_bytes)
+        logger.info(
+            "TTS reply audio bytes=%s content-type=%s ogg_opus=%s converted=%s",
+            len(audio_bytes or b""),
+            content_type,
+            is_ogg_opus,
+            was_converted,
+        )
+        if is_ogg_opus:
+            await message.reply_voice(voice=audio_file, filename=filename)
+        else:
+            await message.reply_audio(audio=audio_file, filename=filename)
+    except asyncio.CancelledError:
+        logger.info("Cancelled pending Telegram voice reply task")
+        raise
+    except Exception as exc:
+        logger.error("Voice reply failed: %s", exc, exc_info=True)
+
+
+def _schedule_voice_reply(message: Message, reply: str) -> None:
+    _track_background_task(asyncio.create_task(_send_voice_reply(message, reply)))
 
 
 async def clear_backend_history(user_id: int) -> bool:
@@ -524,38 +651,21 @@ async def _reply_with_backend_answer(
     except RuntimeError as exc:
         logger.error("Backend chat failed: %s", exc)
         stop_event.set()
-        await update.message.reply_text("CATBot could not process that request right now. Please try again.")
         await _stop_status_updates(stop_event, status_task)
+        await _send_telegram_text_reply(
+            update.message,
+            "CATBot could not process that request right now. Please try again.",
+        )
         return
 
     stop_event.set()
-    await update.message.reply_text(reply)
     await _stop_status_updates(stop_event, status_task)
+    await _send_telegram_text_reply(update.message, reply)
 
-    if VOICE_OUT_ENABLED:
-        try:
-            await update.message.chat.send_action(action=ChatAction.RECORD_VOICE)
-            audio_bytes, content_type = await call_backend_tts(reply)
-            audio_bytes, content_type, was_converted = await _ensure_telegram_voice_note_audio(
-                audio_bytes, content_type
-            )
-            filename = _guess_audio_filename(content_type)
-            audio_file = io.BytesIO(audio_bytes)
-            audio_file.name = filename
-            is_ogg_opus = _is_ogg_opus(content_type, audio_bytes)
-            logger.info(
-                "TTS reply audio bytes=%s content-type=%s ogg_opus=%s converted=%s",
-                len(audio_bytes or b""),
-                content_type,
-                is_ogg_opus,
-                was_converted,
-            )
-            if is_ogg_opus:
-                await update.message.reply_voice(voice=audio_file, filename=filename)
-            else:
-                await update.message.reply_audio(audio=audio_file, filename=filename)
-        except Exception as exc:
-            logger.error("Voice reply failed: %s", exc, exc_info=True)
+    if VOICE_OUT_ENABLED and _should_send_voice_reply(reply):
+        _schedule_voice_reply(update.message, reply)
+    elif VOICE_OUT_ENABLED:
+        logger.info("Skipping Telegram TTS for transient/planning reply: %r", reply[:200])
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -831,6 +941,7 @@ def main() -> None:
         logger.info("CATBot Telegram bot initialized")
 
     async def _post_shutdown(app: Application) -> None:
+        await _cancel_background_tasks()
         await _close_backend_http_client()
 
     app: Application = (

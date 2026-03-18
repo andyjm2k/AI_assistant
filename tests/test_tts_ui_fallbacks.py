@@ -51,3 +51,16 @@ def test_app_js_only_starts_progress_updates_for_request_like_prompts():
     content = _app_js_text()
     assert "if (shouldStartProgressUpdatesForPrompt(promptText)) {" in content
     assert "startProgressUpdates('Analyzing request');" in content
+
+
+def test_app_js_refreshes_model_dropdowns_for_initial_and_companion_settings():
+    content = _app_js_text()
+    assert "function populateModelDropdown(dropdown, models, preferredValue, fallbackValue)" in content
+    assert "await fetchAvailableModels(persistedToolSettings);" in content
+    assert "await fetchAvailableModels(data.settings);" in content
+
+
+def test_app_js_flushes_tool_settings_on_pagehide_for_session_persistence():
+    content = _app_js_text()
+    assert "window.addEventListener('pagehide', () => {" in content
+    assert "saveToolSettings({ skipCompanionRefresh: true });" in content

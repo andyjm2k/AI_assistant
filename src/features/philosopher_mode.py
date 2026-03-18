@@ -17,6 +17,11 @@ from src.utils.token_budget import (
     get_max_token_limit,
     is_context_limit_error,
 )
+from src.utils.openai_compat import (
+    is_minimax_chat_request,
+    normalize_chat_completion_message,
+    prepare_openai_compatible_chat_payload,
+)
 
 class PhilosopherMode:
     """
@@ -273,6 +278,11 @@ When contemplating, you should use tools to gather information to inform your ow
         
         try:
             # Make API call
+            payload = prepare_openai_compatible_chat_payload(
+                payload,
+                api_base=url,
+                model=self.model,
+            )
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(url, headers=headers, json=payload)
             
@@ -302,12 +312,10 @@ When contemplating, you should use tools to gather information to inform your ow
             data = response.json()
             choices = data.get("choices", [])
             if choices:
-                message = choices[0].get("message", {})
-                result = {
-                    "content": message.get("content"),
-                    "tool_calls": message.get("tool_calls")
-                }
-                return result
+                return normalize_chat_completion_message(
+                    choices[0].get("message", {}),
+                    preserve_reasoning_details=is_minimax_chat_request(url, self.model),
+                )
             
             raise Exception("LLM API response did not contain any choices")
         except httpx.TimeoutException:
@@ -498,10 +506,12 @@ ACTION REQUIRED: If I need information, I MUST use the appropriate tools NOW to 
             )
             # Execute tool calls
             tool_messages = []
-            tool_messages.append({
-                "role": "assistant",
-                "tool_calls": tool_calls
-            })
+            tool_messages.append(
+                llm_response.get("message") or {
+                    "role": "assistant",
+                    "tool_calls": tool_calls,
+                }
+            )
             
             for tool_call in tool_calls:
                 function = tool_call.get("function", {})
@@ -952,10 +962,12 @@ IMPORTANT: If at any point during your contemplation you realize you need additi
                     })
                 
                 # Add assistant's tool call message
-                messages.append({
-                    "role": "assistant",
-                    "tool_calls": tool_calls
-                })
+                messages.append(
+                    llm_response.get("message") or {
+                        "role": "assistant",
+                        "tool_calls": tool_calls,
+                    }
+                )
                 
                 # Add tool results
                 messages.extend(tool_results)

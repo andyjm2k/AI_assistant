@@ -56,7 +56,7 @@ def test_skills_list_and_execute_with_auth() -> None:
     assert payload["data"]["pong"] is True
 
 
-def test_skills_openai_tools_hide_overlapping_filesystem_tools_by_default() -> None:
+def test_skills_openai_tools_include_filesystem_tools_by_default() -> None:
     client = _client()
     headers = _auth_headers(client)
 
@@ -68,10 +68,10 @@ def test_skills_openai_tools_hide_overlapping_filesystem_tools_by_default() -> N
         for tool in default_tools
         if isinstance(tool, dict)
     }
-    assert "filesystem.list_files" not in default_names
-    assert "filesystem.read_text" not in default_names
-    assert "filesystem.write_text" not in default_names
-    assert "filesystem.search_files" not in default_names
+    assert "filesystem.list_files" in default_names
+    assert "filesystem.read_text" in default_names
+    assert "filesystem.write_text" in default_names
+    assert "filesystem.search_files" in default_names
 
     include_resp = client.get(
         "/v1/skills/tools/openai?qualified_names=true&include_overlapping_file_tools=true",

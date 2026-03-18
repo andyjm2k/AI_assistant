@@ -15,6 +15,7 @@ from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermi
 from autogen_agentchat.teams import SelectorGroupChat
 from autogen_core.model_context import BufferedChatCompletionContext
 from autogen_ext.models.openai import OpenAIChatCompletionClient
+from src.utils.openai_compat import is_minimax_chat_request, normalize_temperature_for_minimax
 
 
 AUTOGEN_TEAM_BUILDER_FILE = Path(__file__).resolve()
@@ -62,50 +63,83 @@ def _first_non_empty_env(names: Sequence[str]) -> str | None:
 
 
 def _resolve_openrouter_api_key() -> str:
-    api_key = _first_non_empty_env(
-        [
+    base_url = _resolve_openrouter_base_url()
+    model = _resolve_team_model()
+    provider_hint = (_first_non_empty_env(["AUTOGEN_PROVIDER", "AUTOGEN_LLM_PROVIDER"]) or "").lower()
+    candidates: list[str]
+    if provider_hint == "minimax" or is_minimax_chat_request(base_url, model):
+        candidates = [
+            "AUTOGEN_MINIMAX_API_KEY",
+            "MINIMAX_API_KEY",
+            "MCP_LLM_MINIMAX_API_KEY",
+            "MCP_LLM_OPENAI_API_KEY",
+            "OPENAI_API_KEY",
+        ]
+    else:
+        candidates = [
             "AUTOGEN_OPENROUTER_API_KEY",
             "OPENROUTER_API_KEY",
             "MCP_LLM_OPENROUTER_API_KEY",
             "MCP_LLM_OPENAI_API_KEY",
             "OPENAI_API_KEY",
         ]
+    api_key = _first_non_empty_env(
+        candidates
     )
     if not api_key:
-        raise RuntimeError("OpenRouter API key is not configured for the AutoGen team.")
+        raise RuntimeError("No compatible API key is configured for the AutoGen team.")
     return api_key
 
 
 def _resolve_openrouter_base_url() -> str:
-    return (
-        _first_non_empty_env(
-            [
-                "AUTOGEN_OPENROUTER_BASE_URL",
-                "OPENROUTER_API_BASE",
-                "MCP_LLM_BASE_URL",
-                "OPENAI_API_BASE",
-            ]
-        )
-        or "https://openrouter.ai/api/v1"
-    ).rstrip("/")
+    provider_hint = (_first_non_empty_env(["AUTOGEN_PROVIDER", "AUTOGEN_LLM_PROVIDER"]) or "").lower()
+    configured = _first_non_empty_env(
+        [
+            "AUTOGEN_BASE_URL",
+            "AUTOGEN_MINIMAX_BASE_URL",
+            "AUTOGEN_OPENROUTER_BASE_URL",
+            "OPENROUTER_API_BASE",
+            "MCP_LLM_BASE_URL",
+            "OPENAI_API_BASE",
+        ]
+    )
+    if configured:
+        return configured.rstrip("/")
+    if provider_hint == "minimax":
+        return "https://api.minimax.io/v1"
+    return "https://openrouter.ai/api/v1"
 
 
 def _resolve_team_model() -> str:
-    return (
-        _first_non_empty_env(
-            [
-                "AUTOGEN_TEAM_MODEL",
-                "OPENROUTER_AUTOGEN_MODEL",
-                "OPENAI_MODEL",
-            ]
-        )
-        or "x-ai/grok-4.1-fast"
+    model = _first_non_empty_env(
+        [
+            "AUTOGEN_TEAM_MODEL",
+            "AUTOGEN_MINIMAX_MODEL",
+            "OPENROUTER_AUTOGEN_MODEL",
+            "MCP_LLM_MODEL_NAME",
+            "OPENAI_MODEL",
+        ]
     )
+    if model:
+        return model
+    base_url = _resolve_openrouter_base_url()
+    provider_hint = (_first_non_empty_env(["AUTOGEN_PROVIDER", "AUTOGEN_LLM_PROVIDER"]) or "").lower()
+    if provider_hint == "minimax" or is_minimax_chat_request(base_url, None):
+        return "MiniMax-M2.5"
+    return "x-ai/grok-4.1-fast"
 
 
 def _build_model_client(*, temperature: float, max_tokens: int = 2200, timeout: int = 180) -> OpenAIChatCompletionClient:
+    base_url = _resolve_openrouter_base_url()
+    model = _resolve_team_model()
+    minimax_compat = is_minimax_chat_request(base_url, model)
+    effective_temperature = (
+        normalize_temperature_for_minimax(temperature)
+        if minimax_compat
+        else temperature
+    )
     return OpenAIChatCompletionClient(
-        model=_resolve_team_model(),
+        model=model,
         model_info={
             "vision": False,
             "function_calling": True,
@@ -114,13 +148,15 @@ def _build_model_client(*, temperature: float, max_tokens: int = 2200, timeout: 
             "structured_output": False,
         },
         api_key=_resolve_openrouter_api_key(),
-        base_url=_resolve_openrouter_base_url(),
-        temperature=temperature,
+        base_url=base_url,
+        temperature=effective_temperature,
         timeout=timeout,
         max_retries=3,
         max_tokens=max_tokens,
         stop=["<eos>"],
         top_p=1,
+        add_name_prefixes=minimax_compat,
+        include_name_in_message=not minimax_compat,
     )
 
 
