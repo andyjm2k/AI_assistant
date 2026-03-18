@@ -190,6 +190,120 @@ def format_telegram_tool_call(name: Any, arguments: Any) -> str:
     return f"<tool>{tool_name}</tool>\n<parameters>{params_text}</parameters>"
 
 
+def _normalize_tool_parameter_text(raw_text: Any) -> str:
+    text = html.unescape(str(raw_text or "")).strip()
+    if text.startswith("<![CDATA[") and text.endswith("]]>"):
+        text = text[9:-3].strip()
+    return (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+
+
+def _extract_balanced_json_candidate(text: str) -> Optional[str]:
+    if not text:
+        return None
+    start_index = None
+    opening = ""
+    closing = ""
+    for index, char in enumerate(text):
+        if char in "{[":
+            start_index = index
+            opening = char
+            closing = "}" if char == "{" else "]"
+            break
+    if start_index is None:
+        return None
+
+    depth = 0
+    in_string = False
+    escape_next = False
+    for index in range(start_index, len(text)):
+        char = text[index]
+        if in_string:
+            if escape_next:
+                escape_next = False
+                continue
+            if char == "\\":
+                escape_next = True
+                continue
+            if char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == opening:
+            depth += 1
+            continue
+        if char == closing:
+            depth -= 1
+            if depth == 0:
+                return text[start_index:index + 1]
+    return None
+
+
+def _repair_js_style_object_literal(text: str) -> str:
+    repaired = text
+    repaired = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)(\s*:)", r'\1"\2"\3', repaired)
+    repaired = re.sub(r":\s*'([^'\\]*(?:\\.[^'\\]*)*)'", r': "\1"', repaired)
+    return repaired
+
+
+def _parse_xml_parameter_map(text: str) -> Optional[Dict[str, Any]]:
+    if not text or "<" not in text or ">" not in text:
+        return None
+    matches = re.findall(r"<([A-Za-z_][A-Za-z0-9_\-]*)>([\s\S]*?)</\1>", text)
+    if not matches:
+        return None
+    parsed: Dict[str, Any] = {}
+    for key, value in matches:
+        cleaned_value = value.strip()
+        nested = _parse_tool_parameters(cleaned_value)
+        parsed[key] = nested if nested is not None else cleaned_value
+    return parsed or None
+
+
+def _parse_tool_parameters(raw_text: Any) -> Optional[Any]:
+    normalized = _normalize_tool_parameter_text(raw_text)
+    if not normalized:
+        return None
+
+    candidates: List[str] = [normalized]
+    balanced_candidate = _extract_balanced_json_candidate(normalized)
+    if balanced_candidate and balanced_candidate not in candidates:
+        candidates.append(balanced_candidate)
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except (TypeError, json.JSONDecodeError):
+            continue
+
+    for candidate in candidates:
+        try:
+            return ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            continue
+
+    for candidate in candidates:
+        repaired = _repair_js_style_object_literal(candidate)
+        if repaired == candidate:
+            continue
+        try:
+            return json.loads(repaired)
+        except (TypeError, json.JSONDecodeError):
+            continue
+
+    xml_map = _parse_xml_parameter_map(normalized)
+    if xml_map is not None:
+        return xml_map
+
+    return None
+
+
 def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
     """
     Parse assistant content for a single tool call in the same format as the web client.
@@ -208,16 +322,18 @@ def parse_telegram_tool_response(content: str) -> Optional[Dict[str, Any]]:
     # chatty surrounding text cannot cross-wire one tool with another block's args.
     block_match = _TOOL_CALL_CAPTURE_PATTERN.search(content_without_code)
     if block_match:
-        try:
-            tool_name = block_match.group("name").strip()
-            params_str = block_match.group("parameters").strip()
-            if not tool_name:
-                return None
-            params = json.loads(params_str)
-            return {"name": tool_name, "arguments": json.dumps(params) if isinstance(params, dict) else params_str}
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"[TELEGRAM_TOOLS] Error parsing tool call: {e}")
-            pass
+        tool_name = block_match.group("name").strip()
+        params_str = block_match.group("parameters").strip()
+        if not tool_name:
+            return None
+        params = _parse_tool_parameters(params_str)
+        if params is not None:
+            return {"name": tool_name, "arguments": json.dumps(params) if isinstance(params, dict) else str(params)}
+        params_preview = re.sub(r"\s+", " ", _normalize_tool_parameter_text(params_str))[:240]
+        print(
+            "[TELEGRAM_TOOLS] Error parsing tool call arguments "
+            f"for {tool_name}: preview={params_preview}"
+        )
     # JSON-style: content is JSON object
     trimmed = content_without_code.strip()
     if trimmed.startswith("{") or trimmed.startswith("["):

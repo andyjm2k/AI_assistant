@@ -54,23 +54,29 @@ def get_env_config():
         # LLM Provider Configuration - specify which AI model to use
         "MCP_LLM_PROVIDER": os.environ.get("MCP_LLM_PROVIDER", "google"),
         "MCP_LLM_MODEL_NAME": os.environ.get("MCP_LLM_MODEL_NAME", "gemini-2.0-flash-exp"),
+        "MCP_LLM_BASE_URL": os.environ.get("MCP_LLM_BASE_URL", ""),
         
         # API Keys - credentials for AI providers
         "MCP_LLM_GOOGLE_API_KEY": os.environ.get("GOOGLE_API_KEY", ""),
         "MCP_LLM_OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", ""),
+        "MCP_LLM_MINIMAX_API_KEY": os.environ.get("MINIMAX_API_KEY", ""),
         "MCP_LLM_ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", ""),
+        "MCP_LLM_OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
         
         # Browser Configuration - how the browser should behave
         "MCP_BROWSER_HEADLESS": os.environ.get("MCP_BROWSER_HEADLESS", "true"),
-        "MCP_BROWSER_DISABLE_SECURITY": os.environ.get("MCP_BROWSER_DISABLE_SECURITY", "false"),
-        "MCP_BROWSER_KEEP_OPEN": os.environ.get("MCP_BROWSER_KEEP_OPEN", "false"),
+        "MCP_BROWSER_CDP_URL": os.environ.get("MCP_BROWSER_CDP_URL", ""),
+        "MCP_BROWSER_USER_DATA_DIR": os.environ.get("MCP_BROWSER_USER_DATA_DIR", ""),
+        "MCP_BROWSER_CHROMIUM_SANDBOX": os.environ.get("MCP_BROWSER_CHROMIUM_SANDBOX", "true"),
         
         # Research Tool Configuration - where to save research outputs
-        "MCP_RESEARCH_TOOL_SAVE_DIR": os.environ.get("MCP_RESEARCH_TOOL_SAVE_DIR", "./research_output"),
+        "MCP_RESEARCH_SAVE_DIRECTORY": os.environ.get("MCP_RESEARCH_SAVE_DIRECTORY", ""),
+        "MCP_RESEARCH_MAX_SEARCHES": os.environ.get("MCP_RESEARCH_MAX_SEARCHES", "5"),
+        "MCP_RESEARCH_SEARCH_TIMEOUT": os.environ.get("MCP_RESEARCH_SEARCH_TIMEOUT", "120"),
         
         # Agent Tool Configuration - control agent behavior
-        "MCP_AGENT_TOOL_MAX_STEPS": os.environ.get("MCP_AGENT_TOOL_MAX_STEPS", "100"),
-        "MCP_AGENT_TOOL_USE_VISION": os.environ.get("MCP_AGENT_TOOL_USE_VISION", "true"),
+        "MCP_AGENT_MAX_STEPS": os.environ.get("MCP_AGENT_MAX_STEPS", "20"),
+        "MCP_AGENT_USE_VISION": os.environ.get("MCP_AGENT_USE_VISION", "true"),
         
         # Server Configuration - logging and telemetry settings
         "MCP_SERVER_LOGGING_LEVEL": os.environ.get("MCP_SERVER_LOGGING_LEVEL", "INFO"),
@@ -292,9 +298,10 @@ def main():
     logger.info("  POST /api/disconnect - Disconnect MCP client")
     
     # Create research output directory if it doesn't exist
-    research_dir = os.environ.get("MCP_RESEARCH_TOOL_SAVE_DIR", "./research_output")
-    Path(research_dir).mkdir(parents=True, exist_ok=True)
-    logger.info(f"Research output directory: {research_dir}")
+    research_dir = os.environ.get("MCP_RESEARCH_SAVE_DIRECTORY", "").strip()
+    if research_dir:
+        Path(research_dir).mkdir(parents=True, exist_ok=True)
+        logger.info(f"Research output directory: {research_dir}")
     
     # Start the Flask server
     app.run(host=host, port=port, debug=False)

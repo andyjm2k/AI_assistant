@@ -189,11 +189,242 @@ class TestTelegramChatEndpoint:
         data = resp.json()
         assert data.get("reply") == "Hello from CATBot"
 
+    def test_minimax_tool_loop_preserves_reasoning_details_in_history(self):
+        """Minimax tool follow-ups should keep reasoning metadata internally but strip it from the Telegram reply."""
+        client = _get_client()
+        first_response = MagicMock()
+        first_response.status_code = 200
+        first_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "Searching now",
+                        "reasoning_details": [{"type": "reasoning.text", "text": "internal plan"}],
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "webSearch",
+                                    "arguments": "{\"query\": \"test query\"}",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        second_response = MagicMock()
+        second_response.status_code = 200
+        second_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>internal finish</think>\nFinal answer for Telegram"
+                    }
+                }
+            ]
+        }
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            with patch("src.servers.proxy_server.TELEGRAM_OPENAI_BASE_URL", "https://api.minimax.io/v1"):
+                with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search:
+                    mock_search.return_value = {"results": [{"title": "Test", "snippet": "Snippet"}]}
+                    with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                        m_getenv.side_effect = lambda k, d=None: (
+                            "minimax-key"
+                            if k in ("MINIMAX_API_KEY", "MCP_LLM_MINIMAX_API_KEY")
+                            else os.environ.get(k, d)
+                        )
+                        with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                            mock_client_instance = MagicMock()
+                            mock_client_instance.post = AsyncMock(side_effect=[first_response, second_response])
+                            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                            mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                            mock_aclient.return_value = mock_client_instance
+
+                            resp = client.post(
+                                "/v1/telegram/chat",
+                                json={"message": "Search for test", "conversation_id": "minimax-tool-loop"},
+                            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data.get("reply") == "Final answer for Telegram"
+
+        first_payload = mock_client_instance.post.await_args_list[0].kwargs["json"]
+        assert first_payload["extra_body"]["reasoning_split"] is True
+
+        second_payload = mock_client_instance.post.await_args_list[1].kwargs["json"]
+        assistant_turn = next(
+            msg for msg in second_payload["messages"]
+            if msg.get("role") == "assistant" and msg.get("tool_calls")
+        )
+        assert assistant_turn["reasoning_details"][0]["text"] == "internal plan"
+
+    def test_telegram_system_prompt_appends_native_tool_json_rules(self):
+        from src.servers import proxy_server as ps
+
+        prompt = ps._get_telegram_system_prompt_with_tools("prompt-native-rules")
+
+        assert "Native Telegram tools:" in prompt
+        assert "Prefer structured tool calls using the provided tool schema and exact tool name." in prompt
+        assert "Use XML tool markup only as a legacy fallback when structured tool calls are unavailable." in prompt
+        assert "Parameters JSON schema:" in prompt
+        assert "MUST ALWAYS respond in this EXACT format" not in prompt
+        assert "Always use the XML-style format shown above" not in prompt
+        assert '<tool>scrapeWebsite</tool>' not in prompt
+
+    def test_telegram_system_prompt_prefers_filesystem_skills_over_legacy_file_tools(self):
+        from src.servers import proxy_server as ps
+
+        fake_skill_tools = [
+            {"name": "filesystem.read_text", "description": "read", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "filesystem.write_text", "description": "write", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "filesystem.list_files", "description": "list", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "filesystem.search_files", "description": "search", "inputSchema": {"type": "object", "properties": {}}},
+        ]
+
+        with patch("src.servers.proxy_server._get_skill_tools_mcp_schema", return_value=fake_skill_tools):
+            prompt = ps._get_telegram_system_prompt_with_tools("prompt-filesystem-preference")
+
+        assert "prefer filesystem.read_text" in prompt
+        assert "filesystem.write_text" in prompt
+        assert "filesystem.list_files" in prompt
+        assert "filesystem.search_files" in prompt
+
+    def test_telegram_chat_payload_includes_native_and_skill_tools(self):
+        client = _get_client()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _mock_openai_response("Hello from CATBot")
+        fake_skill_tools_openai = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "filesystem.read_text",
+                    "description": "read",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        fake_skill_tools_mcp = [
+            {"name": "filesystem.read_text", "description": "read", "inputSchema": {"type": "object", "properties": {}}}
+        ]
+
+        def getenv(k, d=None):
+            if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"):
+                return "test-key"
+            return os.environ.get(k, d) if d is not None else os.environ.get(k)
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            with patch("src.servers.proxy_server._get_skill_tools_openai_schema", return_value=fake_skill_tools_openai):
+                with patch("src.servers.proxy_server._get_skill_tools_mcp_schema", return_value=fake_skill_tools_mcp):
+                    with patch("src.servers.proxy_server.os.getenv", side_effect=getenv):
+                        with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                            mock_client_instance = MagicMock()
+                            mock_client_instance.post = AsyncMock(return_value=mock_response)
+                            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                            mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                            mock_aclient.return_value = mock_client_instance
+
+                            resp = client.post(
+                                "/v1/telegram/chat",
+                                json={"message": "Use tools", "conversation_id": "tool-payload-test"},
+                            )
+
+        assert resp.status_code == 200, resp.text
+        payload = mock_client_instance.post.await_args_list[0].kwargs["json"]
+        tool_names = {tool["function"]["name"] for tool in payload["tools"]}
+        assert payload["tool_choice"] == "auto"
+        assert "runBrowserAgent" in tool_names
+        assert "filesystem.read_text" in tool_names
+
+    def test_tool_followup_payload_keeps_unified_tool_schemas(self):
+        client = _get_client()
+        mock_first = MagicMock()
+        mock_first.status_code = 200
+        mock_first.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "webSearch",
+                                    "arguments": '{"query": "test query"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        mock_second = MagicMock()
+        mock_second.status_code = 200
+        mock_second.json.return_value = {
+            "choices": [{"message": {"content": "Final answer"}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 10},
+        }
+        fake_skill_tools_openai = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "filesystem.read_text",
+                    "description": "read",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        fake_skill_tools_mcp = [
+            {"name": "filesystem.read_text", "description": "read", "inputSchema": {"type": "object", "properties": {}}}
+        ]
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True):
+            with patch("src.servers.proxy_server._get_skill_tools_openai_schema", return_value=fake_skill_tools_openai):
+                with patch("src.servers.proxy_server._get_skill_tools_mcp_schema", return_value=fake_skill_tools_mcp):
+                    with patch("src.servers.proxy_server._do_proxy_search", new_callable=AsyncMock) as mock_search:
+                        mock_search.return_value = {"results": [{"title": "Test", "snippet": "Snippet"}]}
+                        with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+                            m_getenv.side_effect = lambda k, d=None: (
+                                "test-key" if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+                            )
+                            with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                                mock_client_instance = MagicMock()
+                                mock_client_instance.post = AsyncMock(side_effect=[mock_first, mock_second])
+                                mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                                mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                                mock_aclient.return_value = mock_client_instance
+
+                                resp = client.post(
+                                    "/v1/telegram/chat",
+                                    json={"message": "Search for test", "conversation_id": "tool-followup-payload"},
+                                )
+
+        assert resp.status_code == 200, resp.text
+        followup_payload = mock_client_instance.post.await_args_list[1].kwargs["json"]
+        tool_names = {tool["function"]["name"] for tool in followup_payload["tools"]}
+        assert followup_payload["tool_choice"] == "auto"
+        assert "webSearch" in tool_names
+        assert "filesystem.read_text" in tool_names
+
     def test_no_api_key_returns_503(self):
         """POST when neither OPENAI_API_KEY nor MCP_LLM_OPENAI_API_KEY is set returns 503."""
         client = _get_client()
         with patch("src.servers.proxy_server.os.getenv") as m_getenv:
-            m_getenv.side_effect = lambda k, d=None: None if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY") else os.environ.get(k, d)
+            missing_key_names = {
+                "OPENAI_API_KEY",
+                "MCP_LLM_OPENAI_API_KEY",
+                "MINIMAX_API_KEY",
+                "MCP_LLM_MINIMAX_API_KEY",
+            }
+            m_getenv.side_effect = (
+                lambda k, d=None: None if k in missing_key_names else os.environ.get(k, d)
+            )
             resp = client.post(
                 "/v1/telegram/chat",
                 json={"message": "Hi"},
@@ -707,6 +938,41 @@ class TestTelegramToolsLoop:
         assert data.get("reply") == final_response
         mock_search.assert_awaited_once()
         mock_fetch.assert_awaited_once()
+
+
+class TestBrowserAgentProxy:
+    @pytest.mark.asyncio
+    async def test_do_browser_agent_maps_instruction_alias_to_task(self):
+        from src.servers import proxy_server as ps
+
+        health_response = MagicMock()
+        health_response.status_code = 200
+
+        post_response = MagicMock()
+        post_response.status_code = 200
+        post_response.headers = {"content-type": "application/json"}
+        post_response.json.return_value = {"success": True, "message": "ok"}
+
+        health_client = MagicMock()
+        health_client.get = AsyncMock(return_value=health_response)
+        health_client.__aenter__ = AsyncMock(return_value=health_client)
+        health_client.__aexit__ = AsyncMock(return_value=None)
+
+        post_client = MagicMock()
+        post_client.post = AsyncMock(return_value=post_response)
+        post_client.__aenter__ = AsyncMock(return_value=post_client)
+        post_client.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("src.servers.proxy_server.os.getenv") as m_getenv:
+            m_getenv.side_effect = lambda k, d=None: (
+                "http://127.0.0.1:5001" if k == "MCP_BROWSER_SERVER_URL" else os.environ.get(k, d)
+            )
+            with patch("src.servers.proxy_server.httpx.AsyncClient", side_effect=[health_client, post_client]):
+                result = await ps._do_browser_agent({"instruction": "Open example.com"})
+
+        assert result["success"] is True
+        posted_json = post_client.post.await_args.kwargs["json"]
+        assert posted_json["task"] == "Open example.com"
 
     def test_tool_loop_does_not_infer_next_tool_from_planning_text(self):
         """
@@ -1590,21 +1856,25 @@ class TestPhilosopherFileTools:
     """Tests for file manipulation tools in philosopher mode (get_all_available_tools + execute_tool_for_philosopher)."""
 
     @pytest.mark.asyncio
-    async def test_file_tools_included_when_file_ops_available(self):
-        """When FILE_OPS_AVAILABLE is True, get_all_available_tools includes read_file, write_file, list_files, delete_file."""
+    async def test_filesystem_skill_tools_included_in_tool_list(self):
+        """get_all_available_tools should expose filesystem skill tools and omit retired native duplicates."""
         from src.servers import proxy_server as ps
         with patch.object(ps, "MCP_AVAILABLE", False):
             tools = await ps.get_all_available_tools()
         names = [t.get("name") for t in tools]
-        assert "read_file" in names
-        assert "write_file" in names
-        assert "list_files" in names
-        assert "search_files" in names
+        assert "filesystem.read_text" in names
+        assert "filesystem.write_text" in names
+        assert "filesystem.list_files" in names
+        assert "filesystem.search_files" in names
         assert "delete_file" in names
+        assert "read_file" not in names
+        assert "write_file" not in names
+        assert "list_files" not in names
+        assert "search_files" not in names
 
     @pytest.mark.asyncio
-    async def test_overlapping_filesystem_skill_tools_filtered_from_llm_tool_list(self):
-        """Skill framework filesystem file tools should be hidden when built-in file tools are available."""
+    async def test_filesystem_skill_tools_are_not_filtered(self):
+        """Filesystem skill tools should remain visible now that native duplicates are retired."""
         from src.servers import proxy_server as ps
 
         raw_tools = [
@@ -1614,42 +1884,45 @@ class TestPhilosopherFileTools:
             {"name": "filesystem.search_files", "description": "search"},
             {"name": "core.ping", "description": "ping"},
         ]
-        with patch.object(ps, "FILE_OPS_AVAILABLE", True):
-            filtered = ps._filter_overlapping_file_skill_tools(raw_tools, openai_schema=False)
+        filtered = ps._filter_overlapping_file_skill_tools(raw_tools, openai_schema=False)
         names = [item.get("name") for item in filtered]
         assert "core.ping" in names
-        assert "filesystem.list_files" not in names
-        assert "filesystem.read_text" not in names
-        assert "filesystem.write_text" not in names
-        assert "filesystem.search_files" not in names
+        assert "filesystem.list_files" in names
+        assert "filesystem.read_text" in names
+        assert "filesystem.write_text" in names
+        assert "filesystem.search_files" in names
 
     @pytest.mark.asyncio
-    async def test_execute_list_files_returns_string(self):
-        """execute_tool_for_philosopher list_files returns a string (empty workspace or file list)."""
+    async def test_execute_filesystem_list_files_returns_string(self):
+        """execute_tool_for_philosopher filesystem.list_files returns a readable string."""
         from src.servers import proxy_server as ps
-        result = await ps.execute_tool_for_philosopher("list_files", {})
+        result = await ps.execute_tool_for_philosopher("filesystem.list_files", {})
         assert isinstance(result, str)
         assert "scratch" in result.lower() or "empty" in result.lower() or "Files" in result
 
     @pytest.mark.asyncio
-    async def test_execute_list_files_truncates_when_limit_set(self, monkeypatch):
-        """execute_tool_for_philosopher list_files should cap rendered rows for large directories."""
+    async def test_execute_filesystem_list_files_truncates_when_limit_set(self, monkeypatch):
+        """execute_tool_for_philosopher filesystem.list_files should cap rendered rows for large directories."""
         from src.servers import proxy_server as ps
         monkeypatch.setenv("LIST_FILES_TOOL_MAX_ENTRIES", "3")
 
         fake_result = {
             "success": True,
-            "files": [
-                {"name": "images", "type": "directory"},
-                {"name": "a.txt", "size": 1},
-                {"name": "b.txt", "size": 2},
-                {"name": "c.txt", "size": 3},
-                {"name": "d.txt", "size": 4},
-            ],
+            "message": "OK",
+            "data": {
+                "items": [
+                    {"name": "images", "relative_path": "images", "type": "directory", "size_bytes": None},
+                    {"name": "a.txt", "relative_path": "a.txt", "type": "file", "size_bytes": 1},
+                    {"name": "b.txt", "relative_path": "b.txt", "type": "file", "size_bytes": 2},
+                    {"name": "c.txt", "relative_path": "c.txt", "type": "file", "size_bytes": 3},
+                    {"name": "d.txt", "relative_path": "d.txt", "type": "file", "size_bytes": 4},
+                ],
+                "max_entries": 3,
+            },
         }
 
-        with patch.object(ps, "_list_files_internal", new=AsyncMock(return_value=fake_result)):
-            result = await ps.execute_tool_for_philosopher("list_files", {})
+        with patch.object(ps, "_execute_skill_framework_tool", new=AsyncMock(return_value=fake_result)):
+            result = await ps.execute_tool_for_philosopher("filesystem.list_files", {})
         assert isinstance(result, str)
         assert "images/ [dir]" in result
         assert "a.txt (1 bytes)" in result
@@ -1660,59 +1933,72 @@ class TestPhilosopherFileTools:
         assert "d.txt (4 bytes)" not in result
 
     @pytest.mark.asyncio
-    async def test_execute_list_files_forwards_pagination_arguments(self):
-        """execute_tool_for_philosopher list_files forwards path/recursive/pagination to backend list helper."""
+    async def test_execute_filesystem_list_files_forwards_arguments(self):
+        """execute_tool_for_philosopher filesystem.list_files forwards arguments into the skill executor."""
         from src.servers import proxy_server as ps
 
         fake_result = {
             "success": True,
-            "files": [{"name": "images/a.png", "size": 10}],
+            "message": "OK",
+            "data": {
+                "items": [{"name": "a.png", "relative_path": "images/a.png", "type": "file", "size_bytes": 10}],
+            },
         }
 
-        with patch.object(ps, "_list_files_internal", new=AsyncMock(return_value=fake_result)) as mock_list:
+        with patch.object(ps, "_execute_skill_framework_tool", new=AsyncMock(return_value=fake_result)) as mock_exec:
             result = await ps.execute_tool_for_philosopher(
-                "list_files",
+                "filesystem.list_files",
                 {"path": "images", "recursive": "true", "offset": 2, "max_entries": 5},
             )
-        mock_list.assert_awaited_once_with(path="images", recursive=True, offset=2, max_entries=5)
+        mock_exec.assert_awaited_once_with(
+            tool_name="filesystem.list_files",
+            arguments={"path": "images", "recursive": "true", "offset": 2, "max_entries": 5},
+            conversation_id="",
+            user_id="",
+            metadata={"channel": "philosopher"},
+        )
         assert isinstance(result, str)
         assert "images/a.png (10 bytes)" in result
 
     @pytest.mark.asyncio
-    async def test_execute_search_files_forwards_arguments(self):
-        """execute_tool_for_philosopher search_files forwards search arguments and formats matches."""
+    async def test_execute_filesystem_search_files_formats_matches(self):
+        """execute_tool_for_philosopher filesystem.search_files should format skill matches cleanly."""
         from src.servers import proxy_server as ps
 
         fake_result = {
             "success": True,
-            "query": "alpha",
-            "matches": [
-                {
-                    "relative_path": "docs/notes.txt",
-                    "match_types": ["content"],
-                    "line_number": 3,
-                    "excerpt": "...alpha topic...",
-                }
-            ],
+            "message": "OK",
+            "data": {
+                "query": "alpha",
+                "items": [
+                    {
+                        "relative_path": "docs/notes.txt",
+                        "match_types": ["content"],
+                        "line_number": 3,
+                        "excerpt": "...alpha topic...",
+                    }
+                ],
+                "offset": 2,
+                "next_offset": 3,
+                "has_more": True,
+            },
         }
 
-        with patch.object(ps, "_search_files_internal", new=AsyncMock(return_value=fake_result)) as mock_search:
+        with patch.object(ps, "_execute_skill_framework_tool", new=AsyncMock(return_value=fake_result)) as mock_exec:
             result = await ps.execute_tool_for_philosopher(
-                "search_files",
+                "filesystem.search_files",
                 {"query": "alpha", "path": "docs", "recursive": False, "offset": 2, "max_results": 5},
             )
-        mock_search.assert_awaited_once_with(
-            "alpha",
-            path="docs",
-            recursive=False,
-            offset=2,
-            max_results=5,
-            case_sensitive=False,
-            filename_only=False,
+        mock_exec.assert_awaited_once_with(
+            tool_name="filesystem.search_files",
+            arguments={"query": "alpha", "path": "docs", "recursive": False, "offset": 2, "max_results": 5},
+            conversation_id="",
+            user_id="",
+            metadata={"channel": "philosopher"},
         )
         assert isinstance(result, str)
-        assert "docs/notes.txt" in result
-        assert "alpha" in result
+        assert "docs/notes.txt [content] line 3: ...alpha topic..." in result
+        assert "filesystem.read_text" in result
 
     @pytest.mark.asyncio
     async def test_run_workflow_tool_included_when_autogen_available(self):

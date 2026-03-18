@@ -8,6 +8,8 @@ import asyncio
 import collections
 import json
 import html
+import io
+import logging
 import os
 import mimetypes
 import re
@@ -20,6 +22,8 @@ import secrets
 import glob
 import socket
 import struct
+import traceback
+import shutil
 from typing import Dict, List, Optional, Any, Set, Tuple
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
@@ -34,7 +38,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 import uvicorn
 
 from src.utils.token_budget import (
@@ -42,6 +46,14 @@ from src.utils.token_budget import (
     format_messages_for_summary,
     get_max_token_limit,
     is_context_limit_error,
+)
+from src.utils.openai_compat import (
+    coerce_message_text,
+    is_minimax_chat_request,
+    normalize_chat_completion_message,
+    normalize_temperature_for_minimax,
+    preferred_api_key_env_names,
+    prepare_openai_compatible_chat_payload,
 )
 try:
     from src.skills.bootstrap import create_default_skill_manager
@@ -362,12 +374,20 @@ class ToolCallRequest(BaseModel):
 
 # Pydantic models for file operations
 class ReadFileRequest(BaseModel):
-    filename: str  # Name of the file to read
+    filename: str = Field(validation_alias=AliasChoices("filename", "path", "file"))
+    max_chars: Optional[int] = Field(default=None, ge=1, le=50000)
+    start_line: Optional[int] = Field(default=None, ge=1)
+    end_line: Optional[int] = Field(default=None, ge=1)
+    include_line_numbers: bool = False
 
 class WriteFileRequest(BaseModel):
-    filename: str  # Name of the file to write
-    content: str  # Content to write to the file
-    format: Optional[str] = "txt"  # File format (txt, md, docx, xlsx, pdf)
+    filename: str = Field(validation_alias=AliasChoices("filename", "path", "file"))
+    content: str = Field(validation_alias=AliasChoices("content", "text", "body"))
+    format: Optional[str] = Field(
+        default="txt",
+        validation_alias=AliasChoices("format", "ext", "extension"),
+    )
+    append: bool = False
 
 class FileResponse(BaseModel):
     success: bool  # Whether the operation was successful
@@ -616,6 +636,7 @@ MCP_PRESETS = {
     # Future: "stdio": {"type": "stdio", "command": sys.executable, "allowed_args": [["-m", "mcp_server_browser_use"], ...]},
 }
 TEAM_CONFIG_FILE = _PROJECT_ROOT / "config" / "team-config.json"
+AUTOGEN_TEAM_BUILDER_FILE = _PROJECT_ROOT / "src" / "autogen" / "team_builder.py"
 # Optional: same system prompt / rules as web UI; when present, used for Telegram (overrides TELEGRAM_SYSTEM_PROMPT env)
 CATBOT_SYSTEM_PROMPT_FILE = _PROJECT_ROOT / "config" / "catbot_system_prompt.txt"
 SCRATCH_DIR = _PROJECT_ROOT / "scratch"
@@ -623,12 +644,15 @@ SCRATCH_DIR = _PROJECT_ROOT / "scratch"
 COMPANIONS_DIR = _PROJECT_ROOT / "config" / "companions"
 
 # Allowed file extensions for scratch file operations (path traversal mitigation)
-READ_ALLOWED_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".py", ".js", ".html"}
-WRITE_ALLOWED_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".py", ".js", ".html"}
+TEXT_FILE_EXTENSIONS = {".txt", ".md", ".csv", ".py", ".js", ".html"}
+READ_ALLOWED_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
+WRITE_ALLOWED_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf"}
+SEARCHABLE_TEXT_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf"}
 # Allowed extensions for Google Drive upload (scratch workspace only; path exfiltration mitigation)
 DRIVE_UPLOAD_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
 # Max file size for read/write in bytes (10MB default), configurable via env
 FILE_OPS_MAX_SIZE_BYTES = int(os.getenv("FILE_OPS_MAX_SIZE", "10485760"))
+SEARCH_FILE_MAX_SIZE_BYTES = int(os.getenv("SEARCH_FILE_MAX_SIZE", "1048576"))
 
 # Telegram chat session storage (simple in-memory cache)
 telegram_conversations: Dict[str, List[Dict[str, str]]] = {}
@@ -649,7 +673,7 @@ except ValueError:
 # Optional: tool-capable system prompt for Telegram when TELEGRAM_TOOLS_ENABLED=true
 CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE = _PROJECT_ROOT / "config" / "catbot_system_prompt_with_tools.txt"
 TELEGRAM_TOOLS_ENABLED = os.getenv("TELEGRAM_TOOLS_ENABLED", "false").lower() == "true"
-TELEGRAM_TOOLS_MAX_ITERATIONS = max(1, min(10, int(os.getenv("TELEGRAM_TOOLS_MAX_ITERATIONS", "5"))))
+TELEGRAM_TOOLS_MAX_ITERATIONS = max(1, min(10, int(os.getenv("TELEGRAM_TOOLS_MAX_ITERATIONS", "10"))))
 # Automatic memory injection quality controls (Telegram/web auto-context paths)
 MEMORY_AUTO_SEARCH_MIN_SIMILARITY = max(
     0.0, min(1.0, float(os.getenv("MEMORY_AUTO_SEARCH_MIN_SIMILARITY", "0.72")))
@@ -699,6 +723,357 @@ class StatusSession:
 status_sessions: Dict[Tuple[str, str], StatusSession] = {}
 status_latest_index: Dict[Tuple[str, str], Dict[str, Any]] = {}
 status_write_lock = asyncio.Lock()
+MONITOR_RUN_HISTORY_LIMIT = max(10, int(os.environ.get("MONITOR_RUN_HISTORY_LIMIT", "25")))
+MONITOR_LOG_PREVIEW_LINES = max(10, int(os.environ.get("MONITOR_LOG_PREVIEW_LINES", "80")))
+MONITOR_RUN_LOG_MAX_BYTES = max(32768, int(os.environ.get("MONITOR_RUN_LOG_MAX_BYTES", "1048576")))
+MONITOR_BROWSER_HEALTH_MAX_AGE_SECONDS = max(
+    5.0,
+    float(os.environ.get("MONITOR_BROWSER_HEALTH_MAX_AGE_SECONDS", "15")),
+)
+BROWSER_USE_LOG_FILE = _env_str("BROWSER_USE_LOG_FILE") or _env_str("MCP_BROWSER_USE_LOG_FILE")
+monitor_recent_runs: Dict[str, collections.deque] = {
+    "autogen": collections.deque(maxlen=MONITOR_RUN_HISTORY_LIMIT),
+    "browser_use": collections.deque(maxlen=MONITOR_RUN_HISTORY_LIMIT),
+    "philosopher": collections.deque(maxlen=MONITOR_RUN_HISTORY_LIMIT),
+    "task_execution": collections.deque(maxlen=MONITOR_RUN_HISTORY_LIMIT),
+}
+monitor_active_runs: Dict[str, Dict[str, Any]] = {}
+monitor_browser_health_snapshot: Dict[str, Any] = {
+    "checked_at": None,
+    "ok": False,
+    "message": "Browser-use health has not been checked yet.",
+    "result": None,
+}
+PROXY_LOG_FILE = Path(_env_str("PROXY_LOG_FILE") or (_PROJECT_ROOT / "logs" / "proxy_server.log")).expanduser()
+if not PROXY_LOG_FILE.is_absolute():
+    PROXY_LOG_FILE = (_PROJECT_ROOT / PROXY_LOG_FILE).resolve()
+os.environ.setdefault("PROXY_LOG_FILE", str(PROXY_LOG_FILE))
+_proxy_log_file_handle: Optional[io.TextIOWrapper] = None
+
+
+class _ProxyLogTeeStream:
+    """Mirror stdout/stderr into the proxy log file while preserving the active console stream."""
+
+    def __init__(self, stream: Any, log_handle: io.TextIOWrapper):
+        self._stream = stream
+        self._log_handle = log_handle
+        self.encoding = getattr(stream, "encoding", "utf-8")
+        self.errors = getattr(stream, "errors", "replace")
+        self._proxy_log_tee = True
+        self._proxy_log_path = str(PROXY_LOG_FILE)
+
+    def write(self, data: Any) -> int:
+        text = data if isinstance(data, str) else str(data)
+        written = self._stream.write(text)
+        self._log_handle.write(text)
+        return written
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._log_handle.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    def writable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    @property
+    def buffer(self) -> Any:
+        return getattr(self._stream, "buffer", None)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _install_proxy_log_capture() -> None:
+    global _proxy_log_file_handle
+
+    current_path = str(PROXY_LOG_FILE)
+    if getattr(sys.stdout, "_proxy_log_path", None) == current_path and getattr(sys.stderr, "_proxy_log_path", None) == current_path:
+        return
+
+    try:
+        PROXY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _proxy_log_file_handle = open(PROXY_LOG_FILE, "a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        fallback_stream = getattr(sys, "__stderr__", None) or sys.stderr
+        fallback_stream.write(f"[WARN] Failed to initialize proxy log file {PROXY_LOG_FILE}: {exc}\n")
+        fallback_stream.flush()
+        return
+
+    if getattr(sys.stdout, "_proxy_log_path", None) != current_path:
+        sys.stdout = _ProxyLogTeeStream(sys.stdout, _proxy_log_file_handle)
+    if getattr(sys.stderr, "_proxy_log_path", None) != current_path:
+        sys.stderr = _ProxyLogTeeStream(sys.stderr, _proxy_log_file_handle)
+
+    logging.captureWarnings(True)
+    print(f"[LOG] Proxy log capture initialized at {PROXY_LOG_FILE}", flush=True)
+
+
+_install_proxy_log_capture()
+
+
+def _truncate_monitor_text(value: Any, max_chars: int = 240) -> str:
+    text = "" if value is None else str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _read_monitor_log_excerpt(path: Optional[Path], max_lines: int = MONITOR_LOG_PREVIEW_LINES) -> List[str]:
+    if not path:
+        return []
+    text = _tail_text_file(path, max_lines=max_lines)
+    return text.splitlines()[-max_lines:] if text else []
+
+
+def _resolve_monitor_log_path(log_file: Optional[str]) -> Optional[Path]:
+    if not log_file:
+        return None
+    path = Path(log_file)
+    if not path.is_absolute():
+        path = SCRATCH_DIR / log_file
+    return path
+
+
+def _find_monitor_run(run_id: str) -> Optional[Dict[str, Any]]:
+    entry = monitor_active_runs.get(run_id)
+    if entry is not None:
+        return entry
+    for runs in monitor_recent_runs.values():
+        for run in runs:
+            if run.get("id") == run_id:
+                return run
+    return None
+
+
+def _read_monitor_run_log(path: Optional[Path], max_bytes: int = MONITOR_RUN_LOG_MAX_BYTES) -> Dict[str, Any]:
+    if not path or not path.exists():
+        return {"available": False, "content": "", "truncated": False, "path": str(path) if path else None}
+    try:
+        file_size = path.stat().st_size
+        if file_size <= max_bytes:
+            return {
+                "available": True,
+                "content": path.read_text(encoding="utf-8"),
+                "truncated": False,
+                "path": str(path),
+            }
+        head_bytes = max_bytes // 2
+        tail_bytes = max_bytes - head_bytes
+        with path.open("rb") as f:
+            head = f.read(head_bytes)
+            f.seek(max(0, file_size - tail_bytes))
+            tail = f.read(tail_bytes)
+        marker = b"\n\n...[log truncated for monitor response]...\n\n"
+        content = (head + marker + tail).decode("utf-8", errors="replace")
+        return {"available": True, "content": content, "truncated": True, "path": str(path)}
+    except OSError:
+        return {"available": False, "content": "", "truncated": False, "path": str(path)}
+
+
+def _stringify_autogen_message_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return (
+            normalize_chat_completion_message(
+                {"role": "assistant", "content": content},
+                preserve_reasoning_details=False,
+            ).get("content")
+            or ""
+        )
+    if isinstance(content, (dict, list)):
+        try:
+            normalized = normalize_chat_completion_message(
+                {"role": "assistant", "content": content},
+                preserve_reasoning_details=False,
+            )
+            rendered = normalized.get("content") or ""
+            if rendered:
+                return rendered
+            return json.dumps(content, ensure_ascii=False, indent=2, default=str)
+        except TypeError:
+            return str(content)
+    return str(content)
+
+
+def _format_autogen_conversation_log(
+    input_text: str,
+    messages: List[Dict[str, str]],
+    conversation_summary: str,
+    *,
+    timestamp_human: str,
+    status: str = "completed",
+    progress_notes: Optional[List[str]] = None,
+    error_text: Optional[str] = None,
+) -> str:
+    lines = [
+        "AutoGen team conversation log",
+        f"Updated: {timestamp_human}",
+        f"Status: {status}",
+        "",
+        "Input:",
+        input_text or "(empty)",
+        "",
+        "--- Progress ---",
+    ]
+    if progress_notes:
+        for note in progress_notes:
+            lines.append(note if note else "(empty)")
+    else:
+        lines.append("(No progress updates recorded yet)")
+    lines.extend(
+        [
+            "",
+            "--- Messages ---",
+        ]
+    )
+    if messages:
+        for i, msg in enumerate(messages, 1):
+            source = msg.get("source", "unknown")
+            content = _stringify_autogen_message_content(msg.get("content", ""))
+            lines.append(f"[{i}] {source}:")
+            lines.append(content if content else "(empty)")
+            lines.append("")
+    else:
+        lines.append("(No messages returned from AutoGen team)")
+        lines.append("")
+    lines.extend(
+        [
+            "--- Conversation Summary ---",
+            "",
+            conversation_summary or "(pending)",
+        ]
+    )
+    if error_text:
+        lines.extend(
+            [
+                "",
+                "--- Error ---",
+                "",
+                error_text,
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _monitor_browser_health_is_stale(snapshot: Optional[Dict[str, Any]]) -> bool:
+    if not snapshot:
+        return True
+    checked_at = snapshot.get("checked_at")
+    if not checked_at:
+        return True
+    try:
+        checked_dt = datetime.fromisoformat(str(checked_at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if checked_dt.tzinfo is None:
+        checked_dt = checked_dt.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - checked_dt).total_seconds()
+    return age_seconds >= MONITOR_BROWSER_HEALTH_MAX_AGE_SECONDS
+
+
+def _monitor_run_start(agent: str, kind: str, input_text: str = "", metadata: Optional[Dict[str, Any]] = None) -> str:
+    run_id = secrets.token_hex(8)
+    now_ts = time.time()
+    entry = {
+        "id": run_id,
+        "agent": agent,
+        "kind": kind,
+        "status": "running",
+        "started_at_ts": now_ts,
+        "started_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+        "ended_at_ts": None,
+        "ended_at": None,
+        "duration_ms": None,
+        "input_preview": _truncate_monitor_text(input_text, max_chars=320),
+        "summary": "",
+        "progress": [],
+        "metadata": dict(metadata or {}),
+        "log_file": None,
+        "log_excerpt": [],
+    }
+    monitor_recent_runs.setdefault(agent, collections.deque(maxlen=MONITOR_RUN_HISTORY_LIMIT)).append(entry)
+    monitor_active_runs[run_id] = entry
+    return run_id
+
+
+def _monitor_run_note(run_id: str, note: str) -> None:
+    entry = monitor_active_runs.get(run_id)
+    if not entry:
+        return
+    progress = entry.setdefault("progress", [])
+    progress.append(
+        {
+            "ts": time.time(),
+            "iso": datetime.now(timezone.utc).isoformat(),
+            "message": _truncate_monitor_text(note, max_chars=300),
+        }
+    )
+    if len(progress) > 25:
+        del progress[:-25]
+
+
+def _monitor_run_update(
+    run_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    log_file: Optional[str] = None,
+    log_excerpt: Optional[List[str]] = None,
+) -> None:
+    entry = monitor_active_runs.get(run_id)
+    if not entry:
+        return
+    if summary is not None:
+        entry["summary"] = _truncate_monitor_text(summary, max_chars=500)
+    if metadata:
+        entry.setdefault("metadata", {}).update(metadata)
+    if log_file:
+        entry["log_file"] = log_file
+    if log_excerpt is not None:
+        entry["log_excerpt"] = log_excerpt[-MONITOR_LOG_PREVIEW_LINES:]
+
+
+def _monitor_run_finish(
+    run_id: str,
+    *,
+    status: str,
+    summary: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+    log_file: Optional[str] = None,
+    log_excerpt: Optional[List[str]] = None,
+) -> None:
+    entry = monitor_active_runs.pop(run_id, None)
+    if not entry:
+        return
+    now_ts = time.time()
+    entry["status"] = status
+    entry["ended_at_ts"] = now_ts
+    entry["ended_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat()
+    entry["duration_ms"] = int(max(0.0, now_ts - float(entry.get("started_at_ts") or now_ts)) * 1000)
+    entry["summary"] = _truncate_monitor_text(summary, max_chars=500)
+    if metadata:
+        entry.setdefault("metadata", {}).update(metadata)
+    if log_file:
+        entry["log_file"] = log_file
+    if log_excerpt is not None:
+        entry["log_excerpt"] = log_excerpt[-MONITOR_LOG_PREVIEW_LINES:]
+
+
+def _get_monitor_runs_payload(agent: str) -> Dict[str, Any]:
+    recent = list(monitor_recent_runs.get(agent, []))
+    active = [run for run in recent if run.get("status") == "running"]
+    return {
+        "active_count": len(active),
+        "recent": list(reversed(recent)),
+    }
 
 
 def _ensure_status_storage() -> None:
@@ -885,6 +1260,33 @@ async def _finish_status_session(
             session.heartbeat_task.cancel()
     status_sessions.pop(key, None)
     return event
+
+
+def _format_telegram_tool_status(tool_name: Any) -> str:
+    """Return a user-facing Telegram status update for the given tool."""
+    raw_name = str(tool_name or "").strip()
+    lowered = raw_name.lower()
+    status_map = {
+        "websearch": "On it. I'm looking for the best sources now.",
+        "scrapewebsite": "On it. I'm reading through the page now.",
+        "fetchnews": "On it. I'm pulling together the latest updates.",
+        "weatherinfo": "On it. I'm checking the weather details now.",
+        "runbrowseragent": "On it. I'm working through that in the browser now.",
+        "rundeepresearch": "On it. I'm gathering sources and comparing them now.",
+        "healthcheck": "On it. I'm checking the browser task status now.",
+        "runworkflow": "On it. I'm running that workflow now.",
+    }
+    if lowered in status_map:
+        return status_map[lowered]
+    if lowered.startswith("googleworkspace_cli."):
+        return "On it. I'm checking your Google Workspace data now."
+    if "." in raw_name:
+        prefix = lowered.split(".", 1)[0]
+        if prefix == "filesystem":
+            return "On it. I'm checking the workspace files now."
+        if prefix == "github":
+            return "On it. I'm checking GitHub for that now."
+    return f"On it. I'm using {raw_name or 'a tool'} for that now."
 
 
 def _get_latest_status_event(
@@ -1404,10 +1806,14 @@ def _resolve_task_id_for_state(user_key: str, state: Dict[str, Any]) -> Optional
 def _state_brief_for_response(user_key: str, state: Dict[str, Any]) -> Dict[str, Any]:
     resolved_task_id = _resolve_task_id_for_state(user_key, state)
     original_task_id = _coerce_task_id(state.get("task_id"))
+    diagnostics = _safe_task_execution_diagnostics(state.get("executor"))
     out = {
         "status": state.get("status"),
         "task_id": resolved_task_id or original_task_id,
         "message": state.get("message"),
+        "current_step": diagnostics.get("iterations"),
+        "total_steps": diagnostics.get("max_iterations"),
+        "elapsed_seconds": diagnostics.get("elapsed_seconds"),
     }
     if state.get("run_id"):
         out["run_id"] = state.get("run_id")
@@ -1483,13 +1889,24 @@ async def _call_chat_completion(
     payload: Dict[str, Any],
     timeout_seconds: float = 120.0,
 ) -> httpx.Response:
+    prepared_payload = prepare_openai_compatible_chat_payload(
+        payload,
+        api_base=endpoint,
+        model=payload.get("model"),
+    )
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        return await client.post(endpoint, json=payload, headers=headers)
+        return await client.post(endpoint, json=prepared_payload, headers=headers)
 
 
 _NO_KEY_LLM_PROVIDERS = frozenset({"ollama", "bedrock"})
 _MCP_PROVIDER_API_KEY_ENV_CANDIDATES: Dict[str, List[str]] = {
     "openai": ["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"],
+    "minimax": [
+        "MINIMAX_API_KEY",
+        "MCP_LLM_MINIMAX_API_KEY",
+        "MCP_LLM_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+    ],
     "anthropic": ["ANTHROPIC_API_KEY", "MCP_LLM_ANTHROPIC_API_KEY"],
     "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "MCP_LLM_GOOGLE_API_KEY"],
     "azure_openai": ["AZURE_OPENAI_API_KEY", "MCP_LLM_AZURE_OPENAI_API_KEY"],
@@ -1757,6 +2174,45 @@ def _get_telegram_system_prompt_base() -> str:
     return TELEGRAM_SYSTEM_PROMPT_ENV
 
 
+def _sanitize_telegram_legacy_tool_prompt(content: str) -> str:
+    """Rewrite legacy XML-only Telegram tool prompt text toward structured tool calling."""
+    if not content:
+        return content
+
+    structured_intro = (
+        "To use a tool, prefer structured tool calls with the exact tool name and JSON schema provided.\n"
+        "Return only the tool call when a tool is required, and return plain user-facing text when answering directly.\n"
+        "Use XML tool markup only as a legacy fallback when structured tool calls are unavailable."
+    )
+    content = re.sub(
+        r"To use a tool, you MUST ALWAYS respond in this EXACT format:[\s\S]*?"
+        r"IMPORTANT: Always use the XML-style format shown above\. Never return raw JSON or other formats\.",
+        structured_intro,
+        content,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    content = re.sub(
+        r'\nUser: "Add a task to call John"[\s\S]*?\nIMPORTANT REMINDER:',
+        (
+            "\nStructured tool-call XML examples have been removed. "
+            "Use the generated tool schemas below and prefer structured tool calls.\n\n"
+            "IMPORTANT REMINDER:"
+        ),
+        content,
+        count=1,
+    )
+    content = content.replace(
+        "IMPORTANT REMINDER: Always wrap your tool calls in <tool> and <parameters> tags as shown in the examples above. Never return raw JSON.",
+        "IMPORTANT REMINDER: Prefer structured tool calls. Use XML tool markup only as a legacy fallback.",
+    )
+    content = content.replace(
+        "- If another tool is needed, output only the XML tool call and nothing else.",
+        "- If another tool is needed, return only the structured tool call with no user-facing text.",
+    )
+    return content
+
+
 def _get_telegram_system_prompt_with_tools(conversation_id: str, todo_user_key: Optional[str] = None) -> str:
     """Return the tool-capable system prompt for Telegram, with current todo and memory cache for this conversation."""
     content = ""
@@ -1767,6 +2223,7 @@ def _get_telegram_system_prompt_with_tools(conversation_id: str, todo_user_key: 
             print(f"Warning: Could not read {CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE}: {e}")
     if not content:
         content = _get_telegram_system_prompt_base()
+    content = _sanitize_telegram_legacy_tool_prompt(content)
     # Use persistent todo store when available and todo_user_key provided; else in-memory fallback
     if todo_user_key and TODO_STORE_AVAILABLE and _todo_store:
         todo_list = _todo_store.load_tasks(todo_user_key)
@@ -1776,6 +2233,9 @@ def _get_telegram_system_prompt_with_tools(conversation_id: str, todo_user_key: 
     todo_block = "\n".join([f"{i + 1}. {t}" for i, t in enumerate(todo_list)]) if todo_list else "(empty)"
     mem_block = "\n".join([f"{i + 1}. {m}" for i, m in enumerate(mem_cache)]) if mem_cache else "(empty)"
     content = content.replace("{{MEMORY_CACHE}}", mem_block).replace("{{TODO_LIST}}", todo_block)
+    native_tool_block = _build_telegram_native_tools_prompt_block()
+    if native_tool_block:
+        content = f"{content.rstrip()}\n\n{native_tool_block}"
     dynamic_skill_block = _build_telegram_skill_tools_prompt_block()
     if dynamic_skill_block:
         content = f"{content.rstrip()}\n\n{dynamic_skill_block}"
@@ -1788,14 +2248,17 @@ TELEGRAM_TOOL_FOLLOWUP_TIMEOUT = _parse_telegram_tool_followup_timeout()
 TELEGRAM_OPENAI_BASE_URL = (
     os.getenv("TELEGRAM_OPENAI_BASE_URL")
     or os.getenv("OPENAI_API_BASE")
-    or os.getenv("MCP_LLM_OPENAI_ENDPOINT")
+    or os.getenv("MCP_LLM_BASE_URL")
     or "https://api.openai.com/v1"
 )
 TELEGRAM_OPENAI_CHAT_PATH = os.getenv("TELEGRAM_OPENAI_CHAT_PATH", "/chat/completions")
 OPENAI_ORG_ID = os.getenv("OPENAI_ORG_ID") or os.getenv("OPENAI_ORGANIZATION")
 OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")
-# Optional shared secret for bot-to-proxy auth; when set, requests must include X-Telegram-Secret or Authorization: Bearer <secret>
+# Optional shared secrets for internal service-to-proxy auth.
+# TELEGRAM_SECRET protects Telegram-specific flows.
+# AUTOGEN_TEAM_SECRET protects internal AutoGen team tool calls to selected proxy routes.
 TELEGRAM_SECRET = os.getenv("TELEGRAM_SECRET")
+AUTOGEN_TEAM_SECRET = (os.getenv("AUTOGEN_TEAM_SECRET") or os.getenv("CATBOT_AGENT_SECRET") or "").strip() or None
 
 # Large payload model fallback (optional)
 LARGE_PAYLOAD_MODEL = (os.getenv("LARGE_PAYLOAD_MODEL") or "").strip() or None
@@ -1810,6 +2273,7 @@ CODEX_ENABLE_SEARCH = os.getenv("CODEX_ENABLE_SEARCH", "true").lower() == "true"
 CODEX_TIMEOUT_SECONDS = int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800"))
 CODEX_JSON_EVENTS = os.getenv("CODEX_JSON_EVENTS", "true").lower() == "true"
 CODEX_OUTPUT_LAST_MESSAGE = os.getenv("CODEX_OUTPUT_LAST_MESSAGE", "true").lower() == "true"
+CODEX_AUTOGEN_WORKSPACES_DIRNAME = "autogen"
 
 # Auth configuration
 AUTH_USERS_FILE = _PROJECT_ROOT / "config" / "auth_users.json"
@@ -1956,6 +2420,16 @@ def get_current_user(
     return get_current_user_from_headers(authorization, x_auth_token)
 
 
+def get_current_user_or_autogen_team(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+) -> Dict[str, Any]:
+    if _autogen_team_secret_matches(request):
+        return {"username": "autogen_team", "auth_type": "agent_secret"}
+    return get_current_user_from_headers(authorization, x_auth_token)
+
+
 def security_log(action: str, user: str, server_id: Optional[str], detail: str) -> None:
     """Log MCP config/connect actions for audit; do not log secrets."""
     ts = datetime.now(timezone.utc).isoformat()
@@ -2005,6 +2479,21 @@ def _validate_telegram_secret(request: Request) -> None:
         return
     if not _telegram_secret_matches(request):
         raise HTTPException(status_code=401, detail="Telegram secret required or invalid")
+
+
+def _autogen_team_secret_matches(request: Request) -> bool:
+    """Return True when request carries AUTOGEN_TEAM_SECRET via X-Agent-Secret or Bearer token."""
+    if not AUTOGEN_TEAM_SECRET:
+        return False
+    secret_header = request.headers.get("X-Agent-Secret")
+    if secret_header is not None and secret_header.strip() == AUTOGEN_TEAM_SECRET:
+        return True
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.strip().startswith("Bearer "):
+        token = auth_header.strip()[7:].strip()
+        if token == AUTOGEN_TEAM_SECRET:
+            return True
+    return False
 
 
 # Create scratch and companions directories if they don't exist
@@ -2058,35 +2547,13 @@ def _resolve_skill_tool_qualified_name(tool_name: str) -> Optional[str]:
         return None
 
 
-_OVERLAPPING_FILE_SKILL_TOOL_NAMES: Set[str] = {
-    "filesystem.list_files",
-    "filesystem.read_text",
-    "filesystem.write_text",
-}
-
-
 def _filter_overlapping_file_skill_tools(
     tools: List[Dict[str, Any]],
     *,
     openai_schema: bool,
 ) -> List[Dict[str, Any]]:
-    """Hide overlapping filesystem skill tools when built-in file tools are already available."""
-    if not FILE_OPS_AVAILABLE:
-        return tools
-
-    filtered: List[Dict[str, Any]] = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if openai_schema:
-            function_block = tool.get("function")
-            name = str(function_block.get("name") if isinstance(function_block, dict) else "").strip()
-        else:
-            name = str(tool.get("name") or "").strip()
-        if name in _OVERLAPPING_FILE_SKILL_TOOL_NAMES:
-            continue
-        filtered.append(tool)
-    return filtered
+    """Return skill tools unchanged; filesystem tools are now skill-backed."""
+    return [tool for tool in tools if isinstance(tool, dict)]
 
 
 def _get_skill_tools_openai_schema() -> List[Dict[str, Any]]:
@@ -2163,6 +2630,106 @@ async def _execute_skill_framework_tool(
     return payload
 
 
+def _format_filesystem_skill_tool_output(
+    qualified_name: str,
+    result: Dict[str, Any],
+) -> Optional[str]:
+    """Render filesystem skill results with the same concise text style as legacy file tools."""
+    if not result.get("success", False):
+        return None
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return None
+
+    if qualified_name == "filesystem.read_text":
+        path = str(data.get("path") or "").strip() or "(unknown)"
+        content = data.get("content", "")
+        content = content if isinstance(content, str) else str(content)
+        header_parts = [f"File: {path}"]
+        start_meta = data.get("excerpt_start_line")
+        end_meta = data.get("excerpt_end_line")
+        total_lines = data.get("total_lines")
+        if isinstance(start_meta, int) and start_meta > 0 and isinstance(end_meta, int) and end_meta > 0:
+            if start_meta != 1 or (isinstance(total_lines, int) and end_meta != total_lines):
+                header_parts.append(f"lines {start_meta}-{end_meta}")
+        if isinstance(total_lines, int) and total_lines > 0:
+            header_parts.append(f"total_lines={total_lines}")
+        if data.get("truncated"):
+            header_parts.append("truncated")
+        return " | ".join(header_parts) + "\n\n" + (content or "(empty file)")
+
+    if qualified_name == "filesystem.write_text":
+        path = str(data.get("path") or "").strip() or "(unknown)"
+        bytes_written = data.get("bytes_written")
+        action = "Appended to" if bool(data.get("appended")) else "Wrote"
+        if isinstance(bytes_written, int):
+            return f"{action} {path} ({bytes_written} bytes)."
+        return f"{action} {path}."
+
+    if qualified_name == "filesystem.list_files":
+        items = data.get("items", [])
+        converted_items = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            converted_items.append(
+                {
+                    "name": str(item.get("relative_path") or item.get("name") or "").strip(),
+                    "type": str(item.get("type") or ""),
+                    "size": item.get("size_bytes"),
+                }
+            )
+        skipped_count = int(data.get("skipped_count", 0) or 0)
+        if not converted_items:
+            path_label = data.get("path") or "."
+            total_count = int(data.get("total_count", 0) or 0)
+            recursive = bool(data.get("recursive", False))
+            message = (
+                "Scratch workspace is empty for this scope. "
+                f"(Directory: {data.get('root', 'scratch')}, Path: {path_label}, Recursive: {recursive})"
+            )
+            if total_count > 0 and int(data.get("offset", 0) or 0) > 0:
+                message = (
+                    "No files returned for this page. "
+                    f"(Directory: {data.get('root', 'scratch')}, Path: {path_label}, "
+                    f"Recursive: {recursive}, Offset: {data.get('offset', 0)}, Total: {total_count})"
+                )
+            if skipped_count > 0:
+                message += f" Skipped {skipped_count} inaccessible or unsafe entries."
+            return message
+        rendered = _format_list_files_for_tool_output(
+            converted_items,
+            include_sizes=True,
+            total_count=data.get("total_count"),
+            offset=data.get("offset"),
+            has_more=data.get("has_more"),
+            next_offset=data.get("next_offset"),
+            limit=data.get("max_entries"),
+        )
+        if skipped_count > 0:
+            rendered += f"\n... skipped {skipped_count} inaccessible or unsafe entries."
+        return rendered
+
+    if qualified_name == "filesystem.search_files":
+        items = data.get("items", [])
+        matches = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        rendered = _format_search_files_for_tool_output(
+            matches,
+            query=str(data.get("query") or ""),
+            total_matches=data.get("total_matches"),
+            offset=data.get("offset"),
+            has_more=data.get("has_more"),
+            next_offset=data.get("next_offset"),
+            read_tool_name="filesystem.read_text",
+        )
+        skipped_count = int(data.get("skipped_count", 0) or 0)
+        if skipped_count > 0:
+            rendered += f"\nSkipped {skipped_count} inaccessible, oversized, or unsupported files."
+        return rendered
+
+    return None
+
+
 def _build_telegram_skill_tools_prompt_block() -> str:
     """Render dynamic skill-tool instructions for Telegram XML tool-calling."""
     skill_tools = _get_skill_tools_mcp_schema()
@@ -2172,7 +2739,8 @@ def _build_telegram_skill_tools_prompt_block() -> str:
 
     lines: List[str] = [
         "Additional Skill Framework tools (dynamically loaded):",
-        "Use the exact tool name shown below with the same XML format.",
+        "Prefer structured tool calls with the exact tool name and JSON schema shown below.",
+        "Use XML tool markup only as a legacy fallback when structured tool calls are unavailable.",
     ]
     for item in skill_tools:
         name = str(item.get("name") or "").strip()
@@ -2207,8 +2775,457 @@ def _build_telegram_skill_tools_prompt_block() -> str:
             ]
         )
 
-    if len(lines) <= 2:
+    if len(lines) <= 3:
         return ""
+    return "\n".join(lines)
+
+
+def _get_telegram_native_tools_mcp_schema() -> List[Dict[str, Any]]:
+    """Return native Telegram tools using the same MCP-like schema shape as skills."""
+    return [
+        {
+            "name": "manageTodoList",
+            "description": "Persistent todo list operations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "taskId": {"type": "integer"},
+                    "taskDescription": {"type": "string"},
+                    "scheduledFor": {"type": "string"},
+                    "recurrence": {"type": "object"},
+                    "repeatFrequency": {"type": "string"},
+                    "repeatInterval": {"type": "integer"},
+                    "clearSchedule": {"type": "boolean"},
+                    "clearRecurrence": {"type": "boolean"},
+                },
+                "required": ["action"],
+            },
+        },
+        {
+            "name": "executeTodoTask",
+            "description": "Execute an existing todo task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "taskId": {"type": "integer"},
+                    "promptOverride": {"type": "string"},
+                },
+                "required": ["taskId"],
+            },
+        },
+        {
+            "name": "getTodoExecutionStatus",
+            "description": "Check active todo execution status.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "cancelTodoExecution",
+            "description": "Cancel the current todo execution.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "navigateToUrl",
+            "description": "Return a URL the Telegram user should open in a browser.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+        {
+            "name": "openChatToUser",
+            "description": "Return a Teams chat URL for the Telegram user to open.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+        {
+            "name": "calculate",
+            "description": "Evaluate a simple arithmetic expression.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+            },
+        },
+        {
+            "name": "runWorkflow",
+            "description": "Run an AutoGen workflow.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"contentPrompt": {"type": "string"}},
+                "required": ["contentPrompt"],
+            },
+        },
+        {
+            "name": "runCodexCli",
+            "description": "Run Codex CLI to make CATBot code or tool changes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"prompt": {"type": "string"}},
+                "required": ["prompt"],
+            },
+        },
+        {
+            "name": "restartProxyServer",
+            "description": "Restart the proxy server after explicit confirmation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "confirm": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["confirm"],
+            },
+        },
+        {
+            "name": "scrapeWebsite",
+            "description": "Fetch one URL or try multiple URLs in order.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "urls": {"type": "array", "items": {"type": "string"}},
+                    "render_js": {"type": "boolean"},
+                    "render_engine": {"type": "string"},
+                    "wait_for_selector": {"type": "string"},
+                    "js_wait_ms": {"type": "number"},
+                },
+            },
+        },
+        {
+            "name": "webSearch",
+            "description": "Web search query.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "fetchNews",
+            "description": "Fetch news and write a CSV file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "searchTerm": {"type": "string"},
+                    "filename": {"type": "string"},
+                },
+                "required": ["searchTerm"],
+            },
+        },
+        {
+            "name": "pdfToPowerPoint",
+            "description": "Telegram-only placeholder that redirects users to the web UI for PDF to PowerPoint conversion.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pdfUrl": {"type": "string"},
+                    "title": {"type": "string"},
+                    "filename": {"type": "string"},
+                },
+            },
+        },
+        {
+            "name": "uploadToGoogleDrive",
+            "description": "Upload a scratch file to Google Drive.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "filename": {"type": "string"},
+                    "fileName": {"type": "string"},
+                },
+                "required": ["filePath"],
+            },
+        },
+        {
+            "name": "readFile",
+            "description": "Legacy file read tool. Prefer filesystem.read_text when available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "path": {"type": "string"},
+                    "file": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                    "max_chars": {"type": "integer"},
+                    "include_line_numbers": {"type": "boolean"},
+                },
+                "required": ["filename"],
+            },
+        },
+        {
+            "name": "listFiles",
+            "description": "Legacy file listing tool. Prefer filesystem.list_files when available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "recursive": {"type": "boolean"},
+                    "offset": {"type": "integer"},
+                    "max_entries": {"type": "integer"},
+                },
+            },
+        },
+        {
+            "name": "searchFiles",
+            "description": "Legacy file search tool. Prefer filesystem.search_files when available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                    "recursive": {"type": "boolean"},
+                    "filename_only": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
+                    "offset": {"type": "integer"},
+                    "max_results": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "sendTelegramFile",
+            "description": "Send a scratch file back to the current Telegram chat.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "filePath": {"type": "string"},
+                    "caption": {"type": "string"},
+                },
+                "required": ["filename"],
+            },
+        },
+        {
+            "name": "writeFile",
+            "description": "Legacy file write tool. Prefer filesystem.write_text when available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "path": {"type": "string"},
+                    "file": {"type": "string"},
+                    "content": {"type": "string"},
+                    "text": {"type": "string"},
+                    "body": {"type": "string"},
+                    "format": {"type": "string"},
+                    "append": {"type": "boolean"},
+                },
+            },
+        },
+        {
+            "name": "storeMemory",
+            "description": "Store a persistent memory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "content": {"type": "string"},
+                    "category": {"type": "string"},
+                },
+                "required": ["text"],
+            },
+        },
+        {
+            "name": "searchMemories",
+            "description": "Search persistent memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "listMemories",
+            "description": "List recent persistent memories.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            },
+        },
+        {
+            "name": "deleteMemory",
+            "description": "Delete a persistent memory by ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "id": {"type": "string"},
+                },
+                "required": ["memory_id"],
+            },
+        },
+        {
+            "name": "manageMemoryCache",
+            "description": "Inspect or edit the lightweight in-session Telegram memory cache.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "memoryId": {"type": "integer"},
+                    "memId": {"type": "integer"},
+                    "memoryDescription": {"type": "string"},
+                    "memDescription": {"type": "string"},
+                },
+                "required": ["action"],
+            },
+        },
+        {
+            "name": "runBrowserAgent",
+            "description": "Browser automation task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "url": {"type": "string"},
+                },
+            },
+        },
+        {
+            "name": "runDeepResearch",
+            "description": "Deep browser-based research task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "research_task": {"type": "string"},
+                    "researchTask": {"type": "string"},
+                    "max_parallel_browsers": {"type": "integer"},
+                },
+            },
+        },
+        {
+            "name": "healthCheck",
+            "description": "Browser-use health and running jobs.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "llmQuery",
+            "description": "Send a direct query to the language model without other tools.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contentPrompt": {"type": "string"},
+                    "query": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            },
+        },
+        {
+            "name": "weatherInfo",
+            "description": "Weather lookup.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "requestType": {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+            },
+        },
+    ]
+
+
+def _mcp_tool_entries_to_openai_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert MCP-style tool entries into OpenAI-style tool definitions."""
+    converted: List[Dict[str, Any]] = []
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        input_schema = item.get("inputSchema")
+        if not isinstance(input_schema, dict):
+            input_schema = {"type": "object", "properties": {}}
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(item.get("description") or "").strip(),
+                    "parameters": input_schema,
+                },
+            }
+        )
+    return converted
+
+
+def _merge_openai_tool_lists(*tool_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge OpenAI-style tool lists while keeping the first definition for each name."""
+    merged: List[Dict[str, Any]] = []
+    seen_names: Set[str] = set()
+    for tool_list in tool_lists:
+        for item in tool_list:
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "").strip()
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            merged.append(item)
+    return merged
+
+
+def _get_telegram_native_tools_openai_schema() -> List[Dict[str, Any]]:
+    """Return native Telegram tools formatted for OpenAI-compatible tool calling."""
+    return _mcp_tool_entries_to_openai_tools(_get_telegram_native_tools_mcp_schema())
+
+
+def _get_telegram_combined_openai_tools() -> List[Dict[str, Any]]:
+    """Return the merged native+skill tool list for Telegram chat payloads."""
+    return _merge_openai_tool_lists(
+        _get_telegram_native_tools_openai_schema(),
+        _get_skill_tools_openai_schema(),
+    )
+
+
+def _build_telegram_native_tools_prompt_block() -> str:
+    """Render schema-driven instructions for native Telegram tools."""
+    native_tools = _get_telegram_native_tools_mcp_schema()
+
+    lines: List[str] = [
+        "Native Telegram tools:",
+        "Prefer structured tool calls using the provided tool schema and exact tool name.",
+        "Use XML tool markup only as a legacy fallback when structured tool calls are unavailable.",
+        "If you must use XML, inside <parameters> output exactly one JSON object and nothing else.",
+        "Do not use nested XML child tags, bare keys, comments, trailing commas, or prose inside <parameters>.",
+    ]
+
+    skill_tool_names = {
+        str(item.get("name") or "").strip()
+        for item in (_get_skill_tools_mcp_schema() or [])
+        if isinstance(item, dict)
+    }
+    if {
+        "filesystem.read_text",
+        "filesystem.write_text",
+        "filesystem.list_files",
+        "filesystem.search_files",
+    } & skill_tool_names:
+        lines.append(
+            "When filesystem skill tools are available, prefer filesystem.read_text, "
+            "filesystem.write_text, filesystem.list_files, and filesystem.search_files over "
+            "readFile, writeFile, listFiles, and searchFiles."
+        )
+
+    for item in native_tools:
+        schema_text = json.dumps(item["inputSchema"], ensure_ascii=False, separators=(",", ":"), default=str)
+        lines.append(f"- {item['name']}: {item['description']}")
+        lines.append(f"  Parameters JSON schema: {schema_text}")
+
     return "\n".join(lines)
 
 # MCP Client Manager class to handle transport lifecycle
@@ -2421,19 +3438,22 @@ async def require_auth_for_v1_routes(request: Request, call_next):
         "/v1/proxy/chat/completions",  # Chat completions proxy - public to avoid mixed content
         "/v1/proxy/models",  # Models list proxy - public to avoid mixed content
         "/v1/proxy/autogen",  # AutoGen workflow proxy - public to avoid mixed content
-        "/v1/proxy/browser-agent",  # Browser automation proxy - public to avoid mixed content
-        "/v1/proxy/deep-research",  # Deep research proxy - public to avoid mixed content
-        "/v1/proxy/browser-health",  # Browser-use health/status proxy - public to avoid mixed content
         "/v1/proxy/tts/voices",  # TTS voices endpoint - public
         "/v1/proxy/tts/speech",  # TTS speech endpoint - public
         "/v1/proxy/search",  # Search proxy - public
         "/v1/proxy/news",  # News proxy - public
-        "/v1/proxy/fetch",  # Web fetch proxy - public
         "/v1/status/start",
         "/v1/status/update",
         "/v1/status/finish",
         "/v1/status/latest",
         "/v1/status/events",
+    }
+    autogen_team_secret_paths = {
+        "/v1/proxy/browser-agent",
+        "/v1/proxy/deep-research",
+        "/v1/proxy/browser-health",
+        "/v1/proxy/fetch",
+        "/v1/proxy/codex",
     }
     # Telegram bot endpoints are unauthenticated (bot uses TELEGRAM_SECRET when set)
     require_auth = (
@@ -2443,6 +3463,8 @@ async def require_auth_for_v1_routes(request: Request, call_next):
     )
     if require_auth:
         try:
+            if path in autogen_team_secret_paths and _autogen_team_secret_matches(request):
+                return await call_next(request)
             # Get authorization header - FastAPI headers are case-insensitive, but check both for robustness
             # Use get() with case-insensitive lookup
             auth_header = None
@@ -2698,12 +3720,20 @@ def load_autogen_team():
         
         with open(TEAM_CONFIG_FILE, 'r', encoding='utf-8') as f:
             team_config = json.load(f)
+
+        patched_agents = _patch_autogen_team_config_for_model_compatibility(team_config)
+        if patched_agents:
+            print(
+                "[AUTOGEN] Disabled reflect_on_tool_use for OpenRouter-backed agents: "
+                + ", ".join(patched_agents),
+                flush=True,
+            )
         
         # Load the team from the configuration using ComponentLoader
         loader = ComponentLoader()
         team = loader.load_component(team_config)
 
-        # Inject PythonCodeExecutionTool (Docker) into first participant's workbench if available
+        # Inject PythonCodeExecutionTool (Docker) into the lead engineer when available
         if AUTOGEN_CODE_EXEC_AVAILABLE and PythonCodeExecutionTool and DockerCommandLineCodeExecutor:
             coding_dir = _PROJECT_ROOT / "coding"
             try:
@@ -2719,15 +3749,24 @@ def load_autogen_team():
             code_tool = PythonCodeExecutionTool(executor)
             participants = getattr(team, "participants", None) or getattr(team, "_participants", [])
             if participants:
-                agent = participants[0]
-                wb = getattr(agent, "workbench", getattr(agent, "_workbench", None))
+                target_agent = None
+                for participant in participants:
+                    candidate_name = getattr(participant, "name", None) or getattr(participant, "_name", None)
+                    if candidate_name == "lead_engineer_agent":
+                        target_agent = participant
+                        break
+                if target_agent is None:
+                    target_agent = participants[0]
+
+                wb = getattr(target_agent, "workbench", getattr(target_agent, "_workbench", None))
                 if wb is not None:
                     wb_list = wb if isinstance(wb, list) else [wb]
                     for wb_item in wb_list:
                         tools = getattr(wb_item, "tools", getattr(wb_item, "_tools", None))
                         if tools is not None and isinstance(tools, list):
                             tools.insert(0, code_tool)
-                            print("✅ Injected PythonCodeExecutionTool (Docker) into assistant_agent workbench")
+                            target_name = getattr(target_agent, "name", None) or getattr(target_agent, "_name", "unknown_agent")
+                            print(f"✅ Injected PythonCodeExecutionTool (Docker) into {target_name} workbench")
                             break
 
         print(f"✅ AutoGen team loaded successfully: {team_config.get('label', 'Unknown')}")
@@ -2736,6 +3775,200 @@ def load_autogen_team():
     except Exception as e:
         import traceback
         print(f"âŒ Error loading AutoGen team: {e}")
+        print(traceback.format_exc())
+        error_text = str(e)
+        if "No user query found in messages" in error_text:
+            autogen_base = (
+                os.getenv("AUTOGEN_OPENROUTER_BASE_URL")
+                or os.getenv("OPENROUTER_API_BASE")
+                or os.getenv("MCP_LLM_BASE_URL")
+                or os.getenv("OPENAI_API_BASE")
+                or ""
+            ).strip()
+            autogen_model = (
+                os.getenv("AUTOGEN_TEAM_MODEL")
+                or os.getenv("OPENROUTER_AUTOGEN_MODEL")
+                or os.getenv("MCP_LLM_MODEL_NAME")
+                or os.getenv("OPENAI_MODEL")
+                or ""
+            ).strip()
+            error_text = (
+                "AutoGen team execution failed because the configured AutoGen model endpoint rejected an internal "
+                "multi-agent prompt with 'No user query found in messages'. This usually means the current chat "
+                "template requires a trailing user message and is not compatible with AutoGen's internal "
+                f"assistant/tool turns. Current settings: AUTOGEN_OPENROUTER_BASE_URL={autogen_base or '(unset)'}, "
+                f"AUTOGEN_TEAM_MODEL={autogen_model or '(unset)'}. Fix this by either pointing AutoGen to a "
+                "compatible hosted endpoint such as https://openrouter.ai/api/v1 with a stable chat model, or by "
+                "switching the local model/server to one whose chat template supports assistant continuation and tool "
+                "calling. Restart the proxy server after changing .env."
+            )
+        return None
+
+
+def _patch_autogen_team_config_for_model_compatibility(team_config: Dict[str, Any]) -> List[str]:
+    """Patch known provider incompatibilities in exported AutoGen team configs."""
+    patched_agents: List[str] = []
+    config = team_config.get("config") if isinstance(team_config, dict) else None
+    if not isinstance(config, dict):
+        return patched_agents
+
+    def _patch_model_client_name_compat(model_client: Any) -> bool:
+        if not isinstance(model_client, dict):
+            return False
+        provider = str(model_client.get("provider") or "")
+        if not provider.endswith("OpenAIChatCompletionClient"):
+            return False
+        model_client_config = model_client.get("config")
+        if not isinstance(model_client_config, dict):
+            return False
+        base_url = str(model_client_config.get("base_url") or "")
+        model_name = str(model_client_config.get("model") or "")
+        if not is_minimax_chat_request(base_url, model_name):
+            return False
+        changed = False
+        if model_client_config.get("include_name_in_message") is not False:
+            model_client_config["include_name_in_message"] = False
+            changed = True
+        if model_client_config.get("add_name_prefixes") is not True:
+            model_client_config["add_name_prefixes"] = True
+            changed = True
+        return changed
+
+    selector_model_client = config.get("model_client")
+    if _patch_model_client_name_compat(selector_model_client):
+        patched_agents.append("selector_model_client")
+
+    participants = config.get("participants")
+    if not isinstance(participants, list):
+        return patched_agents
+
+    for participant in participants:
+        if not isinstance(participant, dict):
+            continue
+        participant_config = participant.get("config")
+        if not isinstance(participant_config, dict):
+            continue
+        participant_name = str(participant_config.get("name") or participant.get("label") or "unknown_agent")
+
+        model_client = participant_config.get("model_client")
+        if _patch_model_client_name_compat(model_client):
+            patched_agents.append(f"{participant_name}:minimax_name_compat")
+
+        if participant_config.get("reflect_on_tool_use") is not True:
+            continue
+
+        workbench = participant_config.get("workbench")
+        if not isinstance(workbench, list) or not workbench:
+            continue
+
+        if not isinstance(model_client, dict):
+            continue
+        provider = str(model_client.get("provider") or "")
+        model_client_config = model_client.get("config")
+        if not isinstance(model_client_config, dict):
+            continue
+        base_url = str(model_client_config.get("base_url") or "").lower()
+
+        # OpenRouter + AssistantAgent tool reflection is currently unstable for this team:
+        # after a tool call, the reflection turn may come back without text, which AutoGen
+        # raises as "Reflect on tool use produced no valid text response."
+        if provider.endswith("OpenAIChatCompletionClient") and "openrouter.ai" in base_url:
+            participant_config["reflect_on_tool_use"] = False
+            patched_agents.append(participant_name)
+
+    return patched_agents
+
+
+def _autogen_team_definition_mtime() -> float:
+    """Return the latest mtime for the active AutoGen team definition sources."""
+    mtimes: List[float] = []
+    if AUTOGEN_TEAM_BUILDER_FILE.exists():
+        mtimes.append(AUTOGEN_TEAM_BUILDER_FILE.stat().st_mtime)
+    if TEAM_CONFIG_FILE.exists():
+        mtimes.append(TEAM_CONFIG_FILE.stat().st_mtime)
+    return max(mtimes) if mtimes else 0.0
+
+
+def load_autogen_team_runtime():
+    """Load the AutoGen team from the Python builder, with JSON fallback."""
+    if not AUTOGEN_AVAILABLE:
+        print("AutoGen not available, skipping runtime team load")
+        return None
+
+    try:
+        team = None
+        team_label = "VirtualProductCompany"
+
+        if AUTOGEN_TEAM_BUILDER_FILE.exists():
+            print(f"Loading AutoGen team from Python builder {AUTOGEN_TEAM_BUILDER_FILE}...")
+            from src.autogen.team_builder import (
+                build_virtual_product_company_team,
+                export_virtual_product_company_team_config,
+            )
+
+            team = build_virtual_product_company_team()
+            export_virtual_product_company_team_config()
+            team_label = getattr(team, "name", None) or getattr(team, "_name", None) or team_label
+        elif TEAM_CONFIG_FILE.exists():
+            team = load_autogen_team()
+            team_label = getattr(team, "name", None) or getattr(team, "_name", None) or team_label
+        else:
+            print(
+                "AutoGen team definition not found: "
+                f"{AUTOGEN_TEAM_BUILDER_FILE} or {TEAM_CONFIG_FILE}"
+            )
+            return None
+
+        if team is None:
+            return None
+
+        if AUTOGEN_CODE_EXEC_AVAILABLE and PythonCodeExecutionTool and DockerCommandLineCodeExecutor:
+            coding_dir = _PROJECT_ROOT / "coding"
+            try:
+                coding_dir.mkdir(exist_ok=True)
+            except OSError:
+                pass
+            work_dir = str(coding_dir)
+            executor = DockerCommandLineCodeExecutor(
+                work_dir=work_dir,
+                image="python:3.12-slim",
+                timeout=120,
+            )
+            code_tool = PythonCodeExecutionTool(executor)
+            participants = getattr(team, "participants", None) or getattr(team, "_participants", [])
+            if participants:
+                target_agent = None
+                for participant in participants:
+                    candidate_name = getattr(participant, "name", None) or getattr(participant, "_name", None)
+                    if candidate_name == "lead_engineer_agent":
+                        target_agent = participant
+                        break
+                if target_agent is None:
+                    target_agent = participants[0]
+
+                wb = getattr(target_agent, "workbench", getattr(target_agent, "_workbench", None))
+                if wb is not None:
+                    wb_list = wb if isinstance(wb, list) else [wb]
+                    for wb_item in wb_list:
+                        tools = getattr(wb_item, "tools", getattr(wb_item, "_tools", None))
+                        if tools is not None and isinstance(tools, list):
+                            tool_names = [getattr(t, "name", "") for t in tools]
+                            if "python_code_execution" not in tool_names:
+                                tools.insert(0, code_tool)
+                                print("Injected PythonCodeExecutionTool (Docker) into lead_engineer_agent workbench")
+                            break
+
+        try:
+            team._config_mtime = _autogen_team_definition_mtime()
+        except Exception:
+            pass
+
+        print(f"AutoGen team loaded successfully: {team_label}")
+        return team
+    except Exception as e:
+        import traceback
+
+        print(f"Error loading runtime AutoGen team: {e}")
         print(traceback.format_exc())
         return None
 
@@ -2808,7 +4041,7 @@ except Exception as e:
 
 # Load AutoGen team on startup (with error handling to prevent startup failures)
 try:
-    autogen_team = load_autogen_team()
+    autogen_team = load_autogen_team_runtime()
     if autogen_team is not None:
         print("✅ AutoGen team loaded successfully on startup")
 except Exception as e:
@@ -2848,6 +4081,22 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
         if lowered in {"0", "false", "no", "n", "off"}:
             return False
     return default
+
+
+def _coerce_bounded_int(
+    value: Any,
+    *,
+    default: int,
+    minimum: int = 0,
+    maximum: Optional[int] = None,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if maximum is not None:
+        parsed = min(parsed, maximum)
+    return max(minimum, parsed)
 
 
 def _normalize_render_engine(value: Optional[str]) -> str:
@@ -3854,31 +5103,113 @@ async def proxy_weather(
     return await _do_proxy_weather(location=location, detail=final_detail, user_id=user_id, memory_manager=memory_manager if MEMORY_AVAILABLE else None)
 
 
+def _is_retryable_autogen_provider_error(exc: BaseException) -> bool:
+    """True when the upstream OpenRouter/OpenAI-compatible client returned a malformed response."""
+    text = str(exc)
+    if "NoneType" in text and "subscriptable" in text:
+        return True
+    if "result.choices" in text:
+        return True
+    traceback_text = traceback.format_exc()
+    return "_openai_client.py" in traceback_text and "choices[0]" in traceback_text
+
+
 # Shared AutoGen logic for route and Telegram tool runner
 async def _do_autogen(input_text: str) -> Dict[str, Any]:
     """Run AutoGen team with input_text. Returns dict with output/response/messages. Raises HTTPException on failure."""
     global autogen_team
     if not input_text:
         raise HTTPException(status_code=400, detail="Input parameter is required")
+    monitor_run_id = _monitor_run_start("autogen", "team-run", input_text=input_text)
+    progress_notes: List[str] = []
+    log_filename: Optional[str] = None
+
+    def _persist_autogen_log(
+        *,
+        status: str,
+        messages: Optional[List[Dict[str, str]]] = None,
+        conversation_summary: str = "",
+        error_text: Optional[str] = None,
+        suppress_monitor_note: bool = False,
+    ) -> None:
+        nonlocal log_filename
+        try:
+            log_filename = _write_autogen_conversation_to_scratch(
+                input_text,
+                messages or [],
+                conversation_summary,
+                filename=log_filename,
+                status=status,
+                progress_notes=progress_notes,
+                error_text=error_text,
+            )
+            log_path = _resolve_monitor_log_path(log_filename)
+            _monitor_run_update(
+                monitor_run_id,
+                log_file=log_filename,
+                log_excerpt=_read_monitor_log_excerpt(log_path),
+            )
+        except Exception as log_err:
+            if not suppress_monitor_note:
+                _monitor_run_note(monitor_run_id, f"Failed to update AutoGen scratch log: {log_err}")
+            print(f"[AUTOGEN] Failed to update conversation scratch log: {log_err}", flush=True)
+
+    def _note_autogen_progress(note: str, *, conversation_summary: str = "AutoGen run in progress.") -> None:
+        progress_notes.append(note)
+        _monitor_run_note(monitor_run_id, note)
+        _persist_autogen_log(status="running", conversation_summary=conversation_summary)
+
+    _persist_autogen_log(
+        status="running",
+        conversation_summary="AutoGen run created.",
+        suppress_monitor_note=True,
+    )
     if not AUTOGEN_AVAILABLE:
+        _persist_autogen_log(
+            status="error",
+            conversation_summary="AutoGen run failed before execution started.",
+            error_text="AutoGen is not available on this server.",
+        )
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary="AutoGen is not available on this server.",
+            metadata={"autogen_available": False},
+            log_file=log_filename,
+            log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
+        )
         raise HTTPException(
             status_code=503,
             detail="AutoGen not available. Please install: pip install autogen-agentchat autogen-ext"
         )
     if autogen_team is None:
+        _note_autogen_progress("Loading AutoGen team.")
         print("🔄 Loading AutoGen team for the first time...")
-        autogen_team = load_autogen_team()
+        autogen_team = load_autogen_team_runtime()
         if autogen_team is None:
+            _persist_autogen_log(
+                status="error",
+                conversation_summary="AutoGen run failed during team initialization.",
+                error_text="AutoGen team could not be loaded.",
+            )
+            _monitor_run_finish(
+                monitor_run_id,
+                status="error",
+                summary="AutoGen team could not be loaded.",
+                log_file=log_filename,
+                log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
+            )
             raise HTTPException(
                 status_code=503,
-                detail="AutoGen team not loaded. Check team-config.json exists and is valid."
+                detail="AutoGen team not loaded. Check the Python builder or fallback JSON config."
             )
     try:
-        config_mtime = TEAM_CONFIG_FILE.stat().st_mtime
+        config_mtime = _autogen_team_definition_mtime()
         if not hasattr(autogen_team, '_config_mtime') or autogen_team._config_mtime != config_mtime:
-            print("🔄 Team config file changed, reloading AutoGen team...")
+            _note_autogen_progress("Reloading AutoGen team after config change.")
+            print("Reloading AutoGen team after definition change...")
             await _stop_code_executors(autogen_team)
-            new_team = load_autogen_team()
+            new_team = load_autogen_team_runtime()
             if new_team is not None:
                 autogen_team = new_team
                 autogen_team._config_mtime = config_mtime
@@ -3886,90 +5217,204 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
                     delattr(autogen_team, '_executors_started')
     except Exception as e:
         print(f"âš ï¸  Error checking team config modification time: {e}")
+        _note_autogen_progress(f"Config reload check warning: {e}")
     if not getattr(autogen_team, '_executors_started', False):
+        _note_autogen_progress("Starting AutoGen code executors.")
         await _start_code_executors(autogen_team)
         try:
             autogen_team._executors_started = True
         except Exception:
             pass
+    if hasattr(autogen_team, "reset"):
+        _note_autogen_progress("Resetting AutoGen team state.")
+        await autogen_team.reset()
     try:
         print(f"🚀 Running AutoGen team with input: {input_text[:100]}...")
-        result = await autogen_team.run(task=input_text)
+        _note_autogen_progress("Running AutoGen team.")
+        try:
+            result = await autogen_team.run(task=input_text)
+        except Exception as first_exc:
+            if _is_retryable_autogen_provider_error(first_exc):
+                _note_autogen_progress("Retrying AutoGen run after malformed provider response.")
+                await _stop_code_executors(autogen_team)
+                fresh_team = load_autogen_team_runtime()
+                if fresh_team is None:
+                    raise first_exc
+                autogen_team = fresh_team
+                if not getattr(autogen_team, '_executors_started', False):
+                    _note_autogen_progress("Restarting AutoGen code executors for retry.")
+                    await _start_code_executors(autogen_team)
+                    try:
+                        autogen_team._executors_started = True
+                    except Exception:
+                        pass
+                if hasattr(autogen_team, "reset"):
+                    _note_autogen_progress("Resetting AutoGen team state for retry.")
+                    await autogen_team.reset()
+                result = await autogen_team.run(task=input_text)
+            else:
+                raise
         messages = []
         if hasattr(result, 'messages'):
             messages = [
                 {
                     "source": msg.source if hasattr(msg, 'source') else 'unknown',
-                    "content": msg.content if hasattr(msg, 'content') else str(msg)
+                    "content": _stringify_autogen_message_content(msg.content) if hasattr(msg, 'content') else str(msg)
                 }
                 for msg in result.messages
             ]
-        conversation_summary = "=== AutoGen Team Workflow ===\n\n"
-        if messages:
-            for i, msg in enumerate(messages, 1):
-                conversation_summary += f"[{i}] {msg.get('source', 'unknown')}:\n{msg.get('content', '')}\n\n"
-            conversation_summary += "=== End of Workflow ===\n\n"
-            conversation_summary += "Please review the above conversation and provide a concise summary of the final result."
+        _note_autogen_progress(
+            f"AutoGen returned {len(messages)} messages.",
+            conversation_summary="AutoGen returned messages and is writing the full transcript.",
+        )
+        final_message = _stringify_autogen_message_content(messages[-1].get("content", "")) if messages else ""
+        if final_message:
+            conversation_summary = (
+                f"Completed with {len(messages)} messages. "
+                f"Final message from {messages[-1].get('source', 'unknown')}:\n{final_message}"
+            )
         else:
-            conversation_summary += "No messages returned from AutoGen team."
+            conversation_summary = (
+                f"Completed with {len(messages)} messages."
+                if messages
+                else "No messages returned from AutoGen team."
+            )
         print(f"✅ AutoGen team completed with {len(messages)} messages")
-        try:
-            _write_autogen_conversation_to_scratch(input_text, messages, conversation_summary)
-        except Exception as e:
-            print(f"[AUTOGEN] Failed to write conversation to scratch: {e}", flush=True)
+        _persist_autogen_log(
+            status="completed",
+            messages=messages,
+            conversation_summary=conversation_summary,
+        )
+        log_path = _resolve_monitor_log_path(log_filename)
+        log_payload = _read_monitor_run_log(log_path)
+        transcript_text = log_payload.get("content") if isinstance(log_payload, dict) else ""
+        if not isinstance(transcript_text, str) or not transcript_text:
+            transcript_text = _format_autogen_conversation_log(
+                input_text,
+                messages,
+                conversation_summary,
+                timestamp_human=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+                status="completed",
+                progress_notes=progress_notes,
+            )
+        _monitor_run_finish(
+            monitor_run_id,
+            status="completed",
+            summary=f"Completed with {len(messages)} messages.",
+            metadata={
+                "message_count": len(messages),
+                "sources": [msg.get("source", "unknown") for msg in messages[:12]],
+            },
+            log_file=log_filename,
+            log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
+        )
         return {
             "output": conversation_summary,
             "response": conversation_summary,
             "messages": messages,
-            "message_count": len(messages)
+            "message_count": len(messages),
+            "log_file": log_filename,
+            "log_content": transcript_text,
+            "summary": conversation_summary,
         }
     except Exception as e:
         import traceback
         print(f"âŒ AutoGen team execution error: {e}")
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"AutoGen team execution failed: {str(e)}")
+        error_text = str(e)
+        if "No user query found in messages" in error_text:
+            autogen_base = (
+                os.getenv("AUTOGEN_OPENROUTER_BASE_URL")
+                or os.getenv("OPENROUTER_API_BASE")
+                or os.getenv("MCP_LLM_BASE_URL")
+                or os.getenv("OPENAI_API_BASE")
+                or ""
+            ).strip()
+            autogen_model = (
+                os.getenv("AUTOGEN_TEAM_MODEL")
+                or os.getenv("OPENROUTER_AUTOGEN_MODEL")
+                or os.getenv("MCP_LLM_MODEL_NAME")
+                or os.getenv("OPENAI_MODEL")
+                or ""
+            ).strip()
+            error_text = (
+                "AutoGen team execution failed because the configured AutoGen model endpoint rejected an internal "
+                "multi-agent prompt with 'No user query found in messages'. This usually means the current chat "
+                "template requires a trailing user message and is not compatible with AutoGen's internal "
+                f"assistant/tool turns. Current settings: AUTOGEN_OPENROUTER_BASE_URL={autogen_base or '(unset)'}, "
+                f"AUTOGEN_TEAM_MODEL={autogen_model or '(unset)'}. Fix this by either pointing AutoGen to a "
+                "compatible hosted endpoint such as https://openrouter.ai/api/v1 with a stable chat model, or by "
+                "switching the local model/server to one whose chat template supports assistant continuation and tool "
+                "calling. Restart the proxy server after changing .env."
+            )
+        elif "user name must be consistent (2013)" in error_text:
+            autogen_base = (
+                os.getenv("AUTOGEN_MINIMAX_BASE_URL")
+                or os.getenv("AUTOGEN_BASE_URL")
+                or os.getenv("MCP_LLM_BASE_URL")
+                or os.getenv("OPENAI_API_BASE")
+                or ""
+            ).strip()
+            autogen_model = (
+                os.getenv("AUTOGEN_TEAM_MODEL")
+                or os.getenv("AUTOGEN_MINIMAX_MODEL")
+                or os.getenv("MCP_LLM_MODEL_NAME")
+                or os.getenv("OPENAI_MODEL")
+                or ""
+            ).strip()
+            error_text = (
+                "AutoGen team execution failed because MiniMax rejected the multi-agent message `name` fields with "
+                "'user name must be consistent (2013)'. The proxy now applies a MiniMax compatibility mode that "
+                "removes per-message names and prefixes speaker identity into message text instead. If you still see "
+                f"this after the fix, restart the proxy so the AutoGen team is rebuilt. Current settings: "
+                f"AUTOGEN_MINIMAX_BASE_URL={autogen_base or '(unset)'}, AUTOGEN_TEAM_MODEL={autogen_model or '(unset)' }."
+            )
+        _persist_autogen_log(
+            status="error",
+            conversation_summary="AutoGen execution failed.",
+            error_text=error_text,
+        )
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary=f"AutoGen execution failed: {error_text}",
+            log_file=log_filename,
+            log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
+        )
+        raise HTTPException(status_code=500, detail=error_text)
 
 
 def _write_autogen_conversation_to_scratch(
     input_text: str,
     messages: List[Dict[str, str]],
     conversation_summary: str,
+    *,
+    filename: Optional[str] = None,
+    status: str = "completed",
+    progress_notes: Optional[List[str]] = None,
+    error_text: Optional[str] = None,
 ) -> str:
-    """Write AutoGen conversation to scratch and return filename."""
+    """Write or update an AutoGen conversation log in scratch and return filename."""
     SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now().astimezone()
-    timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
     timestamp_human = now.strftime("%Y-%m-%d %H:%M:%S %Z")
-    suffix = secrets.token_hex(4)
-    filename = f"autogen_run_{timestamp_file}_{suffix}.txt"
+    if not filename:
+        timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+        suffix = secrets.token_hex(4)
+        filename = f"autogen_run_{timestamp_file}_{suffix}.txt"
     filepath = SCRATCH_DIR / filename
-    lines = [
-        "AutoGen team conversation log",
-        f"Date-time: {timestamp_human}",
-        "",
-        "Input:",
-        input_text or "(empty)",
-        "",
-        "--- Messages ---",
-    ]
-    if messages:
-        for i, msg in enumerate(messages, 1):
-            source = msg.get("source", "unknown")
-            content = msg.get("content", "")
-            lines.append(f"[{i}] {source}:")
-            lines.append(content if content else "(empty)")
-            lines.append("")
-    else:
-        lines.append("(No messages returned from AutoGen team)")
-        lines.append("")
-    lines.extend(
-        [
-            "--- Conversation Summary ---",
-            "",
-            conversation_summary or "(empty)",
-        ]
+    filepath.write_text(
+        _format_autogen_conversation_log(
+            input_text,
+            messages,
+            conversation_summary,
+            timestamp_human=timestamp_human,
+            status=status,
+            progress_notes=progress_notes,
+            error_text=error_text,
+        ),
+        encoding="utf-8",
     )
-    filepath.write_text("\n".join(lines), encoding="utf-8")
     print(f"[AUTOGEN] Wrote conversation to {filepath}", flush=True)
     return filename
 
@@ -3984,6 +5429,8 @@ def _write_codex_summary_to_scratch(
     timed_out: bool,
     events_file: Optional[str] = None,
     last_message_file: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
+    workspace_mode: Optional[str] = None,
 ) -> str:
     """Write Codex execution summary to scratch and return filename."""
     SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
@@ -4001,6 +5448,8 @@ def _write_codex_summary_to_scratch(
         f"Exit code: {exit_code if exit_code is not None else 'N/A'}",
         f"Events file: {events_file or 'N/A'}",
         f"Last message file: {last_message_file or 'N/A'}",
+        f"Workspace mode: {workspace_mode or 'project_root'}",
+        f"Workspace dir: {workspace_dir or str(_PROJECT_ROOT)}",
         "",
         "Command:",
         " ".join(command),
@@ -4016,6 +5465,30 @@ def _write_codex_summary_to_scratch(
     ]
     filepath.write_text("\n".join(lines), encoding="utf-8")
     return filename
+
+
+def _prepare_autogen_codex_workspace() -> Path:
+    """Create an empty isolated workspace for AutoGen Codex runs under scratch/autogen."""
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    autogen_root = SCRATCH_DIR / CODEX_AUTOGEN_WORKSPACES_DIRNAME
+    autogen_root.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().astimezone()
+    timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+    suffix = secrets.token_hex(4)
+    workspace_dir = autogen_root / f"codex_run_{timestamp_file}_{suffix}"
+    workspace_dir.mkdir(parents=True, exist_ok=False)
+    marker_path = workspace_dir / "AUTOGEN_WORKSPACE_README.txt"
+    marker_path.write_text(
+        "\n".join(
+            [
+                "This workspace is an empty isolated directory for an AutoGen Codex CLI run.",
+                "It was created under scratch/autogen so Codex can build a new project without copying CATBot.",
+                "Changes here do not modify the live CATBot core repository.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return workspace_dir
 
 
 def _write_codex_error_to_scratch(
@@ -4048,7 +5521,7 @@ def _write_codex_error_to_scratch(
     return filename
 
 
-async def _run_codex_cli(prompt: str) -> Dict[str, Any]:
+async def _run_codex_cli(prompt: str, *, isolated_workspace: bool = False) -> Dict[str, Any]:
     if not CODEX_ENABLED:
         raise HTTPException(status_code=503, detail="Codex CLI tool is disabled.")
     prompt = (prompt or "").strip()
@@ -4061,6 +5534,18 @@ async def _run_codex_cli(prompt: str) -> Dict[str, Any]:
 
     sandbox_mode = CODEX_SANDBOX_MODE if CODEX_SANDBOX_MODE in ("read-only", "workspace-write") else "workspace-write"
     approval_policy = CODEX_APPROVAL_POLICY if CODEX_APPROVAL_POLICY in ("untrusted", "on-request", "on-failure", "never") else "never"
+    workspace_dir = _PROJECT_ROOT
+    workspace_mode = "project_root"
+    if isolated_workspace:
+        try:
+            workspace_dir = _prepare_autogen_codex_workspace()
+            workspace_mode = "scratch_autogen_empty"
+        except Exception as e:
+            error_file = _write_codex_error_to_scratch(prompt, [], f"Failed to prepare AutoGen Codex workspace: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to prepare isolated AutoGen Codex workspace. See {error_file} in scratch for details.",
+            )
 
     cmd: List[str] = [CODEX_CLI_PATH]
     if CODEX_ENABLE_SEARCH:
@@ -4071,7 +5556,7 @@ async def _run_codex_cli(prompt: str) -> Dict[str, Any]:
         "--sandbox",
         sandbox_mode,
         "-C",
-        str(_PROJECT_ROOT),
+        str(workspace_dir),
     ])
     if approval_policy == "never":
         # codex exec no longer accepts -a; --full-auto is the supported non-interactive mode
@@ -4097,7 +5582,7 @@ async def _run_codex_cli(prompt: str) -> Dict[str, Any]:
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            cwd=str(_PROJECT_ROOT),
+            cwd=str(workspace_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -4137,6 +5622,8 @@ async def _run_codex_cli(prompt: str) -> Dict[str, Any]:
         timed_out=timed_out,
         events_file=events_file,
         last_message_file=last_message_file,
+        workspace_dir=str(workspace_dir),
+        workspace_mode=workspace_mode,
     )
     return {
         "success": exit_code == 0 and not timed_out,
@@ -4148,6 +5635,8 @@ async def _run_codex_cli(prompt: str) -> Dict[str, Any]:
         "durationMs": duration_ms,
         "stdout": stdout_text,
         "stderr": stderr_text,
+        "workspaceDir": str(workspace_dir),
+        "workspaceMode": workspace_mode,
     }
 
 
@@ -4174,11 +5663,13 @@ async def autogen_chat(request: Request):
 @app.post("/v1/proxy/codex")
 async def proxy_codex_exec(
     request: CodexExecRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_or_autogen_team),
 ):
-    """Run Codex CLI non-interactively in sandboxed mode. Auth required."""
-    _ = current_user  # keep for auth enforcement
-    return await _run_codex_cli(request.prompt)
+    """Run Codex CLI non-interactively in sandboxed mode. User JWT or AutoGen team secret required."""
+    return await _run_codex_cli(
+        request.prompt,
+        isolated_workspace=current_user.get("auth_type") == "agent_secret",
+    )
 
 
 @app.post("/v1/proxy/restart")
@@ -4283,15 +5774,49 @@ def setup_browser_llm():
     model_provider = os.getenv("MCP_MODEL_PROVIDER", "google").lower()
     model_name = os.getenv("MCP_MODEL_NAME", "gemini-flash-latest")
     temperature = float(os.getenv("MCP_TEMPERATURE", "0.1"))
+    model_base_url = (
+        os.getenv("MCP_MODEL_BASE_URL")
+        or os.getenv("MCP_LLM_BASE_URL")
+        or os.getenv("OPENAI_API_BASE")
+        or ""
+    ).strip()
 
-    if model_provider == "openai":
+    if model_provider in {"openai", "openrouter", "minimax"}:
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=model_name,
-            temperature=temperature,
-            api_key=os.getenv("OPENAI_API_KEY")
+
+        api_key_candidates = (
+            ["MINIMAX_API_KEY", "MCP_LLM_MINIMAX_API_KEY", "OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"]
+            if model_provider == "minimax" or is_minimax_chat_request(model_base_url, model_name)
+            else (
+                ["OPENROUTER_API_KEY", "MCP_LLM_OPENROUTER_API_KEY", "OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"]
+                if model_provider == "openrouter" or "openrouter.ai" in model_base_url.lower()
+                else ["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"]
+            )
         )
-    elif model_provider == "anthropic":
+        chat_kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "temperature": (
+                normalize_temperature_for_minimax(temperature)
+                if is_minimax_chat_request(model_base_url, model_name)
+                else temperature
+            ),
+            "api_key": _first_non_empty_env(api_key_candidates),
+        }
+        if model_base_url:
+            chat_kwargs["base_url"] = model_base_url
+        if model_provider == "openrouter" or "openrouter.ai" in model_base_url.lower():
+            default_headers: Dict[str, str] = {}
+            referer = (os.getenv("OPENROUTER_HTTP_REFERER") or os.getenv("OPENROUTER_REFERER") or "").strip()
+            title = (os.getenv("OPENROUTER_X_TITLE") or "CATBot").strip()
+            if referer:
+                default_headers["HTTP-Referer"] = referer
+            if title:
+                default_headers["X-Title"] = title
+            if default_headers:
+                chat_kwargs["default_headers"] = default_headers
+        return ChatOpenAI(**chat_kwargs)
+
+    if model_provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(
             model=model_name,
@@ -4918,7 +6443,7 @@ async def todo_clear(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 def _write_task_exec_response_to_scratch(
     user_key: str, task_id: Optional[int], status: str, message: str
-) -> None:
+) -> Optional[str]:
     """
     Write the task execution agent response to a timestamped text file in scratch.
     Called whenever a run ends (completed, paused, awaiting confirmation, or cancelled).
@@ -4962,8 +6487,10 @@ def _write_task_exec_response_to_scratch(
         ]
         filepath.write_text("\n".join(lines), encoding="utf-8")
         print(f"[TASK_EXEC] Wrote response to {filepath}", flush=True)
+        return filename
     except Exception as e:
         print(f"[TASK_EXEC] Failed to write response to scratch: {e}", flush=True)
+        return None
 
 
 def _safe_task_execution_diagnostics(executor: Any) -> Dict[str, Any]:
@@ -4976,6 +6503,54 @@ def _safe_task_execution_diagnostics(executor: Any) -> Dict[str, Any]:
     except Exception as e:
         print(f"[TASK_EXEC] Failed to read executor diagnostics: {e}", flush=True)
         return {}
+
+
+def _task_execution_metadata(
+    user_key: str,
+    state: Optional[Dict[str, Any]],
+    diagnostics: Optional[Dict[str, Any]] = None,
+    *,
+    phase: Optional[str] = None,
+) -> Dict[str, Any]:
+    state = state if isinstance(state, dict) else {}
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    task_description = _truncate_monitor_text(state.get("task_description") or "", max_chars=220)
+    status = str(state.get("status") or "").strip() or None
+    metadata: Dict[str, Any] = {
+        "user_key": user_key,
+        "task_id": _coerce_task_id(state.get("task_id")),
+        "workflow_name": task_description or f"Task {state.get('task_id') or 'unknown'}",
+        "task_description": task_description,
+        "status": status,
+        "phase": phase or status or "running",
+        "current_step": diagnostics.get("iterations"),
+        "total_steps": diagnostics.get("max_iterations"),
+        "elapsed_seconds": diagnostics.get("elapsed_seconds"),
+        "tool_success_count": diagnostics.get("tool_success_count"),
+        "tool_failure_count": diagnostics.get("tool_failure_count"),
+    }
+    run_id = str(state.get("run_id") or "").strip()
+    if run_id:
+        metadata["run_id"] = run_id
+    return metadata
+
+
+def _task_execution_summary(
+    state: Optional[Dict[str, Any]],
+    diagnostics: Optional[Dict[str, Any]] = None,
+    fallback_message: str = "",
+) -> str:
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    task_id = _coerce_task_id((state or {}).get("task_id"))
+    iterations = diagnostics.get("iterations")
+    max_iterations = diagnostics.get("max_iterations")
+    message = _truncate_monitor_text(fallback_message or (state or {}).get("message") or "", max_chars=260)
+    base = f"Task {task_id}" if task_id is not None else "Task execution"
+    if isinstance(iterations, int) and isinstance(max_iterations, int) and max_iterations > 0:
+        base += f" step {iterations}/{max_iterations}"
+    if message:
+        return f"{base}. {message}"
+    return base
 
 
 async def _record_task_execution_learning(
@@ -5057,6 +6632,7 @@ async def _run_task_loop_background(user_key: str, task_id: int, executor: Any) 
         # Status may have changed (e.g. cancellation requested) while the loop was in-flight.
         state = _get_task_run_state(user_key, task_id)
         if state and state.get("executor") is executor:
+            diagnostics = _safe_task_execution_diagnostics(executor)
             auto_completion_note = _auto_complete_scheduled_execution(user_key, state, status)
             if auto_completion_note:
                 base_message = (message or "").strip()
@@ -5071,8 +6647,20 @@ async def _run_task_loop_background(user_key: str, task_id: int, executor: Any) 
                 source_phase="background_run",
             )
             # Always capture agent response to scratch with timestamp (paused, awaiting, cancelled, done)
-            _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
+            task_log_filename = _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
             await _maybe_notify_telegram_task_completion(user_key, state, status, message or "")
+            monitor_run_id = str(state.get("monitor_run_id") or "").strip()
+            if monitor_run_id:
+                _monitor_run_finish(
+                    monitor_run_id,
+                    status=status,
+                    summary=_task_execution_summary(state, diagnostics, message or ""),
+                    metadata=_task_execution_metadata(user_key, state, diagnostics, phase=status),
+                    log_file=task_log_filename,
+                    log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / task_log_filename) if task_log_filename else None),
+                )
+                if not _is_task_execution_terminal_status(status):
+                    state["monitor_run_id"] = None
             # Terminal runs should clear execution state so status returns to idle.
             if _is_task_execution_terminal_status(status):
                 _remove_task_run_state(user_key, task_id)
@@ -5133,42 +6721,103 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
     if not task_description:
         raise HTTPException(status_code=400, detail="Invalid task ID.")
     telegram_chat_ids = _resolve_telegram_chat_ids_for_todo_user(user_key)
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured.")
-    experience_guidance = ""
-    if MEMORY_AVAILABLE and memory_manager and hasattr(memory_manager, "build_task_execution_guidance"):
-        try:
-            experience_guidance = await memory_manager.build_task_execution_guidance(task_description=task_description)
-            if experience_guidance:
-                print(
-                    f"[TASK_EXEC] Loaded experience guidance for user {user_key} task {normalized_task_id}",
-                    flush=True,
-                )
-        except Exception as e:
-            print(f"[TASK_EXEC] Failed to load experience guidance: {e}", flush=True)
-    executor = TodoTaskExecutor(
-        api_key=api_key,
-        task_id=normalized_task_id,
-        task_description=task_description,
-        prompt_override=prompt_override,
-        max_iterations=TASK_EXECUTION_MAX_ITERATIONS,
-        tool_executor=execute_tool_for_philosopher,
-        get_tools_func=get_all_available_tools,
-        experience_guidance=experience_guidance,
+    api_key = _first_non_empty_env(
+        preferred_api_key_env_names(
+            os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"),
+            os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        )
     )
-    # Set state to 'executing' before starting so cancel/status work and we never leave state stuck.
-    state = {
-        "task_id": normalized_task_id,
-        "task_item_id": task_item_id,
-        "run_id": f"task-{normalized_task_id}-{secrets.token_hex(4)}",
-        "status": STATUS_EXECUTING,
-        "executor": executor,
-        "message": None,
-        "task_description": task_description,
-        "is_scheduled": task_is_scheduled,
-        "telegram_chat_ids": telegram_chat_ids,
-    }
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No compatible API key is configured for task execution. "
+                "Set OPENAI_API_KEY / MCP_LLM_OPENAI_API_KEY, or MINIMAX_API_KEY / "
+                "MCP_LLM_MINIMAX_API_KEY when using Minimax."
+            ),
+        )
+    monitor_run_id = _monitor_run_start(
+        "task_execution",
+        "task-run",
+        input_text=prompt_override or task_description,
+        metadata={
+            "user_key": user_key,
+            "task_id": normalized_task_id,
+            "workflow_name": _truncate_monitor_text(task_description, max_chars=220),
+            "task_description": _truncate_monitor_text(task_description, max_chars=220),
+            "current_step": 0,
+            "total_steps": TASK_EXECUTION_MAX_ITERATIONS,
+            "phase": STATUS_EXECUTING,
+        },
+    )
+    try:
+        experience_guidance = ""
+        if MEMORY_AVAILABLE and memory_manager and hasattr(memory_manager, "build_task_execution_guidance"):
+            try:
+                experience_guidance = await memory_manager.build_task_execution_guidance(task_description=task_description)
+                if experience_guidance:
+                    print(
+                        f"[TASK_EXEC] Loaded experience guidance for user {user_key} task {normalized_task_id}",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(f"[TASK_EXEC] Failed to load experience guidance: {e}", flush=True)
+        executor = TodoTaskExecutor(
+            api_key=api_key,
+            task_id=normalized_task_id,
+            task_description=task_description,
+            prompt_override=prompt_override,
+            max_iterations=TASK_EXECUTION_MAX_ITERATIONS,
+            tool_executor=execute_tool_for_philosopher,
+            get_tools_func=get_all_available_tools,
+            experience_guidance=experience_guidance,
+            progress_callback=None,
+        )
+        # Set state to 'executing' before starting so cancel/status work and we never leave state stuck.
+        state = {
+            "task_id": normalized_task_id,
+            "task_item_id": task_item_id,
+            "run_id": f"task-{normalized_task_id}-{secrets.token_hex(4)}",
+            "monitor_run_id": monitor_run_id,
+            "status": STATUS_EXECUTING,
+            "executor": executor,
+            "message": None,
+            "task_description": task_description,
+            "is_scheduled": task_is_scheduled,
+            "telegram_chat_ids": telegram_chat_ids,
+        }
+    except Exception as exc:
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary=f"Failed to start task execution: {exc}",
+            metadata={
+                "user_key": user_key,
+                "task_id": normalized_task_id,
+                "workflow_name": _truncate_monitor_text(task_description, max_chars=220),
+                "phase": "error",
+            },
+        )
+        raise HTTPException(status_code=500, detail=f"Failed to start task execution: {exc}")
+
+    async def _task_monitor(event: str, payload: Dict[str, Any]) -> None:
+        diagnostics = _safe_task_execution_diagnostics(executor)
+        metadata = _task_execution_metadata(
+            user_key,
+            state,
+            diagnostics,
+            phase=payload.get("phase") or STATUS_EXECUTING,
+        )
+        for key in ("current_step", "total_steps", "tool_call_count"):
+            value = payload.get(key)
+            if value is not None:
+                metadata[key] = value
+        summary = payload.get("message") or _task_execution_summary(state, diagnostics)
+        _monitor_run_update(monitor_run_id, summary=summary, metadata=metadata)
+        if payload.get("message"):
+            _monitor_run_note(monitor_run_id, payload["message"])
+
+    executor.progress_callback = _task_monitor
     _set_task_run_state(user_key, normalized_task_id, state)
     asyncio.create_task(_run_task_loop_background(user_key, normalized_task_id, executor))
 
@@ -5218,6 +6867,43 @@ async def _task_execute_resume(user_key: str, user_message: str, task_id: Option
     if not executor:
         _remove_task_run_state(user_key, target_tid)
         raise HTTPException(status_code=400, detail="Execution state lost. Start a new execution.")
+    resume_monitor_run_id = _monitor_run_start(
+        "task_execution",
+        "resume-run",
+        input_text=user_message or str(state.get("task_description") or ""),
+        metadata={
+            "user_key": user_key,
+            "task_id": target_tid,
+            "workflow_name": _truncate_monitor_text(state.get("task_description") or f"Task {target_tid}", max_chars=220),
+            "task_description": _truncate_monitor_text(state.get("task_description") or "", max_chars=220),
+            "current_step": _safe_task_execution_diagnostics(executor).get("iterations"),
+            "total_steps": _safe_task_execution_diagnostics(executor).get("max_iterations"),
+            "phase": STATUS_EXECUTING,
+        },
+    )
+    state["monitor_run_id"] = resume_monitor_run_id
+    state["status"] = STATUS_EXECUTING
+    state["message"] = "Task execution resumed."
+
+    async def _task_resume_monitor(event: str, payload: Dict[str, Any]) -> None:
+        diagnostics = _safe_task_execution_diagnostics(executor)
+        metadata = _task_execution_metadata(
+            user_key,
+            state,
+            diagnostics,
+            phase=payload.get("phase") or STATUS_EXECUTING,
+        )
+        for key in ("current_step", "total_steps", "tool_call_count"):
+            value = payload.get(key)
+            if value is not None:
+                metadata[key] = value
+        summary = payload.get("message") or _task_execution_summary(state, diagnostics)
+        _monitor_run_update(resume_monitor_run_id, summary=summary, metadata=metadata)
+        if payload.get("message"):
+            _monitor_run_note(resume_monitor_run_id, payload["message"])
+
+    previous_progress_callback = getattr(executor, "progress_callback", None)
+    executor.progress_callback = _task_resume_monitor
     executor.add_user_message(user_message or "")
     try:
         status, message = await executor.run_loop()
@@ -5231,8 +6917,16 @@ async def _task_execute_resume(user_key: str, user_message: str, task_id: Option
             source_phase="resume_run",
         )
         # Capture agent response to scratch (paused or awaiting confirmation after resume)
-        _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
+        task_log_filename = _write_task_exec_response_to_scratch(user_key, state.get("task_id"), status, message or "")
         await _maybe_notify_telegram_task_completion(user_key, state, status, message or "")
+        _monitor_run_finish(
+            resume_monitor_run_id,
+            status=status,
+            summary=_task_execution_summary(state, _safe_task_execution_diagnostics(executor), message or ""),
+            metadata=_task_execution_metadata(user_key, state, _safe_task_execution_diagnostics(executor), phase=status),
+            log_file=task_log_filename,
+            log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / task_log_filename) if task_log_filename else None),
+        )
         if _is_task_execution_terminal_status(status):
             _remove_task_run_state(user_key, target_tid)
         return (status, message or "Resumed.", _coerce_task_id(state.get("task_id")) or target_tid)
@@ -5246,8 +6940,20 @@ async def _task_execute_resume(user_key: str, user_message: str, task_id: Option
             message=str(e),
             source_phase="resume_error",
         )
-        _write_task_exec_response_to_scratch(user_key, state.get("task_id"), STATUS_AWAITING_CONFIRMATION, str(e))
+        task_log_filename = _write_task_exec_response_to_scratch(user_key, state.get("task_id"), STATUS_AWAITING_CONFIRMATION, str(e))
+        _monitor_run_finish(
+            resume_monitor_run_id,
+            status="error",
+            summary=_task_execution_summary(state, _safe_task_execution_diagnostics(executor), str(e)),
+            metadata=_task_execution_metadata(user_key, state, _safe_task_execution_diagnostics(executor), phase="error"),
+            log_file=task_log_filename,
+            log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / task_log_filename) if task_log_filename else None),
+        )
         return (STATUS_AWAITING_CONFIRMATION, str(e), _coerce_task_id(state.get("task_id")) or target_tid)
+    finally:
+        executor.progress_callback = previous_progress_callback
+        if not _is_task_execution_terminal_status(_state_status_lower(state)):
+            state["monitor_run_id"] = None
 
 
 @app.post("/v1/todo/execute", response_model=TodoExecuteResponse)
@@ -5393,6 +7099,15 @@ def _task_execute_cancel(user_key: str, task_id: Optional[int] = None) -> tuple:
         # while the loop finishes the current step.
         target_state["status"] = STATUS_CANCELLED
         target_state["message"] = "Cancellation requested. The task will stop after the current step."
+        monitor_run_id = str(target_state.get("monitor_run_id") or "").strip()
+        if monitor_run_id:
+            diagnostics = _safe_task_execution_diagnostics(executor)
+            _monitor_run_update(
+                monitor_run_id,
+                summary=_task_execution_summary(target_state, diagnostics, target_state["message"]),
+                metadata=_task_execution_metadata(user_key, target_state, diagnostics, phase=STATUS_CANCELLED),
+            )
+            _monitor_run_note(monitor_run_id, target_state["message"])
         return (True, "Cancellation requested. The task will stop after the current step.", target_tid)
     _remove_task_run_state(user_key, target_tid)
     return (False, "No active execution to cancel.", None)
@@ -5635,45 +7350,44 @@ def _message_requests_proxy_restart(message_text: str) -> bool:
     return normalized in explicit_commands
 
 
+_TELEGRAM_SMALL_TALK_PATTERNS = [
+    re.compile(r"^(?:hi|hello|hey|hiya|yo|howdy)(?:\s+(?:cat|catbot|there))?[!.?]*$", re.IGNORECASE),
+    re.compile(
+        r"^(?:hi|hello|hey)[,!\s]*(?:how are you|how'?s it going|how are things|what'?s up)[?.!\s]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^(?:how are you|how'?s it going|how are things|what'?s up)[?.!\s]*$", re.IGNORECASE),
+    re.compile(
+        r"^(?:thanks|thank you|cheers|cool|awesome|great|nice|sounds good|got it|ok|okay|alright)[!.?\s]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^(?:bye|goodbye|see ya|see you|cya|ttyl|talk to you later|good night)[!.?\s]*$", re.IGNORECASE),
+]
+
+
+def _is_telegram_small_talk_message(message_text: str) -> bool:
+    """Return True for low-intent conversational turns that should not trigger progress chatter."""
+    normalized = re.sub(r"\s+", " ", (message_text or "").strip())
+    if not normalized:
+        return False
+    if len(normalized) > 120:
+        return False
+    return any(pattern.fullmatch(normalized) for pattern in _TELEGRAM_SMALL_TALK_PATTERNS)
+
+
+def _should_emit_telegram_status_updates(message_text: str) -> bool:
+    """
+    Decide whether Telegram should emit progress/status messages for this turn.
+    Suppress them for low-intent small talk so the chat feels conversational.
+    """
+    if _is_telegram_small_talk_message(message_text):
+        return False
+    return True
+
+
 def _coerce_telegram_response_text(content: Any) -> str:
     """Normalize LLM message content (string or structured parts) into plain text."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            if isinstance(item, str):
-                text = item.strip()
-                if text:
-                    parts.append(text)
-                continue
-            if not isinstance(item, dict):
-                continue
-
-            candidate = item.get("text")
-            if isinstance(candidate, dict):
-                candidate = candidate.get("value") or candidate.get("content")
-            if not isinstance(candidate, str):
-                candidate = item.get("content") or item.get("output_text")
-            if isinstance(candidate, str):
-                text = candidate.strip()
-                if text:
-                    parts.append(text)
-        return "\n".join(parts).strip()
-
-    if isinstance(content, dict):
-        candidate = content.get("text")
-        if isinstance(candidate, dict):
-            candidate = candidate.get("value") or candidate.get("content")
-        if not isinstance(candidate, str):
-            candidate = content.get("content") or content.get("output_text")
-        if isinstance(candidate, str):
-            return candidate.strip()
-
-    return str(content).strip()
+    return coerce_message_text(content)
 
 
 async def _restart_proxy_after_delay(trigger: str, requested_by: str) -> None:
@@ -5728,14 +7442,16 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
 
     conversation_id = request.conversation_id or request.user_id or "default"
     request_id = request.request_id or f"telegram-{conversation_id}-{int(time.time() * 1000)}"
+    emit_status_updates = _should_emit_telegram_status_updates(message_text)
 
-    await _start_status_session(
-        conversation_id=conversation_id,
-        request_id=request_id,
-        channel="telegram",
-        initial_state="Working: contacting model",
-        phase="llm_request",
-    )
+    if emit_status_updates:
+        await _start_status_session(
+            conversation_id=conversation_id,
+            request_id=request_id,
+            channel="telegram",
+            initial_state="On it. I'm getting started now.",
+            phase="llm_request",
+        )
 
     # Explicit command path for reliable Telegram-triggered proxy restarts (no LLM/tool-call required).
     if _message_requests_proxy_restart(message_text):
@@ -5756,8 +7472,13 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         trim_telegram_history(history)
         return TelegramChatResponse(reply=reply_text, conversation_id=conversation_id, usage=None)
 
-    # Primary Telegram call uses OPENAI_* key, fallback uses MCP_LLM_* endpoint/model on request errors.
-    primary_api_key = _first_non_empty_env(["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"])
+    # Primary Telegram call uses the endpoint-appropriate OpenAI-compatible key.
+    primary_api_key = _first_non_empty_env(
+        preferred_api_key_env_names(
+            TELEGRAM_OPENAI_BASE_URL,
+            request.model or TELEGRAM_DEFAULT_MODEL,
+        )
+    )
     if not primary_api_key:
         await _finish_status_session(
             conversation_id=conversation_id,
@@ -5767,7 +7488,11 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         )
         raise HTTPException(
             status_code=503,
-            detail="OPENAI_API_KEY or MCP_LLM_OPENAI_API_KEY is not configured on the server",
+            detail=(
+                "No compatible API key is configured for the Telegram chat provider. "
+                "Set OPENAI_API_KEY / MCP_LLM_OPENAI_API_KEY, or MINIMAX_API_KEY / "
+                "MCP_LLM_MINIMAX_API_KEY when using Minimax."
+            ),
         )
 
     todo_user_key = _resolve_todo_user_for_telegram(conversation_id, request.user_id)
@@ -5848,6 +7573,11 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         "model": model_name,
         "messages": messages,
     }
+    if TELEGRAM_TOOLS_ENABLED and _telegram_tools is not None:
+        telegram_tools_payload = _get_telegram_combined_openai_tools()
+        if telegram_tools_payload:
+            payload["tools"] = telegram_tools_payload
+            payload["tool_choice"] = "auto"
 
     if request.temperature is not None:
         payload["temperature"] = request.temperature
@@ -6013,14 +7743,20 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
 
     data = response.json()
     reply = None
+    preserve_reasoning_details = is_minimax_chat_request(url, model_name)
     pending_native_tool_calls: List[Dict[str, Any]] = []
+    pending_native_tool_message: Optional[Dict[str, Any]] = None
     choices = data.get("choices") or []
     if choices:
-        message = choices[0].get("message") or {}
-        tool_calls = message.get("tool_calls")
+        normalized_message = normalize_chat_completion_message(
+            choices[0].get("message") or {},
+            preserve_reasoning_details=preserve_reasoning_details,
+        )
+        tool_calls = normalized_message.get("tool_calls")
         if isinstance(tool_calls, list):
             pending_native_tool_calls = tool_calls
-        reply = _coerce_telegram_response_text(message.get("content"))
+            pending_native_tool_message = normalized_message.get("message")
+        reply = normalized_message.get("content") or ""
 
     if not reply and not pending_native_tool_calls:
         reply = "I couldn't generate a response right now. Please try again shortly."
@@ -6038,6 +7774,12 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         "googleworkspace_cli.check_auth",
         "check_cli",
         "googleworkspace_cli.check_cli",
+        "listFiles",
+        "list_files",
+        "searchFiles",
+        "search_files",
+        "filesystem.list_files",
+        "filesystem.search_files",
     }
     # Friendly message when tool failed or returned an error (avoid showing raw 404/500 to user)
     _telegram_tool_error_reply = "I wasn't able to get that information just now. Please try again or rephrase your question."
@@ -6046,170 +7788,46 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         if system_prompt:
             working_messages.append({"role": "system", "content": system_prompt})
         working_messages.extend(history)
-        iterations = 0
-        while iterations < TELEGRAM_TOOLS_MAX_ITERATIONS:
-            native_tool_calls = pending_native_tool_calls if isinstance(pending_native_tool_calls, list) else []
-            parsed = _telegram_tools.parse_telegram_tool_response(reply)
-            result_message = last_tool_result_message or ""
-            if not native_tool_calls and not parsed:
-                planning_chatter_checker = getattr(_telegram_tools, "reply_looks_like_tool_planning", None)
-                if (
-                    iterations > 0
-                    and result_message
-                    and callable(planning_chatter_checker)
-                    and planning_chatter_checker(reply)
-                ):
-                    if bool(last_tool_success):
-                        reply = f"Here's what I found:\n\n{result_message}"
-                    else:
-                        reply = (
-                            _telegram_tool_error_reply
-                            if _telegram_tools.tool_result_looks_like_error(result_message)
-                            else f"I ran into an issue while calling the tool:\n\n{result_message}"
-                        )
-                break
-            # After at least one tool execution, prefer mixed natural-language replies
-            # over re-entering the tool loop when the model includes incidental XML.
-            if (
-                not native_tool_calls
-                and iterations > 0
-                and parsed
-                and not _telegram_tools.reply_looks_like_tool_call(reply)
-            ):
-                cleaned_reply = _telegram_tools.strip_tool_call_markup(reply)
-                if cleaned_reply:
-                    reply = cleaned_reply
-                break
-            # Build context for tool execution
-            tool_ctx = {
-                "conversation_id": conversation_id,
-                "user_id": request.user_id,
-                "todo_user_key": todo_user_key,
-                "task_execute_start": _task_execute_start,
-                "task_execute_resume": _task_execute_resume,
-                "task_execute_cancel": _task_execute_cancel,
-                "task_execution_status": _task_execution_status,
-                "task_execution_register_telegram_target": _task_execution_register_telegram_target,
-                "todo_store": telegram_todo,
-                "memory_cache_store": telegram_memory_cache,
-                "do_search": _do_proxy_search,
-                "do_fetch": _do_proxy_fetch,
-                "do_news": _do_proxy_news,
-                "do_weather": _do_proxy_weather,
-                "do_autogen": _do_autogen,
-                "do_codex": _run_codex_cli,
-                "do_restart_proxy": lambda reason=None: _request_proxy_restart(
-                    trigger=f"telegram_tool:{(reason or '').strip() or 'requested'}",
-                    requested_by=f"telegram:{request.user_id or conversation_id}",
-                ),
-                "do_browser_agent": _do_browser_agent,
-                "do_deep_research": lambda args: _do_deep_research_for_telegram(
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    body=args if isinstance(args, dict) else {},
-                ),
-                "do_browser_health_check": _do_browser_health_check,
-                "read_file_internal": _read_file_internal,
-                "write_file_internal": _write_file_internal,
-                "list_files_internal": _list_files_internal,
-                "send_telegram_file_internal": lambda filename, caption=None: _send_telegram_file_internal(
-                    request.user_id or conversation_id,
-                    filename,
-                    caption=caption,
-                ),
-                "upload_drive_internal": _upload_drive_internal,
-                "execute_skill_tool": lambda tool_name, tool_args: _execute_skill_framework_tool(
-                    tool_name=tool_name,
-                    arguments=tool_args,
-                    conversation_id=conversation_id,
-                    user_id=request.user_id,
-                    metadata={"channel": "telegram"},
-                ),
-                "memory_manager": memory_manager if MEMORY_AVAILABLE else None,
-            }
 
-            if native_tool_calls:
-                working_messages.append({"role": "assistant", "tool_calls": native_tool_calls})
-                for native_call in native_tool_calls:
-                    native_function = native_call.get("function") if isinstance(native_call, dict) else {}
-                    tool_name = (
-                        (native_function.get("name") if isinstance(native_function, dict) else None)
-                        or (native_call.get("name") if isinstance(native_call, dict) else None)
-                    )
-                    if not tool_name:
-                        continue
-                    await _update_status_session(
-                        conversation_id=conversation_id,
-                        request_id=request_id,
-                        state=f"Working: executing tool {tool_name}",
-                        phase=f"tool:{tool_name}",
-                    )
-                    raw_args = (
-                        (native_function.get("arguments") if isinstance(native_function, dict) else None)
-                        or (native_call.get("arguments") if isinstance(native_call, dict) else "{}")
-                    )
-                    try:
-                        tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    except (TypeError, json.JSONDecodeError):
-                        tool_args = {}
-                    if not isinstance(tool_args, dict):
-                        tool_args = {}
-                    try:
-                        tool_result = await _telegram_tools.execute_telegram_tool(tool_name, tool_args, tool_ctx)
-                    except Exception as e:
-                        tool_result = {"success": False, "message": str(e)}
-                    result_message = tool_result.get("message", str(tool_result))
-                    last_tool_result_message = result_message
-                    last_tool_success = tool_result.get("success", True)
-                    normalized_tool_name = str(tool_name or "").strip()
-                    if (
-                        bool(last_tool_success)
-                        and normalized_tool_name
-                        and normalized_tool_name not in _tool_discovery_or_setup_names
-                    ):
-                        preferred_tool_result_message = result_message
-                        preferred_tool_success = True
-                    working_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": native_call.get("id") if isinstance(native_call, dict) else None,
-                            "content": result_message,
-                        }
-                    )
+        def _build_telegram_tool_loop_controller_prompt() -> str:
+            return (
+                "You are continuing a Telegram tool-assisted reply.\n"
+                "Return exactly one of these two outputs:\n"
+                "1. Structured tool calls only, with no user-facing text, when another tool is required.\n"
+                "2. A direct final answer to the user, with no XML or tool-call markup, when you already have enough information.\n"
+                "Use XML tool markup only as a fallback when structured tool calls are unavailable.\n"
+                "Do not narrate plans, next steps, or intentions.\n"
+                "Do not ask the user to repeat URLs, filenames, search results, or prior tool output already in context.\n"
+                "Reuse exact values from the latest tool result whenever possible.\n"
+                "If the latest tool result already answers the request, summarize it directly for the user.\n"
+                "For file tasks: if a likely filename is already known, use readFile. "
+                "Use searchFiles when you need to find which file contains something. "
+                "Use listFiles only for discovery when no likely file or folder is known. "
+                "Do not repeat broad listFiles calls after a candidate file has already been identified."
+            )
+
+        def _build_telegram_followup_messages(
+            extra_messages: Optional[List[Dict[str, Any]]] = None,
+        ) -> List[Dict[str, Any]]:
+            messages_for_payload = list(working_messages)
+            controller_message = {"role": "system", "content": _build_telegram_tool_loop_controller_prompt()}
+            if messages_for_payload and messages_for_payload[0].get("role") == "system":
+                messages_for_payload.insert(1, controller_message)
             else:
-                tool_name = parsed.get("name")
-                if tool_name:
-                    await _update_status_session(
-                        conversation_id=conversation_id,
-                        request_id=request_id,
-                        state=f"Working: executing tool {tool_name}",
-                        phase=f"tool:{tool_name}",
-                    )
-                args_str = parsed.get("arguments", "{}")
-                try:
-                    tool_args = json.loads(args_str) if isinstance(args_str, str) else args_str
-                except (TypeError, json.JSONDecodeError):
-                    tool_args = {}
-                if not isinstance(tool_args, dict):
-                    tool_args = {}
-                try:
-                    tool_result = await _telegram_tools.execute_telegram_tool(tool_name, tool_args, tool_ctx)
-                except Exception as e:
-                    tool_result = {"success": False, "message": str(e)}
-                result_message = tool_result.get("message", str(tool_result))
-                last_tool_result_message = result_message
-                last_tool_success = tool_result.get("success", True)
-                normalized_tool_name = str(tool_name or "").strip()
-                if (
-                    bool(last_tool_success)
-                    and normalized_tool_name
-                    and normalized_tool_name not in _tool_discovery_or_setup_names
-                ):
-                    preferred_tool_result_message = result_message
-                    preferred_tool_success = True
-                working_messages.append({"role": "assistant", "content": reply})
-                working_messages.append({"role": "user", "content": f"Tool result: {result_message}"})
-            payload_tool = {"model": model_name, "messages": working_messages}
+                messages_for_payload.insert(0, controller_message)
+            if extra_messages:
+                messages_for_payload.extend(extra_messages)
+            return messages_for_payload
+
+        async def _request_telegram_tool_followup(
+            extra_messages: Optional[List[Dict[str, Any]]] = None,
+        ) -> Tuple[str, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+            payload_tool = {"model": model_name, "messages": _build_telegram_followup_messages(extra_messages)}
+            if TELEGRAM_TOOLS_ENABLED and _telegram_tools is not None:
+                telegram_tools_payload = _get_telegram_combined_openai_tools()
+                if telegram_tools_payload:
+                    payload_tool["tools"] = telegram_tools_payload
+                    payload_tool["tool_choice"] = "auto"
             if request.temperature is not None:
                 payload_tool["temperature"] = request.temperature
             if request.max_output_tokens is not None:
@@ -6232,7 +7850,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             await _update_status_session(
                 conversation_id=conversation_id,
                 request_id=request_id,
-                state="Working: requesting final response",
+                state="Nearly there. I'm pulling the result together for you now.",
                 phase="llm_followup",
             )
             try:
@@ -6251,16 +7869,24 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     source_label="telegram_tool_followup_request_error",
                 )
                 if fallback_response_tool is None:
-                    reply = (
+                    fallback_reply = (
                         _telegram_tool_error_reply
                         if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message))
                         else f"Here's what I found:\n\n{result_message}"
                     )
-                    pending_native_tool_calls = []
-                    break
+                    return fallback_reply, [], None
                 response_tool = fallback_response_tool
             if response_tool.status_code != 200:
-                print(f"Telegram tool follow-up returned status {response_tool.status_code}, using tool result as reply")
+                response_text = ""
+                try:
+                    response_text = str(response_tool.text or "")
+                except Exception:
+                    response_text = ""
+                response_preview = response_text[:2000] if response_text else "<empty body>"
+                print(
+                    "Telegram tool follow-up returned status "
+                    f"{response_tool.status_code}, body={response_preview}"
+                )
                 if is_context_limit_error(response_tool.status_code, response_tool.text or ""):
                     if not summarized_tool and isinstance(payload_tool.get("messages"), list):
                         payload_tool["messages"] = await _summarize_messages_for_budget_proxy(
@@ -6320,35 +7946,44 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     if fallback_response_tool is not None:
                         response_tool = fallback_response_tool
                 if response_tool.status_code != 200:
-                    reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
-                    break
+                    fallback_reply = (
+                        _telegram_tool_error_reply
+                        if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message))
+                        else f"Here's what I found:\n\n{result_message}"
+                    )
+                    return fallback_reply, [], None
             data_tool = response_tool.json()
             choices_tool = data_tool.get("choices") or []
             if not choices_tool:
                 print("Telegram tool follow-up returned no choices, using tool result as reply")
-                reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
-                pending_native_tool_calls = []
-                break
-            tool_followup_message = choices_tool[0].get("message") or {}
-            followup_tool_calls = tool_followup_message.get("tool_calls")
-            pending_native_tool_calls = followup_tool_calls if isinstance(followup_tool_calls, list) else []
-            new_content = _coerce_telegram_response_text(tool_followup_message.get("content"))
-            # If follow-up has no content (e.g. GLM 5 returns empty), use tool result so user never sees raw XML
-            if not new_content.strip() and not pending_native_tool_calls:
+                fallback_reply = (
+                    _telegram_tool_error_reply
+                    if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message))
+                    else f"Here's what I found:\n\n{result_message}"
+                )
+                return fallback_reply, [], None
+            normalized_followup = normalize_chat_completion_message(
+                choices_tool[0].get("message") or {},
+                preserve_reasoning_details=preserve_reasoning_details,
+            )
+            new_pending_native_tool_calls = normalized_followup.get("tool_calls") or []
+            new_content = normalized_followup.get("content") or ""
+            if not new_content.strip() and not new_pending_native_tool_calls:
                 print("Telegram tool follow-up returned empty content, using tool result as reply")
-                reply = _telegram_tool_error_reply if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message)) else f"Here's what I found:\n\n{result_message}"
-            else:
-                reply = new_content
-            iterations += 1
+                fallback_reply = (
+                    _telegram_tool_error_reply
+                    if (not last_tool_success or _telegram_tools.tool_result_looks_like_error(result_message))
+                    else f"Here's what I found:\n\n{result_message}"
+                )
+                return fallback_reply, [], None
+            followup_history_message = (
+                normalized_followup.get("message")
+                if new_pending_native_tool_calls
+                else None
+            )
+            return new_content, new_pending_native_tool_calls, followup_history_message
 
-        # If loop exited due iteration cap, prevent planning chatter from leaking
-        # when we already have a concrete tool result.
-        planning_chatter_checker = getattr(_telegram_tools, "reply_looks_like_tool_planning", None)
-        if (
-            callable(planning_chatter_checker)
-            and planning_chatter_checker(reply)
-            and last_tool_result_message
-        ):
+        def _build_telegram_result_reply_from_last_tool() -> str:
             result_for_user = preferred_tool_result_message or last_tool_result_message
             success_for_user = (
                 preferred_tool_success
@@ -6356,13 +7991,184 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 else last_tool_success
             )
             if bool(success_for_user):
-                reply = f"Here's what I found:\n\n{result_for_user}"
+                return f"Here's what I found:\n\n{result_for_user}"
+            return (
+                _telegram_tool_error_reply
+                if _telegram_tools.tool_result_looks_like_error(str(result_for_user or ""))
+                else f"I ran into an issue while calling the tool:\n\n{result_for_user}"
+            )
+
+        planning_chatter_checker = getattr(_telegram_tools, "reply_looks_like_tool_planning", None)
+        iterations = 0
+        while iterations < TELEGRAM_TOOLS_MAX_ITERATIONS:
+            native_tool_calls = pending_native_tool_calls if isinstance(pending_native_tool_calls, list) else []
+            parsed = _telegram_tools.parse_telegram_tool_response(reply)
+            result_message = last_tool_result_message or ""
+            if not native_tool_calls and not parsed:
+                if (
+                    iterations > 0
+                    and result_message
+                    and callable(planning_chatter_checker)
+                    and planning_chatter_checker(reply)
+                ):
+                    reply = _build_telegram_result_reply_from_last_tool()
+                break
+            # After at least one tool execution, prefer mixed natural-language replies
+            # over re-entering the tool loop when the model includes incidental XML.
+            if (
+                not native_tool_calls
+                and iterations > 0
+                and parsed
+                and not _telegram_tools.reply_looks_like_tool_call(reply)
+            ):
+                cleaned_reply = _telegram_tools.strip_tool_call_markup(reply)
+                if cleaned_reply and not _telegram_tools.reply_looks_like_tool_planning(cleaned_reply):
+                    reply = cleaned_reply
+                    break
+            # Build context for tool execution
+            tool_ctx = {
+                "conversation_id": conversation_id,
+                "user_id": request.user_id,
+                "todo_user_key": todo_user_key,
+                "task_execute_start": _task_execute_start,
+                "task_execute_resume": _task_execute_resume,
+                "task_execute_cancel": _task_execute_cancel,
+                "task_execution_status": _task_execution_status,
+                "task_execution_register_telegram_target": _task_execution_register_telegram_target,
+                "todo_store": telegram_todo,
+                "memory_cache_store": telegram_memory_cache,
+                "do_search": _do_proxy_search,
+                "do_fetch": _do_proxy_fetch,
+                "do_news": _do_proxy_news,
+                "do_weather": _do_proxy_weather,
+                "do_autogen": _do_autogen,
+                "do_codex": _run_codex_cli,
+                "do_restart_proxy": lambda reason=None: _request_proxy_restart(
+                    trigger=f"telegram_tool:{(reason or '').strip() or 'requested'}",
+                    requested_by=f"telegram:{request.user_id or conversation_id}",
+                ),
+                "do_browser_agent": _do_browser_agent,
+                "do_deep_research": lambda args: _do_deep_research_for_telegram(
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    body=args if isinstance(args, dict) else {},
+                ),
+                "do_browser_health_check": _do_browser_health_check,
+                "read_file_internal": _read_file_internal,
+                "write_file_internal": _write_file_internal,
+                "list_files_internal": _list_files_internal,
+                "search_files_internal": _search_files_internal,
+                "send_telegram_file_internal": lambda filename, caption=None: _send_telegram_file_internal(
+                    request.user_id or conversation_id,
+                    filename,
+                    caption=caption,
+                ),
+                "upload_drive_internal": _upload_drive_internal,
+                "execute_skill_tool": lambda tool_name, tool_args: _execute_skill_framework_tool(
+                    tool_name=tool_name,
+                    arguments=tool_args,
+                    conversation_id=conversation_id,
+                    user_id=request.user_id,
+                    metadata={"channel": "telegram"},
+                ),
+                "memory_manager": memory_manager if MEMORY_AVAILABLE else None,
+            }
+
+            if native_tool_calls:
+                assistant_tool_message = pending_native_tool_message or {
+                    "role": "assistant",
+                    "tool_calls": native_tool_calls,
+                }
+                working_messages.append(assistant_tool_message)
+                for native_call in native_tool_calls:
+                    native_function = native_call.get("function") if isinstance(native_call, dict) else {}
+                    tool_name = (
+                        (native_function.get("name") if isinstance(native_function, dict) else None)
+                        or (native_call.get("name") if isinstance(native_call, dict) else None)
+                    )
+                    if not tool_name:
+                        continue
+                    await _update_status_session(
+                        conversation_id=conversation_id,
+                        request_id=request_id,
+                        state=_format_telegram_tool_status(tool_name),
+                        phase=f"tool:{tool_name}",
+                    )
+                    raw_args = (
+                        (native_function.get("arguments") if isinstance(native_function, dict) else None)
+                        or (native_call.get("arguments") if isinstance(native_call, dict) else "{}")
+                    )
+                    try:
+                        tool_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except (TypeError, json.JSONDecodeError):
+                        tool_args = {}
+                    if not isinstance(tool_args, dict):
+                        tool_args = {}
+                    try:
+                        tool_result = await _telegram_tools.execute_telegram_tool(tool_name, tool_args, tool_ctx)
+                    except Exception as e:
+                        tool_result = {"success": False, "message": str(e)}
+                    result_message = tool_result.get("message", str(tool_result))
+                    last_tool_result_message = result_message
+                    last_tool_success = tool_result.get("success", True)
+                    normalized_tool_name = str(tool_name or "").strip()
+                    if (
+                        bool(last_tool_success)
+                        and normalized_tool_name
+                        and normalized_tool_name not in _tool_discovery_or_setup_names
+                    ):
+                        preferred_tool_result_message = result_message
+                        preferred_tool_success = True
+                    working_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": native_call.get("id") if isinstance(native_call, dict) else None,
+                            "content": result_message,
+                        }
+                    )
             else:
-                reply = (
-                    _telegram_tool_error_reply
-                    if _telegram_tools.tool_result_looks_like_error(result_for_user)
-                    else f"I ran into an issue while calling the tool:\n\n{result_for_user}"
-                )
+                tool_name = parsed.get("name")
+                if tool_name:
+                    await _update_status_session(
+                        conversation_id=conversation_id,
+                        request_id=request_id,
+                        state=_format_telegram_tool_status(tool_name),
+                        phase=f"tool:{tool_name}",
+                    )
+                args_str = parsed.get("arguments", "{}")
+                try:
+                    tool_args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except (TypeError, json.JSONDecodeError):
+                    tool_args = {}
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+                try:
+                    tool_result = await _telegram_tools.execute_telegram_tool(tool_name, tool_args, tool_ctx)
+                except Exception as e:
+                    tool_result = {"success": False, "message": str(e)}
+                result_message = tool_result.get("message", str(tool_result))
+                last_tool_result_message = result_message
+                last_tool_success = tool_result.get("success", True)
+                normalized_tool_name = str(tool_name or "").strip()
+                if (
+                    bool(last_tool_success)
+                    and normalized_tool_name
+                    and normalized_tool_name not in _tool_discovery_or_setup_names
+                ):
+                    preferred_tool_result_message = result_message
+                    preferred_tool_success = True
+                canonical_tool_reply = _telegram_tools.format_telegram_tool_call(tool_name, tool_args)
+                working_messages.append({"role": "assistant", "content": canonical_tool_reply})
+                working_messages.append({"role": "user", "content": f"Tool result: {result_message}"})
+            reply, pending_native_tool_calls, pending_native_tool_message = await _request_telegram_tool_followup()
+            iterations += 1
+
+        if (
+            callable(planning_chatter_checker)
+            and planning_chatter_checker(reply)
+            and last_tool_result_message
+        ):
+            reply = _build_telegram_result_reply_from_last_tool()
 
     # Never send raw tool-call XML to the user: if reply still looks like a tool call, show last tool result instead
     if _telegram_tools is not None:
@@ -6394,7 +8200,11 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
             else last_tool_success
         )
         if result_for_user is not None:
-            print("Telegram: reply was raw tool call, using last tool result for user")
+            reply_preview = re.sub(r"\s+", " ", str(reply or "")).strip()[:300]
+            print(
+                "Telegram: reply was raw tool call, using last tool result for user. "
+                f"preview={reply_preview}"
+            )
             if not success_for_user or _telegram_tools.tool_result_looks_like_error(result_for_user):
                 reply = _telegram_tool_error_reply
             else:
@@ -6454,7 +8264,7 @@ async def telegram_clear_conversation(request: Request, conversation_id: str):
 @app.post("/v1/status/start")
 async def status_start(request: StatusStartRequest):
     """Start a status session for progress updates."""
-    state = (request.state or "Working: processing your request...").strip()
+    state = (request.state or "On it. I'm working on that now.").strip()
     await _start_status_session(
         conversation_id=request.conversation_id,
         request_id=request.request_id,
@@ -6898,70 +8708,8 @@ async def get_all_available_tools() -> List[Dict]:
     })
     print("[PHILOSOPHER] Added weather_info tool")
     
-    # 4. File manipulation tools (scratch directory only; when file ops available)
+    # 4. Native delete tool (filesystem list/read/write/search are skill-backed)
     if FILE_OPS_AVAILABLE:
-        all_tools.append({
-            "name": "read_file",
-            "description": "Read a file from the scratch workspace. Supported: .txt, .md, .docx, .xlsx, .xls, .pdf, .png, .jpg, .jpeg, .py, .js, .html. Use filename only (e.g. notes.txt), no path traversal.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "filename": {
-                        "type": "string",
-                        "description": "Name of the file to read (e.g. notes.txt)",
-                    },
-                    "max_chars": {
-                        "type": "integer",
-                        "description": "Optional max characters to return (default 12000).",
-                    },
-                },
-                "required": ["filename"]
-            },
-            "server_id": "proxy_server"
-        })
-        all_tools.append({
-            "name": "write_file",
-            "description": "Write or overwrite a file in the scratch workspace. Supported: .txt, .md, .docx, .xlsx, .xls, .pdf, .py, .js, .html. Use filename with extension or filename plus format.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "filename": {
-                        "type": "string",
-                        "description": "Name of the file (e.g. report.txt or report with format)",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Text content to write",
-                    },
-                    "format": {
-                        "type": "string",
-                        "description": "Format if filename has no extension (default: txt)",
-                        "default": "txt"
-                    }
-                },
-                "required": ["filename", "content"]
-            },
-            "server_id": "proxy_server"
-        })
-        all_tools.append({
-            "name": "list_files",
-            "description": "List files in the scratch workspace (optionally under a subdirectory, optionally recursive).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Optional subdirectory under scratch (e.g. images or reports/2026).",
-                    },
-                    "recursive": {
-                        "type": "boolean",
-                        "description": "When true, include files in nested folders below path.",
-                        "default": False,
-                    },
-                },
-            },
-            "server_id": "proxy_server"
-        })
         all_tools.append({
             "name": "delete_file",
             "description": "Delete a file from the scratch workspace. Use filename only (e.g. notes.txt).",
@@ -6977,9 +8725,9 @@ async def get_all_available_tools() -> List[Dict]:
             },
             "server_id": "proxy_server"
         })
-        print("[PHILOSOPHER] Added read_file, write_file, list_files, delete_file tools")
+        print("[PHILOSOPHER] Added delete_file tool; filesystem file tools are skill-backed")
     else:
-        print("[PHILOSOPHER] File ops not available, skipping file manipulation tools")
+        print("[PHILOSOPHER] File ops not available, skipping delete_file tool")
     
     # 5. runWorkflow (AutoGen team - code generation and automation)
     if AUTOGEN_AVAILABLE:
@@ -7307,86 +9055,7 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
         except Exception as e:
             return f"Error executing weather_info: {str(e)}"
 
-    # Handle file manipulation tools (scratch workspace)
-    elif tool_name == "read_file":
-        try:
-            filename = parameters.get("filename", "").strip()
-            if not filename:
-                return "Error: 'filename' is required for read_file"
-            result = await _read_file_internal(filename)
-            if not result.get("success"):
-                return result.get("message", "Read failed")
-            data = result.get("data", {})
-            content = data.get("content", "")
-            content = content if isinstance(content, str) else str(content)
-            req_max_chars = parameters.get("max_chars")
-            if isinstance(req_max_chars, str) and req_max_chars.isdigit():
-                req_max_chars = int(req_max_chars)
-            if isinstance(req_max_chars, (int, float)):
-                max_chars = int(req_max_chars)
-            else:
-                max_chars = int(os.getenv("READ_FILE_MAX_CHARS", "12000") or 12000)
-            max_chars = max(2000, max_chars)
-            if content and len(content) > max_chars:
-                head = max_chars // 2
-                tail = max_chars - head
-                removed = len(content) - max_chars
-                return (
-                    f"{content[:head]}\n\n"
-                    f"...[truncated {removed} chars]...\n\n"
-                    f"{content[-tail:]}"
-                )
-            return content if content else "(empty file)"
-        except Exception as e:
-            return f"Error executing read_file: {str(e)}"
-    
-    elif tool_name == "write_file":
-        try:
-            filename = parameters.get("filename", "").strip()
-            content = parameters.get("content", "")
-            content = content if isinstance(content, str) else str(content)
-            fmt = (parameters.get("format") or "txt").strip() or "txt"
-            if not filename:
-                return "Error: 'filename' is required for write_file"
-            result = await _write_file_internal(filename, content, format=fmt)
-            if not result.get("success"):
-                return result.get("message", "Write failed")
-            return result.get("message", "File written.")
-        except Exception as e:
-            return f"Error executing write_file: {str(e)}"
-    
-    elif tool_name == "list_files":
-        try:
-            requested_path = (
-                str(parameters.get("path", "")).strip()
-                or str(parameters.get("subdir", "")).strip()
-                or str(parameters.get("directory", "")).strip()
-            )
-            recursive = _coerce_bool(parameters.get("recursive", False), default=False)
-
-            result = await _list_files_internal(path=requested_path, recursive=recursive)
-            if not isinstance(result, dict):
-                return "List failed: backend returned an invalid response."
-            if not result.get("success"):
-                return result.get("message", "List failed")
-            files = result.get("files", [])
-            skipped_count = int(result.get("skipped_count", 0) or 0)
-            if not files:
-                path_label = result.get("path") or requested_path or "."
-                message = (
-                    "Scratch workspace is empty for this scope. "
-                    f"(Directory: {result.get('scratch_dir', 'scratch')}, Path: {path_label}, Recursive: {recursive})"
-                )
-                if skipped_count > 0:
-                    message += f" Skipped {skipped_count} inaccessible or unsafe entries."
-                return message
-            rendered = _format_list_files_for_tool_output(files, include_sizes=True)
-            if skipped_count > 0:
-                rendered += f"\n... skipped {skipped_count} inaccessible or unsafe entries."
-            return rendered
-        except Exception as e:
-            return f"Error executing list_files: {str(e)}"
-    
+    # Handle remaining native file tool
     elif tool_name == "delete_file":
         try:
             filename = parameters.get("filename", "").strip()
@@ -7504,6 +9173,10 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             data = result.get("data")
             if not result.get("success", False):
                 return f"Error executing {qualified_skill_tool}: {message or 'unknown error'}"
+            if qualified_skill_tool.startswith("filesystem."):
+                formatted = _format_filesystem_skill_tool_output(qualified_skill_tool, result)
+                if formatted:
+                    return formatted
             if data is None:
                 return message or f"Skill tool '{qualified_skill_tool}' executed successfully."
             if isinstance(data, (dict, list)):
@@ -7620,13 +9293,20 @@ async def philosopher_start(request: PhilosopherStartRequest):
     
     try:
         # Get API configuration
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured")
-        
         api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
-        # Use OPENAI_MODEL directly (not TELEGRAM_DEFAULT_MODEL) since philosopher mode is not Telegram-specific
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        api_key = _first_non_empty_env(preferred_api_key_env_names(api_base, model))
+        if not api_key:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No compatible API key is configured for philosopher mode. "
+                    "Set OPENAI_API_KEY / MCP_LLM_OPENAI_API_KEY, or MINIMAX_API_KEY / "
+                    "MCP_LLM_MINIMAX_API_KEY when using Minimax."
+                ),
+            )
+        
+        # Use OPENAI_MODEL directly (not TELEGRAM_DEFAULT_MODEL) since philosopher mode is not Telegram-specific
         
         # Create philosopher mode instance with tool support
         philosopher = PhilosopherMode(
@@ -7731,13 +9411,77 @@ async def philosopher_contemplate(request: PhilosopherContemplateRequest):
             detail="Philosopher mode instance not found. Try restarting philosopher mode."
         )
     
+    monitor_run_id = _monitor_run_start(
+        "philosopher",
+        "contemplate",
+        input_text=request.question or "",
+        metadata={
+            "conversation_id": conversation_id,
+            "current_step": 0,
+            "total_steps": getattr(philosopher, "max_cycles", 0),
+            "phase": "queued",
+        },
+    )
+
+    async def _philosopher_monitor(event: str, payload: Dict[str, Any]) -> None:
+        workflow_name = _truncate_monitor_text(
+            payload.get("workflow_name") or payload.get("question") or request.question or "Philosopher contemplation",
+            max_chars=220,
+        )
+        metadata: Dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "workflow_name": workflow_name,
+            "phase": payload.get("phase") or event,
+        }
+        for key in (
+            "question",
+            "current_step",
+            "total_steps",
+            "tool_iteration",
+            "max_tool_iterations",
+            "tool_call_count",
+            "completed_steps",
+        ):
+            value = payload.get(key)
+            if value is not None:
+                if key == "question":
+                    value = _truncate_monitor_text(value, max_chars=320)
+                metadata[key] = value
+        summary = payload.get("message") or f"Philosopher event: {event}"
+        _monitor_run_update(monitor_run_id, summary=summary, metadata=metadata)
+        if payload.get("message"):
+            _monitor_run_note(monitor_run_id, payload["message"])
+
+    previous_progress_callback = getattr(philosopher, "progress_callback", None)
+    philosopher.progress_callback = _philosopher_monitor
+
     try:
         # Generate question if not provided
         if request.question:
             question = request.question
+            await _philosopher_monitor(
+                "workflow_selected",
+                {
+                    "question": question,
+                    "workflow_name": question,
+                    "phase": "preparation",
+                    "message": "Using provided philosopher workflow question.",
+                    "current_step": 0,
+                    "total_steps": getattr(philosopher, "max_cycles", 0),
+                },
+            )
         else:
             question = await philosopher.generate_contemplation_question()
             if not question:
+                _monitor_run_finish(
+                    monitor_run_id,
+                    status="error",
+                    summary="Failed to generate philosopher workflow question.",
+                    metadata={
+                        "conversation_id": conversation_id,
+                        "phase": "question_generation",
+                    },
+                )
                 raise HTTPException(status_code=500, detail="Failed to generate contemplation question")
         
         # Execute contemplation
@@ -7748,6 +9492,21 @@ async def philosopher_contemplate(request: PhilosopherContemplateRequest):
             question=result["question"],
             conclusion=result["conclusion"],
             cycle_count=result["cycle_count"]
+        )
+        _monitor_run_finish(
+            monitor_run_id,
+            status="completed",
+            summary=f"Completed philosopher workflow in {result['cycle_count']} step(s).",
+            metadata={
+                "conversation_id": conversation_id,
+                "workflow_name": result["question"],
+                "question": result["question"],
+                "current_step": result["cycle_count"],
+                "total_steps": getattr(philosopher, "max_cycles", result["cycle_count"]),
+                "completed_steps": len(result.get("contemplation_steps") or []),
+                "phase": "completed",
+                "memory_id": memory_id,
+            },
         )
         
         return PhilosopherResponse(
@@ -7762,12 +9521,30 @@ async def philosopher_contemplate(request: PhilosopherContemplateRequest):
             }
         )
     except HTTPException:
+        if monitor_run_id in monitor_active_runs:
+            _monitor_run_finish(
+                monitor_run_id,
+                status="error",
+                summary="Philosopher workflow failed.",
+                metadata={"conversation_id": conversation_id},
+            )
         raise
     except Exception as e:
         print(f"Error during contemplation: {e}")
         import traceback
         print(traceback.format_exc())
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary=f"Philosopher workflow failed: {str(e)}",
+            metadata={
+                "conversation_id": conversation_id,
+                "phase": "error",
+            },
+        )
         raise HTTPException(status_code=500, detail=f"Failed to contemplate: {str(e)}")
+    finally:
+        philosopher.progress_callback = previous_progress_callback
 
 # ============================================================================
 # END PHILOSOPHER MODE ENDPOINTS
@@ -7796,7 +9573,12 @@ async def monitor_dashboard():
 async def monitor_summary():
     """Return high-level system status summary."""
     uptime_seconds = max(0.0, time.time() - PROXY_START_TIME)
-    openai_key_present = bool(os.getenv("OPENAI_API_KEY") or os.getenv("MCP_LLM_OPENAI_API_KEY"))
+    openai_key_present = bool(
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("MCP_LLM_OPENAI_API_KEY")
+        or os.getenv("MINIMAX_API_KEY")
+        or os.getenv("MCP_LLM_MINIMAX_API_KEY")
+    )
     return {
         "time": time.time(),
         "uptime_seconds": uptime_seconds,
@@ -7805,6 +9587,11 @@ async def monitor_summary():
         "status_sessions_active": len(status_sessions),
         "openai_api_key_configured": openai_key_present,
         "status_events_file": str(STATUS_EVENTS_FILE),
+        "autogen_active_runs": _get_monitor_runs_payload("autogen")["active_count"],
+        "browser_use_active_runs": _get_monitor_runs_payload("browser_use")["active_count"],
+        "philosopher_active_runs": _get_monitor_runs_payload("philosopher")["active_count"],
+        "task_execution_active_runs": _get_monitor_runs_payload("task_execution")["active_count"],
+        "browser_use_log_file_configured": bool(BROWSER_USE_LOG_FILE),
     }
 
 
@@ -7819,13 +9606,63 @@ async def monitor_status(limit: int = 50):
 async def monitor_logs(limit: int = 200):
     """Return the last N lines from the proxy log file if configured."""
     limit = max(1, min(1000, limit))
-    log_path_env = os.getenv("PROXY_LOG_FILE") or ""
-    log_path = Path(log_path_env) if log_path_env else None
+    log_path = PROXY_LOG_FILE
     if not log_path or not log_path.exists():
         return {"available": False, "lines": []}
     text = _tail_text_file(log_path, max_lines=limit)
     lines = text.splitlines()
-    return {"available": True, "lines": lines[-limit:]}
+    return {"available": True, "lines": lines[-limit:], "path": str(log_path)}
+
+
+@app.get("/monitor/workflows")
+async def monitor_workflows():
+    """Return recent AutoGen, Browser-use, Philosopher, and task execution activity."""
+    browser_health = dict(monitor_browser_health_snapshot)
+    if _monitor_browser_health_is_stale(browser_health):
+        try:
+            await _do_browser_health_check({})
+            browser_health = dict(monitor_browser_health_snapshot)
+        except HTTPException:
+            browser_health = dict(monitor_browser_health_snapshot)
+    return {
+        "autogen": _get_monitor_runs_payload("autogen"),
+        "browser_use": {
+            **_get_monitor_runs_payload("browser_use"),
+            "health": browser_health,
+            "log_file_configured": bool(BROWSER_USE_LOG_FILE),
+        },
+        "philosopher": _get_monitor_runs_payload("philosopher"),
+        "task_execution": _get_monitor_runs_payload("task_execution"),
+    }
+
+
+@app.get("/monitor/workflows/log/{run_id}")
+async def monitor_workflow_log(run_id: str):
+    """Return the full scratch log for a recent workflow run when available."""
+    run = _find_monitor_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+    log_file = run.get("log_file")
+    log_path = _resolve_monitor_log_path(log_file)
+    payload = _read_monitor_run_log(log_path)
+    return {
+        "run_id": run_id,
+        "status": run.get("status"),
+        "log_file": log_file,
+        **payload,
+    }
+
+
+@app.get("/monitor/logs/browser-use")
+async def monitor_browser_use_logs(limit: int = 200):
+    """Return the last N lines from the browser-use log file when configured."""
+    limit = max(1, min(1000, limit))
+    log_path = Path(BROWSER_USE_LOG_FILE) if BROWSER_USE_LOG_FILE else None
+    if not log_path or not log_path.exists():
+        return {"available": False, "lines": []}
+    text = _tail_text_file(log_path, max_lines=limit)
+    lines = text.splitlines()
+    return {"available": True, "lines": lines[-limit:], "path": str(log_path)}
 
 # Health check endpoint
 @app.get("/health")
@@ -7929,6 +9766,13 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
 # Shared browser-agent logic for route and Telegram tool runner
 async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
     """Forward browser-agent request to MCP browser server. Returns response dict or raises HTTPException."""
+    normalized_body = dict(body or {}) if isinstance(body, dict) else {}
+    if "instruction" in normalized_body and "task" not in normalized_body:
+        normalized_body["task"] = normalized_body.get("instruction")
+    instruction_preview = str(
+        normalized_body.get("task") or normalized_body.get("instruction") or normalized_body.get("url") or ""
+    )
+    monitor_run_id = _monitor_run_start("browser_use", "browser-agent", input_text=instruction_preview)
     mcp_browser_url = os.getenv('MCP_BROWSER_SERVER_URL', None)
     if not mcp_browser_url:
         try:
@@ -7944,6 +9788,7 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
     else:
         print(f"   Using configured MCP_BROWSER_SERVER_URL: {mcp_browser_url}")
     endpoint = f"{mcp_browser_url.rstrip('/')}/api/browser-agent"
+    _monitor_run_note(monitor_run_id, f"Proxying browser-agent request to {endpoint}")
     print(f"ðŸŒ Proxying browser-agent request to: {endpoint}")
     health_endpoint = f"{mcp_browser_url.rstrip('/')}/api/health"
     health_check_passed = False
@@ -7953,6 +9798,7 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
             if health_response.status_code == 200:
                 health_check_passed = True
     except Exception as health_err:
+        _monitor_run_note(monitor_run_id, f"Health check warning: {health_err}")
         print(f"   âš ï¸  MCP browser server health check failed: {health_err}")
         if not mcp_browser_url.startswith("http://127.0.0.1"):
             mcp_browser_url = "http://127.0.0.1:5001"
@@ -7965,23 +9811,31 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
     if not health_check_passed:
+        _monitor_run_note(monitor_run_id, "Browser server health check did not pass, continuing anyway.")
         print(f"   âš ï¸  Warning: Health check failed, but continuing with request")
     timeout = httpx.Timeout(connect=10.0, read=10800.0, write=10.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         try:
-            response = await client.post(endpoint, json=body, headers={'Content-Type': 'application/json'})
+            response = await client.post(
+                endpoint,
+                json=normalized_body,
+                headers={'Content-Type': 'application/json'},
+            )
         except httpx.ConnectError as conn_err:
+            _monitor_run_finish(monitor_run_id, status="error", summary=f"Browser-agent connection error: {conn_err}")
             print(f"âŒ Connection error to MCP browser server: {conn_err}")
             raise HTTPException(
                 status_code=503,
                 detail="Could not connect to MCP browser server. Please ensure it's running on port 5001."
             )
         except httpx.ReadTimeout:
+            _monitor_run_finish(monitor_run_id, status="error", summary="Browser-agent request timed out.")
             raise HTTPException(
                 status_code=504,
                 detail="Browser automation task timed out. Please try again or check the MCP browser server logs."
             )
         except httpx.TimeoutException:
+            _monitor_run_finish(monitor_run_id, status="error", summary="Browser-agent request timed out.")
             raise HTTPException(
                 status_code=504,
                 detail="Browser automation task timed out. Please try again or check the MCP browser server logs."
@@ -7989,9 +9843,22 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
     print(f"✅ Browser-agent response status: {response.status_code}")
     if response.status_code != 200:
         error_content = response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text}
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary=error_content.get("error", str(error_content)),
+            metadata={"http_status": response.status_code},
+        )
         print(f"   Error response: {error_content}")
         raise HTTPException(status_code=response.status_code, detail=error_content.get("error", str(error_content)))
-    return response.json()
+    response_json = response.json()
+    _monitor_run_finish(
+        monitor_run_id,
+        status="completed",
+        summary=_truncate_monitor_text(response_json.get("message") or response_json.get("result") or response_json),
+        metadata={"http_status": response.status_code},
+    )
+    return response_json
 
 
 @app.post("/v1/proxy/browser-agent")
@@ -8003,8 +9870,34 @@ async def proxy_browser_agent(request: Request):
 
 
 # Shared deep-research logic for route and Telegram tool runner
+def _normalize_deep_research_body(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize deep-research payload aliases before forwarding to browser-use."""
+    normalized = dict(body or {}) if isinstance(body, dict) else {}
+
+    research_task = (
+        normalized.get("research_task")
+        or normalized.pop("researchTask", None)
+        or normalized.get("topic")
+    )
+    if research_task is not None:
+        research_text = str(research_task).strip()
+        if research_text:
+            normalized["research_task"] = research_text
+
+    max_parallel = normalized.get("max_parallel_browsers")
+    if max_parallel is None:
+        max_parallel = normalized.pop("maxParallelBrowsers", None)
+    if max_parallel is not None:
+        normalized["max_parallel_browsers"] = max_parallel
+
+    return normalized
+
+
 async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
     """Forward deep-research request to MCP browser server. Returns response dict or raises HTTPException."""
+    normalized_body = _normalize_deep_research_body(body)
+    research_preview = str(normalized_body.get("research_task") or normalized_body.get("topic") or "")
+    monitor_run_id = _monitor_run_start("browser_use", "deep-research", input_text=research_preview)
     mcp_browser_url = os.getenv('MCP_BROWSER_SERVER_URL', None)
     if not mcp_browser_url:
         try:
@@ -8020,11 +9913,12 @@ async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
     else:
         print(f"   Using configured MCP_BROWSER_SERVER_URL: {mcp_browser_url}")
     endpoint = f"{mcp_browser_url.rstrip('/')}/api/deep-research"
+    _monitor_run_note(monitor_run_id, f"Proxying deep-research request to {endpoint}")
     print(f"🔬 Proxying deep-research request to: {endpoint}")
     timeout = httpx.Timeout(connect=10.0, read=10800.0, write=10.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
-            response = await client.post(endpoint, json=body, headers={'Content-Type': 'application/json'})
+            response = await client.post(endpoint, json=normalized_body, headers={'Content-Type': 'application/json'})
         except httpx.ConnectError as conn_err:
             print(f"âŒ Connection error to MCP browser server: {conn_err}")
             raise HTTPException(
@@ -8032,6 +9926,7 @@ async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
                 detail="Could not connect to MCP browser server. Please ensure it's running on port 5001."
             )
         except httpx.ReadTimeout as timeout_err:
+            _monitor_run_finish(monitor_run_id, status="error", summary=f"Deep research timed out: {timeout_err}")
             print(f"âŒ Read timeout from MCP browser server: {timeout_err}")
             raise HTTPException(
                 status_code=504,
@@ -8040,8 +9935,21 @@ async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
     print(f"✅ Deep-research response status: {response.status_code}")
     if response.status_code != 200:
         error_content = response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text}
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary=error_content.get("error", str(error_content)),
+            metadata={"http_status": response.status_code},
+        )
         raise HTTPException(status_code=response.status_code, detail=error_content.get("error", str(error_content)))
-    return response.json()
+    response_json = response.json()
+    _monitor_run_finish(
+        monitor_run_id,
+        status="completed",
+        summary=_truncate_monitor_text(response_json.get("message") or response_json.get("report") or response_json),
+        metadata={"http_status": response.status_code},
+    )
+    return response_json
 
 
 async def _acquire_telegram_deep_research_slot(
@@ -8123,6 +10031,14 @@ async def _do_deep_research_for_telegram(
 async def _do_browser_health_check(body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Call browser-use MCP health_check and normalize to JSON for CATBot tool consumers."""
     if not MCP_BROWSER_USE_HTTP_URL:
+        monitor_browser_health_snapshot.update(
+            {
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "ok": False,
+                "message": "Browser-use is not configured (MCP_BROWSER_USE_HTTP_URL not set).",
+                "result": None,
+            }
+        )
         raise HTTPException(status_code=503, detail="Browser-use is not configured (MCP_BROWSER_USE_HTTP_URL not set).")
     # Upstream health_check tool currently accepts no arguments.
     # Ignore caller-provided payload to avoid schema mismatch errors.
@@ -8130,6 +10046,14 @@ async def _do_browser_health_check(body: Optional[Dict[str, Any]] = None) -> Dic
     try:
         result = await _browser_use_http_call_tool("health_check", payload)
     except Exception as e:
+        monitor_browser_health_snapshot.update(
+            {
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "ok": False,
+                "message": f"{BROWSER_USE_HTTP_UNAVAILABLE_MSG} {str(e)}",
+                "result": None,
+            }
+        )
         raise HTTPException(status_code=503, detail=f"{BROWSER_USE_HTTP_UNAVAILABLE_MSG} {str(e)}")
 
     content = result.get("content", [])
@@ -8156,9 +10080,25 @@ async def _do_browser_health_check(body: Optional[Dict[str, Any]] = None) -> Dic
         running = parsed.get("running_tasks")
         uptime = parsed.get("uptime_seconds")
         message = f"Browser-use status: {status}. Running tasks: {running}. Uptime: {uptime}s."
+        monitor_browser_health_snapshot.update(
+            {
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "ok": True,
+                "message": message,
+                "result": parsed,
+            }
+        )
         return {"success": True, "message": message, "result": parsed}
 
     fallback = text_blob or "Health check completed but returned no content."
+    monitor_browser_health_snapshot.update(
+        {
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "ok": True,
+            "message": fallback,
+            "result": {"raw": fallback},
+        }
+    )
     return {"success": True, "message": fallback, "result": {"raw": fallback}}
 
 
@@ -8227,7 +10167,9 @@ async def proxy_chat_completions(request: Request):
         # Get Authorization header from the request (or server default key)
         auth_header = (request.headers.get('Authorization', '') or "").strip()
         if not auth_header:
-            primary_api_key = _first_non_empty_env(["OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"])
+            primary_api_key = _first_non_empty_env(
+                preferred_api_key_env_names(endpoint, body_clean.get("model"))
+            )
             if primary_api_key:
                 auth_header = f"Bearer {primary_api_key}"
 
@@ -9571,8 +11513,126 @@ def write_pdf_file(filepath: Path, content: str) -> None:
         )
 
 
+def _read_supported_file_text(filepath: Path) -> tuple[str, str]:
+    ext = filepath.suffix.lower()
+    if ext in TEXT_FILE_EXTENSIONS:
+        return read_text_file(filepath), "text"
+    if ext == ".docx":
+        return read_docx_file(filepath), "text"
+    if ext in {".xlsx", ".xls"}:
+        return read_xlsx_file(filepath), "text"
+    if ext == ".pdf":
+        return read_pdf_file(filepath), "text"
+    raise HTTPException(status_code=400, detail=f"Unsupported text-readable file type: {ext}")
+
+
+def _truncate_text_middle(text: str, max_chars: Optional[int]) -> tuple[str, bool]:
+    if max_chars is None or max_chars < 1 or len(text) <= max_chars:
+        return text, False
+    if max_chars < 80:
+        return text[:max_chars], True
+    head = max_chars // 2
+    tail = max_chars - head
+    removed = len(text) - max_chars
+    return (
+        f"{text[:head]}\n\n...[truncated {removed} chars]...\n\n{text[-tail:]}",
+        True,
+    )
+
+
+def _slice_text_for_read(
+    content: str,
+    *,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+    max_chars: Optional[int] = None,
+    include_line_numbers: bool = False,
+) -> Dict[str, Any]:
+    lines = content.splitlines()
+    total_lines = len(lines)
+    excerpt_start_line = 1 if total_lines > 0 else 0
+    excerpt_end_line = total_lines
+    line_filtered = False
+    rendered_lines = lines
+
+    if start_line is not None or end_line is not None:
+        start_index = max(0, (start_line or 1) - 1)
+        resolved_end_line = end_line
+        if resolved_end_line is not None and start_line is not None and resolved_end_line < start_line:
+            resolved_end_line = start_line
+        end_index = total_lines if resolved_end_line is None else min(total_lines, resolved_end_line)
+        rendered_lines = lines[start_index:end_index]
+        excerpt_start_line = start_index + 1 if rendered_lines else 0
+        excerpt_end_line = start_index + len(rendered_lines) if rendered_lines else 0
+        line_filtered = True
+
+    if include_line_numbers and rendered_lines:
+        base_line = excerpt_start_line
+        rendered_text = "\n".join(
+            f"{base_line + index}: {line}" for index, line in enumerate(rendered_lines)
+        )
+    else:
+        rendered_text = "\n".join(rendered_lines)
+
+    truncated_text, truncated = _truncate_text_middle(rendered_text, max_chars)
+    return {
+        "content": truncated_text,
+        "total_lines": total_lines,
+        "excerpt_start_line": excerpt_start_line,
+        "excerpt_end_line": excerpt_end_line,
+        "line_filtered": line_filtered,
+        "truncated": truncated,
+    }
+
+
+def _extract_query_match(
+    content: str,
+    query: str,
+    *,
+    case_sensitive: bool = False,
+) -> Optional[Dict[str, Any]]:
+    if not query:
+        return None
+    haystack = content if case_sensitive else content.lower()
+    needle = query if case_sensitive else query.lower()
+    index = haystack.find(needle)
+    if index < 0:
+        return None
+    line_number = content.count("\n", 0, index) + 1
+    start = max(0, index - 90)
+    end = min(len(content), index + len(query) + 140)
+    excerpt = content[start:end].replace("\r", " ").replace("\n", " ").strip()
+    if start > 0:
+        excerpt = "..." + excerpt
+    if end < len(content):
+        excerpt = excerpt + "..."
+    return {
+        "line_number": line_number,
+        "excerpt": excerpt,
+        "match_count": haystack.count(needle),
+    }
+
+
+def _read_arg_text(arguments: Dict[str, Any], *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = arguments.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return default
+
+
 # Internal file ops for Telegram tool runner (no auth; same security as routes)
-async def _read_file_internal(filename: str) -> Dict[str, Any]:
+async def _read_file_internal(
+    filename: str,
+    *,
+    max_chars: Optional[int] = None,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+    include_line_numbers: bool = False,
+) -> Dict[str, Any]:
     """Read file from scratch dir. Returns dict with success, message, data (content/type). Used by Telegram tools only."""
     if not FILE_OPS_AVAILABLE:
         return {"success": False, "message": "File operations not available."}
@@ -9583,18 +11643,98 @@ async def _read_file_internal(filename: str) -> Dict[str, Any]:
         if filepath.stat().st_size > FILE_OPS_MAX_SIZE_BYTES:
             return {"success": False, "message": "File too large"}
         ext = filepath.suffix.lower()
-        if ext in ['.txt', '.md']:
-            content = read_text_file(filepath)
-            return {"success": True, "message": f"Read {filename}", "data": {"content": content, "type": "text"}}
+        if ext in TEXT_FILE_EXTENSIONS:
+            raw_content = read_text_file(filepath)
+            excerpt = _slice_text_for_read(
+                raw_content,
+                start_line=start_line,
+                end_line=end_line,
+                max_chars=max_chars,
+                include_line_numbers=include_line_numbers,
+            )
+            return {
+                "success": True,
+                "message": f"Read {filename}",
+                "data": {
+                    "content": excerpt["content"],
+                    "type": "text",
+                    "size_bytes": filepath.stat().st_size,
+                    "total_lines": excerpt["total_lines"],
+                    "excerpt_start_line": excerpt["excerpt_start_line"],
+                    "excerpt_end_line": excerpt["excerpt_end_line"],
+                    "truncated": excerpt["truncated"],
+                    "line_filtered": excerpt["line_filtered"],
+                },
+            }
         if ext == '.docx':
-            content = read_docx_file(filepath)
-            return {"success": True, "message": f"Read {filename}", "data": {"content": content, "type": "text"}}
+            raw_content = read_docx_file(filepath)
+            excerpt = _slice_text_for_read(
+                raw_content,
+                start_line=start_line,
+                end_line=end_line,
+                max_chars=max_chars,
+                include_line_numbers=include_line_numbers,
+            )
+            return {
+                "success": True,
+                "message": f"Read {filename}",
+                "data": {
+                    "content": excerpt["content"],
+                    "type": "text",
+                    "size_bytes": filepath.stat().st_size,
+                    "total_lines": excerpt["total_lines"],
+                    "excerpt_start_line": excerpt["excerpt_start_line"],
+                    "excerpt_end_line": excerpt["excerpt_end_line"],
+                    "truncated": excerpt["truncated"],
+                    "line_filtered": excerpt["line_filtered"],
+                },
+            }
         if ext in ['.xlsx', '.xls']:
-            content = read_xlsx_file(filepath)
-            return {"success": True, "message": f"Read {filename}", "data": {"content": content, "type": "text"}}
+            raw_content = read_xlsx_file(filepath)
+            excerpt = _slice_text_for_read(
+                raw_content,
+                start_line=start_line,
+                end_line=end_line,
+                max_chars=max_chars,
+                include_line_numbers=include_line_numbers,
+            )
+            return {
+                "success": True,
+                "message": f"Read {filename}",
+                "data": {
+                    "content": excerpt["content"],
+                    "type": "text",
+                    "size_bytes": filepath.stat().st_size,
+                    "total_lines": excerpt["total_lines"],
+                    "excerpt_start_line": excerpt["excerpt_start_line"],
+                    "excerpt_end_line": excerpt["excerpt_end_line"],
+                    "truncated": excerpt["truncated"],
+                    "line_filtered": excerpt["line_filtered"],
+                },
+            }
         if ext == '.pdf':
-            content = read_pdf_file(filepath)
-            return {"success": True, "message": f"Read {filename}", "data": {"content": content, "type": "text"}}
+            raw_content = read_pdf_file(filepath)
+            excerpt = _slice_text_for_read(
+                raw_content,
+                start_line=start_line,
+                end_line=end_line,
+                max_chars=max_chars,
+                include_line_numbers=include_line_numbers,
+            )
+            return {
+                "success": True,
+                "message": f"Read {filename}",
+                "data": {
+                    "content": excerpt["content"],
+                    "type": "text",
+                    "size_bytes": filepath.stat().st_size,
+                    "total_lines": excerpt["total_lines"],
+                    "excerpt_start_line": excerpt["excerpt_start_line"],
+                    "excerpt_end_line": excerpt["excerpt_end_line"],
+                    "truncated": excerpt["truncated"],
+                    "line_filtered": excerpt["line_filtered"],
+                },
+            }
         if ext in ['.png', '.jpg', '.jpeg']:
             image_data = read_png_file(filepath)
             return {"success": True, "message": f"Read {filename}", "data": {"content": image_data.get("description", ""), "type": "image", "image_data": image_data}}
@@ -9605,7 +11745,13 @@ async def _read_file_internal(filename: str) -> Dict[str, Any]:
         return {"success": False, "message": str(e)}
 
 
-async def _write_file_internal(filename: str, content: str, format: str = "txt") -> Dict[str, Any]:
+async def _write_file_internal(
+    filename: str,
+    content: str,
+    format: str = "txt",
+    *,
+    append: bool = False,
+) -> Dict[str, Any]:
     """Write file to scratch dir. Returns dict with success, message. Used by Telegram tools only."""
     if not FILE_OPS_AVAILABLE:
         return {"success": False, "message": "File operations not available."}
@@ -9620,28 +11766,54 @@ async def _write_file_internal(filename: str, content: str, format: str = "txt")
             logical_name = f"{logical_name}.{format.lower()}"
         filepath = resolve_scratch_path(logical_name, WRITE_ALLOWED_EXTENSIONS)
         ext = filepath.suffix.lower()
-        if ext in ['.txt', '.md']:
-            write_text_file(filepath, content)
+        if ext in TEXT_FILE_EXTENSIONS:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if append else "w"
+            with filepath.open(mode, encoding="utf-8") as handle:
+                handle.write(content)
         elif ext == '.docx':
+            if append:
+                return {"success": False, "message": "append is only supported for text files"}
+            filepath.parent.mkdir(parents=True, exist_ok=True)
             write_docx_file(filepath, content)
         elif ext in ['.xlsx', '.xls']:
+            if append:
+                return {"success": False, "message": "append is only supported for text files"}
+            filepath.parent.mkdir(parents=True, exist_ok=True)
             write_xlsx_file(filepath, content)
         elif ext == '.pdf':
+            if append:
+                return {"success": False, "message": "append is only supported for text files"}
+            filepath.parent.mkdir(parents=True, exist_ok=True)
             write_pdf_file(filepath, content)
         else:
             return {"success": False, "message": f"Unsupported file type for writing: {ext}"}
-        return {"success": True, "message": f"Wrote {filepath.name}", "data": {"filepath": str(filepath), "size": filepath.stat().st_size}}
+        action = "Appended to" if append else "Wrote"
+        return {
+            "success": True,
+            "message": f"{action} {filepath.name}",
+            "data": {"filepath": str(filepath), "size": filepath.stat().st_size, "appended": append},
+        }
     except HTTPException as e:
         return {"success": False, "message": e.detail or "Invalid filename"}
     except Exception as e:
         return {"success": False, "message": str(e)}
 
 
-async def _list_files_internal(path: str = "", recursive: bool = False) -> Dict[str, Any]:
+async def _list_files_internal(
+    path: str = "",
+    recursive: bool = False,
+    offset: int = 0,
+    max_entries: Optional[int] = None,
+) -> Dict[str, Any]:
     """List files in scratch dir (optionally scoped to a subdirectory)."""
     try:
         requested_path = str(path or "").strip()
         recursive_mode = _coerce_bool(recursive, default=False)
+        page_offset = _coerce_bounded_int(offset, default=0, minimum=0)
+        page_size = None
+        if max_entries is not None:
+            page_size = _coerce_bounded_int(max_entries, default=100, minimum=1, maximum=500)
         target_dir = SCRATCH_DIR.resolve()
         if requested_path:
             target_dir = resolve_scratch_path(requested_path)
@@ -9713,26 +11885,202 @@ async def _list_files_internal(path: str = "", recursive: bool = False) -> Dict[
         files.sort(
             key=lambda x: (
                 x.get("type") != "directory",
-                -float(x.get("modified", 0) or 0),
-                str(x.get("name", "")).lower(),
+                str(x.get("relative_path", x.get("name", ""))).lower(),
             )
         )
+        total_count = len(files)
+        directory_count = sum(1 for item in files if item.get("type") == "directory")
+        file_count = total_count - directory_count
+        paged_files = files
+        if page_size is not None:
+            paged_files = files[page_offset:page_offset + page_size]
+        returned_count = len(paged_files)
+        remaining_count = max(0, total_count - (page_offset + returned_count))
         result = {
             "success": True,
-            "files": files,
-            "count": len(files),
+            "files": paged_files,
+            "count": total_count,
+            "directory_count": directory_count,
+            "file_count": file_count,
+            "total_count": total_count,
+            "returned_count": returned_count,
+            "remaining_count": remaining_count,
             "scratch_dir": str(SCRATCH_DIR),
             "path": requested_path or ".",
             "recursive": recursive_mode,
+            "offset": page_offset,
+            "max_entries": page_size,
+            "has_more": remaining_count > 0,
+            "next_offset": (page_offset + returned_count) if remaining_count > 0 else None,
             "skipped_count": skipped_count,
         }
         if skipped_count > 0:
             result["message"] = (
-                f"Listed {len(files)} files. Skipped {skipped_count} inaccessible or unsafe entries."
+                f"Listed {returned_count} of {total_count} files. "
+                f"Skipped {skipped_count} inaccessible or unsafe entries."
             )
         return result
     except Exception as e:
         return {"success": False, "message": str(e), "files": []}
+
+
+async def _search_files_internal(
+    query: str,
+    *,
+    path: str = "",
+    recursive: bool = True,
+    offset: int = 0,
+    max_results: Optional[int] = None,
+    case_sensitive: bool = False,
+    filename_only: bool = False,
+) -> Dict[str, Any]:
+    """Search scratch files by filename and text content."""
+    try:
+        search_query = str(query or "").strip()
+        if not search_query:
+            return {"success": False, "message": "query is required", "matches": []}
+        requested_path = str(path or "").strip()
+        recursive_mode = _coerce_bool(recursive, default=True)
+        case_sensitive_mode = _coerce_bool(case_sensitive, default=False)
+        filename_only_mode = _coerce_bool(filename_only, default=False)
+        page_offset = _coerce_bounded_int(offset, default=0, minimum=0)
+        page_size = _coerce_bounded_int(
+            max_results,
+            default=20,
+            minimum=1,
+            maximum=100,
+        )
+        target_dir = SCRATCH_DIR.resolve()
+        if requested_path:
+            target_dir = resolve_scratch_path(requested_path)
+        if not target_dir.exists():
+            return {"success": False, "message": f"Path not found: {requested_path or '.'}", "matches": []}
+        if not target_dir.is_dir():
+            return {"success": False, "message": f"Path is not a directory: {requested_path}", "matches": []}
+
+        scratch_root = SCRATCH_DIR.resolve()
+        pending_dirs = [target_dir]
+        seen_dirs: Set[Path] = set()
+        matches: List[Dict[str, Any]] = []
+        searched_file_count = 0
+        skipped_count = 0
+
+        while pending_dirs:
+            current_dir = pending_dirs.pop()
+            try:
+                current_resolved = current_dir.resolve()
+                current_resolved.relative_to(scratch_root)
+            except (OSError, RuntimeError, ValueError):
+                skipped_count += 1
+                continue
+            if current_resolved in seen_dirs:
+                continue
+            seen_dirs.add(current_resolved)
+
+            try:
+                entries = sorted(current_dir.iterdir(), key=lambda item: item.name.lower())
+            except OSError:
+                skipped_count += 1
+                continue
+
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        skipped_count += 1
+                        continue
+                    entry_resolved = entry.resolve()
+                    entry_resolved.relative_to(scratch_root)
+                except (OSError, RuntimeError, ValueError):
+                    skipped_count += 1
+                    continue
+
+                try:
+                    if entry.is_dir():
+                        if recursive_mode:
+                            pending_dirs.append(entry)
+                        continue
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    skipped_count += 1
+                    continue
+
+                searched_file_count += 1
+                rel_path = entry.relative_to(scratch_root).as_posix()
+                rel_haystack = rel_path if case_sensitive_mode else rel_path.lower()
+                query_haystack = search_query if case_sensitive_mode else search_query.lower()
+                filename_match = query_haystack in rel_haystack
+                content_match = None
+
+                if not filename_only_mode and entry.suffix.lower() in SEARCHABLE_TEXT_EXTENSIONS:
+                    try:
+                        if entry.stat().st_size <= SEARCH_FILE_MAX_SIZE_BYTES:
+                            text_content, _ = _read_supported_file_text(entry)
+                            content_match = _extract_query_match(
+                                text_content,
+                                search_query,
+                                case_sensitive=case_sensitive_mode,
+                            )
+                    except Exception:
+                        skipped_count += 1
+                        continue
+
+                if not filename_match and not content_match:
+                    continue
+
+                matches.append(
+                    {
+                        "name": rel_path,
+                        "relative_path": rel_path,
+                        "size": entry.stat().st_size,
+                        "extension": entry.suffix,
+                        "type": "file",
+                        "match_types": [
+                            label
+                            for label, matched in (("filename", filename_match), ("content", bool(content_match)))
+                            if matched
+                        ],
+                        "line_number": content_match.get("line_number") if content_match else None,
+                        "excerpt": content_match.get("excerpt", "") if content_match else "",
+                        "match_count": content_match.get("match_count", 1) if content_match else 1,
+                    }
+                )
+
+            if not recursive_mode:
+                break
+
+        matches.sort(
+            key=lambda item: (
+                "filename" not in item.get("match_types", []),
+                -int(item.get("match_count", 0) or 0),
+                str(item.get("relative_path", "")).lower(),
+            )
+        )
+        total_matches = len(matches)
+        paged_matches = matches[page_offset:page_offset + page_size]
+        returned_count = len(paged_matches)
+        remaining_count = max(0, total_matches - (page_offset + returned_count))
+        return {
+            "success": True,
+            "matches": paged_matches,
+            "query": search_query,
+            "total_matches": total_matches,
+            "returned_count": returned_count,
+            "remaining_count": remaining_count,
+            "offset": page_offset,
+            "max_results": page_size,
+            "has_more": remaining_count > 0,
+            "next_offset": (page_offset + returned_count) if remaining_count > 0 else None,
+            "searched_file_count": searched_file_count,
+            "path": requested_path or ".",
+            "recursive": recursive_mode,
+            "filename_only": filename_only_mode,
+            "case_sensitive": case_sensitive_mode,
+            "skipped_count": skipped_count,
+            "scratch_dir": str(SCRATCH_DIR),
+        }
+    except Exception as e:
+        return {"success": False, "message": str(e), "matches": []}
 
 
 def _get_list_files_tool_max_entries() -> int:
@@ -9745,12 +12093,26 @@ def _get_list_files_tool_max_entries() -> int:
     return max(1, parsed)
 
 
-def _format_list_files_for_tool_output(files: List[Dict[str, Any]], include_sizes: bool = False) -> str:
-    """Format scratch files for LLM-facing tool output with a bounded number of rows."""
+def _format_list_files_for_tool_output(
+    files: List[Dict[str, Any]],
+    include_sizes: bool = False,
+    *,
+    total_count: Optional[Any] = None,
+    offset: Optional[Any] = None,
+    has_more: Optional[Any] = None,
+    next_offset: Optional[Any] = None,
+    limit: Optional[int] = None,
+) -> str:
+    """Format scratch files for LLM-facing tool output with explicit pagination metadata."""
     if not files:
         return "Scratch workspace is empty."
-    limit = _get_list_files_tool_max_entries()
-    shown = files[:limit]
+    render_limit = _coerce_bounded_int(
+        limit,
+        default=_get_list_files_tool_max_entries(),
+        minimum=1,
+        maximum=500,
+    )
+    shown = files[:render_limit]
     lines = []
     for item in shown:
         name = str(item.get("name", "?"))
@@ -9762,12 +12124,62 @@ def _format_list_files_for_tool_output(files: List[Dict[str, Any]], include_size
             lines.append(f"{name} ({item.get('size', 0)} bytes)")
         else:
             lines.append(name)
-    remaining = max(0, len(files) - len(shown))
+    parsed_total = _coerce_bounded_int(total_count, default=len(files), minimum=0)
+    parsed_offset = _coerce_bounded_int(offset, default=0, minimum=0)
+    inferred_remaining = max(0, parsed_total - (parsed_offset + len(shown)))
+    parsed_has_more = bool(has_more) if has_more is not None else inferred_remaining > 0
     header = "Files in scratch workspace:"
-    if remaining > 0:
-        header += f" (showing {len(shown)} of {len(files)})"
-        lines.append(f"... and {remaining} more files.")
+    if parsed_total > len(shown) or parsed_offset > 0:
+        header += f" (showing {parsed_offset + 1}-{parsed_offset + len(shown)} of {parsed_total})"
+    if len(files) > len(shown):
+        lines.append(f"... and {len(files) - len(shown)} more files in this page.")
+    if parsed_has_more:
+        continuation_offset = _coerce_bounded_int(
+            next_offset,
+            default=parsed_offset + len(shown),
+            minimum=0,
+        )
+        lines.append(f"... more files available. Continue with offset={continuation_offset}.")
     return header + "\n" + "\n".join(lines)
+
+
+def _format_search_files_for_tool_output(
+    matches: List[Dict[str, Any]],
+    *,
+    query: str,
+    total_matches: Optional[Any] = None,
+    offset: Optional[Any] = None,
+    has_more: Optional[Any] = None,
+    next_offset: Optional[Any] = None,
+    read_tool_name: str = "read_file",
+) -> str:
+    if not matches:
+        return f'No matching files found for "{query}".'
+    parsed_total = _coerce_bounded_int(total_matches, default=len(matches), minimum=0)
+    parsed_offset = _coerce_bounded_int(offset, default=0, minimum=0)
+    lines = [f'Search results for "{query}":']
+    if parsed_total > len(matches) or parsed_offset > 0:
+        lines[0] += f" (showing {parsed_offset + 1}-{parsed_offset + len(matches)} of {parsed_total})"
+    for index, item in enumerate(matches, start=parsed_offset + 1):
+        rel_path = str(item.get("relative_path") or item.get("name") or "?")
+        match_types = ",".join(item.get("match_types") or []) or "unknown"
+        line_number = item.get("line_number")
+        excerpt = str(item.get("excerpt") or "").strip()
+        suffix = f" line {line_number}" if isinstance(line_number, int) and line_number > 0 else ""
+        if excerpt:
+            lines.append(f"{index}. {rel_path} [{match_types}]{suffix}: {excerpt}")
+        else:
+            lines.append(f"{index}. {rel_path} [{match_types}]")
+    parsed_has_more = bool(has_more) if has_more is not None else False
+    if parsed_has_more:
+        continuation_offset = _coerce_bounded_int(
+            next_offset,
+            default=parsed_offset + len(matches),
+            minimum=0,
+        )
+        lines.append(f"More results available. Continue with offset={continuation_offset}.")
+    lines.append(f"Use {read_tool_name} with filename/path and optional start_line/end_line for more context.")
+    return "\n".join(lines)
 
 
 async def _delete_file_internal(filename: str) -> Dict[str, Any]:
@@ -9793,84 +12205,26 @@ async def read_file(
 ):
     """
     Read a file from the scratch directory
-    Supports: txt, md, docx, xlsx, pdf, png
+    Supports: txt, md, csv, docx, xlsx, xls, pdf, png, jpg, jpeg, py, js, html
     """
     if not FILE_OPS_AVAILABLE:
         raise HTTPException(
             status_code=503,
             detail="File operations not available. Install: pip install python-docx openpyxl PyPDF2 reportlab Pillow"
         )
-    # Resolve path with containment and extension checks (blocks path traversal)
-    filepath = resolve_scratch_path(request.filename, READ_ALLOWED_EXTENSIONS)
-    try:
-        # Check if file exists
-        if not filepath.exists():
-            return FileResponse(
-                success=False,
-                message=f"File not found: {request.filename}"
-            )
-        # Enforce max file size before reading
-        if filepath.stat().st_size > FILE_OPS_MAX_SIZE_BYTES:
-            return FileResponse(
-                success=False,
-                message="File too large"
-            )
-        # Determine file extension
-        file_ext = filepath.suffix.lower()
-        # Read file based on extension
-        if file_ext in ['.txt', '.md']:
-            content = read_text_file(filepath)
-            return FileResponse(
-                success=True,
-                message=f"Successfully read {request.filename}",
-                data={'content': content, 'type': 'text'}
-            )
-        
-        elif file_ext == '.docx':
-            content = read_docx_file(filepath)
-            return FileResponse(
-                success=True,
-                message=f"Successfully read {request.filename}",
-                data={'content': content, 'type': 'text'}
-            )
-        
-        elif file_ext in ['.xlsx', '.xls']:
-            content = read_xlsx_file(filepath)
-            return FileResponse(
-                success=True,
-                message=f"Successfully read {request.filename}",
-                data={'content': content, 'type': 'text'}
-            )
-        
-        elif file_ext == '.pdf':
-            content = read_pdf_file(filepath)
-            return FileResponse(
-                success=True,
-                message=f"Successfully read {request.filename}",
-                data={'content': content, 'type': 'text'}
-            )
-        
-        elif file_ext in ['.png', '.jpg', '.jpeg']:
-            image_data = read_png_file(filepath)
-            return FileResponse(
-                success=True,
-                message=f"Successfully read {request.filename}",
-                data={'content': image_data['description'], 'type': 'image', 'image_data': image_data}
-            )
-        
-        else:
-            # Unsupported file type
-            return FileResponse(
-                success=False,
-                message=f"Unsupported file type: {file_ext}. Supported types: txt, md, docx, xlsx, pdf, png"
-            )
-    
-    except Exception as e:
-        # Handle any errors during file reading
-        return FileResponse(
-            success=False,
-            message=f"Error reading file: {str(e)}"
-        )
+    resolve_scratch_path(request.filename, READ_ALLOWED_EXTENSIONS)
+    result = await _read_file_internal(
+        request.filename,
+        max_chars=request.max_chars,
+        start_line=request.start_line,
+        end_line=request.end_line,
+        include_line_numbers=request.include_line_numbers,
+    )
+    return FileResponse(
+        success=bool(result.get("success")),
+        message=str(result.get("message", "")),
+        data=result.get("data"),
+    )
 
 @app.post("/v1/files/write", response_model=FileResponse)
 async def write_file(
@@ -9879,70 +12233,45 @@ async def write_file(
 ):
     """
     Write content to a file in the scratch directory
-    Supports: txt, md, docx, xlsx, pdf
+    Supports: txt, md, csv, docx, xlsx, xls, pdf, py, js, html
     """
     if not FILE_OPS_AVAILABLE:
         raise HTTPException(
             status_code=503,
             detail="File operations not available. Install: pip install python-docx openpyxl PyPDF2 reportlab Pillow"
         )
-    # Enforce max content size before processing
-    content_bytes = request.content.encode("utf-8")
-    if len(content_bytes) > FILE_OPS_MAX_SIZE_BYTES:
-        return FileResponse(success=False, message="Content too large")
-    # Build logical filename with extension from format if missing
     logical_name = (request.filename or "").strip()
-    if not logical_name:
-        return FileResponse(success=False, message="Filename is required")
-    if not Path(logical_name).suffix:
-        logical_name = f"{logical_name}.{request.format.lower()}"
-    # Resolve path with containment and extension checks (blocks path traversal)
-    filepath = resolve_scratch_path(logical_name, WRITE_ALLOWED_EXTENSIONS)
-    file_ext = filepath.suffix.lower()
-    try:
-        # Write file based on extension
-        if file_ext in ['.txt', '.md']:
-            write_text_file(filepath, request.content)
-        
-        elif file_ext == '.docx':
-            write_docx_file(filepath, request.content)
-        
-        elif file_ext in ['.xlsx', '.xls']:
-            write_xlsx_file(filepath, request.content)
-        
-        elif file_ext == '.pdf':
-            write_pdf_file(filepath, request.content)
-        
-        else:
-            # Unsupported file type
-            return FileResponse(
-                success=False,
-                message=f"Unsupported file type for writing: {file_ext}. Supported types: txt, md, docx, xlsx, pdf"
-            )
-        
-        # Return success response
-        return FileResponse(
-            success=True,
-            message=f"Successfully wrote {filepath.name}",
-            data={'filepath': str(filepath), 'size': filepath.stat().st_size}
-        )
-    
-    except Exception as e:
-        # Handle any errors during file writing
-        return FileResponse(
-            success=False,
-            message=f"Error writing file: {str(e)}"
-        )
+    if logical_name and not Path(logical_name).suffix:
+        logical_name = f"{logical_name}.{(request.format or 'txt').lower()}"
+    resolve_scratch_path(logical_name or request.filename, WRITE_ALLOWED_EXTENSIONS)
+    result = await _write_file_internal(
+        request.filename,
+        request.content,
+        format=request.format or "txt",
+        append=bool(request.append),
+    )
+    return FileResponse(
+        success=bool(result.get("success")),
+        message=str(result.get("message", "")),
+        data=result.get("data"),
+    )
 
 @app.get("/v1/files/list")
 async def list_files(
     path: Optional[str] = None,
     recursive: bool = False,
+    offset: int = Query(default=0, ge=0),
+    max_entries: Optional[int] = Query(default=None, ge=1, le=500),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """List files in the scratch directory (optionally scoped by subdirectory and recursion)."""
     try:
-        result = await _list_files_internal(path=(path or ""), recursive=recursive)
+        result = await _list_files_internal(
+            path=(path or ""),
+            recursive=recursive,
+            offset=offset,
+            max_entries=max_entries,
+        )
         if not result.get("success"):
             return {
                 "success": False,
@@ -9956,6 +12285,43 @@ async def list_files(
         return {
             'success': False,
             'message': f"Error listing files: {str(e)}"
+        }
+
+
+@app.get("/v1/files/search")
+async def search_files(
+    query: str,
+    path: Optional[str] = None,
+    recursive: bool = True,
+    offset: int = Query(default=0, ge=0),
+    max_results: Optional[int] = Query(default=20, ge=1, le=100),
+    case_sensitive: bool = False,
+    filename_only: bool = False,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Search scratch files by filename and text content."""
+    try:
+        result = await _search_files_internal(
+            query,
+            path=(path or ""),
+            recursive=recursive,
+            offset=offset,
+            max_results=max_results,
+            case_sensitive=case_sensitive,
+            filename_only=filename_only,
+        )
+        if not result.get("success"):
+            return {
+                "success": False,
+                "message": result.get("message", "Error searching files"),
+                "matches": [],
+            }
+        return result
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error searching files: {str(e)}",
+            "matches": [],
         }
 
 @app.delete("/v1/files/delete/{filename}")

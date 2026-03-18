@@ -660,32 +660,6 @@
             min-width: 0;
         }
 
-        .tool-settings-top-tabs {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin-bottom: 12px;
-        }
-
-        .tool-settings-tab {
-            width: auto;
-            margin: 0;
-            padding: 10px 14px;
-            border-radius: 12px;
-            border: 1px solid rgba(255, 92, 92, 0.38);
-            background: rgba(255, 255, 255, 0.03);
-            color: #f2f2f2;
-            font-size: 0.76rem;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-        }
-
-        .tool-settings-tab:hover,
-        .tool-settings-tab.is-active {
-            background: linear-gradient(180deg, rgba(108, 18, 18, 0.42), rgba(35, 11, 11, 0.96));
-            border-color: #ff5c5c;
-        }
-
         .tool-settings-stage {
             position: relative;
         }
@@ -1319,12 +1293,6 @@
 
             .tool-settings-nav-btn {
                 flex: 0 0 72px;
-            }
-
-            .tool-settings-top-tabs {
-                flex-wrap: nowrap;
-                overflow-x: auto;
-                padding-bottom: 4px;
             }
 
             .companions-header,
