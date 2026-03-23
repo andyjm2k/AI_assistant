@@ -13,8 +13,17 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 from src.skills.base import BaseSkill, BaseTool
+from src.skills.builtin.google_slides_skill import (
+    _MAX_SLIDE_COUNT as _MAX_MARKDOWN_SLIDES,
+    _attach_scratch_images_to_slides,
+    _build_batch_update_payload,
+    _coerce_positive_int as _coerce_positive_slide_int,
+    _list_scratch_images,
+    _parse_markdown_to_slides,
+    _resolve_safe_scratch_path,
+)
 from src.skills.exceptions import SkillValidationError
-from src.skills.models import SkillContext
+from src.skills.models import SkillContext, ToolExecutionResult
 
 _COMMAND_TOKEN_RE = re.compile(r"^[A-Za-z0-9+][A-Za-z0-9+._-]{0,63}$")
 _COMMAND_PATH_SPLIT_RE = re.compile(r"[\\/\s]+")
@@ -377,6 +386,110 @@ def _extract_primary_error(result: Dict[str, Any]) -> str:
     if stdout:
         return stdout
     return "No output returned by gws."
+
+
+def _wrap_windows_command(command: Sequence[str]) -> list[str]:
+    wrapped = [str(part) for part in command if str(part).strip()]
+    if os.name != "nt" or not wrapped:
+        return wrapped
+
+    executable = wrapped[0].strip()
+    lowered = executable.lower()
+    if lowered.endswith((".cmd", ".bat")):
+        comspec = str(os.environ.get("COMSPEC") or "cmd.exe").strip() or "cmd.exe"
+        return [comspec, "/d", "/c", executable, *wrapped[1:]]
+    if lowered.endswith(".ps1"):
+        system_root = str(os.environ.get("SystemRoot") or r"C:\Windows").strip() or r"C:\Windows"
+        powershell = str(
+            Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        )
+        return [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            executable,
+            *wrapped[1:],
+        ]
+    return wrapped
+
+
+def _extract_presentation_id(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("presentationId", "presentation_id", "id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        nested = payload.get("presentation")
+        if nested is not payload:
+            nested_value = _extract_presentation_id(nested)
+            if nested_value:
+                return nested_value
+    return ""
+
+
+async def _create_slides_presentation(
+    *,
+    title: str,
+    timeout_seconds: float,
+    cwd: Path,
+    env_overrides: Dict[str, str],
+) -> Dict[str, Any]:
+    command = [
+        "gws",
+        "slides",
+        "presentations",
+        "create",
+        "--json",
+        json.dumps({"title": title}, separators=(",", ":"), ensure_ascii=False),
+    ]
+    result = await _run_gws_command(
+        command,
+        timeout_seconds=timeout_seconds,
+        cwd=cwd,
+        env_overrides=env_overrides,
+    )
+    if int(result.get("returncode", 1)) != 0:
+        raise RuntimeError(f"gws command failed: {_extract_primary_error(result)}")
+
+    presentation_id = _extract_presentation_id(result.get("parsed_json"))
+    if not presentation_id:
+        raise RuntimeError("gws slides presentations create did not return a presentationId.")
+
+    return {
+        "presentation_id": presentation_id,
+        "response": result,
+    }
+
+
+async def _batch_update_slides_presentation(
+    *,
+    presentation_id: str,
+    requests: Sequence[Dict[str, Any]],
+    timeout_seconds: float,
+    cwd: Path,
+    env_overrides: Dict[str, str],
+) -> Dict[str, Any]:
+    command = [
+        "gws",
+        "slides",
+        "presentations",
+        "batchUpdate",
+        "--params",
+        json.dumps({"presentationId": presentation_id}, separators=(",", ":"), ensure_ascii=False),
+        "--json",
+        json.dumps({"requests": list(requests)}, separators=(",", ":"), ensure_ascii=False),
+    ]
+    result = await _run_gws_command(
+        command,
+        timeout_seconds=timeout_seconds,
+        cwd=cwd,
+        env_overrides=env_overrides,
+    )
+    if int(result.get("returncode", 1)) != 0:
+        raise RuntimeError(f"gws command failed: {_extract_primary_error(result)}")
+    return result
 
 
 def _is_gmail_messages_list_request(
@@ -941,6 +1054,7 @@ async def _run_gws_command(
         cwd_path.mkdir(parents=True, exist_ok=True)
 
     command[0] = _resolve_gws_executable(command[0], cwd_path)
+    command = _wrap_windows_command(command)
 
     env: Optional[Dict[str, str]] = None
     if env_overrides:
@@ -1197,6 +1311,119 @@ class GmailListUnreadTool(BaseTool):
             "max_results": max_results,
             "response": result,
         }
+        if gmail_message_summaries:
+            payload["gmail_message_summaries"] = gmail_message_summaries
+        return payload
+
+
+class GmailListAllTool(BaseTool):
+    name = "gmail_list_all"
+    description = (
+        "List Gmail messages regardless of read state, with pagination support via page_token. "
+        "Use this for requests like 'list all emails' or 'show the next page of messages'."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 25,
+                "default": 10,
+                "description": "Number of messages to fetch for this page.",
+            },
+            "page_token": {
+                "type": "string",
+                "description": "Optional Gmail nextPageToken from a previous gmail_list_all response.",
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional Gmail query filter applied across all messages "
+                    "(for example: `label:important from:billing@example.com`)."
+                ),
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": _MAX_TIMEOUT_SECONDS,
+                "default": _DEFAULT_TIMEOUT_SECONDS,
+                "description": "Timeout for gws command execution.",
+            },
+        },
+        "additionalProperties": False,
+    }
+
+    def __init__(self, default_root_dir: Path) -> None:
+        self.default_root_dir = default_root_dir
+
+    async def run(self, arguments: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
+        try:
+            max_results = int(arguments.get("max_results", 10))
+        except (TypeError, ValueError):
+            max_results = 10
+        max_results = max(1, min(max_results, 25))
+        timeout_seconds = _coerce_timeout_seconds(arguments.get("timeout_seconds"))
+        query = str(arguments.get("query") or "").strip()
+        page_token = str(arguments.get("page_token") or "").strip()
+
+        params: Dict[str, Any] = {"userId": "me", "maxResults": max_results}
+        if query:
+            params["q"] = query
+        if page_token:
+            params["pageToken"] = page_token
+
+        command = [
+            "gws",
+            "gmail",
+            "users",
+            "messages",
+            "list",
+            "--params",
+            json.dumps(params, separators=(",", ":"), ensure_ascii=False),
+        ]
+        working_dir = (context.scratch_dir or self.default_root_dir).resolve()
+        env_overrides = _build_gws_env_overrides(working_dir)
+        result = await _run_gws_command(
+            command,
+            timeout_seconds=timeout_seconds,
+            cwd=working_dir,
+            env_overrides=env_overrides,
+        )
+        if int(result.get("returncode", 1)) != 0:
+            raise RuntimeError(f"gws command failed: {_extract_primary_error(result)}")
+
+        gmail_message_summaries: list[Dict[str, Any]] = []
+        parsed_payload = result.get("parsed_json")
+        if isinstance(parsed_payload, dict):
+            message_ids = _extract_gmail_message_ids(parsed_payload, max_items=max_results)
+            if message_ids:
+                try:
+                    gmail_message_summaries = await _fetch_gmail_message_summaries(
+                        message_ids,
+                        cwd=working_dir,
+                        env_overrides=env_overrides,
+                        timeout_seconds=timeout_seconds,
+                    )
+                except Exception:
+                    gmail_message_summaries = []
+
+        payload: Dict[str, Any] = {
+            "query": query or None,
+            "max_results": max_results,
+            "page_token": page_token or None,
+            "response": result,
+        }
+        if isinstance(parsed_payload, dict):
+            next_page_token = str(parsed_payload.get("nextPageToken") or "").strip()
+            if next_page_token:
+                payload["next_page_token"] = next_page_token
+            result_size_estimate = parsed_payload.get("resultSizeEstimate")
+            if isinstance(result_size_estimate, int):
+                payload["result_size_estimate"] = result_size_estimate
+            raw_messages = parsed_payload.get("messages")
+            if isinstance(raw_messages, list):
+                payload["message_count"] = len(raw_messages)
         if gmail_message_summaries:
             payload["gmail_message_summaries"] = gmail_message_summaries
         return payload
@@ -2034,6 +2261,359 @@ class RunReadonlyCommandTool(BaseTool):
         return response_payload
 
 
+class SlidesBatchUpdatePresentationTool(BaseTool):
+    name = "slides_batch_update_presentation"
+    description = (
+        "Apply Google Slides batchUpdate requests to an existing presentation. "
+        "Provide either raw requests or slide title/bullet/image entries to build requests automatically."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "presentation_id": {
+                "type": "string",
+                "description": "Target Google Slides presentation id.",
+            },
+            "requests": {
+                "type": "array",
+                "description": "Optional raw Google Slides batchUpdate requests.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": True,
+                },
+            },
+            "slides": {
+                "type": "array",
+                "description": (
+                    "Optional slide specs used to build batchUpdate requests when raw requests are not supplied."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "bullets": {
+                            "type": ["array", "string"],
+                            "items": {"type": "string"},
+                        },
+                        "images": {
+                            "type": ["array", "string", "object"],
+                        },
+                    },
+                    "required": ["title"],
+                    "additionalProperties": False,
+                },
+            },
+            "image_url_prefix": {
+                "type": "string",
+                "description": (
+                    "Optional public base URL used to convert scratch-relative image paths into createImage URLs."
+                ),
+            },
+            "include_image_requests": {
+                "type": "boolean",
+                "default": True,
+                "description": "When true, emit createImage requests for slide image inputs.",
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": _MAX_TIMEOUT_SECONDS,
+                "default": _DEFAULT_TIMEOUT_SECONDS,
+                "description": "Timeout for gws command execution.",
+            },
+        },
+        "required": ["presentation_id"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, default_root_dir: Path) -> None:
+        self.default_root_dir = default_root_dir
+
+    async def run(
+        self,
+        arguments: Dict[str, Any],
+        context: SkillContext,
+    ) -> ToolExecutionResult:
+        presentation_id = str(arguments.get("presentation_id") or "").strip()
+        if not presentation_id:
+            raise SkillValidationError("'presentation_id' is required.")
+
+        raw_requests = arguments.get("requests")
+        raw_slides = arguments.get("slides")
+        if (raw_requests is None and raw_slides is None) or (
+            raw_requests is not None and raw_slides is not None
+        ):
+            raise SkillValidationError("Provide exactly one of 'requests' or 'slides'.")
+
+        timeout_seconds = _coerce_timeout_seconds(arguments.get("timeout_seconds"))
+        working_dir = (context.scratch_dir or self.default_root_dir).resolve()
+        env_overrides = _build_gws_env_overrides(working_dir)
+
+        request_source = "requests"
+        response_payload: Dict[str, Any] = {
+            "presentation_id": presentation_id,
+        }
+        if raw_requests is not None:
+            if not isinstance(raw_requests, list) or not raw_requests:
+                raise SkillValidationError("'requests' must be a non-empty array.")
+            requests = raw_requests
+            response_payload["request_count"] = len(requests)
+        else:
+            request_source = "slides"
+            include_image_requests = _coerce_bool(
+                arguments.get("include_image_requests", True),
+                default=True,
+            )
+            image_url_prefix = str(arguments.get("image_url_prefix", "")).strip()
+            builder_payload = _build_batch_update_payload(
+                presentation_id,
+                raw_slides,
+                include_image_requests=include_image_requests,
+                image_url_prefix=image_url_prefix,
+                scratch_root=working_dir,
+            )
+            requests = builder_payload["requests"]
+            response_payload.update(builder_payload)
+
+        batch_update_result = await _batch_update_slides_presentation(
+            presentation_id=presentation_id,
+            requests=requests,
+            timeout_seconds=timeout_seconds,
+            cwd=working_dir,
+            env_overrides=env_overrides,
+        )
+        presentation_url = f"https://docs.google.com/presentation/d/{presentation_id}/edit"
+        response_payload["request_source"] = request_source
+        response_payload["response"] = batch_update_result
+        response_payload["presentation_url"] = presentation_url
+
+        request_count = int(response_payload.get("request_count") or len(requests))
+        skipped_count = len(response_payload.get("skipped_images") or [])
+        message = (
+            f"Updated Google Slides presentation {presentation_id} with {request_count} request(s). "
+            f"Open: {presentation_url}"
+        )
+        if skipped_count:
+            message = f"{message} Skipped {skipped_count} image(s) without usable URLs."
+        return ToolExecutionResult(success=True, message=message, data=response_payload)
+
+
+class SlidesCreatePresentationFromMarkdownTool(BaseTool):
+    name = "slides_create_presentation_from_markdown"
+    description = (
+        "Create a Google Slides presentation from markdown content or a markdown file, "
+        "then populate it with content and optional images via gws slides batchUpdate."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Optional deck title override. Defaults to the markdown filename or first heading.",
+            },
+            "markdown": {
+                "type": "string",
+                "description": "Inline markdown content to transform into slides.",
+            },
+            "markdown_path": {
+                "type": "string",
+                "description": (
+                    "Path to a markdown file under scratch (for example notes/deck.md "
+                    "or scratch/notes/deck.md)."
+                ),
+            },
+            "max_slides": {
+                "type": "integer",
+                "default": _MAX_MARKDOWN_SLIDES,
+                "minimum": 1,
+                "maximum": _MAX_MARKDOWN_SLIDES,
+                "description": "Upper bound on generated slide count.",
+            },
+            "attach_scratch_images": {
+                "type": "boolean",
+                "default": True,
+                "description": "When true, auto-match images from scratch/images to slides.",
+            },
+            "image_dir": {
+                "type": "string",
+                "default": "images",
+                "description": "Scratch-relative image directory to scan for auto-attachment.",
+            },
+            "image_match_mode": {
+                "type": "string",
+                "default": "title",
+                "enum": ["title", "sequential"],
+                "description": "Auto-image matching strategy for scratch image scanning.",
+            },
+            "max_images_per_slide": {
+                "type": "integer",
+                "default": 1,
+                "minimum": 0,
+                "maximum": 4,
+                "description": "Maximum auto-attached images per slide.",
+            },
+            "image_url_prefix": {
+                "type": "string",
+                "description": (
+                    "Optional public base URL used to convert scratch-relative image paths into createImage URLs."
+                ),
+            },
+            "include_image_requests": {
+                "type": "boolean",
+                "default": True,
+                "description": "When true, emit createImage requests for slide image inputs.",
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": _MAX_TIMEOUT_SECONDS,
+                "default": _DEFAULT_TIMEOUT_SECONDS,
+                "description": "Timeout for gws command execution.",
+            },
+        },
+        "additionalProperties": False,
+    }
+
+    def __init__(self, default_root_dir: Path) -> None:
+        self.default_root_dir = default_root_dir
+
+    async def run(
+        self,
+        arguments: Dict[str, Any],
+        context: SkillContext,
+    ) -> ToolExecutionResult:
+        working_dir = (context.scratch_dir or self.default_root_dir).resolve()
+        markdown = str(arguments.get("markdown", "") or "")
+        markdown_path_raw = str(arguments.get("markdown_path", "")).strip()
+        if not markdown.strip() and not markdown_path_raw:
+            raise SkillValidationError("Provide either markdown or markdown_path.")
+
+        source_path: Optional[Path] = None
+        source_dir: Optional[Path] = None
+        if markdown_path_raw:
+            source_path = _resolve_safe_scratch_path(working_dir, markdown_path_raw)
+            if not source_path.exists():
+                raise SkillValidationError(f"markdown_path does not exist: {markdown_path_raw}")
+            if not source_path.is_file():
+                raise SkillValidationError(f"markdown_path is not a file: {markdown_path_raw}")
+            markdown = source_path.read_text(encoding="utf-8")
+            source_dir = source_path.parent
+
+        title = str(arguments.get("title", "") or "").strip()
+        if not title and source_path is not None:
+            title = source_path.stem.replace("_", " ").strip()
+        fallback_title = title or "Untitled Presentation"
+
+        slides = _parse_markdown_to_slides(
+            markdown,
+            fallback_title=fallback_title,
+            scratch_root=working_dir,
+            source_dir=source_dir,
+        )
+        if not title and slides:
+            title = str(slides[0].get("title") or "").strip() or fallback_title
+        elif not title:
+            title = fallback_title
+        max_slides = _coerce_positive_slide_int(
+            arguments.get("max_slides", _MAX_MARKDOWN_SLIDES),
+            default=_MAX_MARKDOWN_SLIDES,
+            minimum=1,
+            maximum=_MAX_MARKDOWN_SLIDES,
+        )
+        slides = slides[:max_slides]
+
+        attach_scratch_images = _coerce_bool(
+            arguments.get("attach_scratch_images", True),
+            default=True,
+        )
+        image_dir = str(arguments.get("image_dir", "images") or "images").strip() or "images"
+        image_match_mode = str(arguments.get("image_match_mode", "title") or "title").strip().lower()
+        if image_match_mode not in {"title", "sequential"}:
+            raise SkillValidationError("image_match_mode must be either 'title' or 'sequential'.")
+        max_images_per_slide = _coerce_positive_slide_int(
+            arguments.get("max_images_per_slide", 1),
+            default=1,
+            minimum=0,
+            maximum=4,
+        )
+
+        available_images: list[str] = []
+        auto_attached_images = 0
+        if attach_scratch_images and max_images_per_slide > 0:
+            available_images = _list_scratch_images(working_dir, image_dir)
+            auto_attached_images = _attach_scratch_images_to_slides(
+                slides,
+                available_images,
+                max_images_per_slide=max_images_per_slide,
+                match_mode=image_match_mode,
+            )
+
+        for idx, slide in enumerate(slides, start=1):
+            slide["index"] = idx
+
+        include_image_requests = _coerce_bool(
+            arguments.get("include_image_requests", True),
+            default=True,
+        )
+        image_url_prefix = str(arguments.get("image_url_prefix", "")).strip()
+        builder_payload = _build_batch_update_payload(
+            "pending-presentation",
+            slides,
+            include_image_requests=include_image_requests,
+            image_url_prefix=image_url_prefix,
+            scratch_root=working_dir,
+        )
+
+        timeout_seconds = _coerce_timeout_seconds(arguments.get("timeout_seconds"))
+        env_overrides = _build_gws_env_overrides(working_dir)
+        create_result = await _create_slides_presentation(
+            title=title,
+            timeout_seconds=timeout_seconds,
+            cwd=working_dir,
+            env_overrides=env_overrides,
+        )
+        presentation_id = create_result["presentation_id"]
+        batch_update_result = await _batch_update_slides_presentation(
+            presentation_id=presentation_id,
+            requests=builder_payload["requests"],
+            timeout_seconds=timeout_seconds,
+            cwd=working_dir,
+            env_overrides=env_overrides,
+        )
+
+        builder_payload["presentation_id"] = presentation_id
+        presentation_url = f"https://docs.google.com/presentation/d/{presentation_id}/edit"
+        data = {
+            "title": title,
+            "source": "markdown_path" if source_path is not None else "markdown",
+            "markdown_path": (
+                str(source_path.relative_to(working_dir)).replace("\\", "/")
+                if source_path is not None
+                else None
+            ),
+            "presentation_id": presentation_id,
+            "presentation_url": presentation_url,
+            "slide_count": len(slides),
+            "slides": slides,
+            "auto_attached_images": auto_attached_images,
+            "scratch_image_count": len(available_images),
+            "request_count": builder_payload["request_count"],
+            "image_request_count": builder_payload["image_request_count"],
+            "requests": builder_payload["requests"],
+            "skipped_images": builder_payload["skipped_images"],
+            "create_response": create_result["response"],
+            "batch_update_response": batch_update_result,
+        }
+        skipped_count = len(builder_payload["skipped_images"])
+        message = (
+            f"Created Google Slides deck '{title}' with {len(slides)} slide(s) "
+            f"and {builder_payload['image_request_count']} image request(s). Open: {presentation_url}"
+        )
+        if skipped_count:
+            message = f"{message} Skipped {skipped_count} image(s) without usable URLs."
+        return ToolExecutionResult(success=True, message=message, data=data)
+
+
 class ListAvailableCommandsTool(BaseTool):
     name = "list_available_commands"
     description = (
@@ -2141,10 +2721,11 @@ class GoogleWorkspaceCliSkill(BaseSkill):
     name = "googleworkspace_cli"
     description = (
         "Google Workspace CLI wrappers with dedicated Gmail tools for common tasks "
-        "(list unread, get message, compose draft, send, mark read), dedicated Calendar tools "
-        "(create event, cancel event, list today, list week), plus an advanced generic command runner."
+        "(list unread, list all with pagination, get message, compose draft, send, mark read), dedicated Calendar tools "
+        "(create event, cancel event, list today, list week), dedicated Slides tools for markdown-driven decks, "
+        "plus an advanced generic command runner."
     )
-    version = "1.1.0"
+    version = "1.3.0"
     tags = ["googleworkspace", "cli", "gws"]
 
     def __init__(self, root_dir: str = "./scratch") -> None:
@@ -2157,6 +2738,7 @@ class GoogleWorkspaceCliSkill(BaseSkill):
             CheckCliTool(default_root_dir=self.root_dir),
             CheckAuthTool(default_root_dir=self.root_dir),
             GmailListUnreadTool(default_root_dir=self.root_dir),
+            GmailListAllTool(default_root_dir=self.root_dir),
             GmailGetMessageTool(default_root_dir=self.root_dir),
             GmailComposeDraftTool(default_root_dir=self.root_dir),
             GmailSendMessageTool(default_root_dir=self.root_dir),
@@ -2165,6 +2747,8 @@ class GoogleWorkspaceCliSkill(BaseSkill):
             CalendarCancelEventTool(default_root_dir=self.root_dir),
             CalendarListTodayTool(default_root_dir=self.root_dir),
             CalendarListWeekTool(default_root_dir=self.root_dir),
+            SlidesBatchUpdatePresentationTool(default_root_dir=self.root_dir),
+            SlidesCreatePresentationFromMarkdownTool(default_root_dir=self.root_dir),
             ListAvailableCommandsTool(default_root_dir=self.root_dir),
             RunReadonlyCommandTool(default_root_dir=self.root_dir),
         ]

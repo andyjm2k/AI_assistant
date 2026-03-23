@@ -55,9 +55,10 @@ def test_manifest_loading_discovers_builtin_skills() -> None:
     assert "core" in names
     assert "filesystem" in names
     assert "GitHubProjectManager" in names
-    assert "google_slides" in names
     assert "googleworkspace_cli" in names
     assert "image_generation" in names
+    assert "spotify_player" in names
+    assert "telegram_admin" in names
     assert "testkit" in names
 
     tool_names = [spec.qualified_name for spec in manager.list_tools()]
@@ -69,19 +70,24 @@ def test_manifest_loading_discovers_builtin_skills() -> None:
     assert "GitHubProjectManager.fetch" in tool_names
     assert "GitHubProjectManager.sync" in tool_names
     assert "GitHubProjectManager.list_pull_requests" in tool_names
-    assert "google_slides.create_outline" in tool_names
-    assert "google_slides.create_outline_from_markdown" in tool_names
-    assert "google_slides.build_batch_update_requests" in tool_names
     assert "googleworkspace_cli.check_cli" in tool_names
     assert "googleworkspace_cli.check_auth" in tool_names
     assert "googleworkspace_cli.gmail_list_unread" in tool_names
+    assert "googleworkspace_cli.gmail_list_all" in tool_names
     assert "googleworkspace_cli.gmail_get_message" in tool_names
     assert "googleworkspace_cli.gmail_compose_draft" in tool_names
     assert "googleworkspace_cli.gmail_send_message" in tool_names
     assert "googleworkspace_cli.gmail_mark_read" in tool_names
+    assert "googleworkspace_cli.slides_batch_update_presentation" in tool_names
+    assert "googleworkspace_cli.slides_create_presentation_from_markdown" in tool_names
     assert "googleworkspace_cli.list_available_commands" in tool_names
     assert "googleworkspace_cli.run_readonly_command" in tool_names
     assert "image_generation.generate_image" in tool_names
+    assert "spotify_player.search_tracks" in tool_names
+    assert "spotify_player.get_available_devices" in tool_names
+    assert "spotify_player.play_track" in tool_names
+    assert "spotify_player.play_playlist" in tool_names
+    assert "telegram_admin.notify_admin" in tool_names
     assert "testkit.context_snapshot" in tool_names
 
     mcp_tools = manager.mcp_tools()
@@ -414,6 +420,411 @@ async def test_image_generation_does_not_fall_back_to_core_openai_key(
 
 
 @pytest.mark.asyncio
+async def test_spotify_player_search_tracks_uses_client_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    token_response = MagicMock()
+    token_response.status_code = 200
+    token_response.json.return_value = {
+        "access_token": "spotify-app-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+
+    search_response = MagicMock()
+    search_response.status_code = 200
+    search_response.json.return_value = {
+        "tracks": {
+            "total": 1,
+            "items": [
+                {
+                    "id": "0123456789ABCDEFGHIJKL",
+                    "name": "CATBot Anthem",
+                    "uri": "spotify:track:0123456789ABCDEFGHIJKL",
+                    "artists": [
+                        {
+                            "id": "artist1234567890123456",
+                            "name": "CATBot",
+                            "uri": "spotify:artist:artist1234567890123456",
+                        }
+                    ],
+                    "album": {
+                        "id": "album12345678901234567",
+                        "name": "Automation Songs",
+                        "release_date": "2026-03-20",
+                        "uri": "spotify:album:album12345678901234567",
+                    },
+                    "duration_ms": 123456,
+                    "explicit": False,
+                    "popularity": 77,
+                    "preview_url": None,
+                    "external_urls": {"spotify": "https://open.spotify.com/track/0123456789ABCDEFGHIJKL"},
+                    "is_playable": True,
+                }
+            ],
+        }
+    }
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "spotify-client-id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "spotify-client-secret")
+    monkeypatch.delenv("SPOTIFY_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("SPOTIFY_REFRESH_TOKEN", raising=False)
+
+    with patch("src.skills.builtin.spotify_player_skill.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_client.post = AsyncMock(return_value=token_response)
+        mock_client.get = AsyncMock(return_value=search_response)
+        mock_client_cls.return_value = mock_client
+
+        result = await manager.execute_tool(
+            "spotify_player.search_tracks",
+            {"query": "catbot anthem", "limit": 5, "market": "au"},
+        )
+
+    assert result.success is True
+    assert result.data["query"] == "catbot anthem"
+    assert result.data["returned_count"] == 1
+    assert result.data["tracks"][0]["name"] == "CATBot Anthem"
+    assert result.data["tracks"][0]["artist_names"] == ["CATBot"]
+
+    token_call = mock_client.post.call_args
+    assert token_call is not None
+    assert token_call.args[0].endswith("/token")
+    assert token_call.kwargs["data"] == {"grant_type": "client_credentials"}
+
+    search_call = mock_client.get.call_args
+    assert search_call is not None
+    assert search_call.args[0].endswith("/search")
+    assert search_call.kwargs["params"] == {
+        "q": "catbot anthem",
+        "type": "track",
+        "limit": 5,
+        "market": "AU",
+    }
+    assert search_call.kwargs["headers"]["Authorization"] == "Bearer spotify-app-token"
+
+
+@pytest.mark.asyncio
+async def test_spotify_player_play_track_requires_user_playback_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "spotify-client-id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "spotify-client-secret")
+    monkeypatch.delenv("SPOTIFY_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("SPOTIFY_REFRESH_TOKEN", raising=False)
+    monkeypatch.delenv("SPOTIFY_DEVICE_ID", raising=False)
+
+    with pytest.raises(
+        SkillValidationError,
+        match="SPOTIFY_ACCESS_TOKEN or SPOTIFY_REFRESH_TOKEN",
+        ):
+            await manager.execute_tool(
+                "spotify_player.play_track",
+                {"track_id": "0123456789ABCDEFGHIJKL"},
+                raise_errors=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_spotify_player_get_available_devices_refreshes_token_and_returns_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    validation_response = MagicMock()
+    validation_response.status_code = 401
+
+    token_response = MagicMock()
+    token_response.status_code = 200
+    token_response.json.return_value = {
+        "access_token": "spotify-device-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+
+    devices_response = MagicMock()
+    devices_response.status_code = 200
+    devices_response.json.return_value = {
+        "devices": [
+            {
+                "id": "device-123",
+                "is_active": True,
+                "is_private_session": False,
+                "is_restricted": False,
+                "name": "Office Speaker",
+                "type": "Speaker",
+                "volume_percent": 42,
+                "supports_volume": True,
+            },
+            {
+                "id": "device-456",
+                "is_active": False,
+                "is_private_session": False,
+                "is_restricted": False,
+                "name": "Phone",
+                "type": "Smartphone",
+                "volume_percent": 88,
+                "supports_volume": True,
+            },
+        ]
+    }
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "spotify-client-id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "spotify-client-secret")
+    monkeypatch.setenv("SPOTIFY_ACCESS_TOKEN", "spotify-expired-token")
+    monkeypatch.setenv("SPOTIFY_REFRESH_TOKEN", "spotify-refresh-token")
+
+    with patch("src.skills.builtin.spotify_player_skill.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_client.get = AsyncMock(side_effect=[validation_response, devices_response])
+        mock_client.post = AsyncMock(return_value=token_response)
+        mock_client_cls.return_value = mock_client
+
+        result = await manager.execute_tool(
+            "spotify_player.get_available_devices",
+            {},
+        )
+
+    assert result.success is True
+    assert result.data["returned_count"] == 2
+    assert result.data["device_ids"] == ["device-123", "device-456"]
+    assert result.data["devices"][0]["id"] == "device-123"
+    assert result.data["devices"][0]["name"] == "Office Speaker"
+
+    first_get_call = mock_client.get.call_args_list[0]
+    assert first_get_call.args[0].endswith("/search")
+    assert first_get_call.kwargs["headers"]["Authorization"] == "Bearer spotify-expired-token"
+
+    token_call = mock_client.post.call_args
+    assert token_call is not None
+    assert token_call.kwargs["data"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "spotify-refresh-token",
+    }
+
+    devices_call = mock_client.get.call_args_list[1]
+    assert devices_call.args[0].endswith("/me/player/devices")
+    assert devices_call.kwargs["headers"]["Authorization"] == "Bearer spotify-device-token"
+
+
+@pytest.mark.asyncio
+async def test_spotify_player_play_track_uses_valid_existing_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    validation_response = MagicMock()
+    validation_response.status_code = 200
+
+    play_response = MagicMock()
+    play_response.status_code = 204
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "spotify-client-id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "spotify-client-secret")
+    monkeypatch.setenv("SPOTIFY_ACCESS_TOKEN", "spotify-existing-token")
+    monkeypatch.delenv("SPOTIFY_REFRESH_TOKEN", raising=False)
+
+    with patch("src.skills.builtin.spotify_player_skill.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_client.get = AsyncMock(return_value=validation_response)
+        mock_client.put = AsyncMock(return_value=play_response)
+        mock_client.post = AsyncMock()
+        mock_client_cls.return_value = mock_client
+
+        result = await manager.execute_tool(
+            "spotify_player.play_track",
+            {"track_id": "0123456789ABCDEFGHIJKL"},
+        )
+
+    assert result.success is True
+    assert result.data["started"] is True
+    assert mock_client.post.await_count == 0
+
+    validation_call = mock_client.get.call_args
+    assert validation_call is not None
+    assert validation_call.args[0].endswith("/search")
+    assert validation_call.kwargs["params"] == {
+        "q": "spotify",
+        "type": "track",
+        "limit": 1,
+    }
+    assert validation_call.kwargs["headers"]["Authorization"] == "Bearer spotify-existing-token"
+
+    play_call = mock_client.put.call_args
+    assert play_call is not None
+    assert play_call.kwargs["headers"]["Authorization"] == "Bearer spotify-existing-token"
+
+
+@pytest.mark.asyncio
+async def test_spotify_player_play_track_refreshes_expired_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    validation_response = MagicMock()
+    validation_response.status_code = 401
+
+    token_response = MagicMock()
+    token_response.status_code = 200
+    token_response.json.return_value = {
+        "access_token": "spotify-refreshed-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+
+    play_response = MagicMock()
+    play_response.status_code = 204
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "spotify-client-id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "spotify-client-secret")
+    monkeypatch.setenv("SPOTIFY_ACCESS_TOKEN", "spotify-expired-token")
+    monkeypatch.setenv("SPOTIFY_REFRESH_TOKEN", "spotify-refresh-token")
+
+    with patch("src.skills.builtin.spotify_player_skill.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_client.get = AsyncMock(return_value=validation_response)
+        mock_client.post = AsyncMock(return_value=token_response)
+        mock_client.put = AsyncMock(return_value=play_response)
+        mock_client_cls.return_value = mock_client
+
+        result = await manager.execute_tool(
+            "spotify_player.play_track",
+            {"track_id": "0123456789ABCDEFGHIJKL"},
+        )
+
+    assert result.success is True
+    assert result.data["started"] is True
+
+    validation_call = mock_client.get.call_args
+    assert validation_call is not None
+    assert validation_call.kwargs["headers"]["Authorization"] == "Bearer spotify-expired-token"
+
+    token_call = mock_client.post.call_args
+    assert token_call is not None
+    assert token_call.kwargs["data"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "spotify-refresh-token",
+    }
+
+    play_call = mock_client.put.call_args
+    assert play_call is not None
+    assert play_call.kwargs["headers"]["Authorization"] == "Bearer spotify-refreshed-token"
+
+
+@pytest.mark.asyncio
+async def test_spotify_player_play_track_invalid_refresh_token_returns_reauth_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    token_response = MagicMock()
+    token_response.status_code = 400
+    token_response.json.return_value = {
+        "error": "invalid_grant",
+        "error_description": "Invalid refresh token",
+    }
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "spotify-client-id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "spotify-client-secret")
+    monkeypatch.setenv("SPOTIFY_REFRESH_TOKEN", "spotify-refresh-token")
+    monkeypatch.setenv("SPOTIFY_REDIRECT_URI", "https://catbot.local:8002/spotify/callback")
+    monkeypatch.delenv("SPOTIFY_ACCESS_TOKEN", raising=False)
+
+    with patch("src.skills.builtin.spotify_player_skill.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_client.post = AsyncMock(return_value=token_response)
+        mock_client_cls.return_value = mock_client
+
+        with pytest.raises(
+            SkillValidationError,
+            match=r"one-time URL: https://catbot\.local:8002/spotify/authorize",
+        ):
+            await manager.execute_tool(
+                "spotify_player.play_track",
+                {"track_id": "0123456789ABCDEFGHIJKL"},
+                raise_errors=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_spotify_player_play_playlist_refreshes_token_and_starts_playback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+
+    token_response = MagicMock()
+    token_response.status_code = 200
+    token_response.json.return_value = {
+        "access_token": "spotify-user-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+
+    play_response = MagicMock()
+    play_response.status_code = 204
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "spotify-client-id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "spotify-client-secret")
+    monkeypatch.setenv("SPOTIFY_REFRESH_TOKEN", "spotify-refresh-token")
+    monkeypatch.setenv("SPOTIFY_DEVICE_ID", "device-from-env")
+    monkeypatch.delenv("SPOTIFY_ACCESS_TOKEN", raising=False)
+
+    with patch("src.skills.builtin.spotify_player_skill.httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_client.post = AsyncMock(return_value=token_response)
+        mock_client.put = AsyncMock(return_value=play_response)
+        mock_client_cls.return_value = mock_client
+
+        result = await manager.execute_tool(
+            "spotify_player.play_playlist",
+            {
+                "playlist_id": "https://open.spotify.com/playlist/0123456789ABCDEFGHIJKL?si=test",
+                "offset_position": 2,
+                "position_ms": 1500,
+            },
+        )
+
+    assert result.success is True
+    assert result.data["started"] is True
+    assert result.data["playlist_id"] == "0123456789ABCDEFGHIJKL"
+    assert result.data["device_id"] == "device-from-env"
+
+    token_call = mock_client.post.call_args
+    assert token_call is not None
+    assert token_call.kwargs["data"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "spotify-refresh-token",
+    }
+
+    play_call = mock_client.put.call_args
+    assert play_call is not None
+    assert play_call.args[0].endswith("/me/player/play")
+    assert play_call.kwargs["params"] == {"device_id": "device-from-env"}
+    assert play_call.kwargs["headers"]["Authorization"] == "Bearer spotify-user-token"
+    assert play_call.kwargs["json"] == {
+        "context_uri": "spotify:playlist:0123456789ABCDEFGHIJKL",
+        "offset": {"position": 2},
+        "position_ms": 1500,
+    }
+
+
+@pytest.mark.asyncio
 async def test_googleworkspace_cli_check_cli_returns_version_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -442,6 +853,42 @@ async def test_googleworkspace_cli_check_cli_returns_version_output(
     assert result.success is True
     assert result.data["available"] is True
     assert result.data["version"] == "gws 0.8.0"
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_run_gws_command_wraps_cmd_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    captured: Dict[str, Any] = {}
+    executable_path = r"C:\Users\pc\AppData\Roaming\npm\gws.cmd"
+
+    class DummyProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b'{"ok":true}', b""
+
+    async def fake_create_subprocess_exec(*args: Any, **kwargs: Any) -> DummyProcess:
+        captured["args"] = list(args)
+        captured["kwargs"] = kwargs
+        return DummyProcess()
+
+    monkeypatch.setattr(gws_skill, "_resolve_gws_executable", lambda requested, working_dir: executable_path)
+    monkeypatch.setattr(gws_skill.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await gws_skill._run_gws_command(
+        ["gws", "--version"],
+        timeout_seconds=5,
+        cwd=Path("."),
+        env_overrides={},
+    )
+
+    assert captured["args"][0].lower().endswith("cmd.exe")
+    assert captured["args"][1:4] == ["/d", "/c", executable_path]
+    assert captured["args"][4:] == ["--version"]
+    assert result["parsed_json"] == {"ok": True}
 
 
 @pytest.mark.asyncio
@@ -591,6 +1038,151 @@ async def test_googleworkspace_cli_allows_create_actions(
 
 
 @pytest.mark.asyncio
+async def test_googleworkspace_cli_slides_batch_update_builds_requests_from_slides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        captured["args"] = list(args)
+        return {
+            "command": list(args),
+            "returncode": 0,
+            "duration_ms": 10,
+            "stdout": '{"replies":[]}',
+            "stderr": "",
+            "parsed_json": {"replies": []},
+        }
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+
+    temp_base = _create_workspace_temp_dir()
+    try:
+        images_dir = temp_base / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        (images_dir / "overview.png").write_bytes(b"overview")
+
+        manager = SkillManager.from_manifest_directory("src/skills/manifests")
+        result = await manager.execute_tool(
+            "googleworkspace_cli.slides_batch_update_presentation",
+            {
+                "presentation_id": "pres_123",
+                "slides": [
+                    {
+                        "title": "Overview",
+                        "bullets": ["Goal"],
+                        "images": [{"path": "images/overview.png", "alt": "Overview chart"}],
+                    }
+                ],
+                "image_url_prefix": "https://cdn.example.com/decks",
+            },
+            context=SkillContext(scratch_dir=temp_base),
+        )
+
+        assert result.success is True
+        assert captured["args"][:4] == ["gws", "slides", "presentations", "batchUpdate"]
+        params = json.loads(captured["args"][captured["args"].index("--params") + 1])
+        payload = json.loads(captured["args"][captured["args"].index("--json") + 1])
+        assert params == {"presentationId": "pres_123"}
+        assert len(payload["requests"]) == 4
+        image_request = next(
+            req["createImage"] for req in payload["requests"] if "createImage" in req
+        )
+        assert image_request["url"] == "https://cdn.example.com/decks/images/overview.png"
+        assert result.data["request_source"] == "slides"
+        assert result.data["image_request_count"] == 1
+        assert "Updated Google Slides presentation pres_123" in result.message
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_slides_create_presentation_from_markdown_runs_create_then_batch_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    calls: list[list[str]] = []
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        command = list(args)
+        calls.append(command)
+        if command[:4] == ["gws", "slides", "presentations", "create"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 11,
+                "stdout": '{"presentationId":"pres_456"}',
+                "stderr": "",
+                "parsed_json": {"presentationId": "pres_456"},
+            }
+        if command[:4] == ["gws", "slides", "presentations", "batchUpdate"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 12,
+                "stdout": '{"replies":[]}',
+                "stderr": "",
+                "parsed_json": {"replies": []},
+            }
+        raise AssertionError(f"Unexpected gws command: {command}")
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+
+    temp_base = _create_workspace_temp_dir()
+    try:
+        images_dir = temp_base / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        (images_dir / "overview-metrics.png").write_bytes(b"overview")
+
+        manager = SkillManager.from_manifest_directory("src/skills/manifests")
+        markdown = "# Q3 Product Roadmap\n\n## Overview Metrics\n- Revenue trend\n"
+        result = await manager.execute_tool(
+            "googleworkspace_cli.slides_create_presentation_from_markdown",
+            {
+                "markdown": markdown,
+                "attach_scratch_images": True,
+                "image_dir": "images",
+                "image_match_mode": "title",
+                "image_url_prefix": "https://cdn.example.com/decks",
+            },
+            context=SkillContext(scratch_dir=temp_base),
+        )
+
+        assert result.success is True
+        assert calls[0][:4] == ["gws", "slides", "presentations", "create"]
+        assert calls[1][:4] == ["gws", "slides", "presentations", "batchUpdate"]
+        create_payload = json.loads(calls[0][calls[0].index("--json") + 1])
+        batch_payload = json.loads(calls[1][calls[1].index("--json") + 1])
+        assert create_payload == {"title": "Q3 Product Roadmap"}
+        image_request = next(
+            req["createImage"] for req in batch_payload["requests"] if "createImage" in req
+        )
+        assert image_request["url"] == "https://cdn.example.com/decks/images/overview-metrics.png"
+        assert result.data["presentation_id"] == "pres_456"
+        assert result.data["title"] == "Q3 Product Roadmap"
+        assert result.data["auto_attached_images"] == 1
+        assert result.data["image_request_count"] == 1
+        assert "Created Google Slides deck 'Q3 Product Roadmap'" in result.message
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_googleworkspace_cli_normalizes_gmail_compose_payload_for_draft_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -727,6 +1319,179 @@ async def test_googleworkspace_cli_gmail_list_unread_tool_builds_expected_query(
     assert params_payload["maxResults"] == 5
     assert "in:inbox is:unread" in params_payload["q"]
     assert "from:billing@example.com" in params_payload["q"]
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_gmail_list_all_tool_supports_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    calls: list[list[str]] = []
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        command = list(args)
+        calls.append(command)
+        if command[:5] == ["gws", "gmail", "users", "messages", "list"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 9,
+                "stdout": (
+                    '{"messages":[{"id":"m3","threadId":"t3"}],'
+                    '"nextPageToken":"token-next","resultSizeEstimate":321}'
+                ),
+                "stderr": "",
+                "parsed_json": {
+                    "messages": [{"id": "m3", "threadId": "t3"}],
+                    "nextPageToken": "token-next",
+                    "resultSizeEstimate": 321,
+                },
+            }
+        if command[:5] == ["gws", "gmail", "users", "messages", "get"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 7,
+                "stdout": (
+                    '{"id":"m3","threadId":"t3","snippet":"Preview all mail",'
+                    '"payload":{"headers":[{"name":"From","value":"Carol <carol@example.com>"},'
+                    '{"name":"Subject","value":"Quarterly update"},{"name":"Date","value":"Tue, 10 Mar 2026"}]},'
+                    '"labelIds":["INBOX"]}'
+                ),
+                "stderr": "",
+                "parsed_json": {
+                    "id": "m3",
+                    "threadId": "t3",
+                    "snippet": "Preview all mail",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "Carol <carol@example.com>"},
+                            {"name": "Subject", "value": "Quarterly update"},
+                            {"name": "Date", "value": "Tue, 10 Mar 2026"},
+                        ]
+                    },
+                    "labelIds": ["INBOX"],
+                },
+            }
+        return {"command": command, "returncode": 0, "duration_ms": 6, "stdout": "{}", "stderr": "", "parsed_json": {}}
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+    result = await manager.execute_tool(
+        "googleworkspace_cli.gmail_list_all",
+        {
+            "max_results": 7,
+            "page_token": "token-prev",
+            "query": "label:important",
+        },
+    )
+    assert result.success is True
+    params_payload = json.loads(calls[0][calls[0].index("--params") + 1])
+    assert params_payload["userId"] == "me"
+    assert params_payload["maxResults"] == 7
+    assert params_payload["pageToken"] == "token-prev"
+    assert params_payload["q"] == "label:important"
+    data = result.data or {}
+    assert data["page_token"] == "token-prev"
+    assert data["next_page_token"] == "token-next"
+    assert data["result_size_estimate"] == 321
+    assert data["message_count"] == 1
+    summaries = data.get("gmail_message_summaries")
+    assert isinstance(summaries, list) and len(summaries) == 1
+    assert summaries[0]["subject"] == "Quarterly update"
+    assert summaries[0]["from"] == "Carol <carol@example.com>"
+    assert any(call[:5] == ["gws", "gmail", "users", "messages", "get"] for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_gmail_list_all_returns_up_to_requested_ten_summaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    calls: list[list[str]] = []
+    list_messages = [{"id": f"m{i}", "threadId": f"t{i}"} for i in range(1, 11)]
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        command = list(args)
+        calls.append(command)
+        if command[:5] == ["gws", "gmail", "users", "messages", "list"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 9,
+                "stdout": json.dumps({"messages": list_messages}),
+                "stderr": "",
+                "parsed_json": {"messages": list_messages},
+            }
+        if command[:5] == ["gws", "gmail", "users", "messages", "get"]:
+            params_payload = json.loads(command[command.index("--params") + 1])
+            message_id = str(params_payload["id"])
+            index = int(message_id.removeprefix("m"))
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 7,
+                "stdout": json.dumps(
+                    {
+                        "id": message_id,
+                        "threadId": f"t{index}",
+                        "snippet": f"Preview {index}",
+                        "payload": {
+                            "headers": [
+                                {"name": "From", "value": f"Sender {index} <sender{index}@example.com>"},
+                                {"name": "Subject", "value": f"Subject {index}"},
+                                {"name": "Date", "value": f"Tue, {index:02d} Mar 2026"},
+                            ]
+                        },
+                    }
+                ),
+                "stderr": "",
+                "parsed_json": {
+                    "id": message_id,
+                    "threadId": f"t{index}",
+                    "snippet": f"Preview {index}",
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": f"Sender {index} <sender{index}@example.com>"},
+                            {"name": "Subject", "value": f"Subject {index}"},
+                            {"name": "Date", "value": f"Tue, {index:02d} Mar 2026"},
+                        ]
+                    },
+                },
+            }
+        return {"command": command, "returncode": 0, "duration_ms": 6, "stdout": "{}", "stderr": "", "parsed_json": {}}
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+    manager = SkillManager.from_manifest_directory("src/skills/manifests")
+    result = await manager.execute_tool(
+        "googleworkspace_cli.gmail_list_all",
+        {"max_results": 10},
+    )
+
+    assert result.success is True
+    data = result.data or {}
+    assert data["max_results"] == 10
+    assert data["message_count"] == 10
+    summaries = data.get("gmail_message_summaries")
+    assert isinstance(summaries, list) and len(summaries) == 10
+    assert summaries[0]["subject"] == "Subject 1"
+    assert summaries[-1]["subject"] == "Subject 10"
+    get_calls = [call for call in calls if call[:5] == ["gws", "gmail", "users", "messages", "get"]]
+    assert len(get_calls) == 10
 
 
 @pytest.mark.asyncio
@@ -1583,128 +2348,6 @@ async def test_googleworkspace_cli_blocks_mutating_actions() -> None:
             },
             raise_errors=True,
         )
-
-
-@pytest.mark.asyncio
-async def test_google_slides_create_outline_returns_requested_slide_count() -> None:
-    manager = SkillManager.from_manifest_directory("src/skills/manifests")
-
-    result = await manager.execute_tool(
-        "google_slides.create_outline",
-        {
-            "topic": "Q3 Product Roadmap",
-            "audience": "Executive team",
-            "slide_count": 8,
-            "objective": "Approve milestone and staffing plan",
-        },
-    )
-
-    assert result.success is True
-    assert result.data["slide_count"] == 8
-    assert len(result.data["slides"]) == 8
-    assert result.data["slides"][0]["title"] == "Q3 Product Roadmap"
-
-
-@pytest.mark.asyncio
-async def test_google_slides_build_batch_update_requests_generates_payload() -> None:
-    manager = SkillManager.from_manifest_directory("src/skills/manifests")
-
-    result = await manager.execute_tool(
-        "google_slides.build_batch_update_requests",
-        {
-            "presentation_id": "test-presentation-id",
-            "slides": [
-                {"title": "Overview", "bullets": ["Goal", "Scope"]},
-                {"title": "Plan", "bullets": ["Milestone 1", "Milestone 2"]},
-            ],
-        },
-    )
-
-    assert result.success is True
-    assert result.data["presentation_id"] == "test-presentation-id"
-    assert result.data["slide_count"] == 2
-    assert result.data["request_count"] == 6
-    assert result.data["requests"][0]["createSlide"]["objectId"] == "slide_1"
-    assert result.data["requests"][1]["insertText"]["objectId"] == "title_1"
-
-
-@pytest.mark.asyncio
-async def test_google_slides_create_outline_from_markdown_attaches_matching_scratch_images() -> None:
-    temp_base = _create_workspace_temp_dir()
-    try:
-        images_dir = temp_base / "images"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        (images_dir / "overview-metrics.png").write_bytes(b"overview")
-        (images_dir / "execution-timeline.png").write_bytes(b"timeline")
-
-        manager = SkillManager.from_manifest_directory("src/skills/manifests")
-        markdown = (
-            "# Q3 Product Roadmap\n\n"
-            "## Overview Metrics\n"
-            "- Revenue trend\n\n"
-            "## Execution Timeline\n"
-            "- Key milestones\n"
-        )
-        result = await manager.execute_tool(
-            "google_slides.create_outline_from_markdown",
-            {
-                "markdown": markdown,
-                "attach_scratch_images": True,
-                "image_dir": "images",
-                "image_match_mode": "title",
-            },
-            context=SkillContext(scratch_dir=temp_base),
-        )
-
-        assert result.success is True
-        assert result.data["slide_count"] == 3
-        slides = result.data["slides"]
-        overview = next(item for item in slides if item["title"] == "Overview Metrics")
-        timeline = next(item for item in slides if item["title"] == "Execution Timeline")
-        assert overview["images"][0]["path"] == "images/overview-metrics.png"
-        assert timeline["images"][0]["path"] == "images/execution-timeline.png"
-        assert result.data["auto_attached_images"] == 2
-    finally:
-        shutil.rmtree(temp_base, ignore_errors=True)
-
-
-@pytest.mark.asyncio
-async def test_google_slides_build_batch_update_requests_includes_image_requests_from_scratch_paths() -> None:
-    temp_base = _create_workspace_temp_dir()
-    try:
-        images_dir = temp_base / "images"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        (images_dir / "overview.png").write_bytes(b"overview")
-
-        manager = SkillManager.from_manifest_directory("src/skills/manifests")
-        result = await manager.execute_tool(
-            "google_slides.build_batch_update_requests",
-            {
-                "presentation_id": "test-presentation-id",
-                "image_url_prefix": "https://cdn.example.com/decks",
-                "slides": [
-                    {
-                        "title": "Overview",
-                        "bullets": ["Goal"],
-                        "images": [{"path": "images/overview.png", "alt": "Overview chart"}],
-                    }
-                ],
-            },
-            context=SkillContext(scratch_dir=temp_base),
-        )
-
-        assert result.success is True
-        assert result.data["slide_count"] == 1
-        assert result.data["image_request_count"] == 1
-        assert result.data["request_count"] == 4
-        image_request = next(
-            req["createImage"] for req in result.data["requests"] if "createImage" in req
-        )
-        assert image_request["objectId"] == "image_1_1"
-        assert image_request["url"] == "https://cdn.example.com/decks/images/overview.png"
-        assert result.data["skipped_images"] == []
-    finally:
-        shutil.rmtree(temp_base, ignore_errors=True)
 
 
 @pytest.mark.asyncio

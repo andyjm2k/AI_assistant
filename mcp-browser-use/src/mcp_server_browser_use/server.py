@@ -8,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 
 def _configure_stdio_logging() -> None:
@@ -78,6 +78,102 @@ logger.setLevel(getattr(logging, settings.server.logging_level.upper()))
 
 # Global registry of running asyncio tasks for cancellation support
 _running_tasks: dict[str, asyncio.Task] = {}
+_background_tasks: set[asyncio.Task] = set()
+_server_session_id = str(uuid.uuid4())
+_task_store_ready = False
+
+
+def _extract_agent_final_text(result: Any) -> str | None:
+    """Recover the most explicit agent result available from history."""
+    if result is None:
+        return None
+
+    final_result_fn = getattr(result, "final_result", None)
+    if callable(final_result_fn):
+        try:
+            final = final_result_fn()
+        except Exception:
+            final = None
+        if isinstance(final, str) and final.strip():
+            return final.strip()
+
+    history = getattr(result, "history", None)
+    if not isinstance(history, list):
+        return None
+
+    for history_item in reversed(history):
+        step_results = getattr(history_item, "result", None)
+        if not isinstance(step_results, list):
+            continue
+
+        for action_result in reversed(step_results):
+            extracted = getattr(action_result, "extracted_content", None)
+            if isinstance(extracted, str) and extracted.strip():
+                return extracted.strip()
+
+        for action_result in reversed(step_results):
+            if getattr(action_result, "is_done", False) is not True:
+                continue
+            memory = getattr(action_result, "long_term_memory", None)
+            if isinstance(memory, str) and memory.strip():
+                return memory.strip()
+
+    return None
+
+
+async def _ensure_task_store_ready() -> None:
+    """Initialize the task store once and reconcile orphaned tasks from prior sessions."""
+    global _task_store_ready
+
+    if _task_store_ready:
+        return
+
+    task_store = get_task_store()
+    await task_store.initialize()
+    reconciled = await task_store.reconcile_incomplete_tasks(_server_session_id)
+    if reconciled:
+        logger.warning("Reconciled %d orphaned tasks from previous server sessions", reconciled)
+    _task_store_ready = True
+
+
+def _register_running_task(task_id: str, task: asyncio.Task) -> None:
+    """Track a live asyncio task for cancellation and health reporting."""
+    _running_tasks[task_id] = task
+
+
+def _track_background_task(task: asyncio.Task) -> None:
+    """Keep detached wrapper tasks alive without reporting them as user-running tasks."""
+    _background_tasks.add(task)
+
+    def _cleanup(done_task: asyncio.Task) -> None:
+        _background_tasks.discard(done_task)
+
+    task.add_done_callback(_cleanup)
+
+
+async def _get_live_running_tasks() -> list[TaskRecord]:
+    """Return running task records that still have a live asyncio task in this server session."""
+    await _ensure_task_store_ready()
+
+    task_store = get_task_store()
+    running_tasks = await task_store.get_running_tasks_for_session(_server_session_id)
+    live_task_ids = set(_running_tasks)
+
+    stale_task_ids = [task.task_id for task in running_tasks if task.task_id not in live_task_ids]
+    for task_id in stale_task_ids:
+        await task_store.update_status(
+            task_id,
+            TaskStatus.FAILED,
+            error="Task lost its live execution handle before completion.",
+        )
+
+    if stale_task_ids:
+        logger.warning(
+            "Marked %d stale running tasks from the current session as failed",
+            len(stale_task_ids),
+        )
+
+    return [task for task in running_tasks if task.task_id in live_task_ids]
 
 
 def serve() -> FastMCP:
@@ -157,12 +253,14 @@ def serve() -> FastMCP:
         """
         # --- Task Tracking Setup ---
         task_id = str(uuid.uuid4())
+        await _ensure_task_store_ready()
         task_store = get_task_store()
         task_record = TaskRecord(
             task_id=task_id,
             tool_name="run_browser_agent",
             status=TaskStatus.PENDING,
             input_params={"task": task, "max_steps": max_steps, "skill_name": skill_name, "learn": learn},
+            session_id=_server_session_id,
         )
         await task_store.create_task(task_record)
         bind_task_context(task_id, "run_browser_agent")
@@ -354,6 +452,7 @@ def serve() -> FastMCP:
                 task=augmented_task,
                 llm=llm,
                 browser_profile=profile,
+                use_vision=settings.agent.use_vision,
                 max_steps=steps,
                 register_new_step_callback=step_callback,
             )
@@ -368,13 +467,10 @@ def serve() -> FastMCP:
 
             # Register task for cancellation support
             agent_task = asyncio.create_task(agent.run())
-            _running_tasks[task_id] = agent_task
-            try:
-                result = await agent_task
-            finally:
-                _running_tasks.pop(task_id, None)
+            _register_running_task(task_id, agent_task)
+            result = await agent_task
 
-            final = result.final_result() or "Task completed without explicit result."
+            final = _extract_agent_final_text(result) or "Task completed without explicit result."
 
             # Validate result if skill was used (execution mode)
             is_valid = True
@@ -392,11 +488,12 @@ def serve() -> FastMCP:
                             task=task,  # Original task without hints
                             llm=llm,
                             browser_profile=profile,
+                            use_vision=settings.agent.use_vision,
                             max_steps=steps,
                             register_new_step_callback=step_callback,
                         )
                         result = await agent.run()
-                        final = result.final_result() or "Task completed without explicit result."
+                        final = _extract_agent_final_text(result) or "Task completed without explicit result."
                         is_valid = True  # Fallback execution is considered valid
 
             # Record skill usage statistics (execution mode)
@@ -491,6 +588,7 @@ def serve() -> FastMCP:
             raise BrowserError(f"Browser automation failed: {e}") from e
 
         finally:
+            _running_tasks.pop(task_id, None)
             # Ensure CDP listeners are always detached, even if exceptions occurred
             if recorder and recorder_attached:
                 try:
@@ -524,12 +622,14 @@ def serve() -> FastMCP:
         """
         # --- Task Tracking Setup ---
         task_id = str(uuid.uuid4())
+        await _ensure_task_store_ready()
         task_store = get_task_store()
         task_record = TaskRecord(
             task_id=task_id,
             tool_name="run_deep_research",
             status=TaskStatus.PENDING,
             input_params={"topic": topic, "max_searches": max_searches, "save_to_file": save_to_file},
+            session_id=_server_session_id,
         )
         await task_store.create_task(task_record)
         bind_task_context(task_id, "run_deep_research")
@@ -569,11 +669,8 @@ def serve() -> FastMCP:
 
             # Register task for cancellation support
             research_task = asyncio.create_task(machine.run())
-            _running_tasks[task_id] = research_task
-            try:
-                report = await research_task
-            finally:
-                _running_tasks.pop(task_id, None)
+            _register_running_task(task_id, research_task)
+            report = await research_task
 
             # Auto-save result if results_dir is configured and no explicit save path
             if settings.server.results_dir and not save_to_file:
@@ -602,6 +699,8 @@ def serve() -> FastMCP:
             task_logger.error("task_failed", error=str(e))
             clear_task_context()
             raise
+        finally:
+            _running_tasks.pop(task_id, None)
 
     # --- Skill Management Tools (only registered when skills.enabled) ---
     if settings.skills.enabled and skill_store:
@@ -681,11 +780,14 @@ def serve() -> FastMCP:
         """Implementation of health check."""
         import json
 
+        await _ensure_task_store_ready()
         import psutil
 
         task_store = get_task_store()
-        running_tasks = await task_store.get_running_tasks()
+        running_tasks = await _get_live_running_tasks()
         stats = await task_store.get_stats()
+        stats["running_count"] = len(running_tasks)
+        stats.setdefault("by_status", {})["running"] = len(running_tasks)
 
         # Get process stats
         process = psutil.Process()
@@ -716,6 +818,7 @@ def serve() -> FastMCP:
         """Implementation of task list."""
         import json
 
+        await _ensure_task_store_ready()
         task_store = get_task_store()
 
         status = None
@@ -725,7 +828,10 @@ def serve() -> FastMCP:
             except ValueError:
                 return f"Error: Invalid status '{status_filter}'. Use: running, completed, failed, pending"
 
-        tasks = await task_store.get_task_history(limit=limit, status=status)
+        if status == TaskStatus.RUNNING:
+            tasks = (await _get_live_running_tasks())[:limit]
+        else:
+            tasks = await task_store.get_task_history(limit=limit, status=status)
 
         return json.dumps(
             {
@@ -749,6 +855,7 @@ def serve() -> FastMCP:
         """Implementation of task get."""
         import json
 
+        await _ensure_task_store_ready()
         task_store = get_task_store()
 
         # Try exact match first, then prefix match
@@ -842,6 +949,7 @@ def serve() -> FastMCP:
         """
         import json
 
+        await _ensure_task_store_ready()
         task_store = get_task_store()
 
         # Find by prefix match
@@ -1061,12 +1169,14 @@ def serve() -> FastMCP:
 
         # Create task ID for tracking
         task_id = str(uuid.uuid4())
+        await _ensure_task_store_ready()
         task_store = get_task_store()
         task_record = TaskRecord(
             task_id=task_id,
             tool_name=f"skill_run:{skill_name}",
             status=TaskStatus.PENDING,
             input_params={"skill_name": skill_name, "url": url, "params": params},
+            session_id=_server_session_id,
         )
         await task_store.create_task(task_record)
 
@@ -1100,19 +1210,17 @@ def serve() -> FastMCP:
                     task=augmented_task,
                     llm=llm,
                     browser_profile=profile,
+                    use_vision=settings.agent.use_vision,
                     max_steps=settings.agent.max_steps,
                 )
 
                 # Register for cancellation
                 agent_task = asyncio.create_task(agent.run())
-                _running_tasks[task_id] = agent_task
+                _register_running_task(task_id, agent_task)
 
-                try:
-                    result = await agent_task
-                finally:
-                    _running_tasks.pop(task_id, None)
+                result = await agent_task
 
-                final = result.final_result() or "Task completed without explicit result."
+                final = _extract_agent_final_text(result) or "Task completed without explicit result."
 
                 # Record usage
                 if skill_store:
@@ -1129,12 +1237,12 @@ def serve() -> FastMCP:
                 logger.error(f"Skill {skill_name} execution failed: {e}")
 
             finally:
+                _running_tasks.pop(task_id, None)
                 clear_task_context()
 
         # Start background task and keep reference to prevent garbage collection
         bg_task = asyncio.create_task(execute_skill())
-        # Store task reference to prevent GC
-        _running_tasks[f"{task_id}_bg"] = bg_task
+        _track_background_task(bg_task)
 
         return JSONResponse(
             {
@@ -1180,12 +1288,14 @@ def serve() -> FastMCP:
 
         # Create task ID for tracking
         task_id = str(uuid.uuid4())
+        await _ensure_task_store_ready()
         task_store = get_task_store()
         task_record = TaskRecord(
             task_id=task_id,
             tool_name="learn",
             status=TaskStatus.PENDING,
             input_params={"task": task_description, "skill_name": skill_name},
+            session_id=_server_session_id,
         )
         await task_store.create_task(task_record)
 
@@ -1219,6 +1329,7 @@ def serve() -> FastMCP:
                     task=augmented_task,
                     llm=llm,
                     browser_profile=profile,
+                    use_vision=settings.agent.use_vision,
                     max_steps=settings.agent.max_steps,
                 )
 
@@ -1229,14 +1340,11 @@ def serve() -> FastMCP:
 
                 # Register for cancellation
                 agent_task = asyncio.create_task(agent.run())
-                _running_tasks[task_id] = agent_task
+                _register_running_task(task_id, agent_task)
 
-                try:
-                    result = await agent_task
-                finally:
-                    _running_tasks.pop(task_id, None)
+                result = await agent_task
 
-                final = result.final_result() or "Task completed without explicit result."
+                final = _extract_agent_final_text(result) or "Task completed without explicit result."
 
                 # Extract skill from execution
                 skill_extraction_result = ""
@@ -1277,12 +1385,12 @@ def serve() -> FastMCP:
                 logger.error(f"Learning session failed: {e}")
 
             finally:
+                _running_tasks.pop(task_id, None)
                 clear_task_context()
 
         # Start background task and keep reference to prevent garbage collection
         bg_task = asyncio.create_task(execute_learn())
-        # Store task reference to prevent GC
-        _running_tasks[f"{task_id}_bg"] = bg_task
+        _track_background_task(bg_task)
 
         return JSONResponse(
             {
@@ -1317,6 +1425,7 @@ def serve() -> FastMCP:
 
         from starlette.responses import StreamingResponse
 
+        await _ensure_task_store_ready()
         task_store = get_task_store()
 
         async def event_generator():
@@ -1326,7 +1435,7 @@ def serve() -> FastMCP:
 
                 while True:
                     # Get current running tasks
-                    running_tasks = await task_store.get_running_tasks()
+                    running_tasks = await _get_live_running_tasks()
 
                     # Stream updates for tasks that changed
                     for task in running_tasks:
@@ -1393,6 +1502,7 @@ def serve() -> FastMCP:
         from starlette.responses import StreamingResponse
 
         task_id = request.path_params["task_id"]
+        await _ensure_task_store_ready()
         task_store = get_task_store()
 
         # Find task by ID (exact or prefix match)

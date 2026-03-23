@@ -58,17 +58,39 @@ def _read_server_info() -> dict | None:
         required = {"pid", "host", "port", "transport"}
         if not required.issubset(info.keys()):
             return None
+        info["pid"] = int(info["pid"])
+        info["port"] = int(info["port"])
+        if info["pid"] <= 0 or info["port"] <= 0:
+            return None
+        if not isinstance(info["host"], str) or not isinstance(info["transport"], str):
+            return None
         return info
-    except (json.JSONDecodeError, OSError):
+    except (TypeError, ValueError, json.JSONDecodeError, OSError):
         return None
 
 
 def _is_process_running(pid: int) -> bool:
     """Check if a process with given PID is running."""
     try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+
+    if pid <= 0:
+        return False
+
+    # Prefer psutil on Windows: os.kill(pid, 0) can raise WinError 87 / SystemError.
+    try:
+        import psutil
+
+        return psutil.pid_exists(pid)
+    except Exception:
+        pass
+
+    try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except (OSError, SystemError, TypeError, ValueError):
         return False
 
 

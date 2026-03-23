@@ -25,6 +25,7 @@ CALC_EXPR_MAX_LEN = 200
 # Allowed characters for safe calculate (numbers, spaces, + - * / ( ) .)
 CALC_ALLOWED_RE = re.compile(r"^[\d\s+\-*/().]+$")
 SKILL_RESULT_MESSAGE_MAX_CHARS = 4000
+DEFAULT_GMAIL_SUMMARY_RENDER_LIMIT = 10
 _TOOL_CALL_BLOCK_RE = (
     r"<(?:tool|tool_call)>[\s\S]*?</(?:tool|tool_call)>\s*"
     r"<parameters>[\s\S]*?</parameters>"
@@ -49,6 +50,13 @@ _TELEGRAM_TOOL_NAME_ALIASES = {
     "run_health_check": "healthCheck",
     # Model sometimes emits the skill name instead of a concrete tool name.
     "googleworkspace_cli": "googleworkspace_cli.gmail_list_unread",
+    # Model sometimes invents a google_slides execution tool name; route it to the real gws-backed tool.
+    "google_slides.slides_create_presentation_from_markdown": (
+        "googleworkspace_cli.slides_create_presentation_from_markdown"
+    ),
+    "google_slides.slides_batch_update_presentation": (
+        "googleworkspace_cli.slides_batch_update_presentation"
+    ),
 }
 _GMAIL_STATE_CACHE_KEY = "__gmail_tool_state__"
 
@@ -828,7 +836,13 @@ def _summarize_skill_data_message(data: Any) -> str:
         raw_summaries = data.get("gmail_message_summaries")
         if isinstance(raw_summaries, list) and raw_summaries:
             lines: List[str] = []
-            for index, item in enumerate(raw_summaries[:5], 1):
+            render_limit = _coerce_bounded_int(
+                data.get("max_results"),
+                default=DEFAULT_GMAIL_SUMMARY_RENDER_LIMIT,
+                minimum=1,
+                maximum=max(len(raw_summaries), DEFAULT_GMAIL_SUMMARY_RENDER_LIMIT),
+            )
+            for index, item in enumerate(raw_summaries[:render_limit], 1):
                 if not isinstance(item, dict):
                     continue
                 message_id = str(item.get("id") or "").strip()
@@ -1766,6 +1780,8 @@ async def execute_telegram_tool(
         msg = out.get("message") if isinstance(out, dict) else None
         if not msg and isinstance(out, dict):
             msg = out.get("output")
+        if not msg and isinstance(out, dict):
+            msg = out.get("result")
         msg = msg or str(out)[:500]
         return {"success": success, "message": msg, "data": out}
 
@@ -1781,6 +1797,8 @@ async def execute_telegram_tool(
         msg = out.get("message") if isinstance(out, dict) else None
         if not msg and isinstance(out, dict):
             msg = out.get("output")
+        if not msg and isinstance(out, dict):
+            msg = out.get("report") or out.get("result")
         msg = msg or str(out)[:500]
         return {"success": success, "message": msg, "data": out}
 

@@ -13,24 +13,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_NAME = "mcp-server-browser-use"
 
-# Load project root .env when running inside a parent project (e.g. AI_assistant) so
-# MCP_LLM_* and other config are picked up from the same .env as the Flask bridge.
-def _load_project_env() -> None:
-    """Load .env from project root (parent of mcp-browser-use) if present."""
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-    # This file is .../mcp-browser-use/src/mcp_server_browser_use/config.py -> parent x3 = project root
-    package_dir = Path(__file__).resolve().parent
-    project_root = package_dir.parent.parent.parent
-    env_file = project_root / ".env"
-    if env_file.is_file():
-        load_dotenv(env_file)
-
-
-_load_project_env()
-
 
 def get_config_dir() -> Path:
     """Get the configuration directory (e.g. ~/.config/mcp-server-browser-use)."""
@@ -81,6 +63,7 @@ def save_config_file(config_data: dict[str, Any]) -> None:
 # For providers with multiple common env var names, use a list (first match wins)
 STANDARD_ENV_VAR_NAMES: dict[str, str | list[str]] = {
     "openai": "OPENAI_API_KEY",
+    "minimax": ["MINIMAX_API_KEY", "OPENAI_API_KEY"],
     "anthropic": "ANTHROPIC_API_KEY",
     "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],  # GEMINI_API_KEY takes priority
     "azure_openai": "AZURE_OPENAI_API_KEY",
@@ -97,6 +80,7 @@ NO_KEY_PROVIDERS = frozenset({"ollama", "bedrock"})
 
 ProviderType = Literal[
     "openai",
+    "minimax",
     "anthropic",
     "google",
     "azure_openai",
@@ -221,7 +205,7 @@ class ResearchSettings(BaseSettings):
 
     max_searches: int = Field(default=5, description="Maximum number of searches per research task")
     save_directory: str | None = Field(default=None, description="Directory to save research reports")
-    search_timeout: int = Field(default=120, description="Timeout per search in seconds")
+    search_timeout: int = Field(default=300, description="Timeout per search in seconds")
 
 
 class SkillsSettings(BaseSettings):

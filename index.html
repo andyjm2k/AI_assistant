@@ -357,20 +357,22 @@
                             <input type="radio" id="tts-service-microsoft" name="tts-service" value="microsoft" checked>
                             <label for="tts-service-microsoft">Microsoft</label>
                             <input type="radio" id="tts-service-openai" name="tts-service" value="openai">
-                            <label for="tts-service-openai">OpenAI-compatible (Chatterbox)</label>
+                            <label for="tts-service-openai">OpenAI-compatible / Embedded</label>
                         </div>
-                        <span class="helper-text">Choose between Microsoft browser TTS or local Chatterbox TTS API</span>
+                        <span class="helper-text">Choose between Microsoft browser TTS or an OpenAI-compatible endpoint, including embedded Kitten and Pocket TTS.</span>
 
                         <label for="tts-endpoint-url">TTS API Endpoint:</label>
                         <input type="text" id="tts-endpoint-url" value="http://localhost:4123/v1" placeholder="http://localhost:4123/v1">
-                        <span class="helper-text">Endpoint for OpenAI-compatible TTS service (Chatterbox default: http://localhost:4123/v1)</span>
+                        <span class="helper-text">Endpoint for the OpenAI-compatible TTS service. Use the CATBot proxy URL for embedded Kitten or Pocket TTS.</span>
 
                         <label for="tts-model-dropdown">TTS Model:</label>
                         <select id="tts-model-dropdown">
                             <option value="tts-1">tts-1</option>
                             <option value="tts-1-hd">tts-1-hd</option>
+                            <option value="kitten-tts-mini-0.8">kitten-tts-mini-0.8</option>
+                            <option value="pocket-tts-realtime">pocket-tts-realtime</option>
                         </select>
-                        <span class="helper-text">Model for OpenAI-compatible TTS (tts-1 is faster, tts-1-hd is higher quality)</span>
+                        <span class="helper-text">Model for the selected TTS endpoint. `kitten-tts-mini-0.8` and `pocket-tts-realtime` target CATBot’s embedded local backends.</span>
 
                         <label for="tts-voice-dropdown">TTS Voice:</label>
                         <div class="settings-inline-field">
@@ -381,7 +383,7 @@
                                 <i class="fas fa-sync-alt"></i>
                             </button>
                         </div>
-                        <span class="helper-text">Voice for OpenAI-compatible TTS. Use refresh to pull voices from the configured TTS endpoint.</span>
+                        <span class="helper-text">Voice for the selected TTS model. Use refresh to pull model-specific voices from the configured endpoint.</span>
                     </div>
 
                     <div class="settings-section tool-settings-screen" id="models-settings-panel" data-tool-settings-panel>

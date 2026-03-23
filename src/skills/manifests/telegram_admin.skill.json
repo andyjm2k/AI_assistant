@@ -1,0 +1,6 @@
+{
+  "name": "telegram_admin",
+  "description": "Send proactive Telegram notifications or scratch files to the configured admin user.",
+  "enabled": true,
+  "module": "src.skills.builtin.telegram_admin_skill:create_skill"
+}

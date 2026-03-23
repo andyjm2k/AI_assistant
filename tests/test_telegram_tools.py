@@ -76,6 +76,14 @@ class TestParseTelegramToolResponse:
         """Plain text with no tool format returns None."""
         assert tg.parse_telegram_tool_response("Just a normal reply.") is None
 
+    def test_google_slides_execution_alias_maps_to_googleworkspace_cli(self):
+        assert (
+            tg._canonicalize_telegram_tool_name(
+                "google_slides.slides_create_presentation_from_markdown"
+            )
+            == "googleworkspace_cli.slides_create_presentation_from_markdown"
+        )
+
     def test_tool_xml_wrapped_in_think_still_parsed(self):
         """Tool call parsing should still work even if model wraps text in <think> blocks."""
         content = (
@@ -336,6 +344,39 @@ class TestExecuteTelegramTool:
         assert "Status update" in out.get("message", "")
         assert "alice@example.com" in out.get("message", "")
         assert "ID: msg_1" in out.get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_dynamic_skill_tool_formats_up_to_ten_gmail_message_summaries(self):
+        """Gmail summary rendering should not truncate a 10-message page to 5 items."""
+
+        async def mock_skill_executor(name, arguments):
+            return {
+                "success": True,
+                "message": "OK",
+                "data": {
+                    "max_results": 10,
+                    "gmail_message_summaries": [
+                        {
+                            "id": f"msg_{index}",
+                            "from": f"Sender {index} <sender{index}@example.com>",
+                            "subject": f"Subject {index}",
+                            "date": f"Mon, {index:02d} Mar 2026",
+                            "snippet": f"Preview {index}",
+                        }
+                        for index in range(1, 11)
+                    ],
+                },
+            }
+
+        ctx = {"conversation_id": "cid1", "memory_cache_store": {}, "execute_skill_tool": mock_skill_executor}
+        out = await tg.execute_telegram_tool("googleworkspace_cli.gmail_list_all", {"max_results": 10}, ctx)
+
+        assert out.get("success") is True
+        message = out.get("message", "")
+        assert "1. Subject 1" in message
+        assert "5. Subject 5" in message
+        assert "10. Subject 10" in message
+        assert "ID: msg_10" in message
 
     @pytest.mark.asyncio
     async def test_dynamic_skill_tool_formats_gmail_summaries_without_unknown_placeholders(self):
@@ -1337,6 +1378,28 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("runBrowserAgent", {"task": "x"}, ctx)
         assert r.get("success") is False
         assert "unavailable" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_run_browser_agent_uses_result_when_message_missing(self):
+        """runBrowserAgent should surface backend result text when message is omitted."""
+        async def fake_browser(_args):
+            return {"success": True, "result": "Found the required page and extracted the answer."}
+
+        ctx = {"do_browser_agent": fake_browser}
+        r = await tg.execute_telegram_tool("runBrowserAgent", {"task": "x"}, ctx)
+        assert r.get("success") is True
+        assert "extracted the answer" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_run_deep_research_uses_report_when_message_missing(self):
+        """runDeepResearch should surface backend report text when message is omitted."""
+        async def fake_research(_args):
+            return {"success": True, "report": "Research summary with explicit final findings."}
+
+        ctx = {"do_deep_research": fake_research}
+        r = await tg.execute_telegram_tool("runDeepResearch", {"researchTask": "x"}, ctx)
+        assert r.get("success") is True
+        assert "explicit final findings" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
     async def test_pdf_to_power_point_returns_web_only_message(self):

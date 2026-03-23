@@ -93,16 +93,34 @@ def _resolve_openrouter_api_key() -> str:
 
 def _resolve_openrouter_base_url() -> str:
     provider_hint = (_first_non_empty_env(["AUTOGEN_PROVIDER", "AUTOGEN_LLM_PROVIDER"]) or "").lower()
-    configured = _first_non_empty_env(
-        [
-            "AUTOGEN_BASE_URL",
+    if provider_hint == "minimax":
+        candidates = [
             "AUTOGEN_MINIMAX_BASE_URL",
+            "AUTOGEN_BASE_URL",
+            "MCP_LLM_BASE_URL",
+            "OPENAI_API_BASE",
             "AUTOGEN_OPENROUTER_BASE_URL",
+            "OPENROUTER_API_BASE",
+        ]
+    elif provider_hint == "openrouter":
+        candidates = [
+            "AUTOGEN_OPENROUTER_BASE_URL",
+            "OPENROUTER_API_BASE",
+            "AUTOGEN_BASE_URL",
+            "MCP_LLM_BASE_URL",
+            "OPENAI_API_BASE",
+            "AUTOGEN_MINIMAX_BASE_URL",
+        ]
+    else:
+        candidates = [
+            "AUTOGEN_BASE_URL",
+            "AUTOGEN_OPENROUTER_BASE_URL",
+            "AUTOGEN_MINIMAX_BASE_URL",
             "OPENROUTER_API_BASE",
             "MCP_LLM_BASE_URL",
             "OPENAI_API_BASE",
         ]
-    )
+    configured = _first_non_empty_env(candidates)
     if configured:
         return configured.rstrip("/")
     if provider_hint == "minimax":
@@ -111,19 +129,35 @@ def _resolve_openrouter_base_url() -> str:
 
 
 def _resolve_team_model() -> str:
-    model = _first_non_empty_env(
-        [
+    provider_hint = (_first_non_empty_env(["AUTOGEN_PROVIDER", "AUTOGEN_LLM_PROVIDER"]) or "").lower()
+    if provider_hint == "minimax":
+        candidates = [
+            "AUTOGEN_TEAM_MODEL",
+            "AUTOGEN_MINIMAX_MODEL",
+            "MCP_LLM_MODEL_NAME",
+            "OPENAI_MODEL",
+            "OPENROUTER_AUTOGEN_MODEL",
+        ]
+    elif provider_hint == "openrouter":
+        candidates = [
+            "AUTOGEN_TEAM_MODEL",
+            "OPENROUTER_AUTOGEN_MODEL",
+            "MCP_LLM_MODEL_NAME",
+            "OPENAI_MODEL",
+            "AUTOGEN_MINIMAX_MODEL",
+        ]
+    else:
+        candidates = [
             "AUTOGEN_TEAM_MODEL",
             "AUTOGEN_MINIMAX_MODEL",
             "OPENROUTER_AUTOGEN_MODEL",
             "MCP_LLM_MODEL_NAME",
             "OPENAI_MODEL",
         ]
-    )
+    model = _first_non_empty_env(candidates)
     if model:
         return model
     base_url = _resolve_openrouter_base_url()
-    provider_hint = (_first_non_empty_env(["AUTOGEN_PROVIDER", "AUTOGEN_LLM_PROVIDER"]) or "").lower()
     if provider_hint == "minimax" or is_minimax_chat_request(base_url, None):
         return "MiniMax-M2.5"
     return "x-ai/grok-4.1-fast"

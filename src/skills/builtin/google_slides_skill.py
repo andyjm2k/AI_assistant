@@ -176,6 +176,154 @@ def _normalize_slide_entries(raw_slides: Any) -> List[Dict[str, Any]]:
     return slides
 
 
+def _build_batch_update_payload(
+    presentation_id: str,
+    raw_slides: Any,
+    *,
+    include_image_requests: bool,
+    image_url_prefix: str,
+    scratch_root: Path,
+) -> Dict[str, Any]:
+    normalized_presentation_id = str(presentation_id or "").strip()
+    if not normalized_presentation_id:
+        raise SkillValidationError("presentation_id is required.")
+
+    slides = _normalize_slide_entries(raw_slides)
+    requests: List[Dict[str, Any]] = []
+    slide_objects: List[Dict[str, str]] = []
+    image_objects: List[Dict[str, str]] = []
+    skipped_images: List[Dict[str, str]] = []
+    image_request_count = 0
+
+    for index, slide in enumerate(slides, start=1):
+        slide_id = _safe_object_id("slide", index)
+        title_id = _safe_object_id("title", index)
+        body_id = _safe_object_id("body", index)
+
+        requests.append(
+            {
+                "createSlide": {
+                    "objectId": slide_id,
+                    "slideLayoutReference": {"predefinedLayout": "TITLE_AND_BODY"},
+                    "placeholderIdMappings": [
+                        {
+                            "layoutPlaceholder": {"type": "TITLE", "index": 0},
+                            "objectId": title_id,
+                        },
+                        {
+                            "layoutPlaceholder": {"type": "BODY", "index": 0},
+                            "objectId": body_id,
+                        },
+                    ],
+                }
+            }
+        )
+        requests.append(
+            {
+                "insertText": {
+                    "objectId": title_id,
+                    "insertionIndex": 0,
+                    "text": slide["title"],
+                }
+            }
+        )
+
+        if slide["bullets"]:
+            body_text = "\n".join(f"- {line}" for line in slide["bullets"])
+            requests.append(
+                {
+                    "insertText": {
+                        "objectId": body_id,
+                        "insertionIndex": 0,
+                        "text": body_text,
+                    }
+                }
+            )
+
+        image_ids: List[str] = []
+        if include_image_requests and slide["images"]:
+            for image_index, image in enumerate(slide["images"], start=1):
+                try:
+                    image_url = _to_public_image_url(
+                        image,
+                        image_url_prefix=image_url_prefix,
+                        scratch_root=scratch_root,
+                    )
+                except SkillValidationError:
+                    image_url = None
+                if not image_url:
+                    skipped_images.append(
+                        {
+                            "slide_index": str(index),
+                            "title": slide["title"],
+                            "path": str(image.get("path", "")),
+                            "url": str(image.get("url", "")),
+                            "reason": (
+                                "No usable image URL. Provide images[].url or image_url_prefix "
+                                "for scratch-relative image paths."
+                            ),
+                        }
+                    )
+                    continue
+
+                image_id = _safe_object_id(f"image_{index}", image_index)
+                image_ids.append(image_id)
+                requests.append(
+                    {
+                        "createImage": {
+                            "objectId": image_id,
+                            "url": image_url,
+                            "elementProperties": {
+                                "pageObjectId": slide_id,
+                                "size": {
+                                    "height": {"magnitude": 240, "unit": "PT"},
+                                    "width": {"magnitude": 360, "unit": "PT"},
+                                },
+                                "transform": {
+                                    "scaleX": 1,
+                                    "scaleY": 1,
+                                    "translateX": 60,
+                                    "translateY": 160,
+                                    "unit": "PT",
+                                },
+                            },
+                        }
+                    }
+                )
+                image_objects.append(
+                    {
+                        "slide_id": slide_id,
+                        "image_id": image_id,
+                        "title": slide["title"],
+                        "url": image_url,
+                        "path": str(image.get("path", "")),
+                        "alt": str(image.get("alt", "")),
+                    }
+                )
+                image_request_count += 1
+
+        slide_objects.append(
+            {
+                "slide_id": slide_id,
+                "title_id": title_id,
+                "body_id": body_id,
+                "title": slide["title"],
+                "image_count": str(len(image_ids)),
+            }
+        )
+
+    return {
+        "presentation_id": normalized_presentation_id,
+        "slide_count": len(slides),
+        "request_count": len(requests),
+        "image_request_count": image_request_count,
+        "requests": requests,
+        "objects": slide_objects,
+        "image_objects": image_objects,
+        "skipped_images": skipped_images,
+    }
+
+
 def _clean_markdown_image_target(target: str) -> str:
     text = str(target or "").strip().strip("<>").strip()
     if not text:
@@ -642,149 +790,18 @@ class BuildBatchUpdateRequestsTool(BaseTool):
         self.default_root_dir = default_root_dir
 
     async def run(self, arguments: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
-        presentation_id = str(arguments.get("presentation_id", "")).strip()
-        if not presentation_id:
-            raise SkillValidationError("presentation_id is required.")
-
-        slides = _normalize_slide_entries(arguments.get("slides"))
         include_image_requests = _coerce_bool(
             arguments.get("include_image_requests", True), default=True
         )
         image_url_prefix = str(arguments.get("image_url_prefix", "")).strip()
         scratch_root = (context.scratch_dir or self.default_root_dir).resolve()
-        requests: List[Dict[str, Any]] = []
-        slide_objects: List[Dict[str, str]] = []
-        image_objects: List[Dict[str, str]] = []
-        skipped_images: List[Dict[str, str]] = []
-        image_request_count = 0
-
-        for index, slide in enumerate(slides, start=1):
-            slide_id = _safe_object_id("slide", index)
-            title_id = _safe_object_id("title", index)
-            body_id = _safe_object_id("body", index)
-
-            requests.append(
-                {
-                    "createSlide": {
-                        "objectId": slide_id,
-                        "slideLayoutReference": {"predefinedLayout": "TITLE_AND_BODY"},
-                        "placeholderIdMappings": [
-                            {
-                                "layoutPlaceholder": {"type": "TITLE", "index": 0},
-                                "objectId": title_id,
-                            },
-                            {
-                                "layoutPlaceholder": {"type": "BODY", "index": 0},
-                                "objectId": body_id,
-                            },
-                        ],
-                    }
-                }
-            )
-            requests.append(
-                {
-                    "insertText": {
-                        "objectId": title_id,
-                        "insertionIndex": 0,
-                        "text": slide["title"],
-                    }
-                }
-            )
-
-            if slide["bullets"]:
-                body_text = "\n".join(f"- {line}" for line in slide["bullets"])
-                requests.append(
-                    {
-                        "insertText": {
-                            "objectId": body_id,
-                            "insertionIndex": 0,
-                            "text": body_text,
-                        }
-                    }
-                )
-
-            image_ids: List[str] = []
-            if include_image_requests and slide["images"]:
-                for image_index, image in enumerate(slide["images"], start=1):
-                    try:
-                        image_url = _to_public_image_url(
-                            image,
-                            image_url_prefix=image_url_prefix,
-                            scratch_root=scratch_root,
-                        )
-                    except SkillValidationError:
-                        image_url = None
-                    if not image_url:
-                        skipped_images.append(
-                            {
-                                "slide_index": str(index),
-                                "title": slide["title"],
-                                "path": str(image.get("path", "")),
-                                "url": str(image.get("url", "")),
-                                "reason": (
-                                    "No usable image URL. Provide images[].url or image_url_prefix "
-                                    "for scratch-relative image paths."
-                                ),
-                            }
-                        )
-                        continue
-
-                    image_id = _safe_object_id(f"image_{index}", image_index)
-                    image_ids.append(image_id)
-                    requests.append(
-                        {
-                            "createImage": {
-                                "objectId": image_id,
-                                "url": image_url,
-                                "elementProperties": {
-                                    "pageObjectId": slide_id,
-                                    "size": {
-                                        "height": {"magnitude": 240, "unit": "PT"},
-                                        "width": {"magnitude": 360, "unit": "PT"},
-                                    },
-                                    "transform": {
-                                        "scaleX": 1,
-                                        "scaleY": 1,
-                                        "translateX": 60,
-                                        "translateY": 160,
-                                        "unit": "PT",
-                                    },
-                                },
-                            }
-                        }
-                    )
-                    image_objects.append(
-                        {
-                            "slide_id": slide_id,
-                            "image_id": image_id,
-                            "title": slide["title"],
-                            "url": image_url,
-                            "path": str(image.get("path", "")),
-                            "alt": str(image.get("alt", "")),
-                        }
-                    )
-                    image_request_count += 1
-
-            slide_objects.append(
-                {
-                    "slide_id": slide_id,
-                    "title_id": title_id,
-                    "body_id": body_id,
-                    "title": slide["title"],
-                    "image_count": str(len(image_ids)),
-                }
-            )
-
-        return {
-            "presentation_id": presentation_id,
-            "slide_count": len(slides),
-            "request_count": len(requests),
-            "image_request_count": image_request_count,
-            "requests": requests,
-            "objects": slide_objects,
-            "image_objects": image_objects,
-            "skipped_images": skipped_images,
-        }
+        return _build_batch_update_payload(
+            str(arguments.get("presentation_id", "")).strip(),
+            arguments.get("slides"),
+            include_image_requests=include_image_requests,
+            image_url_prefix=image_url_prefix,
+            scratch_root=scratch_root,
+        )
 
 
 class CreateOutlineFromMarkdownTool(BaseTool):

@@ -43,6 +43,7 @@ def test_skills_list_and_execute_with_auth() -> None:
     names = [item["name"] for item in list_response.json()["skills"]]
     assert "core" in names
     assert "filesystem" in names
+    assert "telegram_admin" in names
 
     execute_response = client.post(
         "/v1/skills/tools/execute",

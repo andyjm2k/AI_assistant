@@ -13,6 +13,9 @@ httpx>=0.25.0
 # Embedded Kitten TTS (OpenAI-compatible /v1/audio/speech in proxy_server)
 kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentts-0.1.0-py3-none-any.whl
 
+# Embedded Kyutai Pocket TTS (realtime CPU model embedded in proxy_server)
+pocket-tts>=1.1.1
+
 # Environment variable management
 python-dotenv>=1.0.0
 

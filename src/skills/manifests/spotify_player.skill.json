@@ -1,0 +1,9 @@
+{
+  "name": "spotify_player",
+  "description": "Spotify Web API wrappers for track search and playback control.",
+  "enabled": true,
+  "module": "src.skills.builtin.spotify_player_skill:create_skill",
+  "settings": {
+    "root_dir": "./scratch"
+  }
+}

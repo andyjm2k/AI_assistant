@@ -12,6 +12,8 @@ from .googleworkspace_cli_skill import (
     create_skill as create_googleworkspace_cli_skill,
 )
 from .image_generation_skill import ImageGenerationSkill, create_skill as create_image_generation_skill
+from .spotify_player_skill import SpotifyPlayerSkill, create_skill as create_spotify_player_skill
+from .telegram_admin_skill import TelegramAdminSkill, create_skill as create_telegram_admin_skill
 from .test_skill import TestSkill, create_skill as create_test_skill
 
 __all__ = [
@@ -21,6 +23,8 @@ __all__ = [
     "GoogleSlidesSkill",
     "GoogleWorkspaceCliSkill",
     "ImageGenerationSkill",
+    "SpotifyPlayerSkill",
+    "TelegramAdminSkill",
     "TestSkill",
     "create_core_skill",
     "create_filesystem_skill",
@@ -28,5 +32,7 @@ __all__ = [
     "create_google_slides_skill",
     "create_googleworkspace_cli_skill",
     "create_image_generation_skill",
+    "create_spotify_player_skill",
+    "create_telegram_admin_skill",
     "create_test_skill",
 ]

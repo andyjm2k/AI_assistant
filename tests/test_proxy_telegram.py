@@ -33,6 +33,16 @@ def _mock_openai_response(reply_text: str = "Mocked reply"):
     }
 
 
+def test_skill_tool_alias_maps_google_slides_execution_name_to_googleworkspace_cli():
+    from src.servers import proxy_server as ps
+
+    resolved = ps._resolve_skill_tool_qualified_name(
+        "google_slides.slides_create_presentation_from_markdown"
+    )
+
+    assert resolved == "googleworkspace_cli.slides_create_presentation_from_markdown"
+
+
 class TestTelegramChatEndpoint:
     """Tests for POST /v1/telegram/chat."""
 
@@ -1539,6 +1549,7 @@ class TestTelegramSkillPromptBlock:
 
         assert "Gmail tool examples" in block
         assert "<tool>googleworkspace_cli.gmail_list_unread</tool>" in block
+        assert "<tool>googleworkspace_cli.gmail_list_all</tool>" in block
         assert "<tool>googleworkspace_cli.gmail_get_message</tool>" in block
         assert "googleworkspace_cli.run_readonly_command" not in block
 
@@ -2001,6 +2012,53 @@ class TestPhilosopherFileTools:
         assert "filesystem.read_text" in result
 
     @pytest.mark.asyncio
+    async def test_execute_skill_tool_prefers_descriptive_message_over_data_dump(self):
+        """Non-filesystem skill tools should return their readable message without appending raw JSON."""
+        from src.servers import proxy_server as ps
+
+        fake_result = {
+            "success": True,
+            "message": "Created Google Slides deck 'PermitFlow AI' with 12 slide(s). Open: https://docs.google.com/presentation/d/pres_123/edit",
+            "data": {
+                "presentationId": "pres_123",
+                "presentationUrl": "https://docs.google.com/presentation/d/pres_123/edit",
+                "slides": [{"title": "Intro"}],
+            },
+        }
+
+        with patch.object(ps, "_execute_skill_framework_tool", new=AsyncMock(return_value=fake_result)):
+            result = await ps.execute_tool_for_philosopher(
+                "googleworkspace_cli.slides_create_presentation_from_markdown",
+                {"title": "PermitFlow AI"},
+            )
+
+        assert result == fake_result["message"]
+        assert '"presentationId"' not in result
+
+    @pytest.mark.asyncio
+    async def test_execute_skill_tool_falls_back_to_data_for_placeholder_message(self):
+        """Generic placeholder messages should still fall back to the returned skill data."""
+        from src.servers import proxy_server as ps
+
+        fake_result = {
+            "success": True,
+            "message": "OK",
+            "data": {
+                "presentationId": "pres_123",
+                "presentationUrl": "https://docs.google.com/presentation/d/pres_123/edit",
+            },
+        }
+
+        with patch.object(ps, "_execute_skill_framework_tool", new=AsyncMock(return_value=fake_result)):
+            result = await ps.execute_tool_for_philosopher(
+                "googleworkspace_cli.slides_create_presentation_from_markdown",
+                {"title": "PermitFlow AI"},
+            )
+
+        assert '"presentationId": "pres_123"' in result
+        assert '"presentationUrl": "https://docs.google.com/presentation/d/pres_123/edit"' in result
+
+    @pytest.mark.asyncio
     async def test_run_workflow_tool_included_when_autogen_available(self):
         """When AUTOGEN_AVAILABLE is True, get_all_available_tools includes runWorkflow."""
         from src.servers import proxy_server as ps
@@ -2252,3 +2310,81 @@ class TestDeepResearchProxy:
             "research_task": "Find competitor pricing",
             "max_parallel_browsers": 4,
         }
+
+    @pytest.mark.asyncio
+    async def test_do_deep_research_promotes_report_to_message(self):
+        from src.servers import proxy_server as ps
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"success": True, "report": "Final research report"}
+        mock_response.headers = {"content-type": "application/json"}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def post(self, url, json=None, headers=None):
+                return mock_response
+
+        with patch.object(ps, "_monitor_run_start", return_value="deep-research-test"), patch.object(
+            ps, "_monitor_run_note"
+        ), patch.object(ps, "_monitor_run_finish"), patch.object(ps.os, "getenv") as mock_getenv, patch.object(
+            ps.httpx, "AsyncClient", return_value=_Client()
+        ):
+            mock_getenv.side_effect = lambda key, default=None: (
+                "http://127.0.0.1:5001" if key == "MCP_BROWSER_SERVER_URL" else os.environ.get(key, default)
+            )
+            result = await ps._do_deep_research({"researchTask": "Find competitor pricing"})
+
+        assert result["message"] == "Final research report"
+
+
+class TestBrowserAgentProxy:
+    """Tests for browser-agent proxy body normalization and response shaping."""
+
+    @pytest.mark.asyncio
+    async def test_do_browser_agent_promotes_result_to_message(self):
+        from src.servers import proxy_server as ps
+
+        captured = {}
+        health_response = MagicMock()
+        health_response.status_code = 200
+        post_response = MagicMock()
+        post_response.status_code = 200
+        post_response.json.return_value = {"success": True, "result": "Explicit browser result"}
+        post_response.headers = {"content-type": "application/json"}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def get(self, url):
+                captured["health_url"] = url
+                return health_response
+
+            async def post(self, url, json=None, headers=None):
+                captured["url"] = url
+                captured["json"] = json
+                captured["headers"] = headers
+                return post_response
+
+        with patch.object(ps, "_monitor_run_start", return_value="browser-agent-test"), patch.object(
+            ps, "_monitor_run_note"
+        ), patch.object(ps, "_monitor_run_finish"), patch.object(ps.os, "getenv") as mock_getenv, patch.object(
+            ps.httpx, "AsyncClient", return_value=_Client()
+        ):
+            mock_getenv.side_effect = lambda key, default=None: (
+                "http://127.0.0.1:5001" if key == "MCP_BROWSER_SERVER_URL" else os.environ.get(key, default)
+            )
+            result = await ps._do_browser_agent({"instruction": "Open the page and find the answer"})
+
+        assert captured["url"] == "http://127.0.0.1:5001/api/browser-agent"
+        assert captured["json"] == {"instruction": "Open the page and find the answer", "task": "Open the page and find the answer"}
+        assert result["message"] == "Explicit browser result"

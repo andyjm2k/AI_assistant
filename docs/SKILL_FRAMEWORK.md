@@ -32,10 +32,25 @@ Core capabilities:
 - `GitHubProjectManager`: `initialize_repository`, `status`, `fetch`, `pull`, `push`, `sync`, `create_branch`, `checkout_branch`, `bump_version`, `commit_versioned_change`, `create_pull_request`, `list_pull_requests`, `repository_info`, `publish_release`
 - `image_generation`: `generate_image` (OpenRouter Seedream 4.5 image generation)
 - `googleworkspace_cli`: `check_cli`, `check_auth`, `list_available_commands`, `run_readonly_command` (Google Workspace CLI wrappers)
+- `spotify_player`: `search_tracks`, `play_track`, `play_playlist` (Spotify Web API search + playback wrappers)
 - `testkit`: `analyze_text`, `render_template`, `context_snapshot` (reference/demo skill)
+
+### Spotify Player Setup Notes
+- `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` are required for Spotify API authentication.
+- `SPOTIFY_REFRESH_TOKEN` is the recommended playback credential. Before `play_track` or `play_playlist`, the skill validates the current playback token and silently refreshes it when it has expired.
+- `SPOTIFY_ACCESS_TOKEN` is optional. If present, the skill will validate it before playback and only fall back to `SPOTIFY_REFRESH_TOKEN` when needed.
+- `SPOTIFY_REDIRECT_URI` must exactly match a redirect URI registered in your Spotify app. Do not use `localhost`: Spotify's current redirect URI rules prohibit localhost aliases, and CATBot's HTTPS certificate will not validate for `https://localhost:8002`.
+- For CATBot's built-in HTTPS flow, use your trusted local cert hostname, for example `https://laura-pc.local:8002/spotify/callback` when `HTTPS_CERT_HOSTNAME=laura-pc.local`.
+- After the proxy is running, open `https://<your HTTPS_CERT_HOSTNAME>:8002/spotify/authorize` once to complete the Spotify authorization-code flow. CATBot will exchange the code, then persist `SPOTIFY_REFRESH_TOKEN` and `SPOTIFY_ACCESS_TOKEN` back into `.env`.
+- Search endpoints use Spotify client-credentials auth. Playback and device endpoints use user authorization with the `user-modify-playback-state` and `user-read-playback-state` scopes.
+- `SPOTIFY_DEVICE_ID` is optional and can be used as the default Spotify Connect device for playback commands.
 
 ## Proxy API Endpoints
 Skills endpoints are mounted on `src.servers.proxy_server` and follow the existing JWT auth model.
+
+Public Spotify OAuth helpers:
+- `GET /spotify/authorize`: Starts CATBot's Spotify authorization flow.
+- `GET /spotify/callback`: Spotify OAuth callback that exchanges the code and updates `.env`.
 
 - `GET /v1/skills`: List loaded skills
 - `GET /v1/skills/tools`: List loaded tools

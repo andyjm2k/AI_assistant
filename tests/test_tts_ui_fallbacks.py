@@ -13,6 +13,7 @@ def test_app_js_has_env_tts_model_and_voice_fallback_helpers():
     content = _app_js_text()
     assert "function applyEnvDefaultTtsModelOnFetchFailure()" in content
     assert "function applyEnvDefaultTtsVoiceOnFetchFailure()" in content
+    assert "function normalizeTtsVoiceEntries(responseData)" in content
     assert "envToolDefaults.ttsModel" in content
     assert "envToolDefaults.ttsVoice" in content
 
@@ -22,6 +23,8 @@ def test_app_js_applies_model_and_voice_fallbacks_when_tts_voice_fetch_fails():
     assert "Failed to fetch voices from all endpoints" in content
     assert "applyEnvDefaultTtsModelOnFetchFailure();" in content
     assert "applyEnvDefaultTtsVoiceOnFetchFailure();" in content
+    assert "responseData.data" in content
+    assert "&model=${encodeURIComponent(selectedModel)}" in content
 
 
 def test_app_js_has_conversational_progress_tts_hooks():
@@ -64,3 +67,9 @@ def test_app_js_flushes_tool_settings_on_pagehide_for_session_persistence():
     content = _app_js_text()
     assert "window.addEventListener('pagehide', () => {" in content
     assert "saveToolSettings({ skipCompanionRefresh: true });" in content
+
+
+def test_app_js_refreshes_tts_voices_when_model_changes():
+    content = _app_js_text()
+    assert "ttsModelDropdown.addEventListener('change', () => {" in content
+    assert "if (ttsServiceOpenAI && ttsServiceOpenAI.checked) fetchTtsVoices();" in content

@@ -809,7 +809,7 @@ lua = [
 
 [[package]]
 name = "fastmcp"
-version = "2.14.0"
+version = "2.13.3.dev85+3d6fd465"
 source = { git = "https://github.com/jlowin/fastmcp.git?rev=3d6fd4650c4c59465fbd6983693952946259d354#3d6fd4650c4c59465fbd6983693952946259d354" }
 dependencies = [
     { name = "authlib" },
@@ -1655,7 +1655,6 @@ dependencies = [
     { name = "playwright" },
     { name = "psutil" },
     { name = "pydantic-settings" },
-    { name = "python-dotenv" },
     { name = "starlette" },
     { name = "structlog" },
     { name = "typer" },
@@ -1684,7 +1683,6 @@ requires-dist = [
     { name = "playwright", specifier = ">=1.57.0" },
     { name = "psutil", specifier = ">=7.0.0" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "starlette", specifier = ">=0.38.0" },
     { name = "structlog", specifier = ">=25.5.0" },
     { name = "typer", specifier = ">=0.12.0" },

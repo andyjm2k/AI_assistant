@@ -125,14 +125,47 @@
 
 
         // Auto-resize textarea
+        const USER_INPUT_MAX_HEIGHT = 120;
+        let userInputBaseHeight = null;
+
+        function getUserInputBaseHeight(minHeight) {
+            if (!userInput) return minHeight;
+            if (userInputBaseHeight !== null) return userInputBaseHeight;
+
+            const previousHeight = userInput.style.height;
+            userInput.style.height = 'auto';
+            userInputBaseHeight = Math.max(minHeight, userInput.scrollHeight);
+            userInput.style.height = previousHeight;
+            return userInputBaseHeight;
+        }
+
+        function resizeUserInput() {
+            if (!userInput) return;
+
+            const minHeight = parseFloat(window.getComputedStyle(userInput).minHeight) || 0;
+            const baseHeight = getUserInputBaseHeight(minHeight);
+
+            if (userInput.value.length === 0) {
+                userInput.style.height = `${baseHeight}px`;
+                userInput.scrollTop = 0;
+                return;
+            }
+
+            userInput.style.height = '0px';
+            userInput.style.height = Math.max(baseHeight, Math.min(userInput.scrollHeight, USER_INPUT_MAX_HEIGHT)) + 'px';
+        }
+
         function syncUserInputUi() {
             if (!userInput) return;
 
+            resizeUserInput();
+
             if (userInput.value.length === 0) {
-                userInput.style.height = '';
-            } else {
-                userInput.style.height = 'auto';
-                userInput.style.height = Math.min(userInput.scrollHeight, 120) + 'px';
+                window.requestAnimationFrame(() => {
+                    if (userInput && userInput.value.length === 0) {
+                        resizeUserInput();
+                    }
+                });
             }
 
             if (sendBtnMobile) {
@@ -769,7 +802,7 @@
             progressVoiceLastAnnouncementAt = Date.now();
             progressVoiceAnnouncementCount += 1;
             progressVoiceLastStateKey = prompt.key || '';
-            textToSpeechFallback(prompt.text, { preserveThinkingPose: true });
+            textToSpeech(prompt.text, { preserveThinkingPose: true });
         }
 
         function scheduleProgressVoiceAnnouncement(delayMs, sessionId = progressVoiceSessionId) {
@@ -1524,6 +1557,11 @@
             }
         };
 
+        const VRM_ACTION_FADE_IN_SECONDS = 0.36;
+        const VRM_ACTION_FADE_OUT_SECONDS = 0.5;
+        const VRM_IDLE_ACTION_FADE_IN_SECONDS = 0.66;
+        const VRM_IDLE_ACTION_FADE_OUT_SECONDS = 0.42;
+
         function clearVrmAwaitingTtsStart() {
             vrmAwaitingTtsStart = false;
             if (vrmAwaitingTtsStartTimerId) {
@@ -1563,13 +1601,84 @@
             } catch (_) {}
         }
 
-        function stopVrmAction(action) {
+        function clearVrmActionStopTimer(action) {
+            if (!action || !action.__vrmStopTimerId) return;
+            try { clearTimeout(action.__vrmStopTimerId); } catch (_) {}
+            action.__vrmStopTimerId = null;
+        }
+
+        function scheduleVrmActionStop(action, fadeSeconds = VRM_ACTION_FADE_OUT_SECONDS) {
+            if (!action) return;
+            clearVrmActionStopTimer(action);
+            action.__vrmStopTimerId = setTimeout(() => {
+                action.__vrmStopTimerId = null;
+                try { action.stop(); } catch (_) {}
+            }, Math.max(0, Math.round(fadeSeconds * 1000) + 80));
+        }
+
+        function stopVrmAction(action, fadeSeconds = VRM_ACTION_FADE_OUT_SECONDS) {
             if (!action) return;
             try {
-                if (action.isRunning()) {
+                const effectiveWeight = typeof action.getEffectiveWeight === 'function' ? action.getEffectiveWeight() : 0;
+                const isActive = (typeof action.isRunning === 'function' && action.isRunning()) || effectiveWeight > 0.001;
+                if (!isActive || fadeSeconds <= 0) {
+                    clearVrmActionStopTimer(action);
                     action.stop();
+                    return;
                 }
+
+                action.enabled = true;
+                action.clampWhenFinished = true;
+                action.fadeOut(fadeSeconds);
+                scheduleVrmActionStop(action, fadeSeconds);
             } catch (_) {}
+        }
+
+        function transitionToVrmAction(nextAction, {
+            loop = window.THREE.LoopOnce,
+            repetitions = 1,
+            fadeInSeconds = VRM_ACTION_FADE_IN_SECONDS,
+            fadeOutSeconds = VRM_ACTION_FADE_OUT_SECONDS,
+            forceRestart = true
+        } = {}) {
+            if (!nextAction) {
+                return false;
+            }
+
+            const actionsToFade = [
+                vrmLoveVrmaAction,
+                vrmThinkVrmaAction,
+                vrmCryVrmaAction,
+                vrmAngryVrmaAction,
+                vrmIdleVrmaAction
+            ];
+
+            actionsToFade.forEach(action => {
+                if (!action || action === nextAction) return;
+                const fadeSeconds = action === vrmIdleVrmaAction ? VRM_IDLE_ACTION_FADE_OUT_SECONDS : fadeOutSeconds;
+                stopVrmAction(action, fadeSeconds);
+            });
+
+            try {
+                clearVrmActionStopTimer(nextAction);
+                if (forceRestart || !nextAction.isRunning()) {
+                    nextAction.reset();
+                }
+                nextAction.clampWhenFinished = loop !== window.THREE.LoopRepeat;
+                nextAction.loop = loop;
+                if (loop !== window.THREE.LoopRepeat) {
+                    nextAction.repetitions = repetitions;
+                }
+                nextAction.setEffectiveWeight(1.0);
+                nextAction.setEffectiveTimeScale(1.0);
+                nextAction.enabled = true;
+                nextAction.fadeIn(fadeInSeconds);
+                nextAction.play();
+                return true;
+            } catch (e) {
+                console.warn('Failed to transition VRM action smoothly:', e);
+                return false;
+            }
         }
 
         function clearVrmIdleReplayTimer() {
@@ -1605,12 +1714,12 @@
             }, delayMs);
         }
 
-        function playVrmIdleAction() {
+        function playVrmIdleAction({ force = false } = {}) {
             const vrmModeToggle = document.getElementById('vrm-mode');
             if (!vrmIdleVrmaAction || !vrmModeToggle?.checked) {
                 return;
             }
-            if (vrmProcessingThinkLoopActive || vrmAwaitingTtsStart) {
+            if (!force && (vrmProcessingThinkLoopActive || vrmAwaitingTtsStart)) {
                 return;
             }
 
@@ -1620,22 +1729,25 @@
                 (vrmCryVrmaAction && vrmCryVrmaAction.isRunning()) ||
                 (vrmAngryVrmaAction && vrmAngryVrmaAction.isRunning());
 
-            if (hasActiveAnimation) {
+            if (!force && hasActiveAnimation) {
                 return;
             }
 
             try {
                 clearVrmIdleReplayTimer();
-                vrmIdleVrmaAction.stop();
-                vrmIdleVrmaAction.reset();
-                vrmIdleVrmaAction.clampWhenFinished = false;
-                vrmIdleVrmaAction.loop = window.THREE.LoopOnce;
-                vrmIdleVrmaAction.repetitions = 1;
-                vrmIdleVrmaAction.setEffectiveWeight(1.0);
-                vrmIdleVrmaAction.setEffectiveTimeScale(1.0);
-                vrmIdleVrmaAction.enabled = true;
-                vrmIdleVrmaAction.play();
-                vrmIdleHasPlayedOnce = true;
+                if (!force && vrmIdleVrmaAction.isRunning()) {
+                    return;
+                }
+                const didStart = transitionToVrmAction(vrmIdleVrmaAction, {
+                    loop: window.THREE.LoopOnce,
+                    repetitions: 1,
+                    fadeInSeconds: VRM_IDLE_ACTION_FADE_IN_SECONDS,
+                    fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                    forceRestart: force || !vrmIdleVrmaAction.isRunning()
+                });
+                if (didStart) {
+                    vrmIdleHasPlayedOnce = true;
+                }
             } catch (_) {}
         }
 
@@ -1665,20 +1777,14 @@
             vrmProcessingThinkLoopActive = true;
             clearVrmIdleReplayTimer();
             resetVrmPoseState();
-            stopVrmAction(vrmLoveVrmaAction);
-            stopVrmAction(vrmThinkVrmaAction);
-            stopVrmAction(vrmCryVrmaAction);
-            stopVrmAction(vrmAngryVrmaAction);
-            stopVrmAction(vrmIdleVrmaAction);
 
             try {
-                vrmThinkVrmaAction.reset();
-                vrmThinkVrmaAction.clampWhenFinished = false;
-                vrmThinkVrmaAction.loop = window.THREE.LoopRepeat;
-                vrmThinkVrmaAction.setEffectiveWeight(1.0);
-                vrmThinkVrmaAction.setEffectiveTimeScale(1.0);
-                vrmThinkVrmaAction.enabled = true;
-                vrmThinkVrmaAction.play();
+                transitionToVrmAction(vrmThinkVrmaAction, {
+                    loop: window.THREE.LoopRepeat,
+                    fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                    fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                    forceRestart: !vrmThinkVrmaAction.isRunning()
+                });
             } catch (e) {
                 console.warn('Failed to start processing thinking VRMA loop:', e);
                 vrmProcessingThinkLoopActive = false;
@@ -1695,13 +1801,13 @@
                     vrmThinkVrmaAction.clampWhenFinished = true;
                     vrmThinkVrmaAction.loop = window.THREE.LoopOnce;
                     if (wasProcessingLoopActive && vrmThinkVrmaAction.isRunning()) {
-                        vrmThinkVrmaAction.stop();
+                        stopVrmAction(vrmThinkVrmaAction, VRM_ACTION_FADE_OUT_SECONDS);
                     }
                 } catch (_) {}
             }
 
             if (resumeIdle) {
-                playVrmIdleAction();
+                playVrmIdleAction({ force: true });
             }
         }
 
@@ -1715,10 +1821,10 @@
             vrmProcessingThinkLoopActive = false;
             clearVrmIdleReplayTimer();
             resetVrmPoseState();
-            stopVrmAction(vrmLoveVrmaAction);
-            stopVrmAction(vrmThinkVrmaAction);
-            stopVrmAction(vrmCryVrmaAction);
-            stopVrmAction(vrmAngryVrmaAction);
+            stopVrmAction(vrmLoveVrmaAction, VRM_ACTION_FADE_OUT_SECONDS);
+            stopVrmAction(vrmThinkVrmaAction, VRM_ACTION_FADE_OUT_SECONDS);
+            stopVrmAction(vrmCryVrmaAction, VRM_ACTION_FADE_OUT_SECONDS);
+            stopVrmAction(vrmAngryVrmaAction, VRM_ACTION_FADE_OUT_SECONDS);
 
             if (vrmThinkVrmaAction) {
                 try {
@@ -1727,7 +1833,14 @@
                 } catch (_) {}
             }
 
-            playVrmIdleAction();
+            playVrmIdleAction({ force: true });
+        }
+
+        function maybeHandleVrmTtsPlaybackStarted(preserveThinkingPose = false) {
+            if (preserveThinkingPose) {
+                return;
+            }
+            handleVrmTtsPlaybackStarted();
         }
 
 
@@ -2303,6 +2416,21 @@
             return true;
         }
 
+        function normalizeTtsVoiceEntries(responseData) {
+            if (Array.isArray(responseData)) {
+                return responseData;
+            }
+            if (responseData && typeof responseData === 'object') {
+                if (Array.isArray(responseData.voices)) {
+                    return responseData.voices;
+                }
+                if (Array.isArray(responseData.data)) {
+                    return responseData.data;
+                }
+            }
+            return [];
+        }
+
         // Fetch TTS voices from OpenAI-compatible endpoint (e.g., Chatterbox)
         async function fetchTtsVoices() {
             try {
@@ -2310,6 +2438,9 @@
                 const endpoint = (ttsEndpointInput && ttsEndpointInput.value && ttsEndpointInput.value.trim()) 
                     ? ttsEndpointInput.value.trim().replace(/\/$/, '') 
                     : 'http://localhost:4123/v1';
+                const selectedModel = (ttsModelDropdown && ttsModelDropdown.value && ttsModelDropdown.value.trim())
+                    ? ttsModelDropdown.value.trim()
+                    : '';
                 
                 // Extract base URL (origin: protocol + host + port) to pass to proxy
                 // The proxy will try /voices first, then /v1/audio/voices
@@ -2333,7 +2464,7 @@
                 let responseData = null;
                 
                 try {
-                    const proxyUrl = `${PROXY_BASE_URL}/v1/proxy/tts/voices?endpoint=${encodeURIComponent(baseUrl)}`;
+                    const proxyUrl = `${PROXY_BASE_URL}/v1/proxy/tts/voices?endpoint=${encodeURIComponent(baseUrl)}${selectedModel ? `&model=${encodeURIComponent(selectedModel)}` : ''}`;
                     console.log('Fetching voices through proxy:', proxyUrl);
                     response = await fetch(proxyUrl, {
                         method: 'GET',
@@ -2356,7 +2487,7 @@
                     console.warn('Primary fetch failed, trying OpenAI-compatible fallback endpoint');
                     const openAiFallbackUrl = 'http://localhost:8880';
                     try {
-                        const openAiFallbackProxyUrl = `${PROXY_BASE_URL}/v1/proxy/tts/voices?endpoint=${encodeURIComponent(openAiFallbackUrl)}`;
+                        const openAiFallbackProxyUrl = `${PROXY_BASE_URL}/v1/proxy/tts/voices?endpoint=${encodeURIComponent(openAiFallbackUrl)}${selectedModel ? `&model=${encodeURIComponent(selectedModel)}` : ''}`;
                         console.log('Fetching voices from OpenAI-compatible fallback through proxy:', openAiFallbackProxyUrl);
                         response = await fetch(openAiFallbackProxyUrl, {
                             method: 'GET',
@@ -2384,15 +2515,9 @@
                 
                 console.log('Fetched voices:', responseData);
                 
-                // Extract voices array from the response (handle both array and object formats)
-                let voicesData = responseData;
-                if (responseData && typeof responseData === 'object' && responseData.voices) {
-                    // Response is an object with a 'voices' property
-                    voicesData = responseData.voices;
-                } else if (!Array.isArray(responseData)) {
-                    // Response is neither an array nor an object with voices property
+                const voicesData = normalizeTtsVoiceEntries(responseData);
+                if (!Array.isArray(voicesData)) {
                     console.warn('Unexpected voices response format:', responseData);
-                    voicesData = [];
                 }
                 
                 const storedVoice = (() => {
@@ -2411,9 +2536,10 @@
                 // Clear existing options
                 ttsVoiceDropdown.innerHTML = '';
                 
-                // Add default OpenAI voices first
-                const defaultVoices = ['Empress'];
+                // Add a model-aware fallback voice before appending fetched voices.
+                const defaultVoices = selectedModel.toLowerCase().includes('pocket-tts') ? ['alba'] : ['Empress'];
                 defaultVoices.forEach(voice => {
+                    if (Array.from(ttsVoiceDropdown.options).some(option => option.value === voice)) return;
                     const option = document.createElement('option');
                     option.value = voice;
                     option.textContent = voice;
@@ -2424,10 +2550,13 @@
                 if (Array.isArray(voicesData)) {
                     console.log(`Adding ${voicesData.length} voices from Chatterbox`);
                     voicesData.forEach(voice => {
+                        const voiceValue = voice.id || voice.name;
+                        if (!voiceValue) return;
+                        if (Array.from(ttsVoiceDropdown.options).some(option => option.value === voiceValue)) return;
                         const option = document.createElement('option');
-                        option.value = voice.name;
+                        option.value = voiceValue;
                         // Show filename if metadata is not available
-                        const displayName = voice.name + (voice.metadata?.language ? ` (${voice.metadata.language})` : 
+                        const displayName = (voice.name || voiceValue) + (voice.metadata?.language ? ` (${voice.metadata.language})` : 
                             (voice.filename ? ` - ${voice.filename}` : ''));
                         option.textContent = displayName;
                         ttsVoiceDropdown.appendChild(option);
@@ -2833,27 +2962,35 @@
         }
 
         // Update the textToSpeech function
-        function textToSpeech(text) {
+        function textToSpeech(text, { preserveThinkingPose = false } = {}) {
             if (!text) {
                 console.warn('No text provided for speech');
-                stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                if (!preserveThinkingPose) {
+                    stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                }
                 return;
             }
 
             // Check if muted
             if (isMuted) {
                 console.log('TTS is muted, skipping speech');
-                stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                if (!preserveThinkingPose) {
+                    stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                }
                 return;
             }
 
             // Sanitize text to remove emojis, bracketed sections, asterisks, and special symbols
             text = sanitizeTTS(text);
             if (!text) {
-                stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                if (!preserveThinkingPose) {
+                    stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                }
                 return;
             }
-            markVrmAwaitingTtsStart();
+            if (!preserveThinkingPose) {
+                markVrmAwaitingTtsStart();
+            }
             const browserSpeechSessionId = ++browserSpeechGeneration;
 
 			// Cancel any ongoing speech and active lip-sync loops/graphs
@@ -2877,7 +3014,7 @@
                                  (typeof apiKey === 'string' && apiKey.trim().length > 0 && !ttsServiceMicrosoft.checked); // Use OpenAI TTS if OpenAI-compatible is selected or API key is present and Microsoft is not explicitly selected
             
             if (useOpenAITTS) { // If OpenAI-compatible TTS should be used
-                speakWithOpenAITTS(text); // Use OpenAI TTS which returns audio bytes we can analyze
+                speakWithOpenAITTS(text, { preserveThinkingPose }); // Use OpenAI TTS which returns audio bytes we can analyze
                 return; // Do not proceed with browser SpeechSynthesis path
             }
 
@@ -2898,7 +3035,7 @@
             utterance.onstart = function() { // When speech begins
                 if (browserSpeechSessionId !== browserSpeechGeneration) return;
                 console.log('Speech started'); // Log start of speech
-                handleVrmTtsPlaybackStarted();
+                maybeHandleVrmTtsPlaybackStarted(preserveThinkingPose);
                 isSpeaking = true; // Set global speaking flag
                 if (live2dModel) { // If Live2D model is active
                     headMovementInterval = setInterval(() => { // Start periodic head movement
@@ -2961,7 +3098,9 @@
             speechSynthesis.speak(utterance);
             } catch (error) {
                 console.error('Speech synthesis error:', error);
-                stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                if (!preserveThinkingPose) {
+                    stopVrmProcessingThinkingLoop({ resumeIdle: true });
+                }
             }
         }
 
@@ -3371,7 +3510,7 @@
         } // End stopChatterboxLipSync
 
         // Play PCM16 delta chunk using Web Audio API (mirrors existing schedule pattern)
-        function playPcm16Delta(base64, sampleRate = 24000, channels = 1) { // Function to decode and play PCM16 audio chunk
+        function playPcm16Delta(base64, sampleRate = 24000, channels = 1, { preserveThinkingPose = false } = {}) { // Function to decode and play PCM16 audio chunk
             const bin = atob(base64); // Decode base64 to binary string
             const totalSamples = bin.length / 2; // Calculate total number of int16 samples across all channels (2 bytes/sample)
             if (!Number.isFinite(totalSamples) || totalSamples <= 0) {
@@ -3428,11 +3567,7 @@
             // Create and schedule audio source (same pattern as existing schedule function)
             const src = ctx.createBufferSource(); // Create buffer source node
             src.buffer = buf; // Set decoded buffer
-            if (ttsAnalyserNode) { // Route through analyser when available for lip sync
-                src.connect(ttsAnalyserNode);
-            } else {
-                src.connect(ctx.destination); // Fallback directly to destination if analyser missing
-            }
+            const playback = connectScheduledPcmSource(ctx, src, buf.duration);
 
             ttsPcmActiveSources += 1; // Track active sources so we know when playback has finished
             const handleEnded = () => { // Cleanup when buffer playback completes
@@ -3453,19 +3588,42 @@
 				try { src.removeEventListener('ended', handleEnded); } catch(_) {}
 				try { src.stop(0); } catch(_) {}
 				try { src.disconnect(); } catch(_) {}
+				try { playback.gainNode.disconnect(); } catch(_) {}
 			});
 
-            // Keep the same playhead logic (reuse from existing scheduler)
-            window.__opus.playhead = Math.max(ctx.currentTime, window.__opus.playhead || 0); // Calculate start time with playhead overlap
-            src.start(window.__opus.playhead); // Schedule playback at playhead position
-            handleVrmTtsPlaybackStarted();
-            window.__opus.playhead += buf.duration - 0.02; // Update playhead with 20ms overlap to hide seams
+            src.start(playback.startTime); // Schedule playback without chunk overlap
+            maybeHandleVrmTtsPlaybackStarted(preserveThinkingPose);
+            window.__opus.playhead = playback.startTime + buf.duration;
             
             console.log('🔊 Scheduled PCM16 chunk:', framesPerChannel, 'frames per channel (', totalSamples, 'total samples ),', sampleRate, 'Hz,', safeChannels, 'channels, duration:', buf.duration.toFixed(3), 's'); // Log playback info
         } // End playPcm16Delta
 
+        const PCM16_CHUNK_EDGE_FADE_SECONDS = 0.002;
+
+        function connectScheduledPcmSource(ctx, src, durationSeconds) {
+            const gainNode = ctx.createGain();
+            const startTime = Math.max(ctx.currentTime, window.__opus.playhead || 0);
+            const fadeSeconds = Math.min(
+                PCM16_CHUNK_EDGE_FADE_SECONDS,
+                Math.max(0.0005, durationSeconds / 16)
+            );
+            const fadeOutStart = Math.max(startTime + fadeSeconds, startTime + durationSeconds - fadeSeconds);
+
+            gainNode.gain.cancelScheduledValues(startTime);
+            gainNode.gain.setValueAtTime(0, startTime);
+            gainNode.gain.linearRampToValueAtTime(1, startTime + fadeSeconds);
+            gainNode.gain.setValueAtTime(1, fadeOutStart);
+            gainNode.gain.linearRampToValueAtTime(0, startTime + durationSeconds);
+
+            src.connect(gainNode);
+            if (ttsAnalyserNode) gainNode.connect(ttsAnalyserNode);
+            else gainNode.connect(ctx.destination);
+
+            return { gainNode, startTime };
+        }
+
         // Play raw PCM16 bytes (little-endian) using the same scheduler as playPcm16Delta
-        function playPcm16Bytes(u8, sampleRate = 24000, channels = 1) {
+        function playPcm16Bytes(u8, sampleRate = 24000, channels = 1, { preserveThinkingPose = false } = {}) {
             if (!(u8 instanceof Uint8Array) || u8.length < 2) {
                 return;
             }
@@ -3505,8 +3663,7 @@
 
             const src = ctx.createBufferSource();
             src.buffer = buf;
-            if (ttsAnalyserNode) src.connect(ttsAnalyserNode);
-            else src.connect(ctx.destination);
+            const playback = connectScheduledPcmSource(ctx, src, buf.duration);
 
             ttsPcmActiveSources += 1;
             const handleEnded = () => {
@@ -3519,15 +3676,15 @@
                 try { src.removeEventListener('ended', handleEnded); } catch (_) {}
                 try { src.stop(0); } catch (_) {}
                 try { src.disconnect(); } catch (_) {}
+                try { playback.gainNode.disconnect(); } catch (_) {}
             });
-            window.__opus.playhead = Math.max(ctx.currentTime, window.__opus.playhead || 0);
-            src.start(window.__opus.playhead);
-            handleVrmTtsPlaybackStarted();
-            window.__opus.playhead += buf.duration - 0.02;
+            src.start(playback.startTime);
+            maybeHandleVrmTtsPlaybackStarted(preserveThinkingPose);
+            window.__opus.playhead = playback.startTime + buf.duration;
         }
         
         // Speak using Chatterbox TTS endpoint with streaming PCM16 decoding
-		async function speakWithOpenAITTS(text) { // Asynchronous function to fetch and play TTS audio via Chatterbox
+		async function speakWithOpenAITTS(text, { preserveThinkingPose = false } = {}) { // Asynchronous function to fetch and play TTS audio via Chatterbox
             // Declare localGen and localController outside try block so they're accessible in catch block
             let localGen = 0; // Generation token for this TTS request (initialized before try block)
             let localController = null; // Local reference to this request's abort controller
@@ -3536,11 +3693,27 @@
                 
                 // Sanitize text before sending to TTS API (remove emojis/brackets/asterisks/specials)
                 text = sanitizeTTS(text);
+                const isSuperseded = () => localGen > 0 && localGen !== ttsGeneration;
+                const isIntentionalAbort = (error = null) => {
+                    if (error && (error.name === 'AbortError' || error.message?.includes('aborted'))) {
+                        return true;
+                    }
+                    return !!(localController && localController.signal.aborted);
+                };
+                const shouldSkipFallback = (error = null) => isSuperseded() || isIntentionalAbort(error);
+                const runBrowserTtsFallback = (error = null) => {
+                    if (shouldSkipFallback(error)) {
+                        console.log('Skipping browser TTS fallback for cancelled or superseded request');
+                        return false;
+                    }
+                    textToSpeechFallback(text, { preserveThinkingPose });
+                    return true;
+                };
                 
                 // Get TTS settings from UI elements - require Chatterbox endpoint
                 if (!ttsEndpointInput || !ttsEndpointInput.value || !ttsEndpointInput.value.trim()) { // Check if endpoint is configured
                     console.error('❌ Chatterbox TTS endpoint not configured'); // Log error
-                    textToSpeechFallback(text); // Fall back to browser TTS
+                    runBrowserTtsFallback(); // Fall back to browser TTS
                     return; // Exit early
                 } // End endpoint check
                 
@@ -3627,7 +3800,7 @@
                     console.error('❌ Chatterbox TTS error:', res.status, errText); // Log details for diagnostics
                     // Fallback to browser speech if available
                     stopChatterboxLipSync(true); // Ensure any analyser-driven lip sync is reset
-                    textToSpeechFallback(text); // Use backup speaker for continuity
+                    runBrowserTtsFallback(); // Use backup speaker for continuity
                     return; // Exit early
                 } // End error response branch
                 
@@ -3695,7 +3868,7 @@
                                 joined.set(value, carry.length);
                                 const alignedLen = joined.length - (joined.length % frameBytes);
                                 if (alignedLen > 0) {
-                                    playPcm16Bytes(joined.subarray(0, alignedLen), sampleRate, channels);
+                                    playPcm16Bytes(joined.subarray(0, alignedLen), sampleRate, channels, { preserveThinkingPose });
                                 }
                                 carry = joined.subarray(alignedLen);
                             }
@@ -3727,7 +3900,7 @@
                                 };
                                 startLipSyncFromAudioElement(audio);
                                 await audio.play();
-                                handleVrmTtsPlaybackStarted();
+                                maybeHandleVrmTtsPlaybackStarted(preserveThinkingPose);
                                 return;
                             }
                             const channels = Math.max(1, Number(res.headers.get('x-audio-channels') || res.headers.get('x-channels') || reqBody.channels || 1));
@@ -3776,7 +3949,7 @@
                             });
 
                             src.start();
-                            handleVrmTtsPlaybackStarted();
+                            maybeHandleVrmTtsPlaybackStarted(preserveThinkingPose);
                             console.log('🎵 PCM16 playback started:', sampleRate, 'Hz, channels:', channels, 'frames:', framesPerChannel);
                             return;
                         }
@@ -3822,7 +3995,7 @@
                                                     audio.play().then(() => { // When audio starts playing
                                                         console.log('🎵 Audio playback started (streaming, low latency)'); // Log playback start
                                                         // Start lip sync for binary audio path
-                                                        handleVrmTtsPlaybackStarted();
+                                                        maybeHandleVrmTtsPlaybackStarted(preserveThinkingPose);
                                                         startLipSyncFromAudioElement(audio); // Hook up lip sync to this audio element
                                                     }).catch(e => { // Catch play errors
                                                         console.error('Audio play error:', e); // Log error
@@ -3936,7 +4109,7 @@
                             
                             // Play the audio
                             await audio.play(); // Start playback
-                            handleVrmTtsPlaybackStarted();
+                            maybeHandleVrmTtsPlaybackStarted(preserveThinkingPose);
                             console.log('🎵 Playing binary audio from TTS service (blob mode)'); // Log playback start
                             
                             return; // Exit successfully
@@ -3944,7 +4117,11 @@
                     } catch (audioError) {
                         console.error('❌ Error playing binary audio:', audioError); // Log error
                         stopChatterboxLipSync(true); // Reset lip sync state
-                        textToSpeechFallback(text); // Fall back to browser TTS on error
+                        if (shouldSkipFallback(audioError)) {
+                            console.log('Skipping browser TTS fallback after interrupted binary audio playback');
+                            return; // Exit without fallback on intentional interruption
+                        }
+                        runBrowserTtsFallback(audioError); // Fall back to browser TTS on error
                         return; // Exit early
                     }
                 } // End binary audio handling
@@ -3990,7 +4167,7 @@
                     }, // End onInit handler
 					onDelta: (b64) => { // Decode and play each PCM16 delta chunk
 						if (localGen !== ttsGeneration || (localController && localController.signal.aborted)) { return; }
-						playPcm16Delta(b64, ttsSampleRate, ttsChannels);
+						playPcm16Delta(b64, ttsSampleRate, ttsChannels, { preserveThinkingPose });
 					},
                     onDone: () => { // Handle stream completion
 						if (localGen !== ttsGeneration || (localController && localController.signal.aborted)) { return; }
@@ -4011,14 +4188,14 @@
                         console.error('❌ SSE parsing error:', e); // Log error
                         ttsStreamActive = false; // Mark stream inactive on error
                         stopChatterboxLipSync(false); // Schedule cleanup for analyser-driven lip sync
-                        textToSpeechFallback(text); // Fall back to browser TTS if error occurs
+                        runBrowserTtsFallback(e); // Fall back to browser TTS if error occurs
                     } // End onError handler
                 }); // End streamSSE call
                 } else {
                     // Unknown format - neither SSE nor binary audio
                     console.warn('⚠️ Unknown TTS response format:', ct, '- falling back to browser TTS'); // Log format mismatch
                     stopChatterboxLipSync(true); // Reset lip sync state before fallback
-                    textToSpeechFallback(text); // Fall back to browser TTS
+                    runBrowserTtsFallback(); // Fall back to browser TTS
                     return; // Exit early
                 } // End SSE format handling
             } catch (e) { // Catch any runtime errors
@@ -4043,7 +4220,7 @@
                 ttsStreamActive = false; // Ensure stream-active flag is cleared on failure
                 stopChatterboxLipSync(false); // Schedule analyser cleanup so mouth closes gracefully
                 // Fallback to browser speech if available (only for real errors, not cancellations)
-                textToSpeechFallback(text); // Ensure speech still happens
+                runBrowserTtsFallback(e); // Ensure speech still happens
             } // End try/catch
         } // End speakWithOpenAITTS (Chatterbox streaming TTS)
 
@@ -5480,7 +5657,12 @@
                     if (ttsServiceOpenAI && ttsServiceOpenAI.checked) fetchTtsVoices(); // Auto-fetch when endpoint changes
                 });
             }
-            if (ttsModelDropdown) ttsModelDropdown.addEventListener('change', saveToolSettings);
+            if (ttsModelDropdown) {
+                ttsModelDropdown.addEventListener('change', () => {
+                    saveToolSettings();
+                    if (ttsServiceOpenAI && ttsServiceOpenAI.checked) fetchTtsVoices();
+                });
+            }
             if (ttsVoiceDropdown) ttsVoiceDropdown.addEventListener('change', saveToolSettings);
             
             // Add event listener for VRM version dropdown
@@ -5514,6 +5696,17 @@
             console.log('Tool settings persistence enabled');
         }
 
+        function handleAuthInputKeydown(event) {
+            if (event.key !== 'Enter' || event.isComposing) {
+                return;
+            }
+
+            event.preventDefault();
+            performAuth('login');
+        }
+
+        authUsernameInput?.addEventListener('keydown', handleAuthInputKeydown);
+        authPasswordInput?.addEventListener('keydown', handleAuthInputKeydown);
         authLoginBtn?.addEventListener('click', () => performAuth('login'));
         authSignupBtn?.addEventListener('click', () => performAuth('signup'));
         authLogoutBtn?.addEventListener('click', () => {
@@ -9893,16 +10086,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (vrmLoveVrmaAction) {
                                     try {
                                         console.log('Playing VRMA love action');
-                                        // Stop idle animation if playing
-                                        if (vrmIdleVrmaAction && vrmIdleVrmaAction.isRunning()) {
-                                            vrmIdleVrmaAction.stop();
-                                        }
-                                        vrmLoveVrmaAction.stop();
-                                        vrmLoveVrmaAction.reset();
-                                        vrmLoveVrmaAction.setEffectiveWeight(1.0);
-                                        vrmLoveVrmaAction.setEffectiveTimeScale(1.0);
-                                        vrmLoveVrmaAction.enabled = true;
-                                        vrmLoveVrmaAction.play();
+                                        transitionToVrmAction(vrmLoveVrmaAction, {
+                                            loop: window.THREE.LoopOnce,
+                                            repetitions: 1,
+                                            fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                                            fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                                            forceRestart: true
+                                        });
                                         console.log('VRMA action state:', {
                                             isRunning: vrmLoveVrmaAction.isRunning(),
                                             isScheduled: vrmLoveVrmaAction.isScheduled(),
@@ -9920,7 +10110,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     // Smoothly fade out VRMA animation before stopping
                                     if (vrmLoveVrmaAction && vrmLoveVrmaAction.isRunning()) {
                                         try {
-                                            vrmLoveVrmaAction.fadeOut(0.8); // Fade out over 0.8 seconds
+                                            stopVrmAction(vrmLoveVrmaAction, 0.8); // Fade out over 0.8 seconds
                                             console.log('Fading out VRMA animation');
                                         } catch(e) {
                                             console.warn('Error fading out VRMA:', e);
@@ -9949,16 +10139,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (vrmThinkVrmaAction) {
                                     try {
                                         console.log('Playing VRMA thinking action');
-                                        // Stop idle animation if playing
-                                        if (vrmIdleVrmaAction && vrmIdleVrmaAction.isRunning()) {
-                                            vrmIdleVrmaAction.stop();
-                                        }
-                                        vrmThinkVrmaAction.stop();
-                                        vrmThinkVrmaAction.reset();
-                                        vrmThinkVrmaAction.setEffectiveWeight(1.0);
-                                        vrmThinkVrmaAction.setEffectiveTimeScale(1.0);
-                                        vrmThinkVrmaAction.enabled = true;
-                                        vrmThinkVrmaAction.play();
+                                        transitionToVrmAction(vrmThinkVrmaAction, {
+                                            loop: window.THREE.LoopOnce,
+                                            repetitions: 1,
+                                            fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                                            fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                                            forceRestart: true
+                                        });
                                         console.log('VRMA thinking action state:', {
                                             isRunning: vrmThinkVrmaAction.isRunning(),
                                             isScheduled: vrmThinkVrmaAction.isScheduled(),
@@ -9976,7 +10163,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     // Smoothly fade out VRMA animation before stopping
                                     if (vrmThinkVrmaAction && vrmThinkVrmaAction.isRunning()) {
                                         try {
-                                            vrmThinkVrmaAction.fadeOut(0.8); // Fade out over 0.8 seconds
+                                            stopVrmAction(vrmThinkVrmaAction, 0.8); // Fade out over 0.8 seconds
                                             console.log('Fading out VRMA thinking animation');
                                         } catch(e) {
                                             console.warn('Error fading out VRMA thinking:', e);
@@ -10000,16 +10187,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (vrmCryVrmaAction) {
                                     try {
                                         console.log('Playing VRMA cry action');
-                                        // Stop idle animation if playing
-                                        if (vrmIdleVrmaAction && vrmIdleVrmaAction.isRunning()) {
-                                            vrmIdleVrmaAction.stop();
-                                        }
-                                        vrmCryVrmaAction.stop();
-                                        vrmCryVrmaAction.reset();
-                                        vrmCryVrmaAction.setEffectiveWeight(1.0);
-                                        vrmCryVrmaAction.setEffectiveTimeScale(1.0);
-                                        vrmCryVrmaAction.enabled = true;
-                                        vrmCryVrmaAction.play();
+                                        transitionToVrmAction(vrmCryVrmaAction, {
+                                            loop: window.THREE.LoopOnce,
+                                            repetitions: 1,
+                                            fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                                            fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                                            forceRestart: true
+                                        });
                                         console.log('VRMA cry action state:', {
                                             isRunning: vrmCryVrmaAction.isRunning(),
                                             isScheduled: vrmCryVrmaAction.isScheduled(),
@@ -10027,7 +10211,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     // Smoothly fade out VRMA animation before stopping
                                     if (vrmCryVrmaAction && vrmCryVrmaAction.isRunning()) {
                                         try {
-                                            vrmCryVrmaAction.fadeOut(0.8); // Fade out over 0.8 seconds
+                                            stopVrmAction(vrmCryVrmaAction, 0.8); // Fade out over 0.8 seconds
                                             console.log('Fading out VRMA cry animation');
                                         } catch(e) {
                                             console.warn('Error fading out VRMA cry:', e);
@@ -10062,16 +10246,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (vrmAngryVrmaAction) {
                                     try {
                                         console.log('Playing VRMA angry action');
-                                        // Stop idle animation if playing
-                                        if (vrmIdleVrmaAction && vrmIdleVrmaAction.isRunning()) {
-                                            vrmIdleVrmaAction.stop();
-                                        }
-                                        vrmAngryVrmaAction.stop();
-                                        vrmAngryVrmaAction.reset();
-                                        vrmAngryVrmaAction.setEffectiveWeight(1.0);
-                                        vrmAngryVrmaAction.setEffectiveTimeScale(1.0);
-                                        vrmAngryVrmaAction.enabled = true;
-                                        vrmAngryVrmaAction.play();
+                                        transitionToVrmAction(vrmAngryVrmaAction, {
+                                            loop: window.THREE.LoopOnce,
+                                            repetitions: 1,
+                                            fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                                            fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                                            forceRestart: true
+                                        });
                                         console.log('VRMA angry action state:', {
                                             isRunning: vrmAngryVrmaAction.isRunning(),
                                             isScheduled: vrmAngryVrmaAction.isScheduled(),
@@ -10089,7 +10270,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     // Smoothly fade out VRMA animation before stopping
                                     if (vrmAngryVrmaAction && vrmAngryVrmaAction.isRunning()) {
                                         try {
-                                            vrmAngryVrmaAction.fadeOut(0.8); // Fade out over 0.8 seconds
+                                            stopVrmAction(vrmAngryVrmaAction, 0.8); // Fade out over 0.8 seconds
                                             console.log('Fading out VRMA angry animation');
                                         } catch(e) {
                                             console.warn('Error fading out VRMA angry:', e);
@@ -10281,16 +10462,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (vrmLoveVrmaAction) {
                                     try {
                                         console.log('Playing VRMA love action');
-                                        // Stop idle animation if playing
-                                        if (vrmIdleVrmaAction && vrmIdleVrmaAction.isRunning()) {
-                                            vrmIdleVrmaAction.stop();
-                                        }
-                                        vrmLoveVrmaAction.stop();
-                                        vrmLoveVrmaAction.reset();
-                                        vrmLoveVrmaAction.setEffectiveWeight(1.0);
-                                        vrmLoveVrmaAction.setEffectiveTimeScale(1.0);
-                                        vrmLoveVrmaAction.enabled = true;
-                                        vrmLoveVrmaAction.play();
+                                        transitionToVrmAction(vrmLoveVrmaAction, {
+                                            loop: window.THREE.LoopOnce,
+                                            repetitions: 1,
+                                            fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                                            fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                                            forceRestart: true
+                                        });
                                         console.log('VRMA action state:', {
                                             isRunning: vrmLoveVrmaAction.isRunning(),
                                             isScheduled: vrmLoveVrmaAction.isScheduled(),
@@ -10308,7 +10486,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     // Smoothly fade out VRMA animation before stopping
                                     if (vrmLoveVrmaAction && vrmLoveVrmaAction.isRunning()) {
                                         try {
-                                            vrmLoveVrmaAction.fadeOut(0.8); // Fade out over 0.8 seconds
+                                            stopVrmAction(vrmLoveVrmaAction, 0.8); // Fade out over 0.8 seconds
                                             console.log('Fading out VRMA animation');
                                         } catch(e) {
                                             console.warn('Error fading out VRMA:', e);
@@ -10336,16 +10514,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (vrmThinkVrmaAction) {
                                     try {
                                         console.log('Playing VRMA thinking action');
-                                        // Stop idle animation if playing
-                                        if (vrmIdleVrmaAction && vrmIdleVrmaAction.isRunning()) {
-                                            vrmIdleVrmaAction.stop();
-                                        }
-                                        vrmThinkVrmaAction.stop();
-                                        vrmThinkVrmaAction.reset();
-                                        vrmThinkVrmaAction.setEffectiveWeight(1.0);
-                                        vrmThinkVrmaAction.setEffectiveTimeScale(1.0);
-                                        vrmThinkVrmaAction.enabled = true;
-                                        vrmThinkVrmaAction.play();
+                                        transitionToVrmAction(vrmThinkVrmaAction, {
+                                            loop: window.THREE.LoopOnce,
+                                            repetitions: 1,
+                                            fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                                            fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                                            forceRestart: true
+                                        });
                                         console.log('VRMA thinking action state:', {
                                             isRunning: vrmThinkVrmaAction.isRunning(),
                                             isScheduled: vrmThinkVrmaAction.isScheduled(),
@@ -10363,7 +10538,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     // Smoothly fade out VRMA animation before stopping
                                     if (vrmThinkVrmaAction && vrmThinkVrmaAction.isRunning()) {
                                         try {
-                                            vrmThinkVrmaAction.fadeOut(0.8); // Fade out over 0.8 seconds
+                                            stopVrmAction(vrmThinkVrmaAction, 0.8); // Fade out over 0.8 seconds
                                             console.log('Fading out VRMA thinking animation');
                                         } catch(e) {
                                             console.warn('Error fading out VRMA thinking:', e);
@@ -10387,16 +10562,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (vrmCryVrmaAction) {
                                     try {
                                         console.log('Playing VRMA cry action');
-                                        // Stop idle animation if playing
-                                        if (vrmIdleVrmaAction && vrmIdleVrmaAction.isRunning()) {
-                                            vrmIdleVrmaAction.stop();
-                                        }
-                                        vrmCryVrmaAction.stop();
-                                        vrmCryVrmaAction.reset();
-                                        vrmCryVrmaAction.setEffectiveWeight(1.0);
-                                        vrmCryVrmaAction.setEffectiveTimeScale(1.0);
-                                        vrmCryVrmaAction.enabled = true;
-                                        vrmCryVrmaAction.play();
+                                        transitionToVrmAction(vrmCryVrmaAction, {
+                                            loop: window.THREE.LoopOnce,
+                                            repetitions: 1,
+                                            fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                                            fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                                            forceRestart: true
+                                        });
                                         console.log('VRMA cry action state:', {
                                             isRunning: vrmCryVrmaAction.isRunning(),
                                             isScheduled: vrmCryVrmaAction.isScheduled(),
@@ -10414,7 +10586,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     // Smoothly fade out VRMA animation before stopping
                                     if (vrmCryVrmaAction && vrmCryVrmaAction.isRunning()) {
                                         try {
-                                            vrmCryVrmaAction.fadeOut(0.8); // Fade out over 0.8 seconds
+                                            stopVrmAction(vrmCryVrmaAction, 0.8); // Fade out over 0.8 seconds
                                             console.log('Fading out VRMA cry animation');
                                         } catch(e) {
                                             console.warn('Error fading out VRMA cry:', e);
@@ -10449,16 +10621,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (vrmAngryVrmaAction) {
                                     try {
                                         console.log('Playing VRMA angry action');
-                                        // Stop idle animation if playing
-                                        if (vrmIdleVrmaAction && vrmIdleVrmaAction.isRunning()) {
-                                            vrmIdleVrmaAction.stop();
-                                        }
-                                        vrmAngryVrmaAction.stop();
-                                        vrmAngryVrmaAction.reset();
-                                        vrmAngryVrmaAction.setEffectiveWeight(1.0);
-                                        vrmAngryVrmaAction.setEffectiveTimeScale(1.0);
-                                        vrmAngryVrmaAction.enabled = true;
-                                        vrmAngryVrmaAction.play();
+                                        transitionToVrmAction(vrmAngryVrmaAction, {
+                                            loop: window.THREE.LoopOnce,
+                                            repetitions: 1,
+                                            fadeInSeconds: VRM_ACTION_FADE_IN_SECONDS,
+                                            fadeOutSeconds: VRM_ACTION_FADE_OUT_SECONDS,
+                                            forceRestart: true
+                                        });
                                         console.log('VRMA angry action state:', {
                                             isRunning: vrmAngryVrmaAction.isRunning(),
                                             isScheduled: vrmAngryVrmaAction.isScheduled(),
@@ -10476,7 +10645,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     // Smoothly fade out VRMA animation before stopping
                                     if (vrmAngryVrmaAction && vrmAngryVrmaAction.isRunning()) {
                                         try {
-                                            vrmAngryVrmaAction.fadeOut(0.8); // Fade out over 0.8 seconds
+                                            stopVrmAction(vrmAngryVrmaAction, 0.8); // Fade out over 0.8 seconds
                                             console.log('Fading out VRMA angry animation');
                                         } catch(e) {
                                             console.warn('Error fading out VRMA angry:', e);

@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Any, Set, Tuple
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 from dataclasses import dataclass
 from contextlib import suppress
 
@@ -36,7 +36,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, RedirectResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 import uvicorn
@@ -226,6 +226,21 @@ try:
     EMBEDDED_KITTEN_CHUNK_SILENCE_MS = max(0, int(os.environ.get("EMBEDDED_KITTEN_CHUNK_SILENCE_MS", "120")))
 except ValueError:
     EMBEDDED_KITTEN_CHUNK_SILENCE_MS = 120
+
+# Embedded Pocket TTS settings (disabled by default; set EMBEDDED_POCKET_TTS_ENABLED=true)
+EMBEDDED_POCKET_TTS_ENABLED = _env_bool("EMBEDDED_POCKET_TTS_ENABLED", default=False)
+EMBEDDED_POCKET_MODEL = os.environ.get("EMBEDDED_POCKET_MODEL", "pocket-tts-realtime").strip() or "pocket-tts-realtime"
+EMBEDDED_POCKET_DEFAULT_VOICE = os.environ.get("EMBEDDED_POCKET_DEFAULT_VOICE", "alba").strip() or "alba"
+EMBEDDED_POCKET_VOICES = [
+    v.strip() for v in os.environ.get(
+        "EMBEDDED_POCKET_VOICES",
+        "alba,marius,javert,jean,fantine,cosette,eponine,azelma",
+    ).split(",") if v.strip()
+]
+try:
+    EMBEDDED_POCKET_STREAM_CHUNK_BYTES = max(512, int(os.environ.get("EMBEDDED_POCKET_STREAM_CHUNK_BYTES", "8192")))
+except ValueError:
+    EMBEDDED_POCKET_STREAM_CHUNK_BYTES = 8192
 try:
     TTS_PROXY_TIMEOUT_SECONDS = max(30.0, float(os.environ.get("TTS_PROXY_TIMEOUT_SECONDS", "120")))
 except ValueError:
@@ -235,6 +250,10 @@ _embedded_kitten_model_instance = None
 _embedded_kitten_model_lock = asyncio.Lock()
 _embedded_kitten_model_repo_id: Optional[str] = None
 _embedded_kitten_voice_aliases: Dict[str, str] = {}
+_embedded_pocket_model_instance = None
+_embedded_pocket_model_lock = asyncio.Lock()
+_embedded_pocket_voice_states: Dict[str, Any] = {}
+_embedded_pocket_voice_states_lock = asyncio.Lock()
 
 EMBEDDED_KITTEN_COMPAT_VOICE_ALIASES: Dict[str, str] = {
     # OpenAI-style names
@@ -254,6 +273,20 @@ EMBEDDED_KITTEN_COMPAT_VOICE_ALIASES: Dict[str, str] = {
     "kiki": "expr-voice-5-f",
     "leo": "expr-voice-5-m",
     "empress": "expr-voice-4-f",
+}
+EMBEDDED_POCKET_MODEL_ALIASES: Set[str] = {
+    "pocket-tts",
+    "pocket-tts-realtime",
+    "kyutai/pocket-tts",
+}
+EMBEDDED_POCKET_COMPAT_VOICE_ALIASES: Dict[str, str] = {
+    "alloy": "alba",
+    "echo": "marius",
+    "fable": "fantine",
+    "onyx": "javert",
+    "nova": "cosette",
+    "shimmer": "eponine",
+    "empress": "alba",
 }
 
 
@@ -317,6 +350,14 @@ except Exception as e:
     _EmbeddedKittenOnnxModel = None
     EMBEDDED_KITTEN_FALLBACK_LOADER_AVAILABLE = False
     print(f"[WARN] Embedded Kitten fallback loader unavailable: {e}")
+
+try:
+    from pocket_tts import TTSModel as EmbeddedPocketTTSModel
+    EMBEDDED_POCKET_IMPORT_AVAILABLE = True
+except Exception as e:
+    EmbeddedPocketTTSModel = None
+    EMBEDDED_POCKET_IMPORT_AVAILABLE = False
+    print(f"[WARN] Embedded Pocket TTS import not available: {e}")
 
 # Telegram tool parsing and execution (for Telegram tools parity with web client)
 try:
@@ -2277,9 +2318,16 @@ CODEX_AUTOGEN_WORKSPACES_DIRNAME = "autogen"
 
 # Auth configuration
 AUTH_USERS_FILE = _PROJECT_ROOT / "config" / "auth_users.json"
+ENV_FILE = _PROJECT_ROOT / ".env"
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-in-production")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_SECONDS = int(os.getenv("JWT_EXPIRATION_SECONDS", "3600"))
+SPOTIFY_ACCOUNTS_BASE = "https://accounts.spotify.com"
+SPOTIFY_AUTH_BASE = "https://accounts.spotify.com/api"
+SPOTIFY_OAUTH_TIMEOUT_SECONDS = 20.0
+SPOTIFY_OAUTH_STATE_TTL_SECONDS = 600
+SPOTIFY_PLAYBACK_SCOPES = ("user-modify-playback-state", "user-read-playback-state")
+spotify_oauth_pending_states: Dict[str, float] = {}
 
 # Simple in-memory user storage with JSON persistence
 users_db: Dict[str, Dict[str, str]] = {}
@@ -2430,6 +2478,124 @@ def get_current_user_or_autogen_team(
     return get_current_user_from_headers(authorization, x_auth_token)
 
 
+def _spotify_redirect_uri() -> str:
+    """Return the configured Spotify OAuth redirect URI."""
+
+    redirect_uri = str(os.getenv("SPOTIFY_REDIRECT_URI") or "").strip()
+    if not redirect_uri:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "SPOTIFY_REDIRECT_URI is not configured. Register CATBot's callback URL in the Spotify "
+                "Developer Dashboard and set SPOTIFY_REDIRECT_URI in .env."
+            ),
+        )
+
+    parsed = urlparse(redirect_uri)
+    if not parsed.scheme or not parsed.netloc:
+        raise HTTPException(status_code=500, detail="SPOTIFY_REDIRECT_URI must be an absolute URL.")
+    hostname = (parsed.hostname or "").strip().lower()
+    if hostname == "localhost":
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "SPOTIFY_REDIRECT_URI cannot use localhost. Spotify's current redirect URI rules prohibit "
+                "localhost aliases, and CATBot's HTTPS certificate will not validate for https://localhost:8002. "
+                f"Use CATBot's trusted HTTPS hostname instead, for example "
+                f"'https://{_SSL_CERT_HOSTNAME}:8002/spotify/callback', and register that exact URI in the Spotify app dashboard."
+            ),
+        )
+    return redirect_uri
+
+
+def _spotify_client_id() -> str:
+    """Return the configured Spotify client ID."""
+
+    client_id = str(os.getenv("SPOTIFY_CLIENT_ID") or "").strip()
+    if not client_id:
+        raise HTTPException(status_code=500, detail="SPOTIFY_CLIENT_ID is not configured.")
+    return client_id
+
+
+def _spotify_client_secret() -> str:
+    """Return the configured Spotify client secret."""
+
+    client_secret = str(os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip()
+    if not client_secret:
+        raise HTTPException(status_code=500, detail="SPOTIFY_CLIENT_SECRET is not configured.")
+    return client_secret
+
+
+def _cleanup_spotify_oauth_states(now: Optional[float] = None) -> None:
+    """Remove expired Spotify OAuth state values."""
+
+    current_time = time.time() if now is None else now
+    cutoff = current_time - SPOTIFY_OAUTH_STATE_TTL_SECONDS
+    expired = [state for state, created_at in spotify_oauth_pending_states.items() if created_at < cutoff]
+    for state in expired:
+        spotify_oauth_pending_states.pop(state, None)
+
+
+def _format_env_value(value: str) -> str:
+    """Format a value for safe .env persistence."""
+
+    if re.fullmatch(r"[A-Za-z0-9._:/@+-]+", value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _set_key_in_env_content(content: str, key: str, value: str) -> str:
+    """Replace or append a KEY=value pair in .env-style text."""
+
+    line_match = re.compile(r"^(\s*)" + re.escape(key) + r"\s*=[^\n]*", re.MULTILINE)
+    new_line = f"{key}={_format_env_value(value)}\n"
+    if line_match.search(content):
+        return line_match.sub(new_line, content, count=1)
+    return content.rstrip() + ("\n" if content.strip() else "") + new_line
+
+
+def _persist_env_key(key: str, value: str, *, env_file: Optional[Path] = None) -> None:
+    """Persist a runtime-generated secret to .env and the current process environment."""
+
+    target = Path(env_file or ENV_FILE)
+    existing = ""
+    if target.exists():
+        existing = target.read_text(encoding="utf-8")
+    updated = _set_key_in_env_content(existing, key, value)
+    target.write_text(updated, encoding="utf-8")
+    os.environ[key] = value
+
+
+def _spotify_token_request_headers() -> Dict[str, str]:
+    """Build Basic auth headers for Spotify Accounts token exchanges."""
+
+    basic_token = base64.b64encode(
+        f"{_spotify_client_id()}:{_spotify_client_secret()}".encode("utf-8")
+    ).decode("utf-8")
+    return {
+        "Authorization": f"Basic {basic_token}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+
+def _extract_spotify_error_message(payload: Any) -> str:
+    """Extract a compact Spotify OAuth error message."""
+
+    if isinstance(payload, dict):
+        error_description = str(payload.get("error_description") or "").strip()
+        if error_description:
+            return error_description
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or "").strip()
+            if message:
+                return message
+        if isinstance(error, str) and error.strip():
+            return error.strip()
+    return "Spotify OAuth request failed."
+
+
 def security_log(action: str, user: str, server_id: Optional[str], detail: str) -> None:
     """Log MCP config/connect actions for audit; do not log secrets."""
     ts = datetime.now(timezone.utc).isoformat()
@@ -2540,8 +2706,17 @@ def _resolve_skill_tool_qualified_name(tool_name: str) -> Optional[str]:
     """Resolve a skill tool name to its qualified form if available."""
     if not tool_name or skill_manager is None:
         return None
+    alias_map = {
+        "google_slides.slides_create_presentation_from_markdown": (
+            "googleworkspace_cli.slides_create_presentation_from_markdown"
+        ),
+        "google_slides.slides_batch_update_presentation": (
+            "googleworkspace_cli.slides_batch_update_presentation"
+        ),
+    }
+    candidate_name = alias_map.get(str(tool_name).strip(), str(tool_name).strip())
     try:
-        resolved = skill_manager.registry.resolve_tool(tool_name)
+        resolved = skill_manager.registry.resolve_tool(candidate_name)
         return resolved.qualified_name
     except Exception:
         return None
@@ -2612,6 +2787,15 @@ async def _execute_skill_framework_tool(
         user_id=user_id,
         scratch_dir=SCRATCH_DIR,
         metadata=context_metadata,
+    )
+    context.set_service("telegram_send_message", _send_telegram_bot_message)
+    context.set_service(
+        "telegram_send_file",
+        lambda chat_id, filename: _send_telegram_file_internal(chat_id, filename),
+    )
+    context.set_service(
+        "telegram_admin_chat_ids",
+        lambda: [item.strip() for item in str(os.getenv("TELEGRAM_ADMIN_IDS") or "").split(",") if item.strip()],
     )
     result = await skill_manager.execute_tool(
         tool_name=qualified_name,
@@ -2730,6 +2914,23 @@ def _format_filesystem_skill_tool_output(
     return None
 
 
+def _format_generic_skill_tool_output(
+    qualified_name: str,
+    result: Dict[str, Any],
+) -> str:
+    """Prefer descriptive skill messages over raw payload dumps for user-facing tool output."""
+    message = str(result.get("message") or "").strip()
+    if message and message.lower() not in {"ok", "success", "done"}:
+        return message
+
+    data = result.get("data")
+    if data is None:
+        return message or f"Skill tool '{qualified_name}' executed successfully."
+    if isinstance(data, (dict, list)):
+        return json.dumps(data, ensure_ascii=False, default=str)
+    return str(data)
+
+
 def _build_telegram_skill_tools_prompt_block() -> str:
     """Render dynamic skill-tool instructions for Telegram XML tool-calling."""
     skill_tools = _get_skill_tools_mcp_schema()
@@ -2764,6 +2965,8 @@ def _build_telegram_skill_tools_prompt_block() -> str:
                 "Gmail tool examples (prefer these over generic run_readonly_command):",
                 "<tool>googleworkspace_cli.gmail_list_unread</tool>",
                 "<parameters>{\"max_results\": 5}</parameters>",
+                "<tool>googleworkspace_cli.gmail_list_all</tool>",
+                "<parameters>{\"max_results\": 10, \"page_token\": \"NEXT_PAGE_TOKEN\"}</parameters>",
                 "<tool>googleworkspace_cli.gmail_get_message</tool>",
                 "<parameters>{\"message_id\": \"18c...\", \"format\": \"full\"}</parameters>",
                 "<tool>googleworkspace_cli.gmail_compose_draft</tool>",
@@ -6169,6 +6372,103 @@ async def root():
     """Root endpoint."""
     return {"message": "CATBot Proxy Server", "version": "2.0.0"}
 
+
+@app.get("/spotify/authorize")
+async def spotify_authorize() -> RedirectResponse:
+    """Redirect the browser to Spotify's authorization page for CATBot playback access."""
+
+    _cleanup_spotify_oauth_states()
+    state = secrets.token_urlsafe(24)
+    spotify_oauth_pending_states[state] = time.time()
+    query = urlencode(
+        {
+            "client_id": _spotify_client_id(),
+            "response_type": "code",
+            "redirect_uri": _spotify_redirect_uri(),
+            "scope": " ".join(SPOTIFY_PLAYBACK_SCOPES),
+            "state": state,
+            "show_dialog": "true",
+        }
+    )
+    return RedirectResponse(url=f"{SPOTIFY_ACCOUNTS_BASE}/authorize?{query}", status_code=307)
+
+
+@app.get("/spotify/callback")
+async def spotify_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+    """Handle the Spotify authorization code callback and persist playback tokens to .env."""
+
+    if error:
+        raise HTTPException(status_code=400, detail=f"Spotify authorization failed: {error}")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing Spotify authorization code.")
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing Spotify OAuth state.")
+
+    _cleanup_spotify_oauth_states()
+    created_at = spotify_oauth_pending_states.pop(state, None)
+    if created_at is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired Spotify OAuth state.")
+    if time.time() - created_at > SPOTIFY_OAUTH_STATE_TTL_SECONDS:
+        raise HTTPException(status_code=400, detail="Expired Spotify OAuth state.")
+
+    redirect_uri = _spotify_redirect_uri()
+    async with httpx.AsyncClient(timeout=SPOTIFY_OAUTH_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            f"{SPOTIFY_AUTH_BASE}/token",
+            headers=_spotify_token_request_headers(),
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Spotify token exchange failed: {_extract_spotify_error_message(payload)}",
+        )
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="Spotify token exchange returned an invalid payload.")
+
+    access_token = str(payload.get("access_token") or "").strip()
+    refresh_token = str(payload.get("refresh_token") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=500, detail="Spotify token exchange did not return an access token.")
+
+    _persist_env_key("SPOTIFY_ACCESS_TOKEN", access_token)
+    persisted_keys = ["SPOTIFY_ACCESS_TOKEN"]
+    if refresh_token:
+        _persist_env_key("SPOTIFY_REFRESH_TOKEN", refresh_token)
+        persisted_keys.append("SPOTIFY_REFRESH_TOKEN")
+
+    body_lines = [
+        "<h1>Spotify authorization complete</h1>",
+        "<p>CATBot saved the latest Spotify playback credentials to <code>.env</code>.</p>",
+        f"<p>Updated keys: <code>{html.escape(', '.join(persisted_keys))}</code></p>",
+    ]
+    if refresh_token:
+        body_lines.append("<p>You can use Spotify playback immediately. The current CATBot process was updated in memory too.</p>")
+    else:
+        body_lines.append(
+            "<p>Spotify did not return a refresh token in this response. If playback renewal fails later, "
+            "repeat the authorization flow after revoking the app in your Spotify account settings.</p>"
+        )
+    return HTMLResponse(
+        "".join(
+            [
+                "<!doctype html><html><head><meta charset='utf-8'><title>Spotify Auth Complete</title></head><body>",
+                *body_lines,
+                "</body></html>",
+            ]
+        )
+    )
+
 @app.post("/v1/auth/signup", response_model=AuthTokenResponse)
 async def auth_signup(request: AuthSignupRequest):
     """Create a new user account and return a signed JWT."""
@@ -9177,13 +9477,7 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
                 formatted = _format_filesystem_skill_tool_output(qualified_skill_tool, result)
                 if formatted:
                     return formatted
-            if data is None:
-                return message or f"Skill tool '{qualified_skill_tool}' executed successfully."
-            if isinstance(data, (dict, list)):
-                data_text = json.dumps(data, ensure_ascii=False, default=str)
-            else:
-                data_text = str(data)
-            return f"{message}\n\n{data_text}".strip()
+            return _format_generic_skill_tool_output(qualified_skill_tool, result)
         except Exception as e:
             return f"Error executing {qualified_skill_tool}: {str(e)}"
     
@@ -9852,6 +10146,10 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
         print(f"   Error response: {error_content}")
         raise HTTPException(status_code=response.status_code, detail=error_content.get("error", str(error_content)))
     response_json = response.json()
+    if isinstance(response_json, dict) and not str(response_json.get("message") or "").strip():
+        result_text = response_json.get("result")
+        if isinstance(result_text, str) and result_text.strip():
+            response_json["message"] = result_text.strip()
     _monitor_run_finish(
         monitor_run_id,
         status="completed",
@@ -9943,6 +10241,12 @@ async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
         )
         raise HTTPException(status_code=response.status_code, detail=error_content.get("error", str(error_content)))
     response_json = response.json()
+    if isinstance(response_json, dict) and not str(response_json.get("message") or "").strip():
+        for key in ("report", "result", "output"):
+            candidate = response_json.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                response_json["message"] = candidate.strip()
+                break
     _monitor_run_finish(
         monitor_run_id,
         status="completed",
@@ -10452,7 +10756,18 @@ def _float_audio_to_pcm16_bytes(audio: Any) -> bytes:
     try:
         import numpy as np  # type: ignore
 
-        arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+        arr = np.asarray(audio).reshape(-1)
+        if arr.size == 0:
+            return b""
+        if np.issubdtype(arr.dtype, np.integer):
+            return arr.astype(np.int16, copy=False).tobytes()
+
+        arr = arr.astype(np.float32, copy=False)
+        peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+        if peak > 1.5:
+            arr = np.clip(arr, -32768.0, 32767.0)
+            return arr.astype(np.int16).tobytes()
+
         arr = np.clip(arr, -1.0, 1.0)
         return (arr * 32767.0).astype(np.int16).tobytes()
     except Exception:
@@ -10470,6 +10785,251 @@ def _float_audio_to_pcm16_bytes(audio: Any) -> bytes:
     except Exception as exc:
         raise RuntimeError(f"Could not convert generated audio to PCM16: {exc}") from exc
     return bytes(out)
+
+
+def _embedded_tts_endpoint_enabled() -> bool:
+    return EMBEDDED_KITTEN_TTS_ENABLED or EMBEDDED_POCKET_TTS_ENABLED
+
+
+def _is_embedded_pocket_model(model_name: Optional[str]) -> bool:
+    raw = (model_name or "").strip().lower()
+    if not raw:
+        return False
+    normalized = raw.replace("_", "-")
+    if normalized in EMBEDDED_POCKET_MODEL_ALIASES:
+        return True
+    if normalized.startswith("pocket-tts"):
+        return True
+    return "kyutai/pocket-tts" in normalized
+
+
+def _resolve_embedded_tts_backend(model_name: Optional[str] = None) -> str:
+    requested = (model_name or "").strip()
+    if requested:
+        if _is_embedded_pocket_model(requested):
+            if not EMBEDDED_POCKET_TTS_ENABLED:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Embedded Pocket TTS is disabled. Set EMBEDDED_POCKET_TTS_ENABLED=true.",
+                )
+            return "pocket"
+        if not EMBEDDED_KITTEN_TTS_ENABLED:
+            if EMBEDDED_POCKET_TTS_ENABLED:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unsupported embedded TTS model '{requested}'. "
+                        f"Pocket aliases: {', '.join(sorted(EMBEDDED_POCKET_MODEL_ALIASES))}"
+                    ),
+                )
+            raise HTTPException(
+                status_code=503,
+                detail="Embedded Kitten TTS is disabled. Set EMBEDDED_KITTEN_TTS_ENABLED=true.",
+            )
+        return "kitten"
+
+    if EMBEDDED_KITTEN_TTS_ENABLED:
+        return "kitten"
+    if EMBEDDED_POCKET_TTS_ENABLED:
+        return "pocket"
+
+    raise HTTPException(
+        status_code=404,
+        detail="Embedded TTS endpoint is disabled. Enable EMBEDDED_KITTEN_TTS_ENABLED or EMBEDDED_POCKET_TTS_ENABLED.",
+    )
+
+
+def _normalize_embedded_pocket_model_name(model_name: Optional[str]) -> str:
+    raw = (model_name or EMBEDDED_POCKET_MODEL or "").strip()
+    return raw or "pocket-tts-realtime"
+
+
+def _normalize_embedded_pocket_voice_key(prompt: str) -> str:
+    value = (prompt or "").strip()
+    lowered = value.lower()
+    if lowered in {voice.lower() for voice in EMBEDDED_POCKET_VOICES}:
+        return lowered
+    if lowered in EMBEDDED_POCKET_COMPAT_VOICE_ALIASES:
+        return lowered
+    return value
+
+
+def _resolve_embedded_pocket_voice(requested_voice: str) -> str:
+    requested = (requested_voice or "").strip()
+    if not requested:
+        return EMBEDDED_POCKET_DEFAULT_VOICE
+
+    available_lookup = {voice.lower(): voice for voice in EMBEDDED_POCKET_VOICES}
+    if requested.lower() in available_lookup:
+        return available_lookup[requested.lower()]
+
+    alias_target = EMBEDDED_POCKET_COMPAT_VOICE_ALIASES.get(requested.lower())
+    if alias_target and alias_target.lower() in available_lookup:
+        return available_lookup[alias_target.lower()]
+
+    if requested.startswith("hf://") or requested.lower().endswith((".wav", ".mp3", ".flac", ".safetensors")):
+        return requested
+
+    available_preview = ", ".join(EMBEDDED_POCKET_VOICES)
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported voice '{requested}'. Available voices: {available_preview}",
+    )
+
+
+def _load_embedded_pocket_model_sync() -> Any:
+    if not EMBEDDED_POCKET_IMPORT_AVAILABLE or EmbeddedPocketTTSModel is None:
+        raise RuntimeError("Embedded Pocket TTS import unavailable.")
+
+    load_model = getattr(EmbeddedPocketTTSModel, "load_model", None)
+    if callable(load_model):
+        return load_model()
+    return EmbeddedPocketTTSModel()
+
+
+async def _get_embedded_pocket_model() -> Any:
+    global _embedded_pocket_model_instance
+
+    if not EMBEDDED_POCKET_TTS_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedded Pocket TTS is disabled. Set EMBEDDED_POCKET_TTS_ENABLED=true.",
+        )
+
+    if not EMBEDDED_POCKET_IMPORT_AVAILABLE or EmbeddedPocketTTSModel is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedded Pocket TTS is unavailable. Install pocket-tts support dependencies.",
+        )
+
+    async with _embedded_pocket_model_lock:
+        if _embedded_pocket_model_instance is None:
+            try:
+                print("Loading embedded Pocket TTS model")
+                _embedded_pocket_model_instance = await asyncio.to_thread(_load_embedded_pocket_model_sync)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Failed to load embedded Pocket TTS model '{_normalize_embedded_pocket_model_name(None)}': {exc}",
+                ) from exc
+            print("Embedded Pocket TTS model loaded")
+
+    return _embedded_pocket_model_instance
+
+
+async def _get_embedded_pocket_voice_state(voice_prompt: str) -> Any:
+    model = await _get_embedded_pocket_model()
+    cache_key = _normalize_embedded_pocket_voice_key(voice_prompt)
+
+    async with _embedded_pocket_voice_states_lock:
+        if cache_key in _embedded_pocket_voice_states:
+            return _embedded_pocket_voice_states[cache_key]
+
+        try:
+            state = await asyncio.to_thread(model.get_state_for_audio_prompt, voice_prompt)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Embedded Pocket TTS could not load voice '{voice_prompt}': {exc}",
+            ) from exc
+        _embedded_pocket_voice_states[cache_key] = state
+        return state
+
+
+async def _get_embedded_pocket_sample_rate() -> int:
+    model = await _get_embedded_pocket_model()
+    try:
+        return max(8000, int(getattr(model, "sample_rate", EMBEDDED_KITTEN_SAMPLE_RATE)))
+    except Exception:
+        return EMBEDDED_KITTEN_SAMPLE_RATE
+
+
+async def _iter_embedded_pocket_pcm_chunks(
+    text: str,
+    voice: str,
+    model_name: Optional[str] = None,
+    speed: Optional[float] = None,
+    sample_rate: Optional[int] = None,
+):
+    del model_name, speed, sample_rate
+    normalized_text = (text or "").strip()
+    if not normalized_text:
+        raise HTTPException(status_code=400, detail="Input text is required.")
+
+    model = await _get_embedded_pocket_model()
+    resolved_voice = _resolve_embedded_pocket_voice(voice)
+    voice_state = await _get_embedded_pocket_voice_state(resolved_voice)
+
+    try:
+        stream_factory = getattr(model, "generate_audio_stream", None)
+        has_streaming = callable(stream_factory)
+    except Exception:
+        has_streaming = False
+
+    if has_streaming:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        sentinel = object()
+
+        def _stream_worker() -> None:
+            try:
+                for generated_chunk in stream_factory(voice_state, normalized_text):
+                    chunk_pcm = _float_audio_to_pcm16_bytes(generated_chunk)
+                    if chunk_pcm:
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk_pcm)
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+        worker_task = asyncio.create_task(asyncio.to_thread(_stream_worker))
+        chunk_index = 0
+        try:
+            while True:
+                item = await queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise HTTPException(status_code=400, detail=f"Embedded Pocket TTS streaming failed: {item}") from item
+                chunk_index += 1
+                yield item
+        finally:
+            await worker_task
+
+        if chunk_index == 0:
+            raise RuntimeError("Embedded Pocket TTS generated empty audio.")
+        return
+    try:
+        generated = await asyncio.to_thread(model.generate_audio, voice_state, normalized_text)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Embedded Pocket TTS rejected request: {exc}") from exc
+
+    chunk_pcm = _float_audio_to_pcm16_bytes(generated)
+    if not chunk_pcm:
+        raise RuntimeError("Embedded Pocket TTS generated empty audio.")
+    yield chunk_pcm
+
+
+async def _generate_embedded_pocket_pcm(
+    text: str,
+    voice: str,
+    model_name: Optional[str] = None,
+    speed: Optional[float] = None,
+    sample_rate: Optional[int] = None,
+) -> bytes:
+    pcm_parts: List[bytes] = []
+    async for piece in _iter_embedded_pocket_pcm_chunks(
+        text=text,
+        voice=voice,
+        model_name=model_name,
+        speed=speed,
+        sample_rate=sample_rate,
+    ):
+        pcm_parts.append(piece)
+    pcm_bytes = b"".join(pcm_parts)
+    if not pcm_bytes:
+        raise RuntimeError("Embedded Pocket TTS generated empty audio.")
+    return pcm_bytes
 
 
 def _normalize_embedded_kitten_repo_id(model_name: Optional[str]) -> str:
@@ -10835,19 +11395,90 @@ async def _generate_embedded_kitten_pcm(
         raise RuntimeError("Embedded Kitten TTS generated empty audio.")
     return pcm_bytes
 
+
+def _list_embedded_tts_voices(model_name: Optional[str] = None) -> List[Dict[str, str]]:
+    backend = _resolve_embedded_tts_backend(model_name)
+    if backend == "pocket":
+        voices = EMBEDDED_POCKET_VOICES or [EMBEDDED_POCKET_DEFAULT_VOICE]
+    else:
+        voices = EMBEDDED_KITTEN_VOICES or [EMBEDDED_KITTEN_DEFAULT_VOICE]
+
+    return [
+        {"id": voice_id, "object": "voice", "name": voice_id}
+        for voice_id in voices
+    ]
+
+
+async def _get_embedded_tts_sample_rate(model_name: Optional[str], requested_sample_rate: Optional[int]) -> int:
+    backend = _resolve_embedded_tts_backend(model_name)
+    if backend == "pocket":
+        return await _get_embedded_pocket_sample_rate()
+    return max(8000, int(requested_sample_rate or EMBEDDED_KITTEN_SAMPLE_RATE))
+
+
+async def _iter_embedded_tts_pcm_chunks(
+    text: str,
+    voice: str,
+    model_name: Optional[str] = None,
+    speed: Optional[float] = None,
+    sample_rate: Optional[int] = None,
+):
+    backend = _resolve_embedded_tts_backend(model_name)
+    if backend == "pocket":
+        async for piece in _iter_embedded_pocket_pcm_chunks(
+            text=text,
+            voice=voice,
+            model_name=model_name,
+            speed=speed,
+            sample_rate=sample_rate,
+        ):
+            yield piece
+        return
+
+    async for piece in _iter_embedded_kitten_pcm_chunks(
+        text=text,
+        voice=voice,
+        model_name=model_name,
+        speed=speed,
+        sample_rate=sample_rate,
+    ):
+        yield piece
+
+
+async def _generate_embedded_tts_pcm(
+    text: str,
+    voice: str,
+    model_name: Optional[str] = None,
+    speed: Optional[float] = None,
+    sample_rate: Optional[int] = None,
+) -> bytes:
+    backend = _resolve_embedded_tts_backend(model_name)
+    if backend == "pocket":
+        return await _generate_embedded_pocket_pcm(
+            text=text,
+            voice=voice,
+            model_name=model_name,
+            speed=speed,
+            sample_rate=sample_rate,
+        )
+
+    return await _generate_embedded_kitten_pcm(
+        text=text,
+        voice=voice,
+        model_name=model_name,
+        speed=speed,
+        sample_rate=sample_rate,
+    )
+
 @app.get("/v1/audio/voices")
-async def embedded_audio_voices():
-    """OpenAI-compatible voices endpoint served directly by proxy_server (embedded KittenTTS)."""
-    if not EMBEDDED_KITTEN_TTS_ENABLED:
-        raise HTTPException(status_code=404, detail="Embedded Kitten TTS endpoint is disabled.")
-    voices = EMBEDDED_KITTEN_VOICES or [EMBEDDED_KITTEN_DEFAULT_VOICE]
+async def embedded_audio_voices(model: Optional[str] = None):
+    """OpenAI-compatible voices endpoint served directly by proxy_server for embedded TTS backends."""
+    if not _embedded_tts_endpoint_enabled():
+        raise HTTPException(status_code=404, detail="Embedded TTS endpoint is disabled.")
     return JSONResponse(
         content={
             "object": "list",
-            "data": [
-                {"id": voice_id, "object": "voice", "name": voice_id}
-                for voice_id in voices
-            ],
+            "data": _list_embedded_tts_voices(model_name=model),
         },
         status_code=200,
     )
@@ -10855,20 +11486,26 @@ async def embedded_audio_voices():
 
 @app.post("/v1/audio/speech")
 async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
-    """OpenAI-compatible TTS speech endpoint served directly by proxy_server (embedded KittenTTS)."""
-    if not EMBEDDED_KITTEN_TTS_ENABLED:
-        raise HTTPException(status_code=404, detail="Embedded Kitten TTS endpoint is disabled.")
+    """OpenAI-compatible TTS speech endpoint served directly by proxy_server for embedded TTS backends."""
+    if not _embedded_tts_endpoint_enabled():
+        raise HTTPException(status_code=404, detail="Embedded TTS endpoint is disabled.")
 
     text = (payload.input or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Input text is required.")
 
-    requested_model = (payload.model or EMBEDDED_KITTEN_MODEL or "").strip() or EMBEDDED_KITTEN_MODEL
-    requested_voice = (payload.voice or EMBEDDED_KITTEN_DEFAULT_VOICE or "").strip() or EMBEDDED_KITTEN_DEFAULT_VOICE
-    sample_rate = max(8000, int(payload.sample_rate or EMBEDDED_KITTEN_SAMPLE_RATE))
+    backend = _resolve_embedded_tts_backend(payload.model)
+    if backend == "pocket":
+        requested_model = (payload.model or EMBEDDED_POCKET_MODEL or "").strip() or EMBEDDED_POCKET_MODEL
+        requested_voice = (payload.voice or EMBEDDED_POCKET_DEFAULT_VOICE or "").strip() or EMBEDDED_POCKET_DEFAULT_VOICE
+    else:
+        requested_model = (payload.model or EMBEDDED_KITTEN_MODEL or "").strip() or EMBEDDED_KITTEN_MODEL
+        requested_voice = (payload.voice or EMBEDDED_KITTEN_DEFAULT_VOICE or "").strip() or EMBEDDED_KITTEN_DEFAULT_VOICE
+    sample_rate = await _get_embedded_tts_sample_rate(payload.model, payload.sample_rate)
     channels = max(1, int(payload.channels or 1))
     response_format = (payload.response_format or "wav").strip().lower()
     stream_mode = bool(payload.stream)
+    stream_chunk_bytes = EMBEDDED_POCKET_STREAM_CHUNK_BYTES if backend == "pocket" else EMBEDDED_KITTEN_STREAM_CHUNK_BYTES
 
     headers = {
         "X-Audio-Sample-Rate": str(sample_rate),
@@ -10880,19 +11517,19 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
         media_type = "audio/pcm"
         if stream_mode:
             async def pcm_stream():
-                async for generated_chunk in _iter_embedded_kitten_pcm_chunks(
+                async for generated_chunk in _iter_embedded_tts_pcm_chunks(
                     text=text,
                     voice=requested_voice,
                     model_name=requested_model,
                     speed=payload.speed,
                     sample_rate=sample_rate,
                 ):
-                    for i in range(0, len(generated_chunk), EMBEDDED_KITTEN_STREAM_CHUNK_BYTES):
-                        yield generated_chunk[i:i + EMBEDDED_KITTEN_STREAM_CHUNK_BYTES]
+                    for i in range(0, len(generated_chunk), stream_chunk_bytes):
+                        yield generated_chunk[i:i + stream_chunk_bytes]
                         await asyncio.sleep(0)
 
             return StreamingResponse(pcm_stream(), media_type=media_type, headers=headers)
-        pcm_bytes = await _generate_embedded_kitten_pcm(
+        pcm_bytes = await _generate_embedded_tts_pcm(
             text=text,
             voice=requested_voice,
             model_name=requested_model,
@@ -10901,7 +11538,7 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
         )
         return Response(content=pcm_bytes, media_type=media_type, headers=headers, status_code=200)
 
-    pcm_bytes = await _generate_embedded_kitten_pcm(
+    pcm_bytes = await _generate_embedded_tts_pcm(
         text=text,
         voice=requested_voice,
         model_name=requested_model,
@@ -10914,8 +11551,8 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
             yield wav_bytes[:44]
             await asyncio.sleep(0)
             payload_bytes = wav_bytes[44:]
-            for i in range(0, len(payload_bytes), EMBEDDED_KITTEN_STREAM_CHUNK_BYTES):
-                yield payload_bytes[i:i + EMBEDDED_KITTEN_STREAM_CHUNK_BYTES]
+            for i in range(0, len(payload_bytes), stream_chunk_bytes):
+                yield payload_bytes[i:i + stream_chunk_bytes]
                 await asyncio.sleep(0)
 
         return StreamingResponse(wav_stream(), media_type="audio/wav", headers=headers)
@@ -10937,7 +11574,7 @@ def _should_skip_tts_tls_verify(base_url: str) -> bool:
 
 
 @app.get("/v1/proxy/tts/voices")
-async def proxy_tts_voices(endpoint: str):
+async def proxy_tts_voices(endpoint: str, model: Optional[str] = None):
     """Proxy TTS voices requests to handle CORS. Tries /voices first, then /v1/audio/voices."""
     if not endpoint:
         raise HTTPException(status_code=400, detail="Endpoint parameter is required")
@@ -10972,8 +11609,10 @@ async def proxy_tts_voices(endpoint: str):
         if skip_tls_verify:
             print(f"[WARN] TTS voices proxy: TLS verification disabled for local endpoint: {base_url}")
 
+        model_query_suffix = f"?{httpx.QueryParams({'model': model})}" if model else ""
+
         # Try /voices first (Chatterbox style)
-        voices_url_primary = f"{base_url}/voices"
+        voices_url_primary = f"{base_url}/voices{model_query_suffix}"
         print(f"🎤 Trying primary TTS voices endpoint: {voices_url_primary}")
         
         response = None
@@ -11013,7 +11652,7 @@ async def proxy_tts_voices(endpoint: str):
             
             # If primary failed, try /v1/audio/voices (OpenAI-compatible style)
             if not response or response.status_code != 200:
-                voices_url_fallback = f"{base_url}/v1/audio/voices"
+                voices_url_fallback = f"{base_url}/v1/audio/voices{model_query_suffix}"
                 print(f"🎤 Trying fallback TTS voices endpoint: {voices_url_fallback}")
                 
                 try:

@@ -247,7 +247,7 @@ TTS_ENDPOINT=https://api.openai.com
 TTS_MODEL=tts-1
 TTS_VOICE=alloy
 
-# Optional: Embedded Kitten TTS served by proxy_server itself
+# Optional: Embedded Kitten / Pocket TTS served by proxy_server itself
 # EMBEDDED_KITTEN_TTS_ENABLED=true
 # EMBEDDED_KITTEN_MODEL=KittenML/kitten-tts-nano-0.2
 # EMBEDDED_KITTEN_DEFAULT_VOICE=expr-voice-2-f
@@ -255,9 +255,15 @@ TTS_VOICE=alloy
 # EMBEDDED_KITTEN_STREAM_CHUNK_BYTES=4096
 # EMBEDDED_KITTEN_MAX_INPUT_CHARS=220
 # EMBEDDED_KITTEN_CHUNK_SILENCE_MS=80
+# EMBEDDED_POCKET_TTS_ENABLED=true
+# EMBEDDED_POCKET_MODEL=pocket-tts-realtime
+# EMBEDDED_POCKET_DEFAULT_VOICE=alba
+# EMBEDDED_POCKET_VOICES=alba,marius,javert,jean,fantine,cosette,eponine,azelma
+# EMBEDDED_POCKET_STREAM_CHUNK_BYTES=4096
 # TTS_PROXY_TIMEOUT_SECONDS=180
 # Then set TTS endpoint to this proxy:
 # TTS_ENDPOINT=http://localhost:8002
+# Use TTS_MODEL=kitten-tts-mini-0.8 for Kitten or TTS_MODEL=pocket-tts-realtime for Pocket.
 
 # STT Configuration (Whisper-Compatible)
 WHISPER_ENDPOINT=http://localhost:8001/v1/audio/transcriptions
@@ -381,6 +387,11 @@ Key environment variables (see `.env.example` for complete list):
 - `EMBEDDED_KITTEN_STREAM_CHUNK_BYTES`: Embedded stream chunk size in bytes
 - `EMBEDDED_KITTEN_MAX_INPUT_CHARS`: Max text chars per generation chunk for embedded Kitten streaming
 - `EMBEDDED_KITTEN_CHUNK_SILENCE_MS`: Silence inserted between generated chunks (milliseconds)
+- `EMBEDDED_POCKET_TTS_ENABLED`: Enable embedded Kyutai Pocket TTS on the same `/v1/audio/speech` + `/v1/audio/voices` endpoints
+- `EMBEDDED_POCKET_MODEL`: Logical Pocket model selector exposed to clients (`pocket-tts-realtime` by default)
+- `EMBEDDED_POCKET_DEFAULT_VOICE`: Default embedded Pocket voice id
+- `EMBEDDED_POCKET_VOICES`: Comma-separated Pocket voice ids exposed to UI/Telegram
+- `EMBEDDED_POCKET_STREAM_CHUNK_BYTES`: Embedded Pocket PCM/WAV stream chunk size in bytes
 - `TTS_PROXY_TIMEOUT_SECONDS`: Proxy timeout for forwarded TTS requests (seconds)
 - `BRAVE_API_KEY`: Brave Search API key
 - `NEWS_API_KEY`: News API key
@@ -565,8 +576,8 @@ All services are configured to accept connections from devices on your local net
 
 **Speech & Audio:**
 - `POST /v1/audio/transcriptions` - Whisper STT proxy endpoint
-- `GET /v1/audio/voices` - Embedded OpenAI-compatible TTS voices (when enabled)
-- `POST /v1/audio/speech` - Embedded OpenAI-compatible TTS speech (when enabled; PCM/WAV + stream)
+- `GET /v1/audio/voices` - Embedded OpenAI-compatible TTS voices (Kitten or Pocket, selected by `model`)
+- `POST /v1/audio/speech` - Embedded OpenAI-compatible TTS speech (Kitten or Pocket; PCM/WAV + stream)
 - `GET /v1/proxy/tts/voices` - Get available TTS voices
 - `POST /v1/proxy/tts/speech` - Generate TTS speech (supports streaming)
 - `GET /v1/client-config` - Expose non-secret UI defaults (e.g., TTS endpoint/model/voice)
@@ -738,6 +749,7 @@ Key packages include (see [Installation Guide](#step-3-install-python-dependenci
 | `python-dotenv` | Load `.env` configuration |
 | `flask`, `flask-cors` | MCP browser HTTP server |
 | `kittentts` | Embedded OpenAI-compatible TTS (`/v1/audio/speech`, `/v1/audio/voices`) |
+| `pocket-tts` | Embedded Kyutai Pocket TTS realtime backend (`/v1/audio/speech`, `/v1/audio/voices`) |
 | `python-docx`, `openpyxl`, `PyPDF2`, `Pillow`, `reportlab` | File operations |
 
 Install all Python dependencies with: `pip install -r requirements.txt`
