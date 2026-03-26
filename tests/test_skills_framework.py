@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, Sequence
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import openpyxl
 import pytest
+from docx import Document
+from PIL import Image
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
 from src.skills import BaseSkill, BaseTool, SkillContext, SkillManager, SkillValidationError
 
@@ -154,6 +159,82 @@ async def test_filesystem_read_text_supports_line_ranges() -> None:
 
 
 @pytest.mark.asyncio
+async def test_filesystem_read_text_supports_docx() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        root = temp_base / "root"
+        root.mkdir(parents=True, exist_ok=True)
+        doc = Document()
+        doc.add_paragraph("Quarterly summary")
+        doc.add_paragraph("Revenue increased 12 percent")
+        doc.save(root / "summary.docx")
+
+        manager = SkillManager()
+        manager.load_manifests(
+            _create_temp_filesystem_manifest_dir(temp_base, root=root),
+            replace=True,
+        )
+
+        result = await manager.execute_tool("filesystem.read_text", {"path": "summary.docx"})
+        assert result.success is True
+        assert result.data["type"] == "text"
+        assert "Quarterly summary" in result.data["content"]
+        assert "Revenue increased 12 percent" in result.data["content"]
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_read_text_supports_pdf() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        root = temp_base / "root"
+        root.mkdir(parents=True, exist_ok=True)
+        pdf_path = root / "report.pdf"
+        pdf_canvas = canvas.Canvas(str(pdf_path), pagesize=letter)
+        pdf_canvas.drawString(100, 750, "Quarterly pipeline report")
+        pdf_canvas.save()
+
+        manager = SkillManager()
+        manager.load_manifests(
+            _create_temp_filesystem_manifest_dir(temp_base, root=root),
+            replace=True,
+        )
+
+        result = await manager.execute_tool("filesystem.read_text", {"path": "report.pdf"})
+        assert result.success is True
+        assert result.data["type"] == "text"
+        assert "Quarterly pipeline report" in result.data["content"]
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_read_text_supports_images() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        root = temp_base / "root"
+        root.mkdir(parents=True, exist_ok=True)
+        image_path = root / "diagram.png"
+        Image.new("RGB", (64, 32), color="red").save(image_path)
+
+        manager = SkillManager()
+        manager.load_manifests(
+            _create_temp_filesystem_manifest_dir(temp_base, root=root),
+            replace=True,
+        )
+
+        result = await manager.execute_tool("filesystem.read_text", {"path": "diagram.png"})
+        assert result.success is True
+        assert result.data["type"] == "image"
+        assert "64x32" in result.data["content"]
+        assert result.data["image_data"]["metadata"]["width"] == 64
+        assert result.data["image_data"]["metadata"]["height"] == 32
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_filesystem_list_files_supports_recursive_subdirectories() -> None:
     temp_base = _create_workspace_temp_dir()
     try:
@@ -220,6 +301,38 @@ async def test_filesystem_search_files_finds_filename_and_content_matches() -> N
         content_match = next(item for item in result.data["items"] if item["relative_path"] == "docs/misc.txt")
         assert content_match["line_number"] == 1
         assert "alpha" in content_match["excerpt"].lower()
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_search_files_reads_docx_and_xlsx_content() -> None:
+    temp_base = _create_workspace_temp_dir()
+    try:
+        root = temp_base / "root"
+        root.mkdir(parents=True, exist_ok=True)
+        doc = Document()
+        doc.add_paragraph("Board update")
+        doc.add_paragraph("Alpha milestone approved")
+        doc.save(root / "board-update.docx")
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "Milestone"
+        sheet["A2"] = "Alpha milestone approved"
+        workbook.save(root / "tracker.xlsx")
+
+        manager = SkillManager()
+        manager.load_manifests(
+            _create_temp_filesystem_manifest_dir(temp_base, root=root),
+            replace=True,
+        )
+
+        result = await manager.execute_tool("filesystem.search_files", {"query": "Alpha milestone approved"})
+        assert result.success is True
+        paths = [item.get("relative_path") for item in result.data["items"]]
+        assert "board-update.docx" in paths
+        assert "tracker.xlsx" in paths
     finally:
         shutil.rmtree(temp_base, ignore_errors=True)
 
@@ -1092,7 +1205,14 @@ async def test_googleworkspace_cli_slides_batch_update_builds_requests_from_slid
         params = json.loads(captured["args"][captured["args"].index("--params") + 1])
         payload = json.loads(captured["args"][captured["args"].index("--json") + 1])
         assert params == {"presentationId": "pres_123"}
-        assert len(payload["requests"]) == 4
+        assert len(payload["requests"]) == 8
+        assert payload["requests"][0]["createSlide"]["slideLayoutReference"]["predefinedLayout"] == "BLANK"
+        title_shape = next(req["createShape"] for req in payload["requests"] if req.get("createShape", {}).get("objectId") == "title_1")
+        assert title_shape["elementProperties"]["pageObjectId"] == "slide_1"
+        body_insert = next(req["insertText"] for req in payload["requests"] if req.get("insertText", {}).get("objectId") == "body_1")
+        assert body_insert["text"] == "Goal"
+        bullet_request = next(req["createParagraphBullets"] for req in payload["requests"] if "createParagraphBullets" in req)
+        assert bullet_request["objectId"] == "body_1"
         image_request = next(
             req["createImage"] for req in payload["requests"] if "createImage" in req
         )
@@ -1130,6 +1250,18 @@ async def test_googleworkspace_cli_slides_create_presentation_from_markdown_runs
                 "stderr": "",
                 "parsed_json": {"presentationId": "pres_456"},
             }
+        if command[:4] == ["gws", "slides", "presentations", "get"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 11,
+                "stdout": '{"presentationId":"pres_456","slides":[{"objectId":"initial_slide_1"}]}',
+                "stderr": "",
+                "parsed_json": {
+                    "presentationId": "pres_456",
+                    "slides": [{"objectId": "initial_slide_1"}],
+                },
+            }
         if command[:4] == ["gws", "slides", "presentations", "batchUpdate"]:
             return {
                 "command": command,
@@ -1165,10 +1297,21 @@ async def test_googleworkspace_cli_slides_create_presentation_from_markdown_runs
 
         assert result.success is True
         assert calls[0][:4] == ["gws", "slides", "presentations", "create"]
-        assert calls[1][:4] == ["gws", "slides", "presentations", "batchUpdate"]
+        assert calls[1][:4] == ["gws", "slides", "presentations", "get"]
+        assert calls[2][:4] == ["gws", "slides", "presentations", "batchUpdate"]
         create_payload = json.loads(calls[0][calls[0].index("--json") + 1])
-        batch_payload = json.loads(calls[1][calls[1].index("--json") + 1])
+        batch_payload = json.loads(calls[2][calls[2].index("--json") + 1])
         assert create_payload == {"title": "Q3 Product Roadmap"}
+        assert batch_payload["requests"][-1] == {"deleteObject": {"objectId": "initial_slide_1"}}
+        assert batch_payload["requests"][0]["createSlide"]["slideLayoutReference"]["predefinedLayout"] == "BLANK"
+        body_insert = next(
+            req["insertText"] for req in batch_payload["requests"] if req.get("insertText", {}).get("objectId") == "body_2"
+        )
+        assert body_insert["text"] == "Revenue trend"
+        bullet_request = next(
+            req["createParagraphBullets"] for req in batch_payload["requests"] if "createParagraphBullets" in req
+        )
+        assert bullet_request["objectId"] == "body_2"
         image_request = next(
             req["createImage"] for req in batch_payload["requests"] if "createImage" in req
         )
@@ -1177,7 +1320,185 @@ async def test_googleworkspace_cli_slides_create_presentation_from_markdown_runs
         assert result.data["title"] == "Q3 Product Roadmap"
         assert result.data["auto_attached_images"] == 1
         assert result.data["image_request_count"] == 1
+        assert result.data["deleted_initial_slide"] is True
+        assert result.data["deleted_initial_slide_id"] == "initial_slide_1"
+        assert result.data["batch_update_retried_without_delete"] is False
+        assert result.data["result_path"] == "presentations/q3-product-roadmap.slides-result.json"
+        assert result.data["link_path"] == "presentations/q3-product-roadmap.slides-result.txt"
+        manifest_path = temp_base / "presentations" / "q3-product-roadmap.slides-result.json"
+        link_path = temp_base / "presentations" / "q3-product-roadmap.slides-result.txt"
+        assert manifest_path.exists()
+        assert link_path.exists()
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest_payload["presentation_id"] == "pres_456"
+        assert manifest_payload["presentation_url"] == "https://docs.google.com/presentation/d/pres_456/edit"
+        assert manifest_payload["deleted_initial_slide"] is True
+        assert "Presentation URL: https://docs.google.com/presentation/d/pres_456/edit" in link_path.read_text(
+            encoding="utf-8"
+        )
         assert "Created Google Slides deck 'Q3 Product Roadmap'" in result.message
+        assert "Removed the default blank opening slide." in result.message
+        assert "Saved result manifest to presentations/q3-product-roadmap.slides-result.json" in result.message
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_slides_create_presentation_from_markdown_retries_without_delete_when_google_rejects_only_slide_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    calls: list[list[str]] = []
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        command = list(args)
+        calls.append(command)
+        if command[:4] == ["gws", "slides", "presentations", "create"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 11,
+                "stdout": '{"presentationId":"pres_456"}',
+                "stderr": "",
+                "parsed_json": {"presentationId": "pres_456"},
+            }
+        if command[:4] == ["gws", "slides", "presentations", "get"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 11,
+                "stdout": '{"presentationId":"pres_456","slides":[{"objectId":"initial_slide_1"}]}',
+                "stderr": "",
+                "parsed_json": {
+                    "presentationId": "pres_456",
+                    "slides": [{"objectId": "initial_slide_1"}],
+                },
+            }
+        if command[:4] == ["gws", "slides", "presentations", "batchUpdate"]:
+            payload = json.loads(command[command.index("--json") + 1])
+            if payload["requests"] and payload["requests"][-1] == {"deleteObject": {"objectId": "initial_slide_1"}}:
+                return {
+                    "command": command,
+                    "returncode": 0,
+                    "duration_ms": 12,
+                    "stdout": (
+                        '{"error":{"code":400,"message":"Cannot delete object initial_slide_1: '
+                        'presentations must have at least one slide"}}'
+                    ),
+                    "stderr": "",
+                    "parsed_json": {
+                        "error": {
+                            "code": 400,
+                            "message": (
+                                "Cannot delete object initial_slide_1: presentations must have at least one slide"
+                            ),
+                        }
+                    },
+                }
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 12,
+                "stdout": '{"replies":[]}',
+                "stderr": "",
+                "parsed_json": {"replies": []},
+            }
+        raise AssertionError(f"Unexpected gws command: {command}")
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+
+    temp_base = _create_workspace_temp_dir()
+    try:
+        manager = SkillManager.from_manifest_directory("src/skills/manifests")
+        result = await manager.execute_tool(
+            "googleworkspace_cli.slides_create_presentation_from_markdown",
+            {
+                "markdown": "# Q3 Product Roadmap\n\n## Overview Metrics\n- Revenue trend\n",
+            },
+            context=SkillContext(scratch_dir=temp_base),
+        )
+        assert result.success is True
+        batch_calls = [call for call in calls if call[:4] == ["gws", "slides", "presentations", "batchUpdate"]]
+        assert len(batch_calls) == 2
+        first_payload = json.loads(batch_calls[0][batch_calls[0].index("--json") + 1])
+        second_payload = json.loads(batch_calls[1][batch_calls[1].index("--json") + 1])
+        assert first_payload["requests"][-1] == {"deleteObject": {"objectId": "initial_slide_1"}}
+        assert all(request != {"deleteObject": {"objectId": "initial_slide_1"}} for request in second_payload["requests"])
+        assert result.data["deleted_initial_slide"] is False
+        assert result.data["deleted_initial_slide_id"] == "initial_slide_1"
+        assert result.data["batch_update_retried_without_delete"] is True
+        assert "Kept the default opening slide" in result.message
+    finally:
+        shutil.rmtree(temp_base, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_googleworkspace_cli_slides_create_presentation_from_markdown_surfaces_batchupdate_json_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.skills.builtin import googleworkspace_cli_skill as gws_skill
+
+    async def fake_run_gws_command(
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+        cwd: Path | None = None,
+        env_overrides: Dict[str, str] | None = None,
+    ) -> Dict[str, Any]:
+        command = list(args)
+        if command[:4] == ["gws", "slides", "presentations", "create"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 11,
+                "stdout": '{"presentationId":"pres_456"}',
+                "stderr": "",
+                "parsed_json": {"presentationId": "pres_456"},
+            }
+        if command[:4] == ["gws", "slides", "presentations", "get"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 11,
+                "stdout": '{"presentationId":"pres_456","slides":[{"objectId":"initial_slide_1"}]}',
+                "stderr": "",
+                "parsed_json": {
+                    "presentationId": "pres_456",
+                    "slides": [{"objectId": "initial_slide_1"}],
+                },
+            }
+        if command[:4] == ["gws", "slides", "presentations", "batchUpdate"]:
+            return {
+                "command": command,
+                "returncode": 0,
+                "duration_ms": 12,
+                "stdout": '{"error":{"code":400,"message":"Invalid requests[0].createSlide"}}',
+                "stderr": "",
+                "parsed_json": {"error": {"code": 400, "message": "Invalid requests[0].createSlide"}},
+            }
+        raise AssertionError(f"Unexpected gws command: {command}")
+
+    monkeypatch.setattr(gws_skill, "_run_gws_command", fake_run_gws_command)
+
+    temp_base = _create_workspace_temp_dir()
+    try:
+        manager = SkillManager.from_manifest_directory("src/skills/manifests")
+        result = await manager.execute_tool(
+            "googleworkspace_cli.slides_create_presentation_from_markdown",
+            {
+                "markdown": "# Q3 Product Roadmap\n\n## Overview Metrics\n- Revenue trend\n",
+            },
+            context=SkillContext(scratch_dir=temp_base),
+        )
+        assert result.success is False
+        assert "Invalid requests[0].createSlide" in result.message
     finally:
         shutil.rmtree(temp_base, ignore_errors=True)
 

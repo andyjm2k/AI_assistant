@@ -53,6 +53,33 @@ PROVIDER_API_KEY_VAR = {
     "openrouter": "MCP_LLM_OPENROUTER_API_KEY",
 }
 
+STANDARD_PROVIDER_API_KEY_VAR = {
+    "ollama": None,
+    "openai": "OPENAI_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "azure_openai": "AZURE_OPENAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+
+OPENAI_COMPATIBLE_ALIAS_PROVIDERS = frozenset({
+    "ollama",
+    "openai",
+    "minimax",
+    "deepseek",
+    "openrouter",
+})
+
+DEFAULT_OPENAI_COMPATIBLE_BASE_URLS = {
+    "ollama": "http://localhost:11434/v1",
+    "openai": "https://api.openai.com/v1",
+    "minimax": "https://api.minimax.io/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+}
+
 
 def _prompt(prompt: str, default: str = "", secret: bool = False) -> str:
     """Read one line from stdin; return stripped value or default. Flushes stdout so prompts and input are visible when run from batch/PowerShell."""
@@ -149,6 +176,23 @@ def _load_template_with_path_substitution(project_root: Path) -> str:
     return "".join(lines)
 
 
+def _normalize_base_url(value: str) -> str:
+    """Normalize a base URL by trimming whitespace and trailing slashes."""
+    return value.strip().rstrip("/")
+
+
+def _derive_openai_compatible_base_url(provider: str, endpoint: str) -> str:
+    """Return an OpenAI-compatible base URL for modules that still read OPENAI_* vars."""
+    normalized_endpoint = _normalize_base_url(endpoint)
+    if not normalized_endpoint:
+        normalized_endpoint = DEFAULT_OPENAI_COMPATIBLE_BASE_URLS.get(provider, "")
+    if not normalized_endpoint:
+        return ""
+    if provider == "ollama" and not normalized_endpoint.endswith("/v1"):
+        return normalized_endpoint + "/v1"
+    return normalized_endpoint
+
+
 def run_wizard(project_root: Path, env_path: Path) -> bool:
     """
     Run interactive prompts and write .env. Returns True if .env was written.
@@ -177,11 +221,33 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
 
     # 3. API key for chosen provider (skip for ollama unless they want to set base URL)
     api_key = ""
+    azure_api_version = ""
     if provider == "ollama":
         endpoint = _prompt("3) Ollama base URL (leave blank for localhost:11434)", "http://localhost:11434")
     elif provider == "minimax":
         endpoint = _prompt("3) Minimax base URL", "https://api.minimax.io/v1")
         api_key = _prompt("4) API key for minimax", "", secret=True)
+        if not api_key:
+            print("   (You can add it later in .env)")
+    elif provider == "openrouter":
+        endpoint = _prompt("3) OpenRouter base URL", "https://openrouter.ai/api/v1")
+        api_key = _prompt("4) API key for openrouter", "", secret=True)
+        if not api_key:
+            print("   (You can add it later in .env)")
+    elif provider == "azure_openai":
+        endpoint = _prompt("3) Azure OpenAI endpoint", "https://your-resource.openai.azure.com")
+        azure_api_version = _prompt("4) Azure OpenAI API version", "2024-02-01")
+        api_key = _prompt("5) API key for azure_openai", "", secret=True)
+        if not api_key:
+            print("   (You can add it later in .env)")
+    elif provider == "deepseek":
+        endpoint = _prompt("3) DeepSeek base URL", "https://api.deepseek.com/v1")
+        api_key = _prompt("4) API key for deepseek", "", secret=True)
+        if not api_key:
+            print("   (You can add it later in .env)")
+    elif provider == "openai":
+        endpoint = _prompt("3) OpenAI base URL", "https://api.openai.com/v1")
+        api_key = _prompt("4) API key for openai", "", secret=True)
         if not api_key:
             print("   (You can add it later in .env)")
     else:
@@ -260,6 +326,30 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         key_var = PROVIDER_API_KEY_VAR.get(provider)
         if key_var:
             content = _set_key_in_env_content(content, key_var, api_key)
+        standard_key_var = STANDARD_PROVIDER_API_KEY_VAR.get(provider)
+        if standard_key_var:
+            content = _set_key_in_env_content(content, standard_key_var, api_key)
+    content = _set_key_in_env_content(content, "MCP_MODEL_PROVIDER", provider)
+    content = _set_key_in_env_content(content, "MCP_MODEL_NAME", model)
+    if endpoint:
+        content = _set_key_in_env_content(content, "MCP_MODEL_BASE_URL", endpoint)
+    if provider == "azure_openai":
+        if endpoint:
+            content = _set_key_in_env_content(content, "MCP_LLM_AZURE_ENDPOINT", endpoint)
+        content = _set_key_in_env_content(content, "MCP_LLM_AZURE_API_VERSION", azure_api_version or "2024-02-01")
+    openai_compat_base_url = _derive_openai_compatible_base_url(provider, endpoint)
+    if provider in OPENAI_COMPATIBLE_ALIAS_PROVIDERS:
+        content = _set_key_in_env_content(content, "OPENAI_MODEL", model)
+        if openai_compat_base_url:
+            content = _set_key_in_env_content(content, "OPENAI_API_BASE", openai_compat_base_url)
+        if api_key:
+            content = _set_key_in_env_content(content, "OPENAI_API_KEY", api_key)
+    if provider == "openrouter":
+        content = _set_key_in_env_content(
+            content,
+            "OPENROUTER_API_BASE",
+            openai_compat_base_url or "https://openrouter.ai/api/v1",
+        )
     if brave:
         content = _set_key_in_env_content(content, "BRAVE_API_KEY", brave)
     if news:
@@ -307,6 +397,7 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     env_path.write_text(content, encoding="utf-8")
     print("\nWrote", str(env_path))
     print("   For HTTPS from other devices, run: mkcert", https_hostname, "localhost 127.0.0.1 <your-ip>")
+    print("   Review optional .env sections if you plan to use Whisper, Spotify, Google Drive, GitHub, image generation, or memory overrides.")
     return True
 
 

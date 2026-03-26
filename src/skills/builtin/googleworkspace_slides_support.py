@@ -1,44 +1,32 @@
-"""Built-in Google Slides planning, markdown parsing, and request-building skill."""
+"""Shared markdown-to-slides helpers used by the Google Workspace CLI skill."""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
-from src.skills.base import BaseSkill, BaseTool
 from src.skills.exceptions import SkillValidationError
-from src.skills.models import SkillContext
 
-_MIN_SLIDE_COUNT = 3
 _MAX_SLIDE_COUNT = 50
 _SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|(?:\d+[.)]))\s+(.+?)\s*$")
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
-
-
-def _coerce_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"1", "true", "yes", "y", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "n", "off"}:
-            return False
-    return default
-
-
-def _coerce_slide_count(value: Any, default: int = 10) -> int:
-    try:
-        count = int(value)
-    except (TypeError, ValueError):
-        count = default
-    return max(_MIN_SLIDE_COUNT, min(count, _MAX_SLIDE_COUNT))
+_TITLE_BOX_X_PT = 36
+_TITLE_BOX_Y_PT = 24
+_TITLE_BOX_WIDTH_PT = 648
+_TITLE_BOX_HEIGHT_PT = 48
+_BODY_BOX_X_PT = 48
+_BODY_BOX_Y_PT = 96
+_BODY_BOX_HEIGHT_PT = 252
+_BODY_BOX_WIDTH_PT = 624
+_BODY_BOX_WIDTH_WITH_IMAGE_PT = 312
+_IMAGE_BOX_X_PT = 396
+_IMAGE_BOX_Y_PT = 120
+_IMAGE_BOX_WIDTH_PT = 276
+_IMAGE_BOX_HEIGHT_PT = 228
 
 
 def _coerce_positive_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
@@ -199,22 +187,38 @@ def _build_batch_update_payload(
         slide_id = _safe_object_id("slide", index)
         title_id = _safe_object_id("title", index)
         body_id = _safe_object_id("body", index)
+        reserve_image_space = include_image_requests and bool(slide["images"])
+        body_box_width = (
+            _BODY_BOX_WIDTH_WITH_IMAGE_PT if reserve_image_space else _BODY_BOX_WIDTH_PT
+        )
 
         requests.append(
             {
                 "createSlide": {
                     "objectId": slide_id,
-                    "slideLayoutReference": {"predefinedLayout": "TITLE_AND_BODY"},
-                    "placeholderIdMappings": [
-                        {
-                            "layoutPlaceholder": {"type": "TITLE", "index": 0},
-                            "objectId": title_id,
+                    "slideLayoutReference": {"predefinedLayout": "BLANK"},
+                }
+            }
+        )
+        requests.append(
+            {
+                "createShape": {
+                    "objectId": title_id,
+                    "shapeType": "TEXT_BOX",
+                    "elementProperties": {
+                        "pageObjectId": slide_id,
+                        "size": {
+                            "height": {"magnitude": _TITLE_BOX_HEIGHT_PT, "unit": "PT"},
+                            "width": {"magnitude": _TITLE_BOX_WIDTH_PT, "unit": "PT"},
                         },
-                        {
-                            "layoutPlaceholder": {"type": "BODY", "index": 0},
-                            "objectId": body_id,
+                        "transform": {
+                            "scaleX": 1,
+                            "scaleY": 1,
+                            "translateX": _TITLE_BOX_X_PT,
+                            "translateY": _TITLE_BOX_Y_PT,
+                            "unit": "PT",
                         },
-                    ],
+                    },
                 }
             }
         )
@@ -227,15 +231,59 @@ def _build_batch_update_payload(
                 }
             }
         )
+        requests.append(
+            {
+                "updateTextStyle": {
+                    "objectId": title_id,
+                    "textRange": {"type": "ALL"},
+                    "style": {
+                        "fontSize": {"magnitude": 24, "unit": "PT"},
+                        "bold": True,
+                    },
+                    "fields": "fontSize,bold",
+                }
+            }
+        )
 
         if slide["bullets"]:
-            body_text = "\n".join(f"- {line}" for line in slide["bullets"])
+            requests.append(
+                {
+                    "createShape": {
+                        "objectId": body_id,
+                        "shapeType": "TEXT_BOX",
+                        "elementProperties": {
+                            "pageObjectId": slide_id,
+                            "size": {
+                                "height": {"magnitude": _BODY_BOX_HEIGHT_PT, "unit": "PT"},
+                                "width": {"magnitude": body_box_width, "unit": "PT"},
+                            },
+                            "transform": {
+                                "scaleX": 1,
+                                "scaleY": 1,
+                                "translateX": _BODY_BOX_X_PT,
+                                "translateY": _BODY_BOX_Y_PT,
+                                "unit": "PT",
+                            },
+                        },
+                    }
+                }
+            )
+            body_text = "\n".join(slide["bullets"])
             requests.append(
                 {
                     "insertText": {
                         "objectId": body_id,
                         "insertionIndex": 0,
                         "text": body_text,
+                    }
+                }
+            )
+            requests.append(
+                {
+                    "createParagraphBullets": {
+                        "objectId": body_id,
+                        "textRange": {"type": "ALL"},
+                        "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
                     }
                 }
             )
@@ -276,14 +324,16 @@ def _build_batch_update_payload(
                             "elementProperties": {
                                 "pageObjectId": slide_id,
                                 "size": {
-                                    "height": {"magnitude": 240, "unit": "PT"},
-                                    "width": {"magnitude": 360, "unit": "PT"},
+                                    "height": {"magnitude": _IMAGE_BOX_HEIGHT_PT, "unit": "PT"},
+                                    "width": {"magnitude": _IMAGE_BOX_WIDTH_PT, "unit": "PT"},
                                 },
                                 "transform": {
                                     "scaleX": 1,
                                     "scaleY": 1,
-                                    "translateX": 60,
-                                    "translateY": 160,
+                                    "translateX": (
+                                        _IMAGE_BOX_X_PT if reserve_image_space else _BODY_BOX_X_PT
+                                    ),
+                                    "translateY": _IMAGE_BOX_Y_PT,
                                     "unit": "PT",
                                 },
                             },
@@ -328,7 +378,6 @@ def _clean_markdown_image_target(target: str) -> str:
     text = str(target or "").strip().strip("<>").strip()
     if not text:
         return ""
-    # Strip optional trailing markdown image title: path "title text".
     if " " in text and '"' in text:
         text = text.split(" ", 1)[0]
     return text.strip()
@@ -549,416 +598,10 @@ def _to_public_image_url(
         return explicit_url
 
     path_value = str(image.get("path", "")).strip()
-    if not path_value:
-        return None
-    if not image_url_prefix:
+    if not path_value or not image_url_prefix:
         return None
 
     safe_path = _resolve_safe_scratch_path(scratch_root, path_value)
     relative = str(safe_path.relative_to(scratch_root.resolve())).replace("\\", "/")
     encoded = quote(relative, safe="/-._~")
     return f"{image_url_prefix.rstrip('/')}/{encoded.lstrip('/')}"
-
-
-class CreateOutlineTool(BaseTool):
-    name = "create_outline"
-    description = "Generate a practical presentation outline for Google Slides."
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "topic": {"type": "string", "description": "Primary topic for the deck."},
-            "audience": {
-                "type": "string",
-                "default": "General audience",
-                "description": "Target audience for tone and framing.",
-            },
-            "objective": {
-                "type": "string",
-                "default": "",
-                "description": "Desired decision or outcome from the presentation.",
-            },
-            "slide_count": {
-                "type": "integer",
-                "default": 10,
-                "minimum": _MIN_SLIDE_COUNT,
-                "maximum": _MAX_SLIDE_COUNT,
-                "description": "Total number of slides to generate.",
-            },
-            "tone": {
-                "type": "string",
-                "default": "clear and actionable",
-                "description": "Writing tone for notes and bullets.",
-            },
-            "include_agenda": {
-                "type": "boolean",
-                "default": True,
-                "description": "Include an agenda slide near the start of the deck.",
-            },
-            "include_summary": {
-                "type": "boolean",
-                "default": True,
-                "description": "Reserve the final slide for summary and next steps.",
-            },
-        },
-        "required": ["topic"],
-        "additionalProperties": False,
-    }
-
-    async def run(self, arguments: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
-        topic = str(arguments.get("topic", "")).strip()
-        if not topic:
-            raise SkillValidationError("topic is required.")
-
-        audience = str(arguments.get("audience", "General audience")).strip() or "General audience"
-        objective = str(arguments.get("objective", "")).strip()
-        tone = str(arguments.get("tone", "clear and actionable")).strip() or "clear and actionable"
-        slide_count = _coerce_slide_count(arguments.get("slide_count", 10), default=10)
-        include_agenda = _coerce_bool(arguments.get("include_agenda", True), default=True)
-        include_summary = _coerce_bool(arguments.get("include_summary", True), default=True)
-
-        slides: List[Dict[str, Any]] = [
-            {
-                "title": topic,
-                "bullets": [
-                    f"Audience: {audience}",
-                    f"Objective: {objective or 'Align on goals and required decisions'}",
-                ],
-                "speaker_notes": f"Open with context and set expectations in a {tone} tone.",
-            }
-        ]
-
-        if include_agenda and len(slides) < slide_count:
-            slides.append(
-                {
-                    "title": "Agenda",
-                    "bullets": [
-                        "Current state and constraints",
-                        "Recommended approach",
-                        "Execution plan and timeline",
-                        "Risks, decisions, and next steps",
-                    ],
-                    "speaker_notes": "Preview structure so stakeholders can follow the decision path.",
-                }
-            )
-
-        templates = [
-            (
-                "Current State",
-                [
-                    f"What is happening in {topic} right now",
-                    "Primary metrics and trend summary",
-                    "Immediate constraints we must work within",
-                ],
-            ),
-            (
-                "Problem Framing",
-                [
-                    "Why this matters now",
-                    "What happens if no action is taken",
-                    "Decision criteria for success",
-                ],
-            ),
-            (
-                "Recommended Strategy",
-                [
-                    "Core proposal and rationale",
-                    "Alternatives considered and tradeoffs",
-                    "Resource assumptions and dependencies",
-                ],
-            ),
-            (
-                "Execution Plan",
-                [
-                    "Phase breakdown and owners",
-                    "Timeline with critical milestones",
-                    "How progress will be reported",
-                ],
-            ),
-            (
-                "Risks And Mitigations",
-                [
-                    "Top operational and delivery risks",
-                    "Mitigation actions and fallback options",
-                    "Open questions requiring leadership input",
-                ],
-            ),
-            (
-                "Ask And Decision",
-                [
-                    "Decision requested from stakeholders",
-                    "Budget or staffing required",
-                    "Immediate next action after approval",
-                ],
-            ),
-        ]
-
-        reserved_for_summary = 1 if include_summary else 0
-        template_index = 0
-        while len(slides) < (slide_count - reserved_for_summary):
-            title, bullets = templates[template_index % len(templates)]
-            slides.append(
-                {
-                    "title": title,
-                    "bullets": bullets,
-                    "speaker_notes": f"Keep this section concise and {tone}.",
-                }
-            )
-            template_index += 1
-
-        if include_summary and len(slides) < slide_count:
-            slides.append(
-                {
-                    "title": "Summary And Next Steps",
-                    "bullets": [
-                        "What we agreed today",
-                        "Actions by owner and due date",
-                        "Follow-up meeting and success check",
-                    ],
-                    "speaker_notes": "Close with decisions and accountability.",
-                }
-            )
-
-        slides = slides[:slide_count]
-        for idx, slide in enumerate(slides, start=1):
-            slide["index"] = idx
-
-        return {
-            "topic": topic,
-            "audience": audience,
-            "objective": objective,
-            "tone": tone,
-            "slide_count": len(slides),
-            "slides": slides,
-        }
-
-
-class BuildBatchUpdateRequestsTool(BaseTool):
-    name = "build_batch_update_requests"
-    description = (
-        "Build Google Slides API batchUpdate requests from slide title/bullet inputs, "
-        "including optional image create requests."
-    )
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "presentation_id": {
-                "type": "string",
-                "description": "Target Google Slides presentation id.",
-            },
-            "slides": {
-                "type": "array",
-                "description": "Ordered slide specs with title and optional bullet lines.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "bullets": {
-                            "type": ["array", "string"],
-                            "items": {"type": "string"},
-                        },
-                        "images": {
-                            "type": ["array", "string", "object"],
-                            "description": (
-                                "Optional image references per slide. Each entry may be a URL string, "
-                                "scratch-relative path string (for example images/chart.png), or "
-                                "an object with path/url/alt."
-                            ),
-                        },
-                    },
-                    "required": ["title"],
-                    "additionalProperties": False,
-                },
-            },
-            "image_url_prefix": {
-                "type": "string",
-                "description": (
-                    "Optional public base URL used to convert scratch-relative image paths "
-                    "into createImage URLs."
-                ),
-            },
-            "include_image_requests": {
-                "type": "boolean",
-                "default": True,
-                "description": "When true, emit createImage requests for slide image inputs.",
-            },
-        },
-        "required": ["presentation_id", "slides"],
-        "additionalProperties": False,
-    }
-
-    def __init__(self, default_root_dir: Path) -> None:
-        self.default_root_dir = default_root_dir
-
-    async def run(self, arguments: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
-        include_image_requests = _coerce_bool(
-            arguments.get("include_image_requests", True), default=True
-        )
-        image_url_prefix = str(arguments.get("image_url_prefix", "")).strip()
-        scratch_root = (context.scratch_dir or self.default_root_dir).resolve()
-        return _build_batch_update_payload(
-            str(arguments.get("presentation_id", "")).strip(),
-            arguments.get("slides"),
-            include_image_requests=include_image_requests,
-            image_url_prefix=image_url_prefix,
-            scratch_root=scratch_root,
-        )
-
-
-class CreateOutlineFromMarkdownTool(BaseTool):
-    name = "create_outline_from_markdown"
-    description = (
-        "Generate slide title/bullet/image entries from markdown text or a markdown file "
-        "in the scratch workspace."
-    )
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "markdown": {
-                "type": "string",
-                "description": "Inline markdown content to transform into slides.",
-            },
-            "markdown_path": {
-                "type": "string",
-                "description": (
-                    "Path to a markdown file under scratch (for example notes/deck.md "
-                    "or scratch/notes/deck.md)."
-                ),
-            },
-            "max_slides": {
-                "type": "integer",
-                "default": _MAX_SLIDE_COUNT,
-                "minimum": 1,
-                "maximum": _MAX_SLIDE_COUNT,
-                "description": "Upper bound on generated slide count.",
-            },
-            "attach_scratch_images": {
-                "type": "boolean",
-                "default": True,
-                "description": "When true, auto-match images from scratch/images to slides.",
-            },
-            "image_dir": {
-                "type": "string",
-                "default": "images",
-                "description": "Scratch-relative image directory to scan for auto-attachment.",
-            },
-            "image_match_mode": {
-                "type": "string",
-                "default": "title",
-                "enum": ["title", "sequential"],
-                "description": "Auto-image matching strategy for scratch image scanning.",
-            },
-            "max_images_per_slide": {
-                "type": "integer",
-                "default": 1,
-                "minimum": 0,
-                "maximum": 4,
-                "description": "Maximum auto-attached images per slide.",
-            },
-        },
-        "additionalProperties": False,
-    }
-
-    def __init__(self, default_root_dir: Path) -> None:
-        self.default_root_dir = default_root_dir
-
-    async def run(self, arguments: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
-        markdown = str(arguments.get("markdown", "") or "")
-        markdown_path_raw = str(arguments.get("markdown_path", "")).strip()
-        if not markdown.strip() and not markdown_path_raw:
-            raise SkillValidationError("Provide either markdown or markdown_path.")
-
-        scratch_root = (context.scratch_dir or self.default_root_dir).resolve()
-        source_path: Optional[Path] = None
-        source_dir: Optional[Path] = None
-        if markdown_path_raw:
-            source_path = _resolve_safe_scratch_path(scratch_root, markdown_path_raw)
-            if not source_path.exists():
-                raise SkillValidationError(f"markdown_path does not exist: {markdown_path_raw}")
-            if not source_path.is_file():
-                raise SkillValidationError(f"markdown_path is not a file: {markdown_path_raw}")
-            markdown = source_path.read_text(encoding="utf-8")
-            source_dir = source_path.parent
-
-        fallback_title = "Untitled Presentation"
-        if source_path is not None:
-            fallback_title = source_path.stem.replace("_", " ").strip() or fallback_title
-
-        slides = _parse_markdown_to_slides(
-            markdown,
-            fallback_title=fallback_title,
-            scratch_root=scratch_root,
-            source_dir=source_dir,
-        )
-
-        max_slides = _coerce_positive_int(
-            arguments.get("max_slides", _MAX_SLIDE_COUNT),
-            default=_MAX_SLIDE_COUNT,
-            minimum=1,
-            maximum=_MAX_SLIDE_COUNT,
-        )
-        slides = slides[:max_slides]
-
-        attach_scratch_images = _coerce_bool(
-            arguments.get("attach_scratch_images", True),
-            default=True,
-        )
-        image_dir = str(arguments.get("image_dir", "images") or "images").strip() or "images"
-        image_match_mode = str(arguments.get("image_match_mode", "title") or "title").strip().lower()
-        if image_match_mode not in {"title", "sequential"}:
-            raise SkillValidationError("image_match_mode must be either 'title' or 'sequential'.")
-        max_images_per_slide = _coerce_positive_int(
-            arguments.get("max_images_per_slide", 1),
-            default=1,
-            minimum=0,
-            maximum=4,
-        )
-
-        available_images: List[str] = []
-        auto_attached_images = 0
-        if attach_scratch_images and max_images_per_slide > 0:
-            available_images = _list_scratch_images(scratch_root, image_dir)
-            auto_attached_images = _attach_scratch_images_to_slides(
-                slides,
-                available_images,
-                max_images_per_slide=max_images_per_slide,
-                match_mode=image_match_mode,
-            )
-
-        for idx, slide in enumerate(slides, start=1):
-            slide["index"] = idx
-
-        return {
-            "source": "markdown_path" if source_path is not None else "markdown",
-            "markdown_path": (
-                str(source_path.relative_to(scratch_root)).replace("\\", "/")
-                if source_path is not None
-                else None
-            ),
-            "slide_count": len(slides),
-            "slides": slides,
-            "auto_attached_images": auto_attached_images,
-            "scratch_image_count": len(available_images),
-        }
-
-
-class GoogleSlidesSkill(BaseSkill):
-    name = "google_slides"
-    description = "Google Slides planning, markdown conversion, and request-building tools."
-    version = "1.1.0"
-    tags = ["google", "slides", "presentation"]
-
-    def __init__(self, root_dir: str = "./scratch") -> None:
-        super().__init__()
-        self.root_dir = Path(root_dir).resolve()
-        self.root_dir.mkdir(parents=True, exist_ok=True)
-
-    def create_tools(self) -> Sequence[BaseTool]:
-        return [
-            CreateOutlineTool(),
-            CreateOutlineFromMarkdownTool(default_root_dir=self.root_dir),
-            BuildBatchUpdateRequestsTool(default_root_dir=self.root_dir),
-        ]
-
-
-def create_skill(root_dir: str = "./scratch") -> BaseSkill:
-    return GoogleSlidesSkill(root_dir=root_dir)

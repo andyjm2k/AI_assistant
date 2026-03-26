@@ -16,6 +16,7 @@ import re
 import sys
 import time
 import base64
+import binascii
 import hmac
 import hashlib
 import secrets
@@ -27,13 +28,12 @@ import shutil
 from typing import Dict, List, Optional, Any, Set, Tuple
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 from dataclasses import dataclass
 from contextlib import suppress
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, RedirectResponse, Response
@@ -46,6 +46,16 @@ from src.utils.token_budget import (
     format_messages_for_summary,
     get_max_token_limit,
     is_context_limit_error,
+)
+from src.utils.file_readers import (
+    FILE_READERS_AVAILABLE,
+    MISSING_FILE_READER_DEPENDENCIES,
+    read_docx_file,
+    read_pdf_file,
+    read_png_file,
+    read_supported_file_text,
+    read_text_file,
+    read_xlsx_file,
 )
 from src.utils.openai_compat import (
     coerce_message_text,
@@ -108,10 +118,12 @@ try:
     from docx import Document  # python-docx for Word documents
     import openpyxl  # openpyxl for Excel files
     from openpyxl.styles import Font, Alignment  # For Excel formatting
-    import PyPDF2  # PyPDF2 for PDF reading
-    from PIL import Image  # Pillow for image operations
-    FILE_OPS_AVAILABLE = True
-    print("[OK] File operations libraries loaded successfully")
+    FILE_OPS_AVAILABLE = FILE_READERS_AVAILABLE
+    if FILE_OPS_AVAILABLE:
+        print("[OK] File operations libraries loaded successfully")
+    else:
+        missing = ", ".join(MISSING_FILE_READER_DEPENDENCIES)
+        print(f"[WARN] File operations libraries not available: missing {missing}")
 except ImportError as e:
     print(f"[WARN] File operations libraries not available: {e}")
     FILE_OPS_AVAILABLE = False
@@ -539,8 +551,21 @@ class TelegramChatMessage(BaseModel):
     content: str
 
 
+class ChatAttachment(BaseModel):
+    filename: str
+    content_base64: str = Field(validation_alias=AliasChoices("content_base64", "contentBase64", "data"))
+    mime_type: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("mime_type", "mimeType", "content_type", "contentType"),
+    )
+    size_bytes: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("size_bytes", "sizeBytes", "size"),
+    )
+
+
 class TelegramChatRequest(BaseModel):
-    message: str
+    message: str = ""
     conversation_id: Optional[str] = None
     user_id: Optional[str] = None
     request_id: Optional[str] = None
@@ -549,6 +574,7 @@ class TelegramChatRequest(BaseModel):
     model: Optional[str] = None
     temperature: Optional[float] = None
     max_output_tokens: Optional[int] = None
+    attachments: Optional[List[ChatAttachment]] = None
 
 
 class TelegramChatResponse(BaseModel):
@@ -680,6 +706,7 @@ TEAM_CONFIG_FILE = _PROJECT_ROOT / "config" / "team-config.json"
 AUTOGEN_TEAM_BUILDER_FILE = _PROJECT_ROOT / "src" / "autogen" / "team_builder.py"
 # Optional: same system prompt / rules as web UI; when present, used for Telegram (overrides TELEGRAM_SYSTEM_PROMPT env)
 CATBOT_SYSTEM_PROMPT_FILE = _PROJECT_ROOT / "config" / "catbot_system_prompt.txt"
+SOUL_PROMPT_FILE = _PROJECT_ROOT / "config" / "soul.md"
 SCRATCH_DIR = _PROJECT_ROOT / "scratch"
 # Companion configs stored as one JSON file per companion (server filesystem only)
 COMPANIONS_DIR = _PROJECT_ROOT / "config" / "companions"
@@ -691,9 +718,11 @@ WRITE_ALLOWED_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".p
 SEARCHABLE_TEXT_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf"}
 # Allowed extensions for Google Drive upload (scratch workspace only; path exfiltration mitigation)
 DRIVE_UPLOAD_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
+ATTACHMENT_ALLOWED_EXTENSIONS = READ_ALLOWED_EXTENSIONS
 # Max file size for read/write in bytes (10MB default), configurable via env
 FILE_OPS_MAX_SIZE_BYTES = int(os.getenv("FILE_OPS_MAX_SIZE", "10485760"))
 SEARCH_FILE_MAX_SIZE_BYTES = int(os.getenv("SEARCH_FILE_MAX_SIZE", "1048576"))
+ATTACHMENT_MAX_FILES_PER_REQUEST = max(1, min(12, int(os.getenv("ATTACHMENT_MAX_FILES_PER_REQUEST", "6"))))
 
 # Telegram chat session storage (simple in-memory cache)
 telegram_conversations: Dict[str, List[Dict[str, str]]] = {}
@@ -1316,6 +1345,7 @@ def _format_telegram_tool_status(tool_name: Any) -> str:
         "rundeepresearch": "On it. I'm gathering sources and comparing them now.",
         "healthcheck": "On it. I'm checking the browser task status now.",
         "runworkflow": "On it. I'm running that workflow now.",
+        "createslidespresentation": "On it. I'm building the presentation now.",
     }
     if lowered in status_map:
         return status_map[lowered]
@@ -1877,6 +1907,33 @@ def _get_assistant_context_block() -> str:
     )
 
 
+def _read_optional_prompt_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        print(f"Warning: Could not read {path}: {e}")
+        return ""
+
+
+def _get_soul_prompt_text() -> str:
+    """Return optional persona text loaded from config/soul.md."""
+    return _read_optional_prompt_file(SOUL_PROMPT_FILE)
+
+
+def _compose_system_prompt_with_context(system_prompt: Optional[str]) -> str:
+    """Prepend runtime context and optional soul prompt to a base system prompt."""
+    parts: List[str] = [_get_assistant_context_block().strip()]
+    soul_prompt = _get_soul_prompt_text()
+    if soul_prompt:
+        parts.append(soul_prompt)
+    base_prompt = (system_prompt or "").strip()
+    if base_prompt:
+        parts.append(base_prompt)
+    return "\n\n".join(part for part in parts if part).strip()
+
+
 def _normalize_chat_endpoint(endpoint: str) -> str:
     if not endpoint:
         return ""
@@ -2205,13 +2262,9 @@ TELEGRAM_SYSTEM_PROMPT_ENV = os.getenv(
 
 def _get_telegram_system_prompt_base() -> str:
     """Return the base system prompt for Telegram: config file if present, else TELEGRAM_SYSTEM_PROMPT env."""
-    if CATBOT_SYSTEM_PROMPT_FILE.exists():
-        try:
-            content = CATBOT_SYSTEM_PROMPT_FILE.read_text(encoding="utf-8").strip()
-            if content:
-                return content
-        except Exception as e:
-            print(f"Warning: Could not read {CATBOT_SYSTEM_PROMPT_FILE}: {e}")
+    content = _read_optional_prompt_file(CATBOT_SYSTEM_PROMPT_FILE)
+    if content:
+        return content
     return TELEGRAM_SYSTEM_PROMPT_ENV
 
 
@@ -2256,12 +2309,7 @@ def _sanitize_telegram_legacy_tool_prompt(content: str) -> str:
 
 def _get_telegram_system_prompt_with_tools(conversation_id: str, todo_user_key: Optional[str] = None) -> str:
     """Return the tool-capable system prompt for Telegram, with current todo and memory cache for this conversation."""
-    content = ""
-    if CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE.exists():
-        try:
-            content = CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE.read_text(encoding="utf-8").strip()
-        except Exception as e:
-            print(f"Warning: Could not read {CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE}: {e}")
+    content = _read_optional_prompt_file(CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE)
     if not content:
         content = _get_telegram_system_prompt_base()
     content = _sanitize_telegram_legacy_tool_prompt(content)
@@ -2713,6 +2761,11 @@ def _resolve_skill_tool_qualified_name(tool_name: str) -> Optional[str]:
         "google_slides.slides_batch_update_presentation": (
             "googleworkspace_cli.slides_batch_update_presentation"
         ),
+        "slides_create_presentation_from_markdown": (
+            "googleworkspace_cli.slides_create_presentation_from_markdown"
+        ),
+        "markdown_to_slides": "googleworkspace_cli.slides_create_presentation_from_markdown",
+        "markdownToSlides": "googleworkspace_cli.slides_create_presentation_from_markdown",
     }
     candidate_name = alias_map.get(str(tool_name).strip(), str(tool_name).strip())
     try:
@@ -2753,6 +2806,34 @@ def _get_skill_tools_mcp_schema() -> List[Dict[str, Any]]:
     except Exception as exc:
         print(f"[WARN] Failed to list skill tools (mcp schema): {exc}")
         return []
+
+
+def _get_telegram_excluded_skill_tool_names() -> Set[str]:
+    """Return skill tools that should not be exposed directly to Telegram."""
+    return {"googleworkspace_cli.slides_create_presentation_from_markdown"}
+
+
+def _get_telegram_skill_tools_openai_schema() -> List[Dict[str, Any]]:
+    """Return Telegram-safe skill tools for OpenAI-style tool calling."""
+    excluded = _get_telegram_excluded_skill_tool_names()
+    filtered: List[Dict[str, Any]] = []
+    for item in _get_skill_tools_openai_schema():
+        function = item.get("function") if isinstance(item, dict) else None
+        name = str(function.get("name") or "").strip() if isinstance(function, dict) else ""
+        if name and name in excluded:
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def _get_telegram_skill_tools_mcp_schema() -> List[Dict[str, Any]]:
+    """Return Telegram-safe skill tools for MCP-style prompt rendering."""
+    excluded = _get_telegram_excluded_skill_tool_names()
+    return [
+        item
+        for item in _get_skill_tools_mcp_schema()
+        if str(item.get("name") or "").strip() not in excluded
+    ]
 
 
 async def _execute_skill_framework_tool(
@@ -2933,16 +3014,31 @@ def _format_generic_skill_tool_output(
 
 def _build_telegram_skill_tools_prompt_block() -> str:
     """Render dynamic skill-tool instructions for Telegram XML tool-calling."""
-    skill_tools = _get_skill_tools_mcp_schema()
+    skill_tools = _get_telegram_skill_tools_mcp_schema()
     if not skill_tools:
         return ""
     excluded_tool_names = {"googleworkspace_cli.run_readonly_command"}
+    tool_names = {str(item.get("name") or "").strip() for item in skill_tools if isinstance(item, dict)}
 
     lines: List[str] = [
         "Additional Skill Framework tools (dynamically loaded):",
         "Prefer structured tool calls with the exact tool name and JSON schema shown below.",
         "Use XML tool markup only as a legacy fallback when structured tool calls are unavailable.",
     ]
+    filesystem_tool_names = [
+        "filesystem.read_text",
+        "filesystem.write_text",
+        "filesystem.list_files",
+        "filesystem.search_files",
+    ]
+    if any(name in tool_names for name in filesystem_tool_names):
+        lines.extend(
+            [
+                "Filesystem skill tools are available in this conversation.",
+                "Use these exact qualified names and prefer them over legacy readFile/writeFile/listFiles/searchFiles:",
+                *[f"- {name}" for name in filesystem_tool_names if name in tool_names],
+            ]
+        )
     for item in skill_tools:
         name = str(item.get("name") or "").strip()
         if not name:
@@ -2957,7 +3053,6 @@ def _build_telegram_skill_tools_prompt_block() -> str:
         lines.append(f"- {name}: {description}")
         lines.append(f"  Parameters JSON schema: {schema_text}")
 
-    tool_names = {str(item.get("name") or "").strip() for item in skill_tools if isinstance(item, dict)}
     if "googleworkspace_cli.gmail_list_unread" in tool_names:
         lines.extend(
             [
@@ -2975,6 +3070,18 @@ def _build_telegram_skill_tools_prompt_block() -> str:
                 "<parameters>{\"to\": \"user@example.com\", \"subject\": \"Status\", \"body_text\": \"Hi\"}</parameters>",
                 "<tool>googleworkspace_cli.gmail_mark_read</tool>",
                 "<parameters>{\"message_id\": \"18c...\"}</parameters>",
+            ]
+        )
+    if "googleworkspace_cli.slides_create_presentation_from_markdown" in tool_names:
+        lines.extend(
+            [
+                "",
+                "Google Slides markdown-file example:",
+                "<tool>googleworkspace_cli.slides_create_presentation_from_markdown</tool>",
+                "<parameters>{\"markdown_path\":\"<relative_path_to_scratch>/file.md\"}</parameters>",
+                "Use markdown_path for markdown files that already exist under scratch. Do not call any standalone slides skill.",
+                "For slide-creation tasks, reading a markdown file with filesystem.read_text is only preparation, not completion.",
+                "A slide task is only complete after googleworkspace_cli.slides_create_presentation_from_markdown succeeds and returns a presentation URL or saved result file path.",
             ]
         )
 
@@ -3129,6 +3236,31 @@ def _get_telegram_native_tools_mcp_schema() -> List[Dict[str, Any]]:
                     "pdfUrl": {"type": "string"},
                     "title": {"type": "string"},
                     "filename": {"type": "string"},
+                },
+            },
+        },
+        {
+            "name": "createSlidesPresentation",
+            "description": (
+                "Create a Google Slides presentation for Telegram from a prompt, inline markdown, "
+                "or a markdown file under scratch. Prefer this over direct Google Slides skill calls."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "title": {"type": "string"},
+                    "markdown": {"type": "string"},
+                    "markdown_path": {"type": "string"},
+                    "audience": {"type": "string"},
+                    "purpose": {"type": "string"},
+                    "tone": {"type": "string"},
+                    "max_slides": {"type": "integer"},
+                    "attach_scratch_images": {"type": "boolean"},
+                    "image_dir": {"type": "string"},
+                    "max_images_per_slide": {"type": "integer"},
+                    "include_image_requests": {"type": "boolean"},
+                    "timeout_seconds": {"type": "number"},
                 },
             },
         },
@@ -3391,7 +3523,7 @@ def _get_telegram_combined_openai_tools() -> List[Dict[str, Any]]:
     """Return the merged native+skill tool list for Telegram chat payloads."""
     return _merge_openai_tool_lists(
         _get_telegram_native_tools_openai_schema(),
-        _get_skill_tools_openai_schema(),
+        _get_telegram_skill_tools_openai_schema(),
     )
 
 
@@ -3409,7 +3541,7 @@ def _build_telegram_native_tools_prompt_block() -> str:
 
     skill_tool_names = {
         str(item.get("name") or "").strip()
-        for item in (_get_skill_tools_mcp_schema() or [])
+        for item in (_get_telegram_skill_tools_mcp_schema() or [])
         if isinstance(item, dict)
     }
     if {
@@ -3423,13 +3555,289 @@ def _build_telegram_native_tools_prompt_block() -> str:
             "filesystem.write_text, filesystem.list_files, and filesystem.search_files over "
             "readFile, writeFile, listFiles, and searchFiles."
         )
+    lines.append(
+        "For presentation requests in Telegram, use createSlidesPresentation. "
+        "Do not call googleworkspace_cli.slides_create_presentation_from_markdown directly."
+    )
 
     for item in native_tools:
         schema_text = json.dumps(item["inputSchema"], ensure_ascii=False, separators=(",", ":"), default=str)
         lines.append(f"- {item['name']}: {item['description']}")
         lines.append(f"  Parameters JSON schema: {schema_text}")
+        if item["name"] == "createSlidesPresentation":
+            lines.append('  Example: {"prompt":"Create investor slides for PermitFlow AI","title":"PermitFlow AI"}')
+            lines.append('  Use markdown_path when a slide markdown file already exists under scratch.')
 
     return "\n".join(lines)
+
+
+def _slugify_telegram_slides_component(value: str, *, fallback: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug or fallback
+
+
+def _coerce_telegram_slides_max_slides(value: Any, *, default: int = 10) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(3, min(parsed, 20))
+
+
+def _strip_markdown_fence_block(value: str) -> str:
+    text = str(value or "").strip()
+    fenced_match = re.fullmatch(r"```(?:markdown)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    if fenced_match:
+        return fenced_match.group(1).strip()
+    return text
+
+
+def _validate_telegram_slides_markdown(
+    markdown: str,
+    *,
+    title: str,
+    max_slides: int,
+) -> Tuple[bool, Dict[str, int]]:
+    from src.skills.builtin.googleworkspace_slides_support import _parse_markdown_to_slides
+
+    slides = _parse_markdown_to_slides(
+        markdown,
+        fallback_title=title or "Presentation",
+        scratch_root=SCRATCH_DIR,
+        source_dir=SCRATCH_DIR / "presentations",
+    )[:max_slides]
+    slide_count = len(slides)
+    bullet_count = sum(len(slide.get("bullets") or []) for slide in slides)
+    text_length = len(str(markdown or "").strip())
+    valid = bool(text_length >= 120 and slide_count >= 2 and bullet_count >= max(3, min(slide_count, 6)))
+    return valid, {
+        "slide_count": slide_count,
+        "bullet_count": bullet_count,
+        "text_length": text_length,
+    }
+
+
+def _write_telegram_slides_markdown(markdown: str, *, title: str) -> str:
+    slug = _slugify_telegram_slides_component(title, fallback="presentation")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    relative_path = f"presentations/{slug}-{timestamp}.md"
+    output_path = SCRATCH_DIR / relative_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(markdown, encoding="utf-8")
+    return relative_path.replace("\\", "/")
+
+
+async def _generate_telegram_slides_markdown(
+    *,
+    prompt: str,
+    title: str,
+    max_slides: int,
+    model_name: Optional[str] = None,
+    audience: str = "",
+    purpose: str = "",
+    tone: str = "",
+    retry_reason: str = "",
+) -> str:
+    resolved_model = (model_name or TELEGRAM_DEFAULT_MODEL or "").strip() or "gpt-4o-mini"
+    endpoint = _normalize_chat_endpoint(build_openai_url(TELEGRAM_OPENAI_CHAT_PATH))
+    api_key = _first_non_empty_env(preferred_api_key_env_names(TELEGRAM_OPENAI_BASE_URL, resolved_model))
+    if not api_key:
+        raise RuntimeError("No compatible API key is configured for Telegram slide generation.")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if OPENAI_ORG_ID:
+        headers["OpenAI-Organization"] = OPENAI_ORG_ID
+    if OPENAI_PROJECT_ID:
+        headers["OpenAI-Project"] = OPENAI_PROJECT_ID
+
+    guidance_parts = [
+        f"Topic or brief: {prompt}",
+        f"Presentation title: {title or 'Presentation'}",
+        f"Target slide count: {max_slides}",
+    ]
+    if audience.strip():
+        guidance_parts.append(f"Audience: {audience.strip()}")
+    if purpose.strip():
+        guidance_parts.append(f"Purpose: {purpose.strip()}")
+    if tone.strip():
+        guidance_parts.append(f"Tone: {tone.strip()}")
+    if retry_reason.strip():
+        guidance_parts.append(f"Revision requirement: {retry_reason.strip()}")
+
+    payload = {
+        "model": resolved_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are writing slide-ready markdown for Google Slides creation.\n"
+                    "Return markdown only. Do not include code fences or commentary.\n"
+                    "Format rules:\n"
+                    "- First line must be a single H1 title.\n"
+                    "- Then create 5 to 12 H2 sections depending on requested slide count.\n"
+                    "- Each H2 section must contain 2 to 5 bullet lines.\n"
+                    "- Keep each bullet concise and presentation-ready.\n"
+                    "- Do not output blank sections.\n"
+                    "- Do not mention these instructions."
+                ),
+            },
+            {"role": "user", "content": "\n".join(guidance_parts)},
+        ],
+        "temperature": 0.4,
+    }
+    response = await _call_chat_completion(
+        endpoint,
+        headers,
+        payload,
+        timeout_seconds=max(20.0, min(120.0, TELEGRAM_CHAT_TIMEOUT)),
+    )
+    if response.status_code != 200:
+        detail = response.text
+        try:
+            error_json = response.json()
+            detail = error_json.get("error", {}).get("message") or error_json.get("message") or detail
+        except ValueError:
+            pass
+        raise RuntimeError(f"Slide markdown generation failed: {detail}")
+
+    data = response.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("Slide markdown generation returned no choices.")
+    normalized_message = normalize_chat_completion_message(choices[0].get("message") or {})
+    content = _strip_markdown_fence_block(coerce_message_text(normalized_message.get("content") or ""))
+    if not content:
+        raise RuntimeError("Slide markdown generation returned empty content.")
+    return content
+
+
+async def _create_telegram_slides_presentation_internal(
+    arguments: Dict[str, Any],
+    *,
+    conversation_id: str,
+    user_id: str,
+    model_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    prompt = str(
+        arguments.get("prompt")
+        or arguments.get("topic")
+        or arguments.get("brief")
+        or arguments.get("description")
+        or ""
+    ).strip()
+    title = str(arguments.get("title") or "").strip() or "Presentation"
+    markdown = str(arguments.get("markdown") or "").strip()
+    markdown_path = str(arguments.get("markdown_path") or arguments.get("markdownPath") or "").strip()
+    max_slides = _coerce_telegram_slides_max_slides(arguments.get("max_slides"))
+    audience = str(arguments.get("audience") or "").strip()
+    purpose = str(arguments.get("purpose") or "").strip()
+    tone = str(arguments.get("tone") or "").strip()
+
+    if not any([prompt, markdown, markdown_path]):
+        return {"success": False, "message": "Provide at least one of prompt, markdown, or markdown_path."}
+
+    generated_markdown_path: Optional[str] = None
+    generated_stats: Optional[Dict[str, int]] = None
+
+    if not markdown_path:
+        if not markdown:
+            retry_reason = ""
+            for _ in range(2):
+                markdown = await _generate_telegram_slides_markdown(
+                    prompt=prompt,
+                    title=title,
+                    max_slides=max_slides,
+                    model_name=model_name,
+                    audience=audience,
+                    purpose=purpose,
+                    tone=tone,
+                    retry_reason=retry_reason,
+                )
+                is_valid, stats = _validate_telegram_slides_markdown(
+                    markdown,
+                    title=title,
+                    max_slides=max_slides,
+                )
+                generated_stats = stats
+                if is_valid:
+                    break
+                retry_reason = (
+                    "The draft was too thin. Produce a fuller presentation with multiple H2 slides "
+                    "and several bullet points per slide."
+                )
+            else:
+                return {
+                    "success": False,
+                    "message": (
+                        "I couldn't generate a strong enough slide draft for Google Slides. "
+                        "Please provide a more specific prompt or pass markdown directly."
+                    ),
+                    "data": {"validation": generated_stats or {}},
+                }
+        else:
+            is_valid, stats = _validate_telegram_slides_markdown(
+                markdown,
+                title=title,
+                max_slides=max_slides,
+            )
+            generated_stats = stats
+            if not is_valid:
+                return {
+                    "success": False,
+                    "message": (
+                        "The provided markdown is too thin to create a useful presentation. "
+                        "Please add more slide sections and bullet points."
+                    ),
+                    "data": {"validation": stats},
+                }
+
+        generated_markdown_path = _write_telegram_slides_markdown(markdown, title=title)
+        markdown_path = generated_markdown_path
+
+    max_images_per_slide_raw = arguments.get("max_images_per_slide", 1)
+    try:
+        max_images_per_slide = int(max_images_per_slide_raw)
+    except (TypeError, ValueError):
+        max_images_per_slide = 1
+
+    tool_args: Dict[str, Any] = {
+        "title": title,
+        "markdown_path": markdown_path,
+        "max_slides": max_slides,
+        "attach_scratch_images": _coerce_bool(arguments.get("attach_scratch_images", True), default=True),
+        "image_dir": str(arguments.get("image_dir", "images") or "images").strip() or "images",
+        "max_images_per_slide": max(0, min(max_images_per_slide, 4)),
+        "include_image_requests": _coerce_bool(arguments.get("include_image_requests", True), default=True),
+    }
+    timeout_seconds = arguments.get("timeout_seconds")
+    if timeout_seconds is not None:
+        tool_args["timeout_seconds"] = timeout_seconds
+
+    skill_result = await _execute_skill_framework_tool(
+        tool_name="googleworkspace_cli.slides_create_presentation_from_markdown",
+        arguments=tool_args,
+        conversation_id=conversation_id,
+        user_id=user_id,
+        metadata={"channel": "telegram", "source_tool": "createSlidesPresentation"},
+    )
+
+    data = dict(skill_result.get("data") or {}) if isinstance(skill_result.get("data"), dict) else {}
+    if generated_markdown_path:
+        data["generated_markdown_path"] = generated_markdown_path
+    if generated_stats:
+        data["generated_markdown_validation"] = generated_stats
+    if data:
+        skill_result["data"] = data
+
+    if skill_result.get("success") and generated_markdown_path:
+        base_message = str(skill_result.get("message") or "").strip()
+        suffix = f" Source markdown saved to {generated_markdown_path}."
+        if suffix.strip() not in base_message:
+            skill_result["message"] = f"{base_message}{suffix}".strip()
+    return skill_result
 
 # MCP Client Manager class to handle transport lifecycle
 class MCPClientManager:
@@ -7736,11 +8144,16 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     """Process a Telegram chat message via OpenAI-compatible API."""
     _validate_telegram_secret(raw_request)
 
-    message_text = (request.message or "").strip()
-    if not message_text:
-        raise HTTPException(status_code=400, detail="message is required")
-
     conversation_id = request.conversation_id or request.user_id or "default"
+    attachment_records = _store_json_attachments(
+        request.attachments,
+        conversation_id=conversation_id,
+        source="telegram",
+    )
+    message_text = _augment_message_with_attachments(request.message or "", attachment_records)
+    if not message_text:
+        raise HTTPException(status_code=400, detail="message or attachments are required")
+
     request_id = request.request_id or f"telegram-{conversation_id}-{int(time.time() * 1000)}"
     emit_status_updates = _should_emit_telegram_status_updates(message_text)
 
@@ -7817,8 +8230,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         else:
             system_prompt = _get_telegram_system_prompt_base()
 
-    # Prepend assistant context (timezone + knowledge awareness)
-    system_prompt = _get_assistant_context_block() + system_prompt
+    system_prompt = _compose_system_prompt_with_context(system_prompt)
 
     # Retrieve relevant memories only for opinion/knowledge-style prompts.
     memory_context = ""
@@ -7864,6 +8276,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.extend(history)
+    messages = _attach_vision_parts_to_latest_user_message(messages, request.attachments)
 
     model_name = request.model or TELEGRAM_DEFAULT_MODEL
     if not model_name:
@@ -8100,10 +8513,10 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 "Do not ask the user to repeat URLs, filenames, search results, or prior tool output already in context.\n"
                 "Reuse exact values from the latest tool result whenever possible.\n"
                 "If the latest tool result already answers the request, summarize it directly for the user.\n"
-                "For file tasks: if a likely filename is already known, use readFile. "
-                "Use searchFiles when you need to find which file contains something. "
-                "Use listFiles only for discovery when no likely file or folder is known. "
-                "Do not repeat broad listFiles calls after a candidate file has already been identified."
+                "For file tasks: if a likely filename is already known, use filesystem.read_text when available; otherwise use readFile. "
+                "Use filesystem.search_files when available to find which file contains something; otherwise use searchFiles. "
+                "Use filesystem.list_files when available only for discovery when no likely file or folder is known; otherwise use listFiles. "
+                "Do not repeat broad filesystem.list_files or listFiles calls after a candidate file has already been identified."
             )
 
         def _build_telegram_followup_messages(
@@ -8364,6 +8777,12 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     caption=caption,
                 ),
                 "upload_drive_internal": _upload_drive_internal,
+                "create_telegram_slides_internal": lambda tool_args: _create_telegram_slides_presentation_internal(
+                    tool_args if isinstance(tool_args, dict) else {},
+                    conversation_id=conversation_id,
+                    user_id=request.user_id or "",
+                    model_name=model_name,
+                ),
                 "execute_skill_tool": lambda tool_name, tool_args: _execute_skill_framework_tool(
                     tool_name=tool_name,
                     arguments=tool_args,
@@ -9985,6 +10404,7 @@ async def client_config():
     tts_model = _env_str("TTS_MODEL") or _env_str("TELEGRAM_TTS_MODEL")
     tts_voice = _env_str("TTS_VOICE") or _env_str("TELEGRAM_TTS_VOICE")
     return {
+        "soulPrompt": _get_soul_prompt_text(),
         "ttsEndpoint": _env_str("TTS_ENDPOINT"),
         "ttsModel": tts_model,
         "ttsVoice": tts_voice,
@@ -11954,88 +12374,199 @@ def resolve_scratch_path(filename: str, allowed_extensions: Optional[Set[str]] =
     return resolved
 
 
-def read_text_file(filepath: Path) -> str:
-    """Read a plain text file and return its content"""
-    try:
-        # Read the file with UTF-8 encoding
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return f.read()
-    except UnicodeDecodeError:
-        # Fallback to latin-1 if UTF-8 fails
-        with open(filepath, 'r', encoding='latin-1') as f:
-            return f.read()
+def _sanitize_attachment_component(value: str, *, fallback: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+    sanitized = sanitized.strip(".-_")
+    return sanitized or fallback
 
-def read_docx_file(filepath: Path) -> str:
-    """Read a Word document and return its text content"""
-    # Load the document using python-docx
-    doc = Document(filepath)
-    # Extract text from all paragraphs
-    paragraphs = [para.text for para in doc.paragraphs]
-    # Join paragraphs with newlines
-    return '\n'.join(paragraphs)
 
-def read_xlsx_file(filepath: Path) -> str:
-    """Read an Excel file and return its content as formatted text"""
-    # Load the workbook
-    wb = openpyxl.load_workbook(filepath, data_only=True)
-    result = []
-    
-    # Process each sheet in the workbook
-    for sheet_name in wb.sheetnames:
-        sheet = wb[sheet_name]
-        result.append(f"=== Sheet: {sheet_name} ===\n")
-        
-        # Process each row in the sheet
-        for row in sheet.iter_rows(values_only=True):
-            # Filter out None values and convert to strings
-            row_data = [str(cell) if cell is not None else '' for cell in row]
-            # Join cells with tabs for better formatting
-            result.append('\t'.join(row_data))
-        
-        result.append('\n')  # Add blank line between sheets
-    
-    # Join all lines with newlines
-    return '\n'.join(result)
+def _sanitize_attachment_filename(filename: str) -> str:
+    raw_name = Path(str(filename or "").strip() or "attachment.bin").name
+    ext = Path(raw_name).suffix.lower()
+    if ext not in ATTACHMENT_ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported attachment type. Allowed: "
+                + ", ".join(sorted(ATTACHMENT_ALLOWED_EXTENSIONS))
+            ),
+        )
+    stem = _sanitize_attachment_component(Path(raw_name).stem, fallback="attachment")
+    return f"{stem}{ext}"
 
-def read_pdf_file(filepath: Path) -> str:
-    """Read a PDF file and return its text content"""
-    result = []
-    # Open the PDF file in binary mode
-    with open(filepath, 'rb') as f:
-        # Create a PDF reader object
-        pdf_reader = PyPDF2.PdfReader(f)
-        # Extract text from each page
-        for page_num in range(len(pdf_reader.pages)):
-            page = pdf_reader.pages[page_num]
-            text = page.extract_text()
-            result.append(f"=== Page {page_num + 1} ===\n{text}\n")
-    
-    # Join all pages with newlines
-    return '\n'.join(result)
 
-def read_png_file(filepath: Path) -> Dict[str, Any]:
-    """Read a PNG image and return metadata and base64-encoded data"""
-    # Open the image using PIL
-    img = Image.open(filepath)
-    
-    # Get image metadata
-    metadata = {
-        'width': img.width,
-        'height': img.height,
-        'format': img.format,
-        'mode': img.mode
-    }
-    
-    # Convert image to base64 for transmission
-    buffered = BytesIO()
-    img.save(buffered, format=img.format)
-    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    
+def _build_attachment_relative_path(
+    *,
+    source: str,
+    conversation_id: str,
+    filename: str,
+    index: int,
+) -> str:
+    safe_source = _sanitize_attachment_component(source, fallback="web")
+    safe_conversation = _sanitize_attachment_component(conversation_id, fallback="default")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"attachments/{safe_source}/{safe_conversation}/{timestamp}-{index:02d}-{filename}"
+
+
+def _store_attachment_bytes(
+    *,
+    content: bytes,
+    filename: str,
+    mime_type: Optional[str],
+    conversation_id: str,
+    source: str,
+    index: int,
+) -> Dict[str, Any]:
+    if not FILE_OPS_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="File operations not available. Install: pip install python-docx openpyxl PyPDF2 reportlab Pillow",
+        )
+
+    size_bytes = len(content)
+    if size_bytes <= 0:
+        raise HTTPException(status_code=400, detail="Attachment is empty.")
+    if size_bytes > FILE_OPS_MAX_SIZE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Attachment '{filename}' is too large. Limit is {FILE_OPS_MAX_SIZE_BYTES} bytes.",
+        )
+
+    safe_filename = _sanitize_attachment_filename(filename)
+    relative_path = _build_attachment_relative_path(
+        source=source,
+        conversation_id=conversation_id,
+        filename=safe_filename,
+        index=index,
+    )
+    filepath = resolve_scratch_path(relative_path, ATTACHMENT_ALLOWED_EXTENSIONS)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with filepath.open("wb") as handle:
+        handle.write(content)
+
+    resolved_mime = (mime_type or "").strip() or mimetypes.guess_type(filepath.name)[0] or "application/octet-stream"
     return {
-        'metadata': metadata,
-        'data': img_base64,
-        'description': f"Image: {img.width}x{img.height} pixels, format: {img.format}"
+        "filename": filepath.name,
+        "relative_path": filepath.relative_to(SCRATCH_DIR.resolve()).as_posix(),
+        "original_filename": Path(str(filename or "")).name or filepath.name,
+        "mime_type": resolved_mime,
+        "size_bytes": size_bytes,
     }
+
+
+def _store_json_attachments(
+    attachments: Optional[List[ChatAttachment]],
+    *,
+    conversation_id: str,
+    source: str,
+) -> List[Dict[str, Any]]:
+    items = attachments or []
+    if not items:
+        return []
+    if len(items) > ATTACHMENT_MAX_FILES_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many attachments. Limit is {ATTACHMENT_MAX_FILES_PER_REQUEST} files per request.",
+        )
+
+    stored: List[Dict[str, Any]] = []
+    for index, attachment in enumerate(items, start=1):
+        try:
+            content = base64.b64decode(str(attachment.content_base64 or ""), validate=True)
+        except (ValueError, binascii.Error):
+            raise HTTPException(status_code=400, detail=f"Attachment '{attachment.filename}' is not valid base64.")
+        stored.append(
+            _store_attachment_bytes(
+                content=content,
+                filename=attachment.filename,
+                mime_type=attachment.mime_type,
+                conversation_id=conversation_id,
+                source=source,
+                index=index,
+            )
+        )
+    return stored
+
+
+def _build_attachment_manifest(attachments: List[Dict[str, Any]]) -> str:
+    if not attachments:
+        return ""
+    lines = ["Attached files saved in scratch:"]
+    for item in attachments:
+        rel_path = str(item.get("relative_path") or "")
+        original = str(item.get("original_filename") or item.get("filename") or "")
+        mime_type = str(item.get("mime_type") or "application/octet-stream")
+        size_bytes = int(item.get("size_bytes") or 0)
+        lines.append(
+            f"- {rel_path} (original: {original}, type: {mime_type}, size: {size_bytes} bytes)"
+        )
+    lines.append("Use filesystem.read_text with these scratch-relative filenames to inspect attachments before answering.")
+    lines.append("For attached PDFs, DOCX, XLSX, text files, and images, inspect the attachment first instead of guessing.")
+    lines.append("Do not use pdfToPowerPoint unless the user explicitly asks to convert a PDF into a PowerPoint or slide deck.")
+    return "\n".join(lines)
+
+
+def _augment_message_with_attachments(message_text: str, attachments: List[Dict[str, Any]]) -> str:
+    manifest = _build_attachment_manifest(attachments)
+    base_message = str(message_text or "").strip()
+    if not base_message and attachments:
+        base_message = "Please review the attached file(s)."
+    if not manifest:
+        return base_message
+    return f"{base_message}\n\n{manifest}"
+
+
+def _is_vision_image_attachment(*, mime_type: Optional[str], filename: str) -> bool:
+    resolved = str(mime_type or "").strip().lower()
+    if not resolved:
+        resolved = (mimetypes.guess_type(filename)[0] or "").strip().lower()
+    return resolved in {"image/png", "image/jpeg", "image/jpg"}
+
+
+def _build_attachment_vision_parts(
+    attachments: Optional[List[ChatAttachment]],
+) -> List[Dict[str, Any]]:
+    parts: List[Dict[str, Any]] = []
+    for attachment in attachments or []:
+        filename = Path(str(attachment.filename or "")).name or "attachment"
+        mime_type = str(attachment.mime_type or "").strip() or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if not _is_vision_image_attachment(mime_type=mime_type, filename=filename):
+            continue
+        content_base64 = str(attachment.content_base64 or "").strip()
+        if not content_base64:
+            continue
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{content_base64}",
+                    "detail": "auto",
+                },
+            }
+        )
+    return parts
+
+
+def _attach_vision_parts_to_latest_user_message(
+    messages: List[Dict[str, Any]],
+    attachments: Optional[List[ChatAttachment]],
+) -> List[Dict[str, Any]]:
+    vision_parts = _build_attachment_vision_parts(attachments)
+    if not vision_parts:
+        return messages
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if str(message.get("role") or "") != "user":
+            continue
+        current_text = coerce_message_text(message.get("content") or "").strip()
+        content_parts: List[Dict[str, Any]] = []
+        if current_text:
+            content_parts.append({"type": "text", "text": current_text})
+        content_parts.extend(vision_parts)
+        messages[index] = {**message, "content": content_parts}
+        break
+    return messages
+
 
 def write_text_file(filepath: Path, content: str) -> None:
     """Write content to a plain text file"""
@@ -12150,19 +12681,6 @@ def write_pdf_file(filepath: Path, content: str) -> None:
             status_code=500,
             detail="PDF writing requires reportlab library. Install with: pip install reportlab"
         )
-
-
-def _read_supported_file_text(filepath: Path) -> tuple[str, str]:
-    ext = filepath.suffix.lower()
-    if ext in TEXT_FILE_EXTENSIONS:
-        return read_text_file(filepath), "text"
-    if ext == ".docx":
-        return read_docx_file(filepath), "text"
-    if ext in {".xlsx", ".xls"}:
-        return read_xlsx_file(filepath), "text"
-    if ext == ".pdf":
-        return read_pdf_file(filepath), "text"
-    raise HTTPException(status_code=400, detail=f"Unsupported text-readable file type: {ext}")
 
 
 def _truncate_text_middle(text: str, max_chars: Optional[int]) -> tuple[str, bool]:
@@ -12654,7 +13172,7 @@ async def _search_files_internal(
                 if not filename_only_mode and entry.suffix.lower() in SEARCHABLE_TEXT_EXTENSIONS:
                     try:
                         if entry.stat().st_size <= SEARCH_FILE_MAX_SIZE_BYTES:
-                            text_content, _ = _read_supported_file_text(entry)
+                            text_content, _ = read_supported_file_text(entry, TEXT_FILE_EXTENSIONS)
                             content_match = _extract_query_match(
                                 text_content,
                                 search_query,
@@ -12865,6 +13383,36 @@ async def read_file(
         data=result.get("data"),
     )
 
+
+@app.get("/v1/files/content")
+async def read_file_content(
+    path: str = Query(..., min_length=1),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Return raw file bytes from the scratch directory for browser-side consumers."""
+    filepath = resolve_scratch_path(path, READ_ALLOWED_EXTENSIONS)
+    if not filepath.exists() or not filepath.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        size_bytes = filepath.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+    if size_bytes > FILE_OPS_MAX_SIZE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File is too large. Limit is {FILE_OPS_MAX_SIZE_BYTES} bytes.",
+        )
+    mime_type = mimetypes.guess_type(filepath.name)[0] or "application/octet-stream"
+    try:
+        content = filepath.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Failed to read file") from exc
+    return Response(
+        content=content,
+        media_type=mime_type,
+        headers={"Content-Disposition": f'inline; filename="{filepath.name}"'},
+    )
+
 @app.post("/v1/files/write", response_model=FileResponse)
 async def write_file(
     request: WriteFileRequest,
@@ -12894,6 +13442,49 @@ async def write_file(
         message=str(result.get("message", "")),
         data=result.get("data"),
     )
+
+
+@app.post("/v1/files/attachments")
+async def upload_attachments(
+    files: List[UploadFile] = File(...),
+    conversation_id: Optional[str] = Form(default=None),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Upload one or more user attachments into scratch for web chat turns."""
+    upload_files = files or []
+    if not upload_files:
+        raise HTTPException(status_code=400, detail="At least one file is required.")
+    if len(upload_files) > ATTACHMENT_MAX_FILES_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many attachments. Limit is {ATTACHMENT_MAX_FILES_PER_REQUEST} files per request.",
+        )
+
+    effective_conversation_id = str(conversation_id or current_user.get("sub") or "default").strip() or "default"
+    stored: List[Dict[str, Any]] = []
+    for index, upload in enumerate(upload_files, start=1):
+        try:
+            file_bytes = await upload.read()
+            stored.append(
+                _store_attachment_bytes(
+                    content=file_bytes,
+                    filename=upload.filename or f"attachment-{index}.bin",
+                    mime_type=upload.content_type,
+                    conversation_id=effective_conversation_id,
+                    source="web",
+                    index=index,
+                )
+            )
+        finally:
+            with suppress(Exception):
+                await upload.close()
+
+    return {
+        "success": True,
+        "message": f"Uploaded {len(stored)} attachment(s).",
+        "attachments": stored,
+    }
+
 
 @app.get("/v1/files/list")
 async def list_files(

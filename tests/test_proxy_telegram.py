@@ -5,6 +5,7 @@ Uses mocks for external OpenAI and memory; no real API calls.
 """
 
 import os
+import base64
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,18 +34,64 @@ def _mock_openai_response(reply_text: str = "Mocked reply"):
     }
 
 
-def test_skill_tool_alias_maps_google_slides_execution_name_to_googleworkspace_cli():
+def test_skill_tool_alias_maps_markdown_to_slides_variants_to_googleworkspace_cli():
     from src.servers import proxy_server as ps
 
-    resolved = ps._resolve_skill_tool_qualified_name(
-        "google_slides.slides_create_presentation_from_markdown"
-    )
+    expected = "googleworkspace_cli.slides_create_presentation_from_markdown"
+    assert ps._resolve_skill_tool_qualified_name("google_slides.slides_create_presentation_from_markdown") == expected
+    assert ps._resolve_skill_tool_qualified_name("slides_create_presentation_from_markdown") == expected
+    assert ps._resolve_skill_tool_qualified_name("markdown_to_slides") == expected
+    assert ps._resolve_skill_tool_qualified_name("markdownToSlides") == expected
 
-    assert resolved == "googleworkspace_cli.slides_create_presentation_from_markdown"
+
+def test_compose_system_prompt_with_context_includes_soul_prompt():
+    from src.servers import proxy_server as ps
+
+    with patch("src.servers.proxy_server._get_soul_prompt_text", return_value="Soul prompt"):
+        prompt = ps._compose_system_prompt_with_context("Base prompt")
+
+    assert prompt.startswith("Context: Today's date is ")
+    assert "Soul prompt" in prompt
+    assert prompt.endswith("Base prompt")
+    assert prompt.index("Soul prompt") < prompt.index("Base prompt")
 
 
 class TestTelegramChatEndpoint:
     """Tests for POST /v1/telegram/chat."""
+
+    def test_telegram_chat_payload_includes_soul_prompt_before_base_prompt(self):
+        client = _get_client()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _mock_openai_response("Hello from CATBot")
+
+        def getenv(k, d=None):
+            if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"):
+                return "test-key"
+            return os.environ.get(k, d) if d is not None else os.environ.get(k)
+
+        with patch("src.servers.proxy_server.os.getenv", side_effect=getenv):
+            with patch("src.servers.proxy_server._get_soul_prompt_text", return_value="Soul prompt line 1\nSoul prompt line 2"):
+                with patch("src.servers.proxy_server._get_telegram_system_prompt_with_tools", return_value="Base prompt"):
+                    with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                        mock_client_instance = MagicMock()
+                        mock_client_instance.post = AsyncMock(return_value=mock_response)
+                        mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                        mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                        mock_aclient.return_value = mock_client_instance
+
+                        resp = client.post(
+                            "/v1/telegram/chat",
+                            json={"conversation_id": "soul-check", "user_id": "123", "message": "Hi"},
+                            headers=_auth_headers(),
+                        )
+
+        assert resp.status_code == 200, resp.text
+        payload = mock_client_instance.post.await_args.kwargs["json"]
+        system_prompt = payload["messages"][0]["content"]
+        assert "Soul prompt line 1\nSoul prompt line 2" in system_prompt
+        assert "Base prompt" in system_prompt
+        assert system_prompt.index("Soul prompt line 1") < system_prompt.index("Base prompt")
 
     def test_small_talk_does_not_create_status_session(self):
         """Low-intent greetings should not emit Telegram progress/status chatter."""
@@ -127,6 +174,147 @@ class TestTelegramChatEndpoint:
         assert status_payload.get("found") is True
         assert status_payload.get("event", {}).get("channel") == "telegram"
         assert status_payload.get("event", {}).get("request_id") == request_id
+
+    def test_attachment_only_request_saves_attachment_and_augments_prompt(self, monkeypatch):
+        """Telegram chat should accept attachment-only payloads, save them to scratch, and pass a manifest to the model."""
+        from src.servers import proxy_server as ps
+
+        client = _get_client()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _mock_openai_response("Reviewed the attachment")
+        scratch_root = os.path.join(os.path.dirname(__file__), "..", "scratch", f"telegram-attach-{int(time.time() * 1000)}")
+        scratch_path = os.path.abspath(scratch_root)
+        os.makedirs(scratch_path, exist_ok=True)
+        monkeypatch.setattr(ps, "SCRATCH_DIR", ps.Path(scratch_path))
+        attachment_b64 = base64.b64encode(b"hello attachment").decode("ascii")
+
+        def getenv(k, d=None):
+            if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"):
+                return "test-key"
+            return os.environ.get(k, d) if d is not None else os.environ.get(k)
+
+        with patch("src.servers.proxy_server.os.getenv", side_effect=getenv):
+            with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                mock_client_instance = MagicMock()
+                mock_client_instance.post = AsyncMock(return_value=mock_response)
+                mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                mock_aclient.return_value = mock_client_instance
+
+                resp = client.post(
+                    "/v1/telegram/chat",
+                    json={
+                        "conversation_id": "attach-only",
+                        "user_id": "123",
+                        "attachments": [
+                            {
+                                "filename": "brief.txt",
+                                "mime_type": "text/plain",
+                                "content_base64": attachment_b64,
+                            }
+                        ],
+                    },
+                )
+
+        assert resp.status_code == 200, resp.text
+        payload = mock_client_instance.post.await_args.kwargs["json"]
+        user_message = payload["messages"][-1]["content"]
+        assert user_message.startswith("Please review the attached file(s).")
+        assert "Attached files saved in scratch:" in user_message
+        assert "attachments/telegram/attach-only/" in user_message
+        assert "filesystem.read_text" in user_message
+        assert "Do not use pdfToPowerPoint unless the user explicitly asks" in user_message
+        saved_dir = os.path.join(scratch_path, "attachments", "telegram", "attach-only")
+        try:
+            saved_files = []
+            for root, _, files in os.walk(saved_dir):
+                for name in files:
+                    if name.endswith(".txt"):
+                        saved_files.append(os.path.join(root, name))
+            assert len(saved_files) == 1
+            with open(saved_files[0], "rb") as handle:
+                assert handle.read() == b"hello attachment"
+        finally:
+            import shutil
+            shutil.rmtree(scratch_path, ignore_errors=True)
+
+    def test_image_attachment_is_forwarded_as_vision_input(self, monkeypatch):
+        """Telegram image attachments should be included as image_url parts for vision-capable models."""
+        from src.servers import proxy_server as ps
+
+        client = _get_client()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _mock_openai_response("Reviewed the image")
+        scratch_root = os.path.join(os.path.dirname(__file__), "..", "scratch", f"telegram-image-{int(time.time() * 1000)}")
+        scratch_path = os.path.abspath(scratch_root)
+        os.makedirs(scratch_path, exist_ok=True)
+        monkeypatch.setattr(ps, "SCRATCH_DIR", ps.Path(scratch_path))
+        image_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z0k8AAAAASUVORK5CYII="
+        )
+
+        def getenv(k, d=None):
+            if k in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"):
+                return "test-key"
+            return os.environ.get(k, d) if d is not None else os.environ.get(k)
+
+        with patch("src.servers.proxy_server.os.getenv", side_effect=getenv):
+            with patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+                mock_client_instance = MagicMock()
+                mock_client_instance.post = AsyncMock(return_value=mock_response)
+                mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+                mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+                mock_aclient.return_value = mock_client_instance
+
+                resp = client.post(
+                    "/v1/telegram/chat",
+                    json={
+                        "conversation_id": "attach-image",
+                        "user_id": "123",
+                        "message": "What is in this image?",
+                        "attachments": [
+                            {
+                                "filename": "pixel.png",
+                                "mime_type": "image/png",
+                                "content_base64": image_b64,
+                            }
+                        ],
+                    },
+                )
+
+        try:
+            assert resp.status_code == 200, resp.text
+            payload = mock_client_instance.post.await_args.kwargs["json"]
+            user_message = payload["messages"][-1]["content"]
+            assert isinstance(user_message, list)
+            assert user_message[0]["type"] == "text"
+            image_parts = [part for part in user_message if part.get("type") == "image_url"]
+            assert len(image_parts) == 1
+            assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+        finally:
+            import shutil
+            shutil.rmtree(scratch_path, ignore_errors=True)
+
+    def test_invalid_attachment_base64_returns_400(self):
+        """Telegram chat should reject malformed base64 attachments."""
+        client = _get_client()
+        resp = client.post(
+            "/v1/telegram/chat",
+            json={
+                "conversation_id": "attach-invalid",
+                "attachments": [
+                    {
+                        "filename": "brief.txt",
+                        "mime_type": "text/plain",
+                        "content_base64": "%%%not-base64%%%",
+                    }
+                ],
+            },
+        )
+        assert resp.status_code == 400
+        assert "base64" in resp.text.lower()
 
     def test_valid_request_handles_structured_content_reply(self):
         """POST should coerce list/dict content parts into plain text reply."""
@@ -302,6 +490,36 @@ class TestTelegramChatEndpoint:
         assert "filesystem.write_text" in prompt
         assert "filesystem.list_files" in prompt
         assert "filesystem.search_files" in prompt
+        assert "Filesystem skill tools are available in this conversation." in prompt
+
+    def test_tool_capable_prompt_template_mentions_filesystem_skill_tools(self):
+        from src.servers import proxy_server as ps
+
+        prompt_template = ps.CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE.read_text(encoding="utf-8")
+
+        assert "filesystem.read_text" in prompt_template
+        assert "filesystem.write_text" in prompt_template
+        assert "filesystem.list_files" in prompt_template
+        assert "filesystem.search_files" in prompt_template
+
+    def test_telegram_system_prompt_prefers_native_create_slides_tool_over_raw_skill(self):
+        from src.servers import proxy_server as ps
+
+        fake_skill_tools = [
+            {
+                "name": "googleworkspace_cli.slides_create_presentation_from_markdown",
+                "description": "create slides from markdown",
+                "inputSchema": {"type": "object", "properties": {"markdown_path": {"type": "string"}}},
+            }
+        ]
+
+        with patch("src.servers.proxy_server._get_skill_tools_mcp_schema", return_value=fake_skill_tools):
+            prompt = ps._get_telegram_system_prompt_with_tools("prompt-slides-example")
+
+        assert "createSlidesPresentation" in prompt
+        assert "Do not call googleworkspace_cli.slides_create_presentation_from_markdown directly." in prompt
+        assert 'Example: {"prompt":"Create investor slides for PermitFlow AI","title":"PermitFlow AI"}' in prompt
+        assert "<tool>googleworkspace_cli.slides_create_presentation_from_markdown</tool>" not in prompt
 
     def test_telegram_chat_payload_includes_native_and_skill_tools(self):
         client = _get_client()
@@ -348,7 +566,38 @@ class TestTelegramChatEndpoint:
         tool_names = {tool["function"]["name"] for tool in payload["tools"]}
         assert payload["tool_choice"] == "auto"
         assert "runBrowserAgent" in tool_names
+        assert "createSlidesPresentation" in tool_names
         assert "filesystem.read_text" in tool_names
+
+    def test_telegram_combined_openai_tools_excludes_raw_slides_skill(self):
+        from src.servers import proxy_server as ps
+
+        fake_skill_tools_openai = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "googleworkspace_cli.slides_create_presentation_from_markdown",
+                    "description": "create slides from markdown",
+                    "parameters": {"type": "object", "properties": {"markdown_path": {"type": "string"}}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "filesystem.read_text",
+                    "description": "read",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
+        with patch("src.servers.proxy_server._get_skill_tools_openai_schema", return_value=fake_skill_tools_openai):
+            tools = ps._get_telegram_combined_openai_tools()
+
+        tool_names = {tool["function"]["name"] for tool in tools}
+        assert "createSlidesPresentation" in tool_names
+        assert "filesystem.read_text" in tool_names
+        assert "googleworkspace_cli.slides_create_presentation_from_markdown" not in tool_names
 
     def test_tool_followup_payload_keeps_unified_tool_schemas(self):
         client = _get_client()
@@ -535,6 +784,7 @@ class TestTelegramToolsLoop:
 
         assert ps._format_telegram_tool_status("webSearch") == "On it. I'm looking for the best sources now."
         assert ps._format_telegram_tool_status("runDeepResearch") == "On it. I'm gathering sources and comparing them now."
+        assert ps._format_telegram_tool_status("createSlidesPresentation") == "On it. I'm building the presentation now."
         assert ps._format_telegram_tool_status("googleworkspace_cli.gmail_list_unread") == (
             "On it. I'm checking your Google Workspace data now."
         )

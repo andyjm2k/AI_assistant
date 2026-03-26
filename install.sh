@@ -18,16 +18,30 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-# 2. Git submodule (mcp-browser-use)
+# 2. mcp-browser-use: initialize existing checkout if present, else clone CATBot fork
 echo ""
 echo "[2/10] Initializing mcp-browser-use..."
 MCP_DIR="$PROJECT_ROOT/mcp-browser-use"
-if [ -d "$MCP_DIR" ]; then
-  if [ -d "$MCP_DIR/.git" ]; then
-    git submodule update --init --recursive || true
+MCP_REPO_URL="https://github.com/andyjm2k/mcp-browser-use.git"
+if [ -d "$PROJECT_ROOT/.git" ]; then
+  git submodule update --init --recursive || true
+fi
+MCP_PYPROJECT="$MCP_DIR/pyproject.toml"
+MCP_EXCEPTIONS="$MCP_DIR/src/mcp_server_browser_use/exceptions.py"
+if [ ! -d "$MCP_DIR" ] || [ ! -f "$MCP_PYPROJECT" ] || [ ! -f "$MCP_EXCEPTIONS" ]; then
+  if [ -d "$MCP_DIR" ]; then
+    echo "mcp-browser-use exists but is incomplete; cloning fresh copy..."
+    rm -rf "$MCP_DIR"
   fi
-else
-  echo "mcp-browser-use directory not found. Clone it or add as submodule; see README." >&2
+  echo "Cloning $MCP_REPO_URL into mcp-browser-use..."
+  git clone --depth 1 "$MCP_REPO_URL" "$MCP_DIR"
+  if [ $? -ne 0 ]; then
+    echo "Failed to clone mcp-browser-use from $MCP_REPO_URL. Check network and Git, then run install.sh again." >&2
+    exit 1
+  fi
+fi
+if [ ! -d "$MCP_DIR" ]; then
+  echo "mcp-browser-use directory not found after init/clone. See README." >&2
   exit 1
 fi
 
@@ -69,9 +83,9 @@ fi
 # 5. Node dependencies
 echo ""
 echo "[5/10] Installing Node.js dependencies..."
-npm install
+npm ci 2>/dev/null || npm install
 if [ $? -ne 0 ]; then
-  echo "npm install failed." >&2
+  echo "Node dependency install failed." >&2
   exit 1
 fi
 
@@ -88,7 +102,7 @@ fi
 # 7. mcp-browser-use: uv sync and playwright
 echo ""
 echo "[7/10] Setting up mcp-browser-use (uv sync + playwright)..."
-(cd "$MCP_DIR" && uv sync && uv run playwright install)
+(cd "$MCP_DIR" && if [ -f uv.lock ]; then uv sync --frozen; else uv sync; fi && uv run playwright install)
 if [ $? -ne 0 ]; then
   echo "mcp-browser-use setup failed." >&2
   exit 1
@@ -129,6 +143,8 @@ echo "  If you skipped the wizard or need to change settings: edit .env"
 echo "  If using Telegram tools/file attachments, set TELEGRAM_SECRET on both bot and proxy."
 echo "  Telegram listFiles now supports path/recursive; sendTelegramFile accepts subdirectory paths under scratch/."
 echo "  Built-in image_generation skill is available (see docs/SKILL_FRAMEWORK.md)."
+echo "  Review optional .env sections for Whisper, Spotify, Google Drive, GitHub, and memory overrides."
+echo "  If you plan to use embedded Kitten TTS, install eSpeak NG and ensure espeak-ng is on PATH."
 echo "  Activate venv: source venv/bin/activate"
 echo "  Start services (see README for running each component or use your process manager)."
 echo ""

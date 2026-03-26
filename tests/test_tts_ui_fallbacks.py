@@ -63,6 +63,21 @@ def test_app_js_refreshes_model_dropdowns_for_initial_and_companion_settings():
     assert "await fetchAvailableModels(data.settings);" in content
 
 
+def test_app_js_fetches_and_prepends_soul_prompt_for_chat_requests():
+    content = _app_js_text()
+    assert "soulPrompt: data.soulPrompt || ''" in content
+    assert "typeof envToolDefaults.soulPrompt === 'string'" in content
+    assert "effectiveSystemPrompt = `${soulPrompt}\\n\\n${effectiveSystemPrompt}`;" in content
+
+
+def test_app_js_renders_soul_prompt_preview_in_identity_panel():
+    content = _app_js_text()
+    assert "const soulPromptDisplay = document.getElementById('soul-prompt-display');" in content
+    assert "function renderSoulPromptPreview(soulPrompt = '')" in content
+    assert "soulPromptDisplay.value = typeof soulPrompt === 'string' ? soulPrompt : '';" in content
+    assert "renderSoulPromptPreview(envToolDefaults ? envToolDefaults.soulPrompt : '');" in content
+
+
 def test_app_js_flushes_tool_settings_on_pagehide_for_session_persistence():
     content = _app_js_text()
     assert "window.addEventListener('pagehide', () => {" in content

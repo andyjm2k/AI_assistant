@@ -21,14 +21,20 @@ EXAMPLE_PREFIX_POSIX = "/home/user/AI_assistant"
 
 # Env vars that contain paths we substitute with project root
 PATH_ENV_VARS = frozenset({
+    "CATBOT_WORKSPACE",
+    "MCP_BROWSER_USE_DIR",
     "MCP_RESEARCH_SAVE_DIRECTORY",
     "MCP_BROWSER_USER_DATA_DIR",
     "MCP_SERVER_RESULTS_DIR",
     "MCP_SKILLS_DIRECTORY",
+    "MEMORY_STORAGE_PATH",
+    "PROXY_LOG_FILE",
+    "SCHEDULED_TASK_POLLER_USERS_FILE",
+    "TODO_DATA_PATH",
 })
 
 # Directories to create under project root (align with proxy and .env)
-REQUIRED_DIRS = ["scratch", "todo_data", "research", "memory_data"]
+REQUIRED_DIRS = ["logs", "scratch", "todo_data", "research", "memory_data"]
 # Alternative name used in config/mcp_config.env.example
 RESEARCH_OUTPUT_DIR = "research_output"
 

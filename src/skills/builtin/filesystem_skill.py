@@ -9,8 +9,12 @@ from typing import Any, Dict, Optional, Sequence, Set
 from src.skills.base import BaseSkill, BaseTool
 from src.skills.exceptions import SkillValidationError
 from src.skills.models import SkillContext
+from src.utils.file_readers import read_png_file, read_supported_file_text
 
-TEXT_SEARCH_EXTENSIONS = {".txt", ".md", ".csv", ".py", ".js", ".html"}
+TEXT_FILE_EXTENSIONS = {".txt", ".md", ".csv", ".py", ".js", ".html"}
+DOCUMENT_TEXT_EXTENSIONS = {".docx", ".xlsx", ".xls", ".pdf"}
+IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+READABLE_TEXT_EXTENSIONS = TEXT_FILE_EXTENSIONS | DOCUMENT_TEXT_EXTENSIONS
 
 
 def _normalize_relative_path_input(relative_path: str) -> str:
@@ -338,8 +342,8 @@ class ListFilesTool(BaseTool):
 class ReadTextTool(BaseTool):
     name = "read_text"
     description = (
-        "Read text from a file inside the configured root. "
-        "Supports partial reads by line range and character limit so you can inspect large files safely."
+        "Read supported file content from a file inside the configured root. "
+        "Supports text, Office documents, PDFs, and basic image metadata with partial reads for text-like formats."
     )
     input_schema = {
         "type": "object",
@@ -384,28 +388,50 @@ class ReadTextTool(BaseTool):
             raise SkillValidationError(f"File does not exist: {path_value}")
         if not path.is_file():
             raise SkillValidationError("Path is not a file.")
+        suffix = path.suffix.lower()
         start_line = _coerce_optional_bounded_int(arguments.get("start_line"), minimum=1)
         end_line = _coerce_optional_bounded_int(arguments.get("end_line"), minimum=1)
         max_chars = _coerce_optional_bounded_int(arguments.get("max_chars"), minimum=1, maximum=50000)
         include_line_numbers = _coerce_bool(arguments.get("include_line_numbers", False), default=False)
-        full_content = _read_text_with_fallback(path)
-        excerpt = _slice_text_content(
-            full_content,
-            start_line=start_line,
-            end_line=end_line,
-            max_chars=max_chars,
-            include_line_numbers=include_line_numbers,
-        )
-        return {
-            "path": str(path.relative_to(self.root_dir)).replace("\\", "/"),
-            "content": excerpt["content"],
-            "size_bytes": len(full_content.encode("utf-8")),
-            "total_lines": excerpt["total_lines"],
-            "excerpt_start_line": excerpt["excerpt_start_line"],
-            "excerpt_end_line": excerpt["excerpt_end_line"],
-            "truncated": excerpt["truncated"],
-            "line_filtered": excerpt["line_filtered"],
-        }
+        relative_path = str(path.relative_to(self.root_dir)).replace("\\", "/")
+
+        if suffix in READABLE_TEXT_EXTENSIONS:
+            full_content, content_type = read_supported_file_text(path, TEXT_FILE_EXTENSIONS)
+            excerpt = _slice_text_content(
+                full_content,
+                start_line=start_line,
+                end_line=end_line,
+                max_chars=max_chars,
+                include_line_numbers=include_line_numbers,
+            )
+            return {
+                "path": relative_path,
+                "content": excerpt["content"],
+                "type": content_type,
+                "size_bytes": path.stat().st_size,
+                "total_lines": excerpt["total_lines"],
+                "excerpt_start_line": excerpt["excerpt_start_line"],
+                "excerpt_end_line": excerpt["excerpt_end_line"],
+                "truncated": excerpt["truncated"],
+                "line_filtered": excerpt["line_filtered"],
+            }
+
+        if suffix in IMAGE_FILE_EXTENSIONS:
+            image_data = read_png_file(path)
+            return {
+                "path": relative_path,
+                "content": str(image_data.get("description") or "Image file"),
+                "type": "image",
+                "size_bytes": path.stat().st_size,
+                "total_lines": 0,
+                "excerpt_start_line": 0,
+                "excerpt_end_line": 0,
+                "truncated": False,
+                "line_filtered": False,
+                "image_data": image_data,
+            }
+
+        raise SkillValidationError(f"Unsupported file type for filesystem.read_text: {suffix or '(none)'}")
 
 
 class WriteTextTool(BaseTool):
@@ -463,7 +489,7 @@ class WriteTextTool(BaseTool):
 class SearchFilesTool(BaseTool):
     name = "search_files"
     description = (
-        "Search file names and text content inside the configured root. "
+        "Search file names and supported text-readable file contents inside the configured root. "
         "Use this when you know the topic but not which file contains it."
     )
     input_schema = {
@@ -591,14 +617,14 @@ class SearchFilesTool(BaseTool):
                 filename_match = query_haystack in path_haystack
                 content_match = None
 
-                if not filename_only and item.suffix.lower() in TEXT_SEARCH_EXTENSIONS:
+                if not filename_only and item.suffix.lower() in READABLE_TEXT_EXTENSIONS:
                     try:
                         content_match = _first_content_match(
-                            _read_text_with_fallback(item),
+                            read_supported_file_text(item, TEXT_FILE_EXTENSIONS)[0],
                             query,
                             case_sensitive=case_sensitive,
                         )
-                    except OSError:
+                    except Exception:
                         skipped_count += 1
                         continue
 
@@ -655,8 +681,8 @@ class SearchFilesTool(BaseTool):
 
 class FilesystemSkill(BaseSkill):
     name = "filesystem"
-    description = "Root-sandboxed text file tools for listing, reading, writing, and searching files."
-    version = "1.2.0"
+    description = "Root-sandboxed file tools for listing, reading, writing, and searching files."
+    version = "1.3.0"
     tags = ["filesystem", "io"]
 
     def __init__(self, root_dir: str = "./scratch") -> None:

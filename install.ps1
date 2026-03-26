@@ -16,16 +16,16 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# 2. mcp-browser-use: init submodule if configured, else clone so directory is fully populated
+# 2. mcp-browser-use: initialize existing checkout if present, else clone CATBot fork
 Write-Host ([Environment]::NewLine + '[2/10] Initializing mcp-browser-use...') -ForegroundColor Yellow
 $mcpDir = Join-Path $ProjectRoot 'mcp-browser-use'
-$mcpRepoUrl = 'https://github.com/Saik0s/mcp-browser-use.git'
+$mcpRepoUrl = 'https://github.com/andyjm2k/mcp-browser-use.git'
 $projectGitDir = Join-Path $ProjectRoot '.git'
 if (Test-Path $projectGitDir) {
     & git submodule update --init --recursive
     if ($LASTEXITCODE -ne 0) { Write-Host 'Note: git submodule update had issues (may be OK if no submodules).' -ForegroundColor Gray }
 }
-# Require full Saik0s tree (pyproject.toml + key source); incomplete/broken copies get replaced by fresh clone
+# Require full mcp-browser-use tree (pyproject.toml + key source); incomplete/broken copies get replaced by fresh clone
 $mcpPyproject = Join-Path $mcpDir 'pyproject.toml'
 $mcpExceptions = Join-Path $mcpDir 'src/mcp_server_browser_use/exceptions.py'
 $mcpHasContent = (Test-Path $mcpDir) -and (Test-Path $mcpPyproject) -and (Test-Path $mcpExceptions)
@@ -75,8 +75,12 @@ if ($LASTEXITCODE -ne 0) { Write-Host 'Playwright install failed.' -ForegroundCo
 
 # 5. Node dependencies
 Write-Host ([Environment]::NewLine + '[5/10] Installing Node.js dependencies...') -ForegroundColor Yellow
-& npm install
-if ($LASTEXITCODE -ne 0) { Write-Host 'npm install failed.' -ForegroundColor Red; exit 1 }
+if (Test-Path (Join-Path $ProjectRoot 'package-lock.json')) {
+    & npm ci
+} else {
+    & npm install
+}
+if ($LASTEXITCODE -ne 0) { Write-Host 'Node dependency install failed.' -ForegroundColor Red; exit 1 }
 
 # 6. Codex CLI (optional)
 Write-Host ([Environment]::NewLine + '[6/10] Installing Codex CLI (optional)...') -ForegroundColor Yellow
@@ -95,7 +99,11 @@ if (-not $codexCmd) {
 Write-Host ([Environment]::NewLine + '[7/10] Setting up mcp-browser-use (uv sync + playwright)...') -ForegroundColor Yellow
 Push-Location $mcpDir
 try {
-    & uv sync
+    $uvSyncArgs = @('sync')
+    if (Test-Path (Join-Path $mcpDir 'uv.lock')) {
+        $uvSyncArgs += '--frozen'
+    }
+    & uv @uvSyncArgs
     if ($LASTEXITCODE -ne 0) { Write-Host 'uv sync failed in mcp-browser-use.' -ForegroundColor Red; exit 1 }
     & uv run playwright install
     if ($LASTEXITCODE -ne 0) { Write-Host 'uv run playwright install failed.' -ForegroundColor Red; exit 1 }
@@ -128,5 +136,7 @@ Write-Host '  If you skipped the wizard or need to change settings: edit .env'
 Write-Host '  If using Telegram tools/file attachments, set TELEGRAM_SECRET on both bot and proxy.'
 Write-Host '  Telegram listFiles now supports path/recursive; sendTelegramFile accepts subdirectory paths under scratch/.'
 Write-Host '  Built-in image_generation skill is available (see docs/SKILL_FRAMEWORK.md).'
+Write-Host '  Review optional .env sections for Whisper, Spotify, Google Drive, GitHub, and memory overrides.'
+Write-Host '  If you plan to use embedded Kitten TTS, install eSpeak NG and ensure espeak-ng is on PATH.'
 Write-Host '  Start CATBot: .\start.bat  or  .\venv\Scripts\python.exe scripts/start_all.py'
 Write-Host ''

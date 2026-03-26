@@ -20,7 +20,14 @@
         const hideChatBtn = document.getElementById('hide-chat-btn');
         const hideChatIcon = document.getElementById('hide-chat-icon');
         const attachBtn = document.getElementById('attach-btn');
+        const attachmentInput = document.getElementById('attachment-input');
+        const attachmentPreview = document.getElementById('attachment-preview');
+        const attachmentPreviewList = document.getElementById('attachment-preview-list');
+        const attachmentClearBtn = document.getElementById('attachment-clear-btn');
         const thinkBtn = document.getElementById('think-btn');
+        const MAX_PENDING_ATTACHMENTS = 6;
+        const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024;
+        let pendingAttachmentFiles = [];
 
         // Settings menu toggle
         if (hamburgerBtn && settingsOverlay && settingsMenu) {
@@ -170,8 +177,80 @@
 
             if (sendBtnMobile) {
                 const hasText = userInput.value.trim().length > 0;
-                sendBtnMobile.style.display = hasText ? 'flex' : 'none';
-                if (startRecordBtn) startRecordBtn.style.display = hasText ? 'none' : 'flex';
+                const hasAttachments = pendingAttachmentFiles.length > 0;
+                sendBtnMobile.style.display = (hasText || hasAttachments) ? 'flex' : 'none';
+                if (startRecordBtn) startRecordBtn.style.display = (hasText || hasAttachments) ? 'none' : 'flex';
+            }
+        }
+
+        function formatAttachmentSize(bytes = 0) {
+            if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+            if (bytes < 1024) return `${bytes} B`;
+            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+            return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+        }
+
+        function clearPendingAttachments() {
+            pendingAttachmentFiles = [];
+            if (attachmentInput) attachmentInput.value = '';
+            renderAttachmentPreview();
+            syncUserInputUi();
+        }
+
+        function renderAttachmentPreview() {
+            if (!attachmentPreview || !attachmentPreviewList) return;
+
+            if (!pendingAttachmentFiles.length) {
+                attachmentPreview.style.display = 'none';
+                attachmentPreviewList.innerHTML = '';
+                return;
+            }
+
+            attachmentPreview.style.display = 'block';
+            attachmentPreviewList.innerHTML = pendingAttachmentFiles.map((file, index) => `
+                <div class="attachment-chip">
+                    <span class="attachment-chip-name" title="${file.name}">${file.name}</span>
+                    <span class="attachment-chip-size">${formatAttachmentSize(file.size)}</span>
+                    <button type="button" class="attachment-chip-remove" data-attachment-index="${index}" aria-label="Remove attachment">&times;</button>
+                </div>
+            `).join('');
+
+            attachmentPreviewList.querySelectorAll('[data-attachment-index]').forEach((button) => {
+                button.addEventListener('click', () => {
+                    const index = Number(button.getAttribute('data-attachment-index'));
+                    if (Number.isInteger(index) && index >= 0) {
+                        pendingAttachmentFiles.splice(index, 1);
+                        renderAttachmentPreview();
+                        syncUserInputUi();
+                    }
+                });
+            });
+        }
+
+        function addPendingAttachments(fileList) {
+            const incomingFiles = Array.from(fileList || []);
+            if (!incomingFiles.length) return;
+
+            const nextFiles = [...pendingAttachmentFiles];
+            const rejectedNames = [];
+            for (const file of incomingFiles) {
+                if (nextFiles.length >= MAX_PENDING_ATTACHMENTS) {
+                    rejectedNames.push(file.name);
+                    continue;
+                }
+                if (file.size > MAX_ATTACHMENT_SIZE_BYTES) {
+                    rejectedNames.push(file.name);
+                    continue;
+                }
+                nextFiles.push(file);
+            }
+
+            pendingAttachmentFiles = nextFiles;
+            renderAttachmentPreview();
+            syncUserInputUi();
+
+            if (rejectedNames.length) {
+                console.warn('Rejected attachment(s):', rejectedNames);
             }
         }
 
@@ -179,11 +258,22 @@
             userInput.addEventListener('input', syncUserInputUi);
         }
 
-        // Attach button (placeholder - can be extended)
         if (attachBtn) {
             attachBtn.addEventListener('click', function() {
-                // Placeholder for attachment functionality
-                console.log('Attach clicked');
+                if (attachmentInput) attachmentInput.click();
+            });
+        }
+
+        if (attachmentInput) {
+            attachmentInput.addEventListener('change', function(event) {
+                addPendingAttachments(event.target.files);
+                attachmentInput.value = '';
+            });
+        }
+
+        if (attachmentClearBtn) {
+            attachmentClearBtn.addEventListener('click', function() {
+                clearPendingAttachments();
             });
         }
 
@@ -209,8 +299,7 @@
         if (userInput && sendBtnMobile) {
             // Handle blur event - switch back to microphone button when input loses focus
             userInput.addEventListener('blur', function() {
-                sendBtnMobile.style.display = 'none';
-                if (startRecordBtn) startRecordBtn.style.display = 'flex';
+                syncUserInputUi();
             });
 
             // Handle focus event - show send button if there's text when input regains focus
@@ -220,13 +309,13 @@
 
             // Send on button click - call shared handler directly (iOS Safari ignores programmatic sendBtn.click() on display:none)
             sendBtnMobile.addEventListener('click', function() {
-                if (userInput.value.trim().length > 0 && window.submitUserMessage) {
+                if ((userInput.value.trim().length > 0 || pendingAttachmentFiles.length > 0) && window.submitUserMessage) {
                     window.submitUserMessage();
                 }
             });
             // iOS Safari: touchend fires reliably; click can be delayed or lost when keyboard is open
             sendBtnMobile.addEventListener('touchend', function(e) {
-                if (userInput.value.trim().length > 0 && window.submitUserMessage) {
+                if ((userInput.value.trim().length > 0 || pendingAttachmentFiles.length > 0) && window.submitUserMessage) {
                     e.preventDefault();
                     window.submitUserMessage();
                 }
@@ -240,6 +329,7 @@
         const apiKeyInput = document.getElementById('api-key');
         const newsApiKeyInput = document.getElementById('news-api-key');
         const systemPromptInput = document.getElementById('system-prompt');
+        const soulPromptDisplay = document.getElementById('soul-prompt-display');
         const voiceDropdown = document.getElementById('voice-dropdown');
         const ttsServiceMicrosoft = document.getElementById('tts-service-microsoft'); // Microsoft TTS service radio
         const ttsServiceOpenAI = document.getElementById('tts-service-openai'); // OpenAI-compatible TTS service radio
@@ -406,6 +496,7 @@
                 }
 
                 envToolDefaults = await fetchClientToolDefaults();
+                renderSoulPromptPreview(envToolDefaults ? envToolDefaults.soulPrompt : '');
                 // Load persisted tool settings (User Name, Assistant Name, etc.)
                 const persistedToolSettings = (() => {
                     try {
@@ -2318,11 +2409,15 @@
             if (isToolRequest) {
                 return toolModelDropdown.value || toolModel;
             }
+            const hasPendingImageAttachments = pendingAttachmentFiles.some((file) => isVisionImageFile(file));
             // If webcam or clipboard vision is enabled, use the corresponding model
             if (webcamEnabled) {
                 return visionModel || 'qwen/qwen2.5-vl-7b';
             }
             if (clipboardVisionEnabled && clipboardType === 'image') {
+                return visionModel || 'qwen/qwen2.5-vl-7b';
+            }
+            if (hasPendingImageAttachments) {
                 return visionModel || 'qwen/qwen2.5-vl-7b';
             }
             if (clipboardVisionEnabled && clipboardType === 'text') {
@@ -2724,6 +2819,57 @@
                 };
             }
             return body;
+        }
+
+        function isVisionImageMimeType(mimeType = '') {
+            const normalized = String(mimeType || '').trim().toLowerCase();
+            return normalized === 'image/png' || normalized === 'image/jpeg' || normalized === 'image/jpg';
+        }
+
+        function isVisionImageFile(file) {
+            if (!file) return false;
+            if (isVisionImageMimeType(file.type)) return true;
+            const name = String(file.name || '').toLowerCase();
+            return name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg');
+        }
+
+        function fileToDataUrl(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(reader.error || new Error('Failed to read file.'));
+                reader.readAsDataURL(file);
+            });
+        }
+
+        async function buildVisionImagePartsFromFiles(files = []) {
+            const imageFiles = Array.isArray(files)
+                ? files.filter((file) => isVisionImageFile(file))
+                : [];
+            if (!imageFiles.length) return [];
+
+            const parts = [];
+            for (const file of imageFiles) {
+                const dataUrl = await fileToDataUrl(file);
+                if (!dataUrl) continue;
+                parts.push({
+                    type: 'image_url',
+                    image_url: {
+                        url: dataUrl,
+                        detail: 'auto'
+                    }
+                });
+            }
+            return parts;
+        }
+
+        function stringifyPayloadForLog(payload) {
+            return JSON.stringify(payload, (key, value) => {
+                if (typeof value === 'string' && value.startsWith('data:image/')) {
+                    return `[image-data-url:${value.length} chars]`;
+                }
+                return value;
+            }, 2);
         }
 
         function buildAssistantHistoryMessage(message = {}) {
@@ -4805,6 +4951,11 @@
             return { settings: merged, applied };
         }
 
+        function renderSoulPromptPreview(soulPrompt = '') {
+            if (!soulPromptDisplay) return;
+            soulPromptDisplay.value = typeof soulPrompt === 'string' ? soulPrompt : '';
+        }
+
         async function fetchClientToolDefaults() {
             try {
                 const res = await fetch(`${PROXY_BASE_URL}/v1/client-config`, {
@@ -4814,6 +4965,7 @@
                 const data = await res.json();
                 if (!data || typeof data !== 'object') return null;
                 const defaults = {
+                    soulPrompt: data.soulPrompt || '',
                     ttsEndpoint: data.ttsEndpoint || '',
                     ttsModel: data.ttsModel || '',
                     ttsVoice: data.ttsVoice || ''
@@ -6998,7 +7150,7 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "pdfToPowerPoint",
-                    description: "Use this tool whenever the user wants to convert a PDF to PowerPoint, turn a PDF into a presentation, or create slides from a PDF. Call it with title and filename; if the user did not provide a PDF URL, omit pdfUrl and the user will be prompted to upload a PDF file. Do not reply in text—always invoke this tool for PDF-to-PowerPoint requests.",
+                    description: "Use this tool only when the user explicitly wants to convert a PDF into a PowerPoint or slide presentation. Do not use it for reviewing, summarizing, or extracting text from an attached PDF; use the filesystem read tool for that. Call it with title and filename; if the user did not provide a PDF URL, omit pdfUrl and the user will be prompted to upload a PDF file.",
                     parameters: {
                         type: "object",
                         properties: {
@@ -7468,9 +7620,14 @@ function saveWAVFile(wavBlob) {
         }
 
         // Handler for reading files from the scratch directory
-        async function handleReadFile({ filename }) {
+        async function handleReadFile(args = {}) {
+            const path = String(args?.filename || args?.path || args?.file || '').trim();
             return await handleSkillFrameworkTool('filesystem.read_text', {
-                path: filename
+                path,
+                start_line: args?.start_line,
+                end_line: args?.end_line,
+                max_chars: args?.max_chars,
+                include_line_numbers: args?.include_line_numbers
             });
         }
 
@@ -7527,7 +7684,7 @@ function saveWAVFile(wavBlob) {
                         success: result.success !== false,
                         message: result.message || `Read ${data.path || args?.path || args?.filename || 'file'}.`,
                         content: typeof data.content === 'string' ? data.content : '',
-                        type: 'text',
+                        type: typeof data.type === 'string' ? data.type : 'text',
                         data,
                         tool_name: normalizedToolName
                     };
@@ -9425,9 +9582,47 @@ function saveWAVFile(wavBlob) {
         }
 
         // Update the fetchOpenAIResponse function to handle context properly
+        async function uploadPendingAttachmentsForChat() {
+            if (!pendingAttachmentFiles.length) return [];
+
+            const formData = new FormData();
+            pendingAttachmentFiles.forEach((file) => {
+                formData.append('files', file, file.name);
+            });
+            formData.append('conversation_id', activeConversationId || 'default');
+
+            const response = await fetch(`${PROXY_BASE_URL}/v1/files/attachments`, {
+                method: 'POST',
+                body: formData
+            });
+
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data.success) {
+                throw new Error(data.detail || data.message || 'Failed to upload attachments.');
+            }
+
+            return Array.isArray(data.attachments) ? data.attachments : [];
+        }
+
+        function buildAttachmentPromptText(promptText, attachments) {
+            const attachmentList = Array.isArray(attachments) ? attachments : [];
+            if (!attachmentList.length) return promptText;
+
+            const basePrompt = (promptText || '').trim() || 'Please review the attached file(s).';
+            const manifestLines = attachmentList.map((attachment) => {
+                const relPath = attachment.relative_path || attachment.relativePath || attachment.filename || 'attachment';
+                const original = attachment.original_filename || attachment.originalFilename || attachment.filename || relPath;
+                const mimeType = attachment.mime_type || attachment.mimeType || 'application/octet-stream';
+                const sizeBytes = Number(attachment.size_bytes || attachment.sizeBytes || 0);
+                return `- ${relPath} (original: ${original}, type: ${mimeType}, size: ${sizeBytes} bytes)`;
+            });
+
+            return `${basePrompt}\n\nAttached files saved in scratch:\n${manifestLines.join('\n')}\nUse the filesystem read skill tool shown in the dynamic skill list, usually skill__filesystem_read_text, with these scratch-relative paths to inspect attachments before answering.\nFor attached PDFs, DOCX, XLSX, text files, and images, inspect the attachment first instead of guessing.\nDo not call pdfToPowerPoint unless the user explicitly asks to convert a PDF into a PowerPoint or slide deck.`;
+        }
+
         async function fetchOpenAIResponse(promptText) {
             // Validate promptText parameter
-            if (!promptText || typeof promptText !== 'string') {
+            if (typeof promptText !== 'string') {
                 console.error('fetchOpenAIResponse called with invalid promptText:', promptText);
                 status.textContent = "Error: Invalid input text. Please try again.";
                 return;
@@ -9435,8 +9630,9 @@ function saveWAVFile(wavBlob) {
             
             // Trim and validate the prompt text
             promptText = promptText.trim();
-            if (promptText.length === 0) {
-                console.error('fetchOpenAIResponse called with empty promptText');
+            const hasPendingAttachments = pendingAttachmentFiles.length > 0;
+            if (promptText.length === 0 && !hasPendingAttachments) {
+                console.error('fetchOpenAIResponse called with empty promptText and no attachments');
                 status.textContent = "Error: Empty input text. Please try again.";
                 return;
             }
@@ -9462,6 +9658,14 @@ function saveWAVFile(wavBlob) {
             try {
             let endpoint = endpointInput.value;
             const apiKey = apiKeyInput.value.trim();
+            let uploadedAttachments = [];
+            let promptTextForModel = promptText;
+
+            if (hasPendingAttachments) {
+                updateProgressState('Uploading attachments');
+                uploadedAttachments = await uploadPendingAttachmentsForChat();
+                promptTextForModel = buildAttachmentPromptText(promptText, uploadedAttachments);
+            }
             
             // Store the original endpoint for proxy routing
             const originalEndpoint = endpoint;
@@ -9475,18 +9679,18 @@ function saveWAVFile(wavBlob) {
             };
 
             // Start periodic progress updates only for request-like turns, not small talk.
-            if (shouldStartProgressUpdatesForPrompt(promptText)) {
+            if (shouldStartProgressUpdatesForPrompt(promptTextForModel)) {
                 startProgressUpdates('Analyzing request');
             }
 
             // Check for tool chaining before proceeding with normal processing
-            const hasChaining = promptText.toLowerCase().includes('then') || 
-                               promptText.match(/first.*second|1st.*2nd|step.*step/i);
+            const hasChaining = promptTextForModel.toLowerCase().includes('then') || 
+                               promptTextForModel.match(/first.*second|1st.*2nd|step.*step/i);
 
             if (hasChaining) {
                 console.log('Detected task chaining in prompt');
                 updateProgressState('Planning tool chain');
-                const tasks = await extractTasks(promptText);
+                const tasks = await extractTasks(promptTextForModel);
                 
                 if (tasks.length > 1) {
                     console.log('Executing task chain:', tasks);
@@ -9501,6 +9705,9 @@ function saveWAVFile(wavBlob) {
                     responseOutput.value = chainResult;
                     addMessageToHistory('assistant', chainResult); // Add to message history
                     textToSpeech(chainResult);
+                    if (uploadedAttachments.length) {
+                        clearPendingAttachments();
+                    }
                     stopProgressUpdates();
                     return;
                 }
@@ -9627,7 +9834,7 @@ Parameters:
 }
 
 12. pdfToPowerPoint
-Description: Use this tool whenever the user wants to convert a PDF to PowerPoint, turn a PDF into a presentation, or create slides from a PDF. Always call the tool—do not reply in text. If the user provides a PDF URL, include pdfUrl; if they do not, omit pdfUrl and the user will be prompted to upload a file. Required: title, filename.
+Description: Use this tool only when the user explicitly wants to convert a PDF to PowerPoint, turn a PDF into a presentation, or create slides from a PDF. Do not use it for reviewing, summarizing, or reading an attached PDF. If the user provides a PDF URL, include pdfUrl; if they do not, omit pdfUrl and the user will be prompted to upload a file. Required: title, filename.
 Parameters:
 {
     "pdfUrl": "string (optional; include only when user provides a URL; if omitted, user is prompted to upload)",
@@ -9814,18 +10021,25 @@ Tool calling rules:
 - Do not invent tool outputs; rely on real tool results.
 
 Task-specific rules:
-- For PDF-to-PowerPoint requests, always call pdfToPowerPoint instead of replying with plain text.
+- For attached files, inspect them with the filesystem read tool before answering.
+- Use pdfToPowerPoint only when the user explicitly asks to convert a PDF into PowerPoint/slides.
 - For CATBot code/tool changes, use runCodexCli.
 - Call restartProxyServer only with explicit user confirmation.
 - For scratch files, use relative filenames and preserve requested output names.
 
-Current memory cache contents:
+            Current memory cache contents:
 ${compactMemoryLines}`;
 
             // Preserve existing system prompt by default; user input overrides it
             let effectiveSystemPrompt = systemPromptInput.value.trim() || compactSystemPrompt;
+            const soulPrompt = (envToolDefaults && typeof envToolDefaults.soulPrompt === 'string')
+                ? envToolDefaults.soulPrompt.trim()
+                : '';
             if (dynamicSkillPrompt) {
                 effectiveSystemPrompt = `${effectiveSystemPrompt}\n${dynamicSkillPrompt}`;
+            }
+            if (soulPrompt) {
+                effectiveSystemPrompt = `${soulPrompt}\n\n${effectiveSystemPrompt}`;
             }
             
             // Prepend context: timezone, knowledge-gap awareness, and todo execution rules (always applies)
@@ -9848,7 +10062,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             // Automatically search memories for opinion/knowledge questions (when not in philosopher mode)
             let memoryContext = null;
             if (!philosopherModeActive) {
-                memoryContext = await autoSearchMemoriesForQuestion(promptText);
+                memoryContext = await autoSearchMemoriesForQuestion(promptTextForModel);
                 if (memoryContext) {
                     // Add memory context to system prompt
                     effectiveSystemPrompt += `\n\nRelevant context from previous conversations:\n${memoryContext}\n\nUse this context to provide more personalized and relevant responses based on what you've discussed before.`;
@@ -9864,40 +10078,49 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 ...modelHistory,
                 {
                     role: 'user',
-                    content: promptText
+                    content: promptTextForModel
                 }
             ];
 
             // Track if clipboard content was used (store in a way that persists through async operations)
             const hadClipboardContent = clipboardData && clipboardVisionEnabled;
             const clipboardContentType = clipboardType; // Store type before potential clearing
-            
-            // Add image content if present
-            if (clipboardData && clipboardType === 'image' && clipboardVisionEnabled) {
-                const base64Image = await new Promise((resolve) => {
-                    const reader = new FileReader();
-                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                    reader.readAsDataURL(clipboardData);
-                });
-                
-                messages.push({
-                    role: 'user',
-                    content: [
-                        {
-                            type: 'image_url',
-                            image_url: {
-                                url: `data:image/jpeg;base64,${base64Image}`,
-                                detail: 'auto'
-                            }
-                        }
-                    ]
-                });
-            }
+
             // Add text content if present (prepend to user message)
-            else if (clipboardData && clipboardType === 'text' && clipboardVisionEnabled) {
-                // Prepend clipboard text to the user's message
+            if (clipboardData && clipboardType === 'text' && clipboardVisionEnabled) {
                 const originalPrompt = messages[messages.length - 1].content;
                 messages[messages.length - 1].content = `[Clipboard content: ${clipboardData}]\n\n${originalPrompt}`;
+            }
+
+            const visionParts = [];
+            if (clipboardData && clipboardType === 'image' && clipboardVisionEnabled) {
+                const clipboardDataUrl = await fileToDataUrl(clipboardData);
+                if (clipboardDataUrl) {
+                    visionParts.push({
+                        type: 'image_url',
+                        image_url: {
+                            url: clipboardDataUrl,
+                            detail: 'auto'
+                        }
+                    });
+                }
+            }
+
+            const attachmentVisionParts = await buildVisionImagePartsFromFiles(pendingAttachmentFiles);
+            if (attachmentVisionParts.length) {
+                visionParts.push(...attachmentVisionParts);
+            }
+
+            if (visionParts.length) {
+                const currentPromptText = coerceMessageText(messages[messages.length - 1].content || '').trim();
+                const contentParts = [];
+                if (currentPromptText) {
+                    contentParts.push({
+                        type: 'text',
+                        text: currentPromptText
+                    });
+                }
+                messages[messages.length - 1].content = [...contentParts, ...visionParts];
             }
 
             const body = buildCompatibleChatBody(endpoint, {
@@ -9912,8 +10135,8 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             });
 
             // Add user message to history before sending
-            console.log('Adding user message to history with content:', promptText); // Debug log
-            addMessageToHistory('user', promptText);
+            console.log('Adding user message to history with content:', promptTextForModel); // Debug log
+            addMessageToHistory('user', promptTextForModel);
             
             try {
                 // Add pulsing effect to indicate we are waiting for the API
@@ -9923,9 +10146,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 console.log('Sending request:', {
                     endpoint,
                     model: getCurrentModel(),
-                    prompt: promptText
+                    prompt: promptTextForModel
                 });
-                console.log('Full request:', JSON.stringify(body, null, 2));
+                console.log('Full request:', stringifyPayloadForLog(body));
                 
                 const response = await fetch(endpoint, {
                     method: 'POST',
@@ -10065,6 +10288,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 if (hadClipboardContent) {
                                     clearClipboardPreview();
                                     console.log('Clipboard content cleared after followup response');
+                                }
+                                if (uploadedAttachments.length) {
+                                    clearPendingAttachments();
                                 }
                                 
                                 textToSpeech(finalContent);
@@ -10411,6 +10637,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     clearClipboardPreview();
                                     console.log('Clipboard content cleared after tool execution');
                                 }
+                                if (uploadedAttachments.length) {
+                                    clearPendingAttachments();
+                                }
                                 
                                 // Remove pulsing effect after tool execution
                                 responseOutput.classList.remove('responding');
@@ -10439,6 +10668,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                             if (hadClipboardContent) {
                                 clearClipboardPreview();
                                 console.log('Clipboard content cleared after message sent');
+                            }
+                            if (uploadedAttachments.length) {
+                                clearPendingAttachments();
                             }
                             
                             textToSpeech(cleanContent);
@@ -10689,6 +10921,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 console.warn('Memory extraction failed:', err);
                             });
                             
+                            if (uploadedAttachments.length) {
+                                clearPendingAttachments();
+                            }
                             textToSpeech(fallbackText);
                         }
                     }
@@ -10750,7 +10985,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             }
             await resumeAudioContextOnce(); // Resume audio context on first user action (for autoplay and lip sync)
             const userText = userInput.value; // Get user input text
-            if (userText.trim() === '') { // Check if input is empty
+            if (userText.trim() === '' && pendingAttachmentFiles.length === 0) { // Check if input is empty
                 alert('Please enter some text or record your voice.'); // Show alert if empty
                 return; // Exit early
             } // End empty check
@@ -10803,7 +11038,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     await stopPhilosopherMode(true); // Pass true to skip message display
                 }
                 
-                if (userText.trim() !== '') { // Check if input is not empty
+                if (userText.trim() !== '' || pendingAttachmentFiles.length > 0) { // Check if input is not empty
                     if (activeChatRequest) {
                         status.textContent = 'A response is already in progress. Please wait.';
                         return;
@@ -13427,6 +13662,8 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     pdfUrl = await readFileAsDataUrl(file);
                 }
 
+                pdfUrl = await resolvePdfInputToDocumentSource(pdfUrl);
+
                 const loadingTask = window.pdfjsLib.getDocument({ url: pdfUrl, withCredentials: false });
                 const pdf = await loadingTask.promise;
 
@@ -13907,7 +14144,28 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             });
         }
 
-        // Reads a File as a data URL
+        async function resolvePdfInputToDocumentSource(pdfUrl) {
+            const source = String(pdfUrl || '').trim();
+            if (!source) {
+                throw new Error('Missing PDF');
+            }
+            if (source.startsWith('data:') || source.startsWith('blob:') || /^https?:\/\//i.test(source)) {
+                return source;
+            }
+
+            const response = await fetch(`${PROXY_BASE_URL}/v1/files/content?path=${encodeURIComponent(source)}`, {
+                method: 'GET',
+                cache: 'no-store'
+            });
+            if (!response.ok) {
+                const message = await response.text().catch(() => '');
+                throw new Error(message || `Missing PDF: ${source}`);
+            }
+            const blob = await response.blob();
+            return await readFileAsDataUrl(blob);
+        }
+
+        // Reads a File or Blob as a data URL
         function readFileAsDataUrl(file) {
             return new Promise((resolve, reject) => {
                 const reader = new FileReader();

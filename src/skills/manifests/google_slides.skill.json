@@ -1,6 +1,0 @@
-{
-  "name": "google_slides",
-  "description": "Google Slides planning, markdown-to-slides, and batchUpdate request generation tools.",
-  "enabled": false,
-  "module": "src.skills.builtin.google_slides_skill:create_skill"
-}

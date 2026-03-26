@@ -144,6 +144,24 @@ class TestCallBackendChat:
             assert result == "Hello from CATBot"
 
     @pytest.mark.asyncio
+    async def test_includes_attachments_in_backend_payload(self):
+        """When attachments are provided, call_backend_chat forwards them unchanged to the backend."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"reply": "Hello from CATBot"}
+
+        with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value = mock_client
+
+            attachments = [{"filename": "brief.txt", "content_base64": "aGVsbG8=", "mime_type": "text/plain"}]
+            await telegram_bot.call_backend_chat(123, "Review this", attachments=attachments)
+
+        payload = mock_client.post.await_args.kwargs["json"]
+        assert payload["attachments"] == attachments
+
+    @pytest.mark.asyncio
     async def test_raises_on_non_200(self):
         """On non-200 response, call_backend_chat raises RuntimeError."""
         mock_response = MagicMock()
@@ -189,6 +207,41 @@ class TestClearBackendHistory:
 
             result = await telegram_bot.clear_backend_history(123)
             assert result is False
+
+
+class TestHandleAttachment:
+    """Tests for Telegram document/photo attachment handling."""
+
+    @pytest.mark.asyncio
+    async def test_document_attachment_is_forwarded_to_backend(self):
+        update = MagicMock()
+        update.effective_chat.id = 456
+        update.message.caption = "Please summarize this"
+        update.message.photo = []
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock()
+        update.message.document = MagicMock(
+            file_id="file-1",
+            file_name="brief.txt",
+            file_unique_id="unique-1",
+            mime_type="text/plain",
+        )
+        context = MagicMock()
+        tg_file = MagicMock()
+        tg_file.download_as_bytearray = AsyncMock(return_value=bytearray(b"hello"))
+        context.bot.get_file = AsyncMock(return_value=tg_file)
+
+        with patch("src.integrations.telegram_bot._authorize_or_reject", AsyncMock(return_value=123)), patch(
+            "src.integrations.telegram_bot._reply_with_backend_answer",
+            AsyncMock(),
+        ) as mock_reply:
+            await telegram_bot.handle_attachment(update, context)
+
+        args = mock_reply.await_args.args
+        assert args[3] == "Please summarize this"
+        assert mock_reply.await_args.kwargs["attachments"][0]["filename"] == "brief.txt"
+        assert mock_reply.await_args.kwargs["attachments"][0]["mime_type"] == "text/plain"
+        assert mock_reply.await_args.kwargs["attachments"][0]["content_base64"] == "aGVsbG8="
 
 
 class TestBackendHeaders:

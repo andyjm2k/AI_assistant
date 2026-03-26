@@ -76,13 +76,13 @@ class TestParseTelegramToolResponse:
         """Plain text with no tool format returns None."""
         assert tg.parse_telegram_tool_response("Just a normal reply.") is None
 
-    def test_google_slides_execution_alias_maps_to_googleworkspace_cli(self):
-        assert (
-            tg._canonicalize_telegram_tool_name(
-                "google_slides.slides_create_presentation_from_markdown"
-            )
-            == "googleworkspace_cli.slides_create_presentation_from_markdown"
-        )
+    def test_markdown_to_slides_aliases_map_to_native_create_slides_tool(self):
+        expected = "createSlidesPresentation"
+        assert tg._canonicalize_telegram_tool_name("slides_create_presentation_from_markdown") == expected
+        assert tg._canonicalize_telegram_tool_name("markdown_to_slides") == expected
+        assert tg._canonicalize_telegram_tool_name("markdownToSlides") == expected
+        assert tg._canonicalize_telegram_tool_name("googleworkspace_cli.slides_create_presentation_from_markdown") == expected
+        assert tg._canonicalize_telegram_tool_name("google_slides.create_outline_from_markdown") == expected
 
     def test_tool_xml_wrapped_in_think_still_parsed(self):
         """Tool call parsing should still work even if model wraps text in <think> blocks."""
@@ -1407,6 +1407,34 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("pdfToPowerPoint", {"title": "T", "filename": "f.pptx"}, {})
         assert r.get("success") is True
         assert "web" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_create_slides_presentation_uses_internal_backend(self):
+        captured: Dict[str, Any] = {}
+
+        async def fake_create(args):
+            captured["args"] = args
+            return {
+                "success": True,
+                "message": "Created Google Slides deck 'PermitFlow AI'.",
+                "data": {"presentation_url": "https://docs.google.com/presentation/d/pres_1/edit"},
+            }
+
+        r = await tg.execute_telegram_tool(
+            "createSlidesPresentation",
+            {"prompt": "Create investor slides", "title": "PermitFlow AI"},
+            {"create_telegram_slides_internal": fake_create},
+        )
+        assert r.get("success") is True
+        assert captured["args"] == {"prompt": "Create investor slides", "title": "PermitFlow AI"}
+        assert "permitflow ai" in r.get("message", "").lower()
+        assert r.get("data", {}).get("presentation_url", "").endswith("/edit")
+
+    @pytest.mark.asyncio
+    async def test_create_slides_presentation_requires_backend_callback(self):
+        r = await tg.execute_telegram_tool("createSlidesPresentation", {"prompt": "x"}, {})
+        assert r.get("success") is False
+        assert "not available" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
     async def test_unknown_tool_returns_failure(self):

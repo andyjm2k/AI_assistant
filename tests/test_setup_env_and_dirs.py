@@ -1,5 +1,6 @@
 """Unit tests for scripts/setup_env_and_dirs.py (env and dirs helper)."""
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -16,6 +17,9 @@ from scripts.setup_env_and_dirs import (
 
 def test_path_env_vars_contains_expected():
     """PATH_ENV_VARS includes known MCP path variables."""
+    assert "PROXY_LOG_FILE" in PATH_ENV_VARS
+    assert "TODO_DATA_PATH" in PATH_ENV_VARS
+    assert "MEMORY_STORAGE_PATH" in PATH_ENV_VARS
     assert "MCP_RESEARCH_SAVE_DIRECTORY" in PATH_ENV_VARS
     assert "MCP_BROWSER_USER_DATA_DIR" in PATH_ENV_VARS
     assert "MCP_SERVER_RESULTS_DIR" in PATH_ENV_VARS
@@ -58,20 +62,29 @@ def test_substitute_path_ignores_non_path_var():
     assert _substitute_path_in_line(line, root, on_windows=True) == line
 
 
-def test_create_dirs_creates_missing(tmp_path):
+def test_create_dirs_creates_missing():
     """create_dirs creates required dirs under given root."""
-    created = create_dirs(tmp_path)
-    assert len(created) >= len(REQUIRED_DIRS) or "scratch" in created
-    for name in REQUIRED_DIRS:
-        assert (tmp_path / name).is_dir()
-    assert (tmp_path / "research_output").is_dir() or (tmp_path / "research").is_dir()
+    root = Path.cwd() / f"setup-env-{next(tempfile._get_candidate_names())}"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        created = create_dirs(root)
+        assert len(created) >= len(REQUIRED_DIRS) or "scratch" in created
+        for name in REQUIRED_DIRS:
+            assert (root / name).is_dir()
+        assert (root / "research_output").is_dir() or (root / "research").is_dir()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
-def test_create_dirs_idempotent(tmp_path):
+def test_create_dirs_idempotent():
     """Second create_dirs does not duplicate; returns empty or minimal list."""
-    create_dirs(tmp_path)
-    created_second = create_dirs(tmp_path)
-    for name in REQUIRED_DIRS:
-        assert (tmp_path / name).is_dir()
-    # Second run should not "create" again (implementation may still list existing)
-    assert (tmp_path / "scratch").is_dir()
+    root = Path.cwd() / f"setup-env-{next(tempfile._get_candidate_names())}"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        create_dirs(root)
+        create_dirs(root)
+        for name in REQUIRED_DIRS:
+            assert (root / name).is_dir()
+        assert (root / "scratch").is_dir()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

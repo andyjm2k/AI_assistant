@@ -311,6 +311,10 @@
                         <input type="text" id="assistant-name" value="EVA" placeholder="Assistant name">
                         <span class="helper-text">Assistant name shown in message history</span>
 
+                        <label for="soul-prompt-display">Soul Prompt:</label>
+                        <textarea id="soul-prompt-display" rows="7" placeholder="Loaded from config/soul.md after sign-in" readonly></textarea>
+                        <span class="helper-text">Read-only preview of the full `config/soul.md` persona text automatically prepended to web and Telegram chat prompts.</span>
+
                         <div class="toggle-container">
                             <label for="webcam-toggle">Webcam Mode:</label>
                             <label class="switch">
@@ -563,6 +567,13 @@
 
     <!-- Mobile Input Area - Fixed Bottom -->
     <div class="mobile-input-area">
+        <input
+            type="file"
+            id="attachment-input"
+            class="attachment-input"
+            multiple
+            accept=".txt,.md,.csv,.py,.js,.html,.docx,.xlsx,.xls,.pdf,.png,.jpg,.jpeg"
+        >
         <div class="input-wrapper">
             <button class="input-action-btn" id="attach-btn" title="Attach">
                 <i class="fas fa-plus"></i>
@@ -584,6 +595,13 @@
             <button id="send-btn" style="display: none;"></button>
             <button id="philosopher-mode-btn" style="display: none;"></button>
             <button id="paste-btn" style="display: none;"></button>
+        </div>
+        <div class="attachment-preview" id="attachment-preview" style="display: none;">
+            <div class="attachment-preview-header">
+                <span>Attachments</span>
+                <button type="button" class="attachment-clear-btn" id="attachment-clear-btn">Clear</button>
+            </div>
+            <div class="attachment-preview-list" id="attachment-preview-list"></div>
         </div>
         <div id="status"></div>
     </div>

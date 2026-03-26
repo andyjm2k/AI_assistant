@@ -9,11 +9,11 @@ import os
 import re
 from email.message import EmailMessage
 from email.policy import SMTP
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional, Sequence
 
 from src.skills.base import BaseSkill, BaseTool
-from src.skills.builtin.google_slides_skill import (
+from src.skills.builtin.googleworkspace_slides_support import (
     _MAX_SLIDE_COUNT as _MAX_MARKDOWN_SLIDES,
     _attach_scratch_images_to_slides,
     _build_batch_update_payload,
@@ -388,6 +388,24 @@ def _extract_primary_error(result: Dict[str, Any]) -> str:
     return "No output returned by gws."
 
 
+def _extract_gws_json_error_message(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    raw_error = payload.get("error")
+    if isinstance(raw_error, dict):
+        message = str(raw_error.get("message") or "").strip()
+        code = str(raw_error.get("code") or "").strip()
+        if message and code:
+            return f"{message} (code: {code})"
+        if message:
+            return message
+    elif raw_error is not None:
+        message = str(raw_error).strip()
+        if message:
+            return message
+    return ""
+
+
 def _wrap_windows_command(command: Sequence[str]) -> list[str]:
     wrapped = [str(part) for part in command if str(part).strip()]
     if os.name != "nt" or not wrapped:
@@ -429,6 +447,101 @@ def _extract_presentation_id(payload: Any) -> str:
     return ""
 
 
+def _extract_first_slide_id(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    raw_slides = payload.get("slides")
+    if isinstance(raw_slides, list):
+        for item in raw_slides:
+            if not isinstance(item, dict):
+                continue
+            object_id = str(item.get("objectId") or item.get("object_id") or "").strip()
+            if object_id:
+                return object_id
+    return ""
+
+
+def _is_only_slide_deletion_error(error_text: str, *, slide_id: str) -> bool:
+    message = str(error_text or "").strip().lower()
+    if not message or not slide_id:
+        return False
+    if slide_id.lower() not in message:
+        return False
+    indicators = (
+        "delete",
+        "last slide",
+        "only slide",
+        "must have at least one slide",
+        "minimum of one slide",
+    )
+    return any(indicator in message for indicator in indicators)
+
+
+def _slugify_filename_component(value: str, *, fallback: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text or fallback
+
+
+def _derive_slides_result_relative_path(
+    *,
+    source_path: Optional[Path],
+    working_dir: Path,
+    title: str,
+) -> str:
+    if source_path is not None:
+        return str(source_path.relative_to(working_dir).with_suffix(".slides-result.json")).replace("\\", "/")
+
+    slug = _slugify_filename_component(title, fallback="slides-deck")
+    return f"presentations/{slug}.slides-result.json"
+
+
+def _derive_slides_link_relative_path(result_relative_path: str) -> str:
+    result_path = PurePosixPath(str(result_relative_path or "").strip())
+    if not result_path.name:
+        return "presentations/slides-link.txt"
+
+    name = result_path.name
+    if name.endswith(".json"):
+        name = f"{name[:-5]}.txt"
+    else:
+        name = f"{name}.txt"
+    return str(result_path.with_name(name))
+
+
+def _write_slides_result_artifacts(
+    *,
+    scratch_root: Path,
+    result_relative_path: str,
+    result_payload: Dict[str, Any],
+) -> Dict[str, str]:
+    result_path = _resolve_safe_scratch_path(scratch_root, result_relative_path)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(
+        json.dumps(result_payload, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+    link_relative_path = _derive_slides_link_relative_path(result_relative_path)
+    link_path = _resolve_safe_scratch_path(scratch_root, link_relative_path)
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    link_lines = [
+        f"Title: {result_payload.get('title') or ''}".strip(),
+        f"Presentation ID: {result_payload.get('presentation_id') or ''}".strip(),
+        f"Presentation URL: {result_payload.get('presentation_url') or ''}".strip(),
+    ]
+    markdown_path = str(result_payload.get("markdown_path") or "").strip()
+    if markdown_path:
+        link_lines.append(f"Markdown source: {markdown_path}")
+    link_lines.append(f"Result manifest: {result_relative_path}")
+    link_path.write_text("\n".join(link_lines).strip() + "\n", encoding="utf-8")
+
+    return {
+        "result_path": str(result_path.relative_to(scratch_root)).replace("\\", "/"),
+        "link_path": str(link_path.relative_to(scratch_root)).replace("\\", "/"),
+    }
+
+
 async def _create_slides_presentation(
     *,
     title: str,
@@ -452,6 +565,9 @@ async def _create_slides_presentation(
     )
     if int(result.get("returncode", 1)) != 0:
         raise RuntimeError(f"gws command failed: {_extract_primary_error(result)}")
+    json_error = _extract_gws_json_error_message(result.get("parsed_json"))
+    if json_error:
+        raise RuntimeError(f"gws command failed: {json_error}")
 
     presentation_id = _extract_presentation_id(result.get("parsed_json"))
     if not presentation_id:
@@ -489,6 +605,38 @@ async def _batch_update_slides_presentation(
     )
     if int(result.get("returncode", 1)) != 0:
         raise RuntimeError(f"gws command failed: {_extract_primary_error(result)}")
+    json_error = _extract_gws_json_error_message(result.get("parsed_json"))
+    if json_error:
+        raise RuntimeError(f"gws command failed: {json_error}")
+    return result
+
+
+async def _get_slides_presentation(
+    *,
+    presentation_id: str,
+    timeout_seconds: float,
+    cwd: Path,
+    env_overrides: Dict[str, str],
+) -> Dict[str, Any]:
+    command = [
+        "gws",
+        "slides",
+        "presentations",
+        "get",
+        "--params",
+        json.dumps({"presentationId": presentation_id}, separators=(",", ":"), ensure_ascii=False),
+    ]
+    result = await _run_gws_command(
+        command,
+        timeout_seconds=timeout_seconds,
+        cwd=cwd,
+        env_overrides=env_overrides,
+    )
+    if int(result.get("returncode", 1)) != 0:
+        raise RuntimeError(f"gws command failed: {_extract_primary_error(result)}")
+    json_error = _extract_gws_json_error_message(result.get("parsed_json"))
+    if json_error:
+        raise RuntimeError(f"gws command failed: {json_error}")
     return result
 
 
@@ -1250,6 +1398,20 @@ class GmailListUnreadTool(BaseTool):
                 "maximum": _MAX_TIMEOUT_SECONDS,
                 "default": _DEFAULT_TIMEOUT_SECONDS,
                 "description": "Timeout for gws command execution.",
+            },
+            "result_path": {
+                "type": "string",
+                "description": (
+                    "Optional scratch-relative path for a saved JSON result manifest. "
+                    "Defaults to a .slides-result.json file beside the source markdown or under presentations/."
+                ),
+            },
+            "write_result_file": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "When true, save a JSON result manifest and a companion .txt link file into scratch."
+                ),
             },
         },
         "additionalProperties": False,
@@ -2573,13 +2735,48 @@ class SlidesCreatePresentationFromMarkdownTool(BaseTool):
             env_overrides=env_overrides,
         )
         presentation_id = create_result["presentation_id"]
-        batch_update_result = await _batch_update_slides_presentation(
-            presentation_id=presentation_id,
-            requests=builder_payload["requests"],
-            timeout_seconds=timeout_seconds,
-            cwd=working_dir,
-            env_overrides=env_overrides,
-        )
+        initial_slide_id = _extract_first_slide_id(create_result["response"].get("parsed_json"))
+        if not initial_slide_id:
+            try:
+                presentation_get_result = await _get_slides_presentation(
+                    presentation_id=presentation_id,
+                    timeout_seconds=timeout_seconds,
+                    cwd=working_dir,
+                    env_overrides=env_overrides,
+                )
+                initial_slide_id = _extract_first_slide_id(presentation_get_result.get("parsed_json"))
+            except Exception:
+                initial_slide_id = ""
+        content_requests = list(builder_payload["requests"])
+        requests = list(content_requests)
+        delete_initial_slide_requested = False
+        batch_update_retried_without_delete = False
+        batch_update_error = ""
+        if initial_slide_id:
+            requests.append({"deleteObject": {"objectId": initial_slide_id}})
+            delete_initial_slide_requested = True
+        try:
+            batch_update_result = await _batch_update_slides_presentation(
+                presentation_id=presentation_id,
+                requests=requests,
+                timeout_seconds=timeout_seconds,
+                cwd=working_dir,
+                env_overrides=env_overrides,
+            )
+        except RuntimeError as exc:
+            batch_update_error = str(exc)
+            if not _is_only_slide_deletion_error(batch_update_error, slide_id=initial_slide_id):
+                raise
+            requests = list(content_requests)
+            delete_initial_slide_requested = False
+            batch_update_retried_without_delete = True
+            batch_update_result = await _batch_update_slides_presentation(
+                presentation_id=presentation_id,
+                requests=requests,
+                timeout_seconds=timeout_seconds,
+                cwd=working_dir,
+                env_overrides=env_overrides,
+            )
 
         builder_payload["presentation_id"] = presentation_id
         presentation_url = f"https://docs.google.com/presentation/d/{presentation_id}/edit"
@@ -2597,18 +2794,68 @@ class SlidesCreatePresentationFromMarkdownTool(BaseTool):
             "slides": slides,
             "auto_attached_images": auto_attached_images,
             "scratch_image_count": len(available_images),
-            "request_count": builder_payload["request_count"],
+            "request_count": len(requests),
             "image_request_count": builder_payload["image_request_count"],
-            "requests": builder_payload["requests"],
+            "requests": requests,
+            "deleted_initial_slide": delete_initial_slide_requested,
+            "deleted_initial_slide_id": initial_slide_id or None,
+            "batch_update_retried_without_delete": batch_update_retried_without_delete,
+            "batch_update_retry_reason": batch_update_error if batch_update_retried_without_delete else None,
             "skipped_images": builder_payload["skipped_images"],
             "create_response": create_result["response"],
             "batch_update_response": batch_update_result,
         }
+        write_result_file = _coerce_bool(arguments.get("write_result_file", True), default=True)
+        saved_artifacts: Dict[str, str] = {}
+        if write_result_file:
+            result_path_raw = str(arguments.get("result_path") or "").strip()
+            result_relative_path = (
+                str(_resolve_safe_scratch_path(working_dir, result_path_raw).relative_to(working_dir)).replace("\\", "/")
+                if result_path_raw
+                else _derive_slides_result_relative_path(
+                    source_path=source_path,
+                    working_dir=working_dir,
+                    title=title,
+                )
+            )
+            result_payload = {
+                "title": title,
+                "presentation_id": presentation_id,
+                "presentation_url": presentation_url,
+                "slide_count": len(slides),
+                "image_request_count": builder_payload["image_request_count"],
+                "request_count": len(requests),
+                "auto_attached_images": auto_attached_images,
+                "markdown_path": data["markdown_path"],
+                "source": data["source"],
+                "deleted_initial_slide": delete_initial_slide_requested,
+                "deleted_initial_slide_id": initial_slide_id or None,
+                "batch_update_retried_without_delete": batch_update_retried_without_delete,
+                "skipped_images": builder_payload["skipped_images"],
+            }
+            saved_artifacts = _write_slides_result_artifacts(
+                scratch_root=working_dir,
+                result_relative_path=result_relative_path,
+                result_payload=result_payload,
+            )
+            data.update(saved_artifacts)
         skipped_count = len(builder_payload["skipped_images"])
         message = (
             f"Created Google Slides deck '{title}' with {len(slides)} slide(s) "
             f"and {builder_payload['image_request_count']} image request(s). Open: {presentation_url}"
         )
+        if delete_initial_slide_requested:
+            message = f"{message} Removed the default blank opening slide."
+        elif batch_update_retried_without_delete and initial_slide_id:
+            message = (
+                f"{message} Kept the default opening slide because Google Slides rejected deleting "
+                f"the only existing slide during batchUpdate."
+            )
+        if saved_artifacts:
+            message = (
+                f"{message} Saved result manifest to {saved_artifacts['result_path']} "
+                f"and link file to {saved_artifacts['link_path']}."
+            )
         if skipped_count:
             message = f"{message} Skipped {skipped_count} image(s) without usable URLs."
         return ToolExecutionResult(success=True, message=message, data=data)

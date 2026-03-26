@@ -50,13 +50,12 @@ _TELEGRAM_TOOL_NAME_ALIASES = {
     "run_health_check": "healthCheck",
     # Model sometimes emits the skill name instead of a concrete tool name.
     "googleworkspace_cli": "googleworkspace_cli.gmail_list_unread",
-    # Model sometimes invents a google_slides execution tool name; route it to the real gws-backed tool.
-    "google_slides.slides_create_presentation_from_markdown": (
-        "googleworkspace_cli.slides_create_presentation_from_markdown"
-    ),
-    "google_slides.slides_batch_update_presentation": (
-        "googleworkspace_cli.slides_batch_update_presentation"
-    ),
+    "slides_create_presentation_from_markdown": "createSlidesPresentation",
+    "markdown_to_slides": "createSlidesPresentation",
+    "markdownToSlides": "createSlidesPresentation",
+    "googleworkspace_cli.slides_create_presentation_from_markdown": "createSlidesPresentation",
+    "google_slides.slides_create_presentation_from_markdown": "createSlidesPresentation",
+    "google_slides.create_outline_from_markdown": "createSlidesPresentation",
 }
 _GMAIL_STATE_CACHE_KEY = "__gmail_tool_state__"
 
@@ -1824,6 +1823,20 @@ async def execute_telegram_tool(
         if not message:
             message = str(out)[:1000]
         return {"success": success, "message": message, "data": out if isinstance(out, dict) else {"raw": out}}
+
+    # --- createSlidesPresentation ---
+    if name == "createSlidesPresentation":
+        create_slides_internal = context.get("create_telegram_slides_internal")
+        if not create_slides_internal:
+            return {"success": False, "message": "Telegram slide creation is not available."}
+        out = await create_slides_internal(arguments if isinstance(arguments, dict) else {})
+        if not isinstance(out, dict):
+            return {"success": False, "message": "Telegram slide creation returned an invalid response."}
+        return {
+            "success": bool(out.get("success", False)),
+            "message": str(out.get("message") or "Slide creation finished."),
+            "data": out.get("data"),
+        }
 
     # --- pdfToPowerPoint ---
     if name == "pdfToPowerPoint":

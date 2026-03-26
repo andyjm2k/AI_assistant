@@ -1547,6 +1547,10 @@
             box-sizing: border-box;
         }
 
+        .attachment-input {
+            display: none;
+        }
+
         .input-wrapper {
             display: flex;
             align-items: center;
@@ -1644,6 +1648,74 @@
         .send-btn-mobile:active {
             opacity: 0.8;
             background: #3a3a3a;
+        }
+
+        .attachment-preview {
+            margin-top: 10px;
+            padding: 10px 12px;
+            background: #111111;
+            border: 1px solid #2a2a2a;
+            border-radius: 16px;
+        }
+
+        .attachment-preview-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 8px;
+            color: #d8d8d8;
+            font-size: 0.85rem;
+        }
+
+        .attachment-clear-btn {
+            background: none;
+            border: none;
+            color: #9dc2ff;
+            font-size: 0.8rem;
+            cursor: pointer;
+            padding: 0;
+        }
+
+        .attachment-preview-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .attachment-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            max-width: 100%;
+            padding: 8px 10px;
+            border-radius: 14px;
+            background: #1b1f28;
+            border: 1px solid #303745;
+            color: #f2f4f7;
+            font-size: 0.8rem;
+        }
+
+        .attachment-chip-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 180px;
+        }
+
+        .attachment-chip-size {
+            color: #9ba3af;
+            font-size: 0.74rem;
+        }
+
+        .attachment-chip-remove {
+            background: none;
+            border: none;
+            color: #c7ced9;
+            cursor: pointer;
+            padding: 0;
+            line-height: 1;
+            font-size: 0.95rem;
         }
 
         #status {

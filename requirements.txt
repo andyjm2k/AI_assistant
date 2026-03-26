@@ -10,6 +10,9 @@ pydantic>=2.0.0
 # HTTP client library
 httpx>=0.25.0
 
+# HTML parsing used by proxy fetch/scrape helpers
+beautifulsoup4>=4.12.0
+
 # Embedded Kitten TTS (OpenAI-compatible /v1/audio/speech in proxy_server)
 kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentts-0.1.0-py3-none-any.whl
 
@@ -39,9 +42,15 @@ openpyxl>=3.1.0
 PyPDF2>=3.0.0
 Pillow>=10.0.0
 reportlab>=4.0.0
+python-multipart>=0.0.9
 
 # Cryptographic operations (for HTTPS server)
 cryptography>=41.0.0
+
+# Optional integrations that are imported directly by runtime modules
+google-auth>=2.0.0
+google-api-python-client>=2.0.0
+huggingface-hub>=0.24.0
 
 # MCP and browser automation (browser-use runs in mcp-browser-use submodule via uv)
 mcp>=1.6.0

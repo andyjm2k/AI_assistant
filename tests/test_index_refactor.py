@@ -42,6 +42,23 @@ class TestIndexRefactorAssets:
         assert content.count("</body>") == 1, "HTML should have exactly one </body>"
         assert content.count("</html>") == 1, "HTML should have exactly one </html>"
 
+    def test_identity_panel_contains_soul_prompt_preview(self):
+        """Identity settings should expose the loaded soul prompt as a read-only preview."""
+        path = PROJECT_ROOT / "index.html"
+        content = path.read_text(encoding="utf-8")
+        assert 'id="soul-prompt-display"' in content
+        assert "config/soul.md" in content
+        assert "Soul Prompt:" in content
+
+    def test_index_contains_attachment_controls(self):
+        """Main HTML should expose the attachment picker and preview container for chat uploads."""
+        path = PROJECT_ROOT / "index.html"
+        content = path.read_text(encoding="utf-8")
+        assert 'id="attachment-input"' in content
+        assert 'id="attachment-preview"' in content
+        assert 'id="attachment-preview-list"' in content
+        assert "/v1/files/attachments" not in content
+
     def test_css_file_exists_and_non_empty(self):
         """Extracted CSS file must exist and be non-empty."""
         path = PROJECT_ROOT / "css" / "catbot.css"
@@ -62,3 +79,29 @@ class TestIndexRefactorAssets:
         content = path.read_text(encoding="utf-8")
         assert "window.PIXI" in content, "app.js should set window.PIXI"
         assert "PIXI" in content[:500], "app.js should reference PIXI near the start"
+
+    def test_app_js_contains_attachment_upload_flow(self):
+        """app.js should upload pending attachments to the proxy before chat completion requests."""
+        path = PROJECT_ROOT / "js" / "app.js"
+        content = path.read_text(encoding="utf-8")
+        assert "async function uploadPendingAttachmentsForChat()" in content
+        assert "buildAttachmentPromptText(promptText, attachments)" in content
+        assert "/v1/files/attachments" in content
+        assert "clearPendingAttachments()" in content
+        assert "Do not call pdfToPowerPoint unless the user explicitly asks" in content
+
+    def test_app_js_contains_attachment_vision_flow(self):
+        """app.js should forward image attachments as image_url parts for vision-capable models."""
+        path = PROJECT_ROOT / "js" / "app.js"
+        content = path.read_text(encoding="utf-8")
+        assert "async function buildVisionImagePartsFromFiles(files = [])" in content
+        assert "type: 'image_url'" in content
+        assert "hasPendingImageAttachments" in content
+
+    def test_app_js_can_resolve_scratch_relative_pdfs_for_pdf_to_powerpoint(self):
+        """pdfToPowerPoint should be able to fetch uploaded scratch PDFs via the proxy."""
+        path = PROJECT_ROOT / "js" / "app.js"
+        content = path.read_text(encoding="utf-8")
+        assert "async function resolvePdfInputToDocumentSource(pdfUrl)" in content
+        assert "/v1/files/content?path=" in content
+        assert "pdfUrl = await resolvePdfInputToDocumentSource(pdfUrl);" in content

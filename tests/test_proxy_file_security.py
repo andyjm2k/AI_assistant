@@ -414,6 +414,75 @@ class TestFileApiSecurity:
             if test_file.exists():
                 test_file.unlink()
 
+    def test_attachment_upload_requires_auth(self, client_with_auth):
+        """POST /v1/files/attachments without auth returns 401."""
+        response = client_with_auth.post(
+            "/v1/files/attachments",
+            files=[("files", ("note.txt", b"hello", "text/plain"))],
+        )
+        assert response.status_code == 401
+
+    def test_attachment_upload_stores_files_in_scratch(self, client_with_auth, monkeypatch):
+        """POST /v1/files/attachments should store allowed files under scratch and return relative paths."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-attachments-api-{uuid.uuid4().hex}"
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            response = client_with_auth.post(
+                "/v1/files/attachments",
+                data={"conversation_id": "web-conv-1"},
+                files=[
+                    ("files", ("brief.txt", b"project brief", "text/plain")),
+                    ("files", ("chart.png", b"fake-image", "image/png")),
+                ],
+                headers=_auth_headers(),
+            )
+
+            assert response.status_code == 200, response.text
+            data = response.json()
+            assert data.get("success") is True
+            attachments = data.get("attachments", [])
+            assert len(attachments) == 2
+            rel_paths = [item.get("relative_path") for item in attachments]
+            assert all(path.startswith("attachments/web/web-conv-1/") for path in rel_paths)
+            assert (scratch / rel_paths[0]).read_bytes() == b"project brief"
+            assert (scratch / rel_paths[1]).read_bytes() == b"fake-image"
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_read_file_content_requires_auth(self, client_with_auth):
+        """GET /v1/files/content without auth returns 401."""
+        response = client_with_auth.get("/v1/files/content", params={"path": "note.txt"})
+        assert response.status_code == 401
+
+    def test_read_file_content_returns_raw_bytes(self, client_with_auth, monkeypatch):
+        """GET /v1/files/content should return the raw bytes for an allowed scratch file."""
+        from src.servers import proxy_server as ps
+
+        scratch = PROJECT_ROOT / "scratch" / f"proxy-file-content-{uuid.uuid4().hex}"
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+            pdf_path = scratch / "attachments" / "web" / "web-conv-1" / "sample.pdf"
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            pdf_bytes = b"%PDF-1.4\nfake pdf bytes\n"
+            pdf_path.write_bytes(pdf_bytes)
+            monkeypatch.setattr(ps, "SCRATCH_DIR", scratch)
+
+            response = client_with_auth.get(
+                "/v1/files/content",
+                params={"path": "attachments/web/web-conv-1/sample.pdf"},
+                headers=_auth_headers(),
+            )
+
+            assert response.status_code == 200, response.text
+            assert response.content == pdf_bytes
+            assert response.headers["content-type"].startswith("application/pdf")
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
     def test_list_files_api_accepts_scratch_prefixed_paths(self, client_with_auth, monkeypatch):
         """GET /v1/files/list should accept scratch/ and scratch\\ path prefixes."""
         from src.servers import proxy_server as ps

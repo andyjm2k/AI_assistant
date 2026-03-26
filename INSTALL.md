@@ -1,102 +1,128 @@
-# CATBot — Automated install and deploy
+# CATBot Automated Install
 
-Short guide for deploying CATBot on a new machine using the automated installer.
+Short deploy guide for bringing CATBot up on a new machine, especially a fresh Windows environment.
 
 ## Prerequisites
 
-Install these before running the installer (the installer will check and report what is missing):
+Install these before running the installer:
 
 | Tool | Version | Notes |
-|------|---------|--------|
-| **Python** | 3.11+ | [python.org](https://www.python.org/downloads/) |
-| **Node.js** | 16+ | [nodejs.org](https://nodejs.org/) |
-| **Git** | — | For clone and submodule; [git-scm.com](https://git-scm.com/) |
-| **uv** | — | For mcp-browser-use; `pip install uv` or [astral-sh/uv](https://github.com/astral-sh/uv) |
-| **Codex CLI** | — | Optional but recommended for `runCodexCli` tool; installed by the automated scripts (uses npm) |
+|------|---------|-------|
+| Python | 3.11+ | Used for CATBot and the main venv |
+| Node.js | 16+ | Used for package install and optional Codex CLI install |
+| Git | current | Used for the repo and the forked `mcp-browser-use` checkout |
+| uv | current | Used by `mcp-browser-use` (`pip install uv`) |
 
-Optional: Chrome/Chromium for browser automation.
+Recommended:
 
-## One-line install
+- Chrome or Chromium for browser automation
+- `espeak-ng` on `PATH` if you plan to enable embedded Kitten TTS
 
-1. **Clone** the repository (if you have not already):
-   ```bash
-   git clone https://github.com/andyjm2k/CATBot.git
-   cd CATBot
-   ```
+## Install
 
-2. **Run the installer** from the project root:
-   - **Windows:** `.\install.ps1` or `install.bat`
-   - **Linux/macOS:** `chmod +x install.sh` (once), then `./install.sh`
+1. Clone the repo:
 
-3. **Configure:** The installer runs an interactive **configuration wizard** that asks for your LLM provider, model, API keys (OpenAI/Google/etc.), optional Brave/News keys, and optional Telegram bot. Your answers are written to `.env` so you usually don’t need to edit it by hand. If you skip the wizard (e.g. non-interactive install) or need to change something later, edit `.env` (see below).
+```bash
+git clone https://github.com/andyjm2k/CATBot.git
+cd CATBot
+```
 
-4. **Start:** On Windows run `start.bat` or `python scripts/start_all.py`. On Linux/macOS start the services as documented in the README (e.g. run the same Python modules in separate terminals or use your preferred process manager).
+2. Run the installer from the project root:
 
-## Post-install: API keys
+- Windows: `.\install.ps1` or `install.bat`
+- Linux/macOS: `chmod +x install.sh && ./install.sh`
 
-In `.env` set at least:
+The installer now does the full dependency path:
 
-- **LLM:** e.g. `MCP_LLM_PROVIDER` and `MCP_LLM_MODEL_NAME`, plus the matching API key (`MCP_LLM_OPENAI_API_KEY`, `MCP_LLM_GOOGLE_API_KEY`, etc.) or use Ollama locally.
-- **Web search:** `BRAVE_API_KEY` (or the app will fall back to DuckDuckGo).
-- **Optional:** `NEWS_API_KEY`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ADMIN_IDS` for Telegram.
-- **Skills:** Built-in `image_generation.generate_image` uses `OPENAI_API_KEY` (or falls back to `MCP_LLM_OPENAI_API_KEY`).
+- checks Python / Node / Git / `uv`
+- creates the main `venv`
+- installs Python deps from `requirements.txt`
+- installs Playwright browsers for the main venv
+- installs Node deps with `npm ci` when `package-lock.json` is present
+- installs Codex CLI if it is not already on `PATH`
+- prepares the forked `mcp-browser-use` checkout with `uv sync --frozen` when `uv.lock` is present
+- creates `.env` and required directories
+- runs the interactive configuration wizard
+- runs `scripts/verify_install.py`
 
-See `config/mcp_config.env.example` and the README Configuration section for the full list.
+## Configuration
 
-### Context Window Controls (optional)
+The installer wizard writes the core `.env` entries for you and now mirrors provider settings into the standard env names that older CATBot modules still read directly.
 
-If you work with large payloads (deep research, long reports, tool outputs), you can configure:
+Required for a basic install:
 
-- `MAX_TOKEN_LIMIT`: Max total tokens (input + output) allowed per LLM request. The proxy preflights, summarizes, and retries when exceeded.
-- `TOKEN_ESTIMATE_CHARS_PER_TOKEN`: Heuristic for token estimation when no tokenizer is available (default 4).
-- `LIST_FILES_TOOL_MAX_ENTRIES`: Max rows returned by model-facing file list tools (`listFiles`/`list_files`) to keep chat context small.
-- `LARGE_PAYLOAD_MODEL`: Optional model to retry with when context window exhaustion occurs.
-- `LARGE_PAYLOAD_ENDPOINT`: Optional endpoint for the large payload model (OpenAI-compatible).
+- `MCP_LLM_PROVIDER`
+- `MCP_LLM_MODEL_NAME`
+- the matching API key, or local Ollama config
 
-## Optional: Whisper (speech-to-text)
+Recommended for day-one usability:
 
-The default STT endpoint is `http://localhost:8001/v1/audio/transcriptions`. To use your own Whisper-compatible server:
+- `BRAVE_API_KEY` for web search
+- `HTTPS_CERT_HOSTNAME` for local HTTPS/cert generation
 
-1. Run or deploy a Whisper API server (e.g. [whisper-api-server](https://github.com/ahmetoner/whisper-api-server) in a sibling directory).
-2. In `.env` set `WHISPER_ENDPOINT` to your server URL.
+Optional sections in [.env.example](/C:/Users/pc/CATBot/.env.example) to review before first full test:
 
-The Windows `start_all.py` script can start a sibling `whisper-api-server` if present; otherwise start it separately.
+- Whisper/STT: `WHISPER_*`
+- Telegram: `TELEGRAM_*`
+- Google Drive uploads: `GOOGLE_DRIVE_*`
+- GitHub skill: `GITHUB_*`
+- Spotify skill: `SPOTIFY_*`
+- image generation: `IMAGE_GENERATION_*`, `OPENROUTER_*`
+- memory overrides: `MEMORY_*`, `EMBEDDINGS_*`, `MEMORY_EXTRACTOR_*`
+- Codex tool: `CODEX_*`
 
-## Optional: Telegram bot
+## Forked browser-use
 
-1. Create a bot with [BotFather](https://core.telegram.org/bots#botfather) and get the token.
-2. In `.env` set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ADMIN_IDS` (or `TELEGRAM_ALLOW_ALL=true`).
-3. If you enable Telegram tools, `listFiles` supports `path` + `recursive` for subdirectory listings, and `sendTelegramFile` accepts subdirectory paths under `scratch/`.
-4. Start the stack; the Telegram bot is started by `start_all.py` on Windows.
+The project uses the CATBot-maintained fork in `mcp-browser-use/`.
 
-## Optional: Codex CLI tool
+Manual recovery commands if you want to re-run just that piece:
 
-The installer attempts to install the Codex CLI automatically (via npm) if it is not already on your PATH. To configure:
+```bash
+cd mcp-browser-use
+uv sync --frozen
+uv run playwright install
+uv run mcp-server-browser-use --help
+```
 
-1. Ensure `codex` is available on PATH (or set `CODEX_CLI_PATH` in `.env`).
-2. Optional: tune `CODEX_SANDBOX_MODE`, `CODEX_APPROVAL_POLICY`, and `CODEX_TIMEOUT_SECONDS` in `.env`.
-3. The `runCodexCli` tool is available in both web and Telegram when tools are enabled. It runs in the CATBot project root and writes a summary file to `scratch/`.
+On Windows, use the project launcher for the HTTP server so UTF-8 and repo-local runtime paths are forced:
+
+```bash
+python scripts/start_mcp_browser_use_http_server.py
+```
 
 ## Verification
 
-To re-run the post-install checks without reinstalling:
+Re-run post-install verification:
 
 ```bash
-# From project root with venv activated (Windows: venv\Scripts\activate)
 python scripts/verify_install.py
 ```
 
-To only check prerequisites:
+Check prerequisites only:
 
 ```bash
 python scripts/check_prereqs.py
 ```
 
+## Start
+
+Windows:
+
+```bash
+start.bat
+```
+
+or:
+
+```bash
+venv\Scripts\python.exe scripts/start_all.py
+```
+
+Linux/macOS: start the same Python entrypoints documented in [README.md](/C:/Users/pc/CATBot/README.md) with your preferred process manager.
+
 ## Troubleshooting
 
-- **"Python 3.11+ required"** — Install Python 3.11 or newer and ensure `python` or `py` is on your PATH.
-- **"uv not found"** — Install uv: `pip install uv` or use the official install script for your OS.
-- **"mcp-browser-use directory not found"** — Clone or add the mcp-browser-use repo into the project as `mcp-browser-use/` (see README).
-- **Verify step fails** — Ensure the venv is activated and you ran the full installer (pip install, playwright, uv sync in mcp-browser-use).
-
-For more help see the main [README](README.md) and [Troubleshooting](README.md#troubleshooting) section.
+- `uv not found`: install `uv` first, then rerun the installer
+- `mcp-browser-use` verification fails: rerun `uv sync --frozen` and `uv run playwright install` inside `mcp-browser-use`
+- embedded Kitten TTS warnings: install `espeak-ng`
+- feature sanity warnings in `verify_install.py`: finish the matching `.env` section for that feature before testing it

@@ -9,6 +9,7 @@ from scripts.install_wizard import (
     DEFAULT_PROJECT_ROOT,
     LLM_PROVIDERS,
     PROVIDER_API_KEY_VAR,
+    STANDARD_PROVIDER_API_KEY_VAR,
     _set_key_in_env_content,
     run_wizard,
 )
@@ -35,6 +36,8 @@ def test_provider_api_key_var_mapping():
     assert PROVIDER_API_KEY_VAR["minimax"] == "MCP_LLM_MINIMAX_API_KEY"
     assert PROVIDER_API_KEY_VAR["google"] == "MCP_LLM_GOOGLE_API_KEY"
     assert PROVIDER_API_KEY_VAR["ollama"] is None
+    assert STANDARD_PROVIDER_API_KEY_VAR["openai"] == "OPENAI_API_KEY"
+    assert STANDARD_PROVIDER_API_KEY_VAR["google"] == "GOOGLE_API_KEY"
 
 
 def test_set_key_in_env_content_replaces_existing():
@@ -105,5 +108,23 @@ def test_run_wizard_uses_default_https_hostname_when_empty():
             run_wizard(scratch_root, env_path)
         content = env_path.read_text(encoding="utf-8")
         assert "HTTPS_CERT_HOSTNAME=anton.local" in content
+    finally:
+        env_path.unlink(missing_ok=True)
+
+
+def test_run_wizard_sets_standard_google_aliases():
+    """run_wizard mirrors Google provider settings into standard env names used by runtime modules."""
+    scratch_root = DEFAULT_PROJECT_ROOT / "scratch"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    env_path = scratch_root / f"test_wizard_{next(tempfile._get_candidate_names())}.env"
+    try:
+        with patch("builtins.input", side_effect=["4", "", "google-test-key", "", "", "n", "n", "", "", "", ""]):
+            run_wizard(scratch_root, env_path)
+        content = env_path.read_text(encoding="utf-8")
+        assert "MCP_LLM_PROVIDER=google" in content
+        assert "MCP_LLM_GOOGLE_API_KEY=google-test-key" in content
+        assert "GOOGLE_API_KEY=google-test-key" in content
+        assert "MCP_MODEL_PROVIDER=google" in content
+        assert "MCP_MODEL_NAME=gemini-3-flash-preview" in content
     finally:
         env_path.unlink(missing_ok=True)

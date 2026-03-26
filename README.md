@@ -28,7 +28,7 @@ git clone https://github.com/andyjm2k/CATBot.git
 cd CATBot
 
 # Install Node.js dependencies
-npm install
+npm ci
 
 # Create Python virtual environment
 python -m venv venv
@@ -43,16 +43,19 @@ pip install -r requirements.txt
 # Install Playwright browsers
 playwright install
 
-# Set up MCP Browser-Use submodule
+# Clone the CATBot MCP Browser-Use fork
+git clone https://github.com/andyjm2k/mcp-browser-use.git mcp-browser-use
+
+# Set up MCP Browser-Use
 cd mcp-browser-use
 pip install uv
-uv sync
+uv sync --frozen
 uv run playwright install
 cd ..
 
 # Configure environment variables
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with your provider/API settings and any optional feature sections you need
 
 # Start all services (run from project root)
 python scripts/start_all.py
@@ -71,14 +74,14 @@ For embedded Kitten TTS, install `espeak-ng` on the host and ensure `espeak-ng` 
   ```powershell
   .\install.ps1
   ```
-  or double-click `install.bat`. A **configuration wizard** will prompt for LLM provider, API keys, and optional Telegram; it writes `.env` for you. Then start with `start.bat` or `python scripts/start_all.py`.
+  or double-click `install.bat`. The installer now uses `npm ci` when the lockfile is present, prepares the forked `mcp-browser-use` checkout with `uv sync --frozen` when `uv.lock` exists, runs a configuration wizard, and then verifies the install. The wizard writes both the MCP-prefixed provider vars and the standard provider aliases still used by older CATBot modules. Then start with `start.bat` or `python scripts/start_all.py`.
 - **Linux/macOS:** From project root run:
   ```bash
   ./install.sh
   ```
   Then edit `.env` and start services (see [INSTALL.md](INSTALL.md)).
 
-See [INSTALL.md](INSTALL.md) for a short deploy guide (prerequisites, one-line install, optional Whisper/Telegram).
+See [INSTALL.md](INSTALL.md) for the current deploy flow and [docs/BROWSER_USE_INSTALL_GUIDE.md](docs/BROWSER_USE_INSTALL_GUIDE.md) for the forked browser-use setup.
 
 ## Highlights
 
@@ -178,7 +181,7 @@ pip install -r requirements.txt
 playwright install
 ```
 
-#### Option B: Using UV (For mcp-browser-use submodule)
+#### Option B: Using UV (For the `mcp-browser-use` checkout)
 
 ```bash
 # Install UV package manager
@@ -220,7 +223,7 @@ Replace `C:\Users\pc\AI_assistant\mcp-browser-use` with your actual path to the 
 
 **Resources:**
 - [UV Package Manager](https://github.com/astral-sh/uv)
-- [MCP Browser-Use](https://github.com/Saik0s/mcp-browser-use)
+- [CATBot MCP Browser-Use Fork](https://github.com/andyjm2k/mcp-browser-use)
 
 ### Step 4: Configure Environment Variables
 
@@ -715,7 +718,7 @@ AI_assistant/
 ├── assets/                # Static assets (favicons, images)
 ├── certs/                 # TLS certificates
 ├── libs/                  # Third-party libraries (ogg-opus-decoder)
-├── mcp-browser-use/       # MCP Browser-Use submodule
+├── mcp-browser-use/       # MCP Browser-Use checkout from the CATBot fork
 ├── memory_data/           # Runtime memory data
 ├── scratch/               # File operations workspace
 ├── research_output/       # Research tool outputs
@@ -765,7 +768,7 @@ Install all Python dependencies with: `pip install -r requirements.txt`
 - **[Browser-Use](https://docs.browser-use.com/)** — Autonomous browser automation
   - GitHub: https://github.com/browser-use/browser-use
 
-- **[MCP Browser-Use Server](https://github.com/Saik0s/mcp-browser-use)** — MCP integration for browser-use
+- **[MCP Browser-Use Server](https://github.com/andyjm2k/mcp-browser-use)** — CATBot-maintained MCP integration for browser-use
 
 - **[Model Context Protocol (MCP)](https://modelcontextprotocol.io/)** — Protocol for AI tool integration
   - Python SDK: https://github.com/modelcontextprotocol/python-sdk

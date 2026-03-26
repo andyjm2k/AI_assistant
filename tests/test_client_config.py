@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from unittest.mock import patch
 
 
 def _client():
@@ -43,3 +44,14 @@ def test_client_config_falls_back_to_telegram(monkeypatch):
     assert data["ttsEndpoint"] is None
     assert data["ttsModel"] == "telegram-model"
     assert data["ttsVoice"] == "telegram-voice"
+
+
+def test_client_config_includes_soul_prompt():
+    client = _client()
+
+    with patch("src.servers.proxy_server._get_soul_prompt_text", return_value="Persona text"):
+        response = client.get("/v1/client-config", headers=_auth_headers())
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["soulPrompt"] == "Persona text"

@@ -25,8 +25,10 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -35,11 +37,11 @@ import sys
 import uuid
 from contextlib import suppress
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Audio, Message, Update, Voice
+from telegram import Audio, Document, Message, PhotoSize, Update, Voice
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     AIORateLimiter,
@@ -304,7 +306,12 @@ async def _stop_status_updates(stop_event: asyncio.Event, status_task: asyncio.T
         await status_task
 
 
-async def call_backend_chat(user_id: int, message: str, request_id: Optional[str] = None) -> str:
+async def call_backend_chat(
+    user_id: int,
+    message: str,
+    request_id: Optional[str] = None,
+    attachments: Optional[List[Dict[str, object]]] = None,
+) -> str:
     payload = {
         "conversation_id": str(user_id),
         "user_id": str(user_id),
@@ -316,6 +323,8 @@ async def call_backend_chat(user_id: int, message: str, request_id: Optional[str
         payload["system_prompt"] = SYSTEM_PROMPT_OVERRIDE
     if MODEL_OVERRIDE:
         payload["model"] = MODEL_OVERRIDE
+    if attachments:
+        payload["attachments"] = attachments
 
     url = _build_backend_url(CHAT_ENDPOINT)
     headers = _backend_headers()
@@ -630,6 +639,7 @@ async def _reply_with_backend_answer(
     context: ContextTypes.DEFAULT_TYPE,
     user_id: int,
     prompt_text: str,
+    attachments: Optional[List[Dict[str, object]]] = None,
 ) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -647,7 +657,7 @@ async def _reply_with_backend_answer(
         )
     )
     try:
-        reply = await call_backend_chat(user_id, prompt_text, request_id=request_id)
+        reply = await call_backend_chat(user_id, prompt_text, request_id=request_id, attachments=attachments)
     except RuntimeError as exc:
         logger.error("Backend chat failed: %s", exc)
         stop_event.set()
@@ -679,7 +689,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     message_counts.setdefault(user_id, 0)
     await update.message.reply_text(
         f"Hi {user_name}. I am CATBot.\n\n"
-        "Send a text message or a voice note and I will reply.\n"
+        "Send a text message, voice note, photo, or document and I will reply.\n"
         "Use /help to see available commands."
     )
 
@@ -695,7 +705,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/clear - clear conversation history\n"
         "/restart - restart all CATBot services\n"
         "/backup - create a ZIP backup in C:\\Users\\pc\\CATBot\\backups\n\n"
-        "You can send text, voice notes, or audio files.",
+        "You can send text, voice notes, audio files, photos, or documents.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -875,6 +885,31 @@ def _voice_file_info(voice: Optional[Voice], audio: Optional[Audio]) -> tuple[st
     return "audio.bin", "application/octet-stream", 0
 
 
+def _document_file_info(document: Optional[Document]) -> tuple[str, str]:
+    if not document:
+        return "attachment.bin", "application/octet-stream"
+    filename = document.file_name or f"document_{document.file_unique_id}.bin"
+    mime_type = document.mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return filename, mime_type
+
+
+def _photo_file_info(photos: List[PhotoSize]) -> tuple[Optional[PhotoSize], str, str]:
+    if not photos:
+        return None, "photo.jpg", "image/jpeg"
+    photo = photos[-1]
+    filename = f"photo_{photo.file_unique_id}.jpg"
+    return photo, filename, "image/jpeg"
+
+
+def _build_backend_attachment_payload(filename: str, mime_type: str, content: bytes) -> Dict[str, object]:
+    return {
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": len(content),
+        "content_base64": base64.b64encode(content).decode("ascii"),
+    }
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -915,6 +950,49 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"Transcript:\n{transcript}")
 
     await _reply_with_backend_answer(update, context, user_id, transcript)
+
+
+async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    user_id = await _authorize_or_reject(update)
+    if user_id is None:
+        return
+
+    document = update.message.document
+    photos = list(update.message.photo or [])
+    if not document and not photos:
+        await update.message.reply_text("No supported attachment was found.")
+        return
+
+    await update.message.chat.send_action(action=ChatAction.TYPING)
+
+    try:
+        if document:
+            filename, mime_type = _document_file_info(document)
+            tg_file = await context.bot.get_file(document.file_id)
+        else:
+            photo, filename, mime_type = _photo_file_info(photos)
+            if photo is None:
+                await update.message.reply_text("No supported attachment was found.")
+                return
+            tg_file = await context.bot.get_file(photo.file_id)
+
+        attachment_bytes = bytes(await tg_file.download_as_bytearray())
+        prompt_text = (update.message.caption or "").strip() or "Please review the attached file."
+        attachments = [_build_backend_attachment_payload(filename, mime_type, attachment_bytes)]
+    except Exception as exc:
+        logger.error("Attachment handling failed unexpectedly: %s", exc, exc_info=True)
+        await update.message.reply_text("Failed to process that attachment.")
+        return
+
+    await _reply_with_backend_answer(
+        update,
+        context,
+        user_id,
+        prompt_text,
+        attachments=attachments,
+    )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -963,6 +1041,12 @@ def main() -> None:
     app.add_handler(CommandHandler("backup_bot", backup_bot_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_voice))
+    app.add_handler(
+        MessageHandler(
+            ((filters.Document.ALL | filters.PHOTO) & ~filters.VOICE & ~filters.AUDIO) & ~filters.COMMAND,
+            handle_attachment,
+        )
+    )
     app.add_error_handler(error_handler)
 
     logger.info("Starting CATBot Telegram bot")
