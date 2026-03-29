@@ -507,7 +507,26 @@
                         return null;
                     }
                 })();
-                loadToolSettings(persistedToolSettings);
+                let initialToolSettings = persistedToolSettings;
+                if (defaultCompanionId) {
+                    try {
+                        const defaultCompanion = await fetchCompanionRecord(defaultCompanionId);
+                        if (defaultCompanion && defaultCompanion.settings) {
+                            initialToolSettings = defaultCompanion.settings;
+                            activeCompanionId = defaultCompanionId;
+                            activeCompanionName = defaultCompanion.name || defaultCompanionId;
+                            latestSavedCompanionId = defaultCompanionId;
+                            latestSavedCompanionName = activeCompanionName;
+                            companionHasUnsavedChanges = false;
+                        }
+                    } catch (error) {
+                        console.warn('Could not load default companion during initialization:', error);
+                        if (/not found|404/i.test(String(error && error.message || ''))) {
+                            setDefaultCompanion(null, { render: false, refreshDraft: false });
+                        }
+                    }
+                }
+                loadToolSettings(initialToolSettings);
                 // Ensure VRM version is initialized (default to 1.0 if not set)
                 const vrmVersionDropdown = document.getElementById('vrm-version-dropdown');
                 if (vrmVersionDropdown && !vrmVersion) {
@@ -521,8 +540,13 @@
                 }
 
                 // Fetch available models based on current tool settings (also sets VRM list and currentVRMModelPath)
-                await fetchAvailableModels(persistedToolSettings);
+                await fetchAvailableModels(initialToolSettings);
                 await scanAndMergeModelAvatarLists({ silent: true });
+                if (activeCompanionId) {
+                    activeCompanionSignature = getSettingsSignature(getToolSettingsFromDOM());
+                    latestSavedCompanionSignature = activeCompanionSignature;
+                    saveToolSettings({ syncDirtyState: false });
+                }
                 await initAudioRecording();
                 // Initialize avatar based on mode preference (default to Live2D)
                 const avatarMode = localStorage.getItem('avatarMode') || 'live2d';
@@ -5132,6 +5156,13 @@
                 if (newMode === 'vrm') vrmModeEl.checked = true;
                 else live2dModeEl.checked = true;
             }
+            try { localStorage.setItem('avatarMode', newMode); } catch {}
+            if (modelPath) {
+                try { localStorage.setItem(L2D_SELECTED_KEY, modelPath); } catch {}
+            }
+            if (currentVRMModelPath) {
+                try { localStorage.setItem(VRM_SELECTED_KEY, currentVRMModelPath); } catch {}
+            }
             // Re-initialize avatar so the companion's model loads (always cleanup and init so model path change takes effect)
             setTimeout(async () => {
                 try {
@@ -5322,6 +5353,28 @@
             return res.json();
         }
 
+        const DEFAULT_COMPANION_STORAGE_KEY = 'defaultCompanionId';
+
+        function getStoredDefaultCompanionId() {
+            try {
+                const value = localStorage.getItem(DEFAULT_COMPANION_STORAGE_KEY);
+                return value && value.trim() ? value.trim() : null;
+            } catch (error) {
+                console.warn('Could not read default companion from localStorage:', error);
+                return null;
+            }
+        }
+
+        function persistDefaultCompanionId(id) {
+            try {
+                if (id && String(id).trim()) localStorage.setItem(DEFAULT_COMPANION_STORAGE_KEY, String(id).trim());
+                else localStorage.removeItem(DEFAULT_COMPANION_STORAGE_KEY);
+            } catch (error) {
+                console.warn('Could not persist default companion in localStorage:', error);
+            }
+        }
+
+        let defaultCompanionId = getStoredDefaultCompanionId();
         let activeCompanionId = null;
         let activeCompanionName = '';
         let activeCompanionSignature = '';
@@ -5330,6 +5383,23 @@
         let latestSavedCompanionName = '';
         let latestSavedCompanionSignature = '';
         let activeToolSettingsPanelId = 'connection-settings-panel';
+
+        function setDefaultCompanion(id, options = {}) {
+            defaultCompanionId = id && String(id).trim() ? String(id).trim() : null;
+            persistDefaultCompanionId(defaultCompanionId);
+            if (options.render !== false) renderCompanionList();
+            if (options.refreshDraft !== false) updateCompanionDraftUI(undefined, { syncDirtyState: false });
+        }
+
+        async function fetchCompanionRecord(id) {
+            const url = `${PROXY_BASE_URL}/v1/companions/${encodeURIComponent(id)}`;
+            const res = await fetch(url, { headers: { 'Authorization': `Bearer ${authToken}` } });
+            if (!res.ok) {
+                const detail = await res.text().catch(() => '');
+                throw new Error(detail || res.statusText || 'Companion not found');
+            }
+            return res.json();
+        }
 
         function setActiveToolSettingsPanel(panelId, options = {}) {
             const panels = Array.from(document.querySelectorAll('[data-tool-settings-panel]'));
@@ -5495,6 +5565,7 @@
             const summary = summarizeCompanionSettings(settings);
             const currentSignature = getSettingsSignature(settings);
             const previousDirtyState = companionHasUnsavedChanges;
+            const isDefaultActiveCompanion = Boolean(activeCompanionId && activeCompanionId === defaultCompanionId);
 
             if (options.syncDirtyState !== false && activeCompanionId && activeCompanionSignature) {
                 companionHasUnsavedChanges = currentSignature !== activeCompanionSignature;
@@ -5514,11 +5585,17 @@
 
             if (activeCompanionId) {
                 if (companionHasUnsavedChanges) {
-                    stateLabel = 'Unsaved changes';
+                    stateLabel = isDefaultActiveCompanion ? 'Default with changes' : 'Unsaved changes';
                     summaryText = `${summary.description}. This no longer matches "${activeCompanionName || 'the active companion'}".`;
+                    if (isDefaultActiveCompanion) {
+                        summaryText += ' The saved default profile will still load when CATBot opens.';
+                    }
                 } else {
-                    stateLabel = 'Active companion';
+                    stateLabel = isDefaultActiveCompanion ? 'Default companion' : 'Active companion';
                     summaryText = `${summary.description}. Saved as "${activeCompanionName || summary.title}".`;
+                    if (isDefaultActiveCompanion) {
+                        summaryText += ' This profile loads automatically when CATBot opens.';
+                    }
                 }
             } else if (latestSavedCompanionSignature && currentSignature === latestSavedCompanionSignature) {
                 stateLabel = 'Saved snapshot';
@@ -5551,8 +5628,10 @@
                     const li = document.createElement('li');
                     li.setAttribute('data-companion-id', c.id);
                     const isActive = c.id === activeCompanionId;
+                    const isDefault = c.id === defaultCompanionId;
                     if (isActive) li.classList.add('companion-active');
                     if (isActive && companionHasUnsavedChanges) li.classList.add('companion-active-dirty');
+                    if (isDefault) li.classList.add('companion-default');
 
                     const copy = document.createElement('div');
                     copy.className = 'companion-list-copy';
@@ -5564,13 +5643,42 @@
 
                     const subtitle = document.createElement('span');
                     subtitle.className = 'companion-subtitle';
-                    if (isActive && companionHasUnsavedChanges) subtitle.textContent = 'Active companion with unsaved changes';
+                    if (isDefault && isActive && companionHasUnsavedChanges) subtitle.textContent = 'Default companion with unsaved changes';
+                    else if (isDefault && isActive) subtitle.textContent = 'Default companion';
+                    else if (isDefault) subtitle.textContent = 'Loads automatically when CATBot opens';
+                    else if (isActive && companionHasUnsavedChanges) subtitle.textContent = 'Active companion with unsaved changes';
                     else if (isActive) subtitle.textContent = 'Active companion';
                     else if (!activeCompanionId && c.id === latestSavedCompanionId && currentSignature === latestSavedCompanionSignature) subtitle.textContent = 'Matches the current setup';
                     else subtitle.textContent = 'Click to load this setup';
                     copy.appendChild(subtitle);
 
                     li.appendChild(copy);
+                    const actions = document.createElement('div');
+                    actions.className = 'companion-list-actions';
+
+                    const defaultBtn = document.createElement('button');
+                    defaultBtn.type = 'button';
+                    defaultBtn.className = 'companion-default-btn';
+                    defaultBtn.setAttribute('aria-label', isDefault ? 'Clear default companion' : 'Set as default companion');
+                    defaultBtn.title = isDefault
+                        ? `Clear "${c.name || c.id}" as the default companion`
+                        : `Set "${c.name || c.id}" as the default companion`;
+                    if (isDefault) defaultBtn.classList.add('is-default');
+                    defaultBtn.innerHTML = isDefault
+                        ? '<i class="fas fa-star"></i><span>Default</span>'
+                        : '<i class="far fa-star"></i><span>Set default</span>';
+                    defaultBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        if (isDefault) {
+                            setDefaultCompanion(null);
+                            setCompanionFeedback(`Cleared "${c.name || c.id}" as the default companion.`, 'success');
+                        } else {
+                            setDefaultCompanion(c.id);
+                            setCompanionFeedback(`"${c.name || c.id}" will load automatically when CATBot opens.`, 'success');
+                        }
+                    });
+                    actions.appendChild(defaultBtn);
+
                     const delBtn = document.createElement('button');
                     delBtn.type = 'button';
                     delBtn.className = 'companion-delete-btn';
@@ -5583,7 +5691,8 @@
                             setCompanionFeedback(`Failed to delete companion: ${error.message}`, 'error');
                         });
                     });
-                    li.appendChild(delBtn);
+                    actions.appendChild(delBtn);
+                    li.appendChild(actions);
                     listEl.appendChild(li);
                 });
             }).catch(err => {
@@ -5593,10 +5702,7 @@
         }
 
         async function loadCompanion(id) {
-            const url = `${PROXY_BASE_URL}/v1/companions/${encodeURIComponent(id)}`;
-            const res = await fetch(url, { headers: { 'Authorization': `Bearer ${authToken}` } });
-            if (!res.ok) throw new Error(res.statusText || 'Companion not found');
-            const data = await res.json();
+            const data = await fetchCompanionRecord(id);
             if (data.settings) {
                 applyToolSettingsToDOM(data.settings);
                 await fetchAvailableModels(data.settings);
@@ -5629,6 +5735,9 @@
                 latestSavedCompanionId = null;
                 latestSavedCompanionName = '';
                 latestSavedCompanionSignature = '';
+            }
+            if (defaultCompanionId === id) {
+                setDefaultCompanion(null, { render: false, refreshDraft: false });
             }
             renderCompanionList();
             updateCompanionDraftUI(undefined, { syncDirtyState: false });
@@ -7150,13 +7259,65 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "pdfToPowerPoint",
-                    description: "Use this tool only when the user explicitly wants to convert a PDF into a PowerPoint or slide presentation. Do not use it for reviewing, summarizing, or extracting text from an attached PDF; use the filesystem read tool for that. Call it with title and filename; if the user did not provide a PDF URL, omit pdfUrl and the user will be prompted to upload a PDF file.",
+                    description: "Use this tool only when the user explicitly wants to convert a PDF or Markdown document into a PowerPoint or slide presentation. Do not use it for reviewing, summarizing, or extracting text from an attached file; use the filesystem read tool for that. Call it with title and filename; use source for structured inputs, or sourceUrl/pdfUrl for simple URL/path inputs. If the user did not provide a source, omit source, sourceUrl, and pdfUrl and the user will be prompted to upload a PDF or Markdown file.",
                     parameters: {
                         type: "object",
                         properties: {
+                            source: {
+                                type: "object",
+                                description: "Optional structured source descriptor. Supports URL, scratch-relative path, uploaded attachment metadata, inline Markdown text, or base64 file content.",
+                                properties: {
+                                    type: {
+                                        type: "string",
+                                        enum: ["url", "path", "attachment", "inline", "file"],
+                                        description: "Optional source locator kind."
+                                    },
+                                    value: {
+                                        type: "string",
+                                        description: "Generic source value. Use for a URL, scratch-relative path, or inline Markdown content."
+                                    },
+                                    url: {
+                                        type: "string",
+                                        description: "Optional source URL."
+                                    },
+                                    path: {
+                                        type: "string",
+                                        description: "Optional scratch-relative path."
+                                    },
+                                    relativePath: {
+                                        type: "string",
+                                        description: "Optional scratch-relative path for uploaded attachments."
+                                    },
+                                    content: {
+                                        type: "string",
+                                        description: "Optional inline Markdown content."
+                                    },
+                                    contentBase64: {
+                                        type: "string",
+                                        description: "Optional base64-encoded PDF or Markdown file content."
+                                    },
+                                    mimeType: {
+                                        type: "string",
+                                        description: "Optional MIME type for inline or base64 content."
+                                    },
+                                    filename: {
+                                        type: "string",
+                                        description: "Optional filename used for source-type detection."
+                                    }
+                                }
+                            },
+                            sourceUrl: {
+                                type: "string",
+                                description: "Optional. URL or scratch-relative path to the source document. Supports PDF and Markdown files."
+                            },
+                            sourceType: {
+                                type: "string",
+                                enum: ["pdf", "markdown"],
+                                description: "Optional. Source document type. Use 'markdown' for .md/.markdown files. Omit to auto-detect when possible."
+                            },
                             pdfUrl: {
                                 type: "string",
-                                description: "Optional. URL of the PDF (http/https). Omit when the user has not provided a URL—they will be prompted to upload a file."
+                                description: "Optional legacy alias for a PDF URL or scratch-relative path. Prefer sourceUrl for new calls."
                             },
                             title: {
                                 type: "string",
@@ -9617,7 +9778,7 @@ function saveWAVFile(wavBlob) {
                 return `- ${relPath} (original: ${original}, type: ${mimeType}, size: ${sizeBytes} bytes)`;
             });
 
-            return `${basePrompt}\n\nAttached files saved in scratch:\n${manifestLines.join('\n')}\nUse the filesystem read skill tool shown in the dynamic skill list, usually skill__filesystem_read_text, with these scratch-relative paths to inspect attachments before answering.\nFor attached PDFs, DOCX, XLSX, text files, and images, inspect the attachment first instead of guessing.\nDo not call pdfToPowerPoint unless the user explicitly asks to convert a PDF into a PowerPoint or slide deck.`;
+            return `${basePrompt}\n\nAttached files saved in scratch:\n${manifestLines.join('\n')}\nUse the filesystem read skill tool shown in the dynamic skill list, usually skill__filesystem_read_text, with these scratch-relative paths to inspect attachments before answering.\nFor attached PDFs, DOCX, XLSX, text files, Markdown files, and images, inspect the attachment first instead of guessing.\nDo not call pdfToPowerPoint unless the user explicitly asks to convert a PDF or Markdown document into a PowerPoint or slide deck.`;
         }
 
         async function fetchOpenAIResponse(promptText) {
@@ -9834,10 +9995,23 @@ Parameters:
 }
 
 12. pdfToPowerPoint
-Description: Use this tool only when the user explicitly wants to convert a PDF to PowerPoint, turn a PDF into a presentation, or create slides from a PDF. Do not use it for reviewing, summarizing, or reading an attached PDF. If the user provides a PDF URL, include pdfUrl; if they do not, omit pdfUrl and the user will be prompted to upload a file. Required: title, filename.
+Description: Use this tool only when the user explicitly wants to convert a PDF or Markdown document to PowerPoint, turn one into a presentation, or create slides from one. Do not use it for reviewing, summarizing, or reading an attached source file. For structured inputs such as uploaded attachments, inline Markdown, or base64 content, use source. For simple PDF/Markdown URLs or scratch-relative paths, use sourceUrl and sourceType when helpful; for legacy PDF calls, pdfUrl is still accepted. If they do not provide a source, omit source, sourceUrl, and pdfUrl and the user will be prompted to upload a file. Required: title, filename.
 Parameters:
 {
-    "pdfUrl": "string (optional; include only when user provides a URL; if omitted, user is prompted to upload)",
+    "source": {
+        "type": "object (optional structured source descriptor)",
+        "value": "string (optional URL, scratch-relative path, or inline Markdown content)",
+        "url": "string (optional source URL)",
+        "path": "string (optional scratch-relative path)",
+        "relativePath": "string (optional scratch-relative path for an uploaded attachment)",
+        "content": "string (optional inline Markdown content)",
+        "contentBase64": "string (optional base64-encoded PDF/Markdown file content)",
+        "mimeType": "string (optional MIME type for inline/base64 content)",
+        "filename": "string (optional filename used for type detection)"
+    },
+    "sourceUrl": "string (optional; URL or scratch-relative path to a PDF or Markdown source file)",
+    "sourceType": "string (optional; 'pdf' or 'markdown')",
+    "pdfUrl": "string (optional legacy alias for PDF source URL/path)",
     "title": "string (required; presentation title)",
     "author": "string (optional)",
     "maxSlides": "number (optional; default 15)",
@@ -9947,7 +10121,8 @@ User: "Turn this PDF into a PowerPoint: https://example.com/report.pdf. Title it
 Assistant: <tool>pdfToPowerPoint</tool>
 <parameters>
 {
-    "pdfUrl": "https://example.com/report.pdf",
+    "sourceUrl": "https://example.com/report.pdf",
+    "sourceType": "pdf",
     "title": "Quarterly Report",
     "filename": "report.pptx"
 }
@@ -9959,6 +10134,33 @@ Assistant: <tool>pdfToPowerPoint</tool>
 {
     "title": "My Presentation",
     "filename": "my_preso.pptx"
+}
+</parameters>
+
+User: "Create a PowerPoint from scratch/notes/quarterly-update.md and save it as quarterly-update.pptx"
+Assistant: <tool>pdfToPowerPoint</tool>
+<parameters>
+{
+    "sourceUrl": "scratch/notes/quarterly-update.md",
+    "sourceType": "markdown",
+    "title": "Quarterly Update",
+    "filename": "quarterly-update.pptx"
+}
+</parameters>
+
+User: "Turn the uploaded attachment attachments/web/demo/brief.md into a deck called brief.pptx"
+Assistant: <tool>pdfToPowerPoint</tool>
+<parameters>
+{
+    "source": {
+        "type": "attachment",
+        "relativePath": "attachments/web/demo/brief.md",
+        "filename": "brief.md",
+        "mimeType": "text/markdown"
+    },
+    "sourceType": "markdown",
+    "title": "Brief",
+    "filename": "brief.pptx"
 }
 </parameters>
 
@@ -10022,7 +10224,7 @@ Tool calling rules:
 
 Task-specific rules:
 - For attached files, inspect them with the filesystem read tool before answering.
-- Use pdfToPowerPoint only when the user explicitly asks to convert a PDF into PowerPoint/slides.
+- Use pdfToPowerPoint only when the user explicitly asks to convert a PDF or Markdown document into PowerPoint/slides.
 - For CATBot code/tool changes, use runCodexCli.
 - Call restartProxyServer only with explicit user confirmation.
 - For scratch files, use relative filenames and preserve requested output names.
@@ -10655,7 +10857,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                             // Handle regular message response
                         responseOutput.value = cleanContent;
                         addMessageToHistory('assistant', cleanContent); // Add to message history (also updates chatHistory)
-                            // If user asked to convert PDF to PowerPoint but the LLM replied in text, show upload widget in chat
+                            // If user asked to convert a PDF/Markdown document to PowerPoint but the LLM replied in text, show upload widget in chat
                             if (isPdfToPowerPointRequest(promptText)) {
                                 appendPdfUploadWidgetToChat(promptText);
                             }
@@ -13632,71 +13834,91 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             return images;
         }
 
-        // Converts a PDF (by URL or data URL) into an intelligent PowerPoint presentation.
+        // Converts a PDF or Markdown source into an intelligent PowerPoint presentation.
         // Enhanced approach:
-        // 1) Load PDF with PDF.js and extract ALL text content
-        // 2) Send text to OpenAI LLM for intelligent summarization and structuring
-        // 3) Create structured slides based on LLM output (intro, key points, details, conclusion)
-        // 4) Save the enhanced PPTX file
-        async function handlePdfToPowerPoint({ pdfUrl, promptUpload = false, title, author = "", maxSlides = 15, filename }) {
+        // 1) Load the source document and extract text content
+        // 2) For PDFs, also extract images with PDF.js
+        // 3) Send text to OpenAI LLM for intelligent summarization and structuring
+        // 4) Create structured slides based on LLM output (intro, key points, details, conclusion)
+        // 5) Save the enhanced PPTX file
+        async function handlePdfToPowerPoint({ pdfUrl, source, sourceUrl, sourceType, sourceFile = null, promptUpload = false, title, author = "", maxSlides = 15, filename }) {
+            let sourceLabel = 'source';
             try {
-                if (!window.pdfjsLib) {
-                    throw new Error('PDF.js not loaded');
-                }
                 if (!window.PptxGenJS) {
                     throw new Error('PptxGenJS not loaded');
                 }
-
-                // Configure PDF.js worker if available
-                if (window.pdfjsLib.GlobalWorkerOptions) {
-                    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
-                }
-
-                // When no PDF URL is supplied, always prompt the user to upload a PDF
-                if (!pdfUrl) {
-                    const file = await promptForLocalPdf();
-                    if (!file) {
-                        return { success: false, message: 'No PDF selected.' };
-                    }
-                    // Use data URL for local files to avoid CORS issues
-                    pdfUrl = await readFileAsDataUrl(file);
-                }
-
-                pdfUrl = await resolvePdfInputToDocumentSource(pdfUrl);
-
-                const loadingTask = window.pdfjsLib.getDocument({ url: pdfUrl, withCredentials: false });
-                const pdf = await loadingTask.promise;
-
-                // Extract ALL text content and images from the PDF
                 let fullText = '';
                 let extractedImages = [];
-                
-                for (let pageIndex = 1; pageIndex <= pdf.numPages; pageIndex++) {
-                    const page = await pdf.getPage(pageIndex);
-                    
-                    // Extract text content
-                    const textContent = await page.getTextContent();
-                    const pageText = textContent.items.map(it => it.str).join(' ').replace(/\s+/g, ' ').trim();
-                    fullText += pageText + ' ';
-                    
-                    // Extract images from this page
-                    try {
-                        const operators = await page.getOperatorList();
-                        const pageImages = await extractImagesFromPage(page, operators, pageIndex);
-                        extractedImages = extractedImages.concat(pageImages);
-                    } catch (imageError) {
-                        console.warn(`Could not extract images from page ${pageIndex}:`, imageError);
+                const legacyPdfSource = !sourceUrl && !!pdfUrl;
+                let resolvedSource = sourceFile || source || sourceUrl || pdfUrl;
+
+                if (!resolvedSource) {
+                    const file = await promptForLocalPdf();
+                    if (!file) {
+                        return { success: false, message: 'No source file selected.' };
                     }
+                    resolvedSource = file;
                 }
 
-                // Clean up the extracted text
-                fullText = fullText.trim().replace(/\s+/g, ' ');
-                
-                if (!fullText || fullText.length < 50) {
-                    throw new Error('Could not extract sufficient text content from PDF');
+                const normalizedSource = normalizePresentationSourceInput(
+                    resolvedSource,
+                    sourceType || (legacyPdfSource ? 'pdf' : '')
+                );
+                const resolvedSourceType = normalizedSource.sourceType;
+                sourceLabel = resolvedSourceType === 'markdown' ? 'Markdown' : 'PDF';
+
+                if (resolvedSourceType === 'pdf') {
+                    if (!window.pdfjsLib) {
+                        throw new Error('PDF.js not loaded');
+                    }
+                    if (window.pdfjsLib.GlobalWorkerOptions) {
+                        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+                    }
+
+                    const resolvedPdfSource = normalizedSource.sourceBlob
+                        ? await readFileAsDataUrl(normalizedSource.sourceBlob)
+                        : await resolvePdfInputToDocumentSource(normalizedSource.locator);
+
+                    const loadingTask = window.pdfjsLib.getDocument({ url: resolvedPdfSource, withCredentials: false });
+                    const pdf = await loadingTask.promise;
+
+                    for (let pageIndex = 1; pageIndex <= pdf.numPages; pageIndex++) {
+                        const page = await pdf.getPage(pageIndex);
+
+                        const textContent = await page.getTextContent();
+                        const pageText = textContent.items.map(it => it.str).join(' ').replace(/\s+/g, ' ').trim();
+                        fullText += pageText + ' ';
+
+                        try {
+                            const operators = await page.getOperatorList();
+                            const pageImages = await extractImagesFromPage(page, operators, pageIndex);
+                            extractedImages = extractedImages.concat(pageImages);
+                        } catch (imageError) {
+                            console.warn(`Could not extract images from page ${pageIndex}:`, imageError);
+                        }
+                    }
+
+                    fullText = fullText.trim().replace(/\s+/g, ' ');
+
+                    if (!fullText || fullText.length < 50) {
+                        throw new Error('Could not extract sufficient text content from PDF');
+                    }
+
+                    console.log(`Extracted ${extractedImages.length} images from PDF`);
+                } else {
+                    fullText = normalizedSource.inlineText != null
+                        ? normalizedSource.inlineText
+                        : normalizedSource.sourceBlob
+                            ? await readFileAsText(normalizedSource.sourceBlob)
+                            : await resolveMarkdownInputToTextSource(normalizedSource.locator);
+                    fullText = normalizeMarkdownForPresentation(fullText);
+
+                    if (!fullText || fullText.length < 50) {
+                        throw new Error('Could not extract sufficient text content from Markdown source');
+                    }
+
+                    console.log(`Loaded ${fullText.length} characters from Markdown source`);
                 }
-                
-                console.log(`Extracted ${extractedImages.length} images from PDF`);
 
                 // Determine which model to use for the presentation generation
                 const modelUsed = extractedImages.length > 0 ? 
@@ -13716,10 +13938,17 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 }
 
                 // Use OpenAI to intelligently structure the content including image placement
-                const structuredContent = await generateStructuredPresentation(fullText, title, maxSlides, extractedImages, imageAnalysis);
+                const structuredContent = await generateStructuredPresentation(
+                    fullText,
+                    title,
+                    maxSlides,
+                    extractedImages,
+                    imageAnalysis,
+                    resolvedSourceType
+                );
                 
                 if (!structuredContent) {
-                    throw new Error('Failed to generate structured content from PDF text');
+                    throw new Error(`Failed to generate structured content from ${sourceLabel}`);
                 }
 
                 // Helper function to find image by ID
@@ -13954,24 +14183,32 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 
                 console.log(`✅ FINAL RESULT: ${imagesEmbedded} images successfully embedded in presentation`);
                 
-                return { 
-                    success: true, 
-                    message: `Successfully created intelligent presentation with ${structuredContent.slides?.length || 0} content slides and ${imagesEmbedded}/${extractedImages.length} images embedded using ${modelUsed.includes('vl') ? 'vision model' : 'standard model'}. Saved to ${filename}` 
+                if (resolvedSourceType === 'markdown') {
+                    return {
+                        success: true,
+                        message: `Successfully created presentation from Markdown with ${structuredContent.slides?.length || 0} content slides. Saved to ${filename}`
+                    };
+                }
+
+                return {
+                    success: true,
+                    message: `Successfully created intelligent presentation with ${structuredContent.slides?.length || 0} content slides and ${imagesEmbedded}/${extractedImages.length} images embedded using ${modelUsed.includes('vl') ? 'vision model' : 'standard model'}. Saved to ${filename}`
                 };
             } catch (error) {
-                console.error('PDF to PPTX error:', error);
-                return { success: false, message: `Error converting PDF: ${error.message}` };
+                console.error('Document to PPTX error:', error);
+                return { success: false, message: `Error converting ${sourceLabel}: ${error.message}` };
             }
         }
 
-        // Detects if the user message is asking to convert a PDF to PowerPoint (so we can show upload UI when the LLM replies in text instead of calling the tool).
+        // Detects if the user message is asking to convert a PDF or Markdown document to PowerPoint
+        // so we can show upload UI when the LLM replies in text instead of calling the tool.
         function isPdfToPowerPointRequest(text) {
             if (!text || typeof text !== 'string') return false;
             const lower = text.toLowerCase();
-            const hasPdf = /\bpdf\b/i.test(text);
-            const hasPowerPoint = /\bpowerpoint\b|\bpptx\b|\bpresentation\b|\.pptx\b/i.test(text) || lower.includes('power point');
+            const hasSourceType = /\bpdf\b|\bmarkdown\b|\.md\b|\.markdown\b/i.test(text);
+            const hasPowerPoint = /\bpowerpoint\b|\bpptx\b|\bpresentation\b|\bslides?\b|\.pptx\b/i.test(text) || lower.includes('power point');
             const hasConvert = /\bconvert\b|\bturn\b|\btransform\b|\bcreate\b|\bmake\b|\bupload\b/i.test(text);
-            return hasPdf && (hasPowerPoint || hasConvert);
+            return hasSourceType && (hasPowerPoint || hasConvert);
         }
 
         // Parses optional filename (e.g. my_preso.pptx) and title from the user message for PDF-to-PowerPoint.
@@ -13983,7 +14220,8 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             return { title, filename };
         }
 
-        // When the LLM replied in text instead of calling the tool, show the upload widget in chat and run conversion when the user selects a file.
+        // When the LLM replied in text instead of calling the tool, show the upload widget in chat
+        // and run conversion when the user selects a PDF or Markdown file.
         function appendPdfUploadWidgetToChat(userMessage) {
             const messageHistory = document.getElementById('message-history');
             if (!messageHistory) return;
@@ -13991,7 +14229,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
 
             const wrapper = document.createElement('div');
             wrapper.id = 'pdf-upload-prompt';
-            wrapper.setAttribute('aria-label', 'PDF upload');
+            wrapper.setAttribute('aria-label', 'Presentation source upload');
             wrapper.style.margin = '16px 0';
             wrapper.style.padding = '16px';
             wrapper.style.background = 'rgba(42, 42, 42, 0.95)';
@@ -14001,14 +14239,14 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             wrapper.style.color = '#ffffff';
 
             const text = document.createElement('div');
-            text.textContent = 'Select a PDF to convert to PowerPoint';
+            text.textContent = 'Select a PDF or Markdown file to convert to PowerPoint';
             text.style.marginBottom = '12px';
             text.style.fontSize = '15px';
             text.style.fontWeight = '600';
 
             const input = document.createElement('input');
             input.type = 'file';
-            input.accept = 'application/pdf';
+            input.accept = '.pdf,.md,.markdown,application/pdf,text/markdown,text/plain';
             input.style.position = 'absolute';
             input.style.width = '1px';
             input.style.height = '1px';
@@ -14016,7 +14254,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             input.style.pointerEvents = 'none';
 
             const selectBtn = document.createElement('button');
-            selectBtn.textContent = 'Select PDF file';
+            selectBtn.textContent = 'Select source file';
             selectBtn.type = 'button';
             selectBtn.style.padding = '12px 20px';
             selectBtn.style.marginRight = '10px';
@@ -14045,8 +14283,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 selectBtn.disabled = true;
                 text.textContent = 'Converting…';
                 try {
-                    const pdfUrl = await readFileAsDataUrl(file);
-                    const result = await handlePdfToPowerPoint({ pdfUrl, title, filename });
+                    const result = await handlePdfToPowerPoint({ sourceFile: file, title, filename });
                     if (wrapper.parentNode) wrapper.parentNode.removeChild(wrapper);
                     addMessageToHistory('assistant', result.message);
                     responseOutput.value = result.message;
@@ -14065,7 +14302,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             messageHistory.scrollTop = messageHistory.scrollHeight;
         }
 
-        // Shows PDF upload UI inline in the message history so it is always visible
+        // Shows source document upload UI inline in the message history so it is always visible
         // (no popup/modal—avoids issues with iframes, z-index, and security blocking dialogs).
         // Button triggers file input so the OS file dialog opens on user gesture.
         function promptForLocalPdf() {
@@ -14073,7 +14310,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 const messageHistory = document.getElementById('message-history');
                 const wrapper = document.createElement('div');
                 wrapper.id = 'pdf-upload-prompt';
-                wrapper.setAttribute('aria-label', 'PDF upload');
+                wrapper.setAttribute('aria-label', 'Presentation source upload');
                 wrapper.style.margin = '16px 0';
                 wrapper.style.padding = '16px';
                 wrapper.style.background = 'rgba(42, 42, 42, 0.95)';
@@ -14083,14 +14320,14 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 wrapper.style.color = '#ffffff';
 
                 const text = document.createElement('div');
-                text.textContent = 'Select a PDF to convert to PowerPoint';
+                text.textContent = 'Select a PDF or Markdown file to convert to PowerPoint';
                 text.style.marginBottom = '12px';
                 text.style.fontSize = '15px';
                 text.style.fontWeight = '600';
 
                 const input = document.createElement('input');
                 input.type = 'file';
-                input.accept = 'application/pdf';
+                input.accept = '.pdf,.md,.markdown,application/pdf,text/markdown,text/plain';
                 input.style.position = 'absolute';
                 input.style.width = '1px';
                 input.style.height = '1px';
@@ -14098,7 +14335,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 input.style.pointerEvents = 'none';
 
                 const selectBtn = document.createElement('button');
-                selectBtn.textContent = 'Select PDF file';
+                selectBtn.textContent = 'Select source file';
                 selectBtn.type = 'button';
                 selectBtn.style.padding = '12px 20px';
                 selectBtn.style.marginRight = '10px';
@@ -14165,6 +14402,287 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             return await readFileAsDataUrl(blob);
         }
 
+        function normalizePresentationSourceInput(sourceInput, explicitType = '') {
+            const sourceType = inferPresentationSourceType(sourceInput, explicitType);
+
+            if (isPresentationFileLike(sourceInput)) {
+                return {
+                    sourceType,
+                    sourceBlob: sourceInput,
+                    inlineText: null,
+                    locator: ''
+                };
+            }
+
+            if (typeof sourceInput === 'string') {
+                const locator = sourceInput.trim();
+                if (!locator) {
+                    throw new Error('Missing source document');
+                }
+                return {
+                    sourceType,
+                    sourceBlob: null,
+                    inlineText: null,
+                    locator
+                };
+            }
+
+            if (!sourceInput || typeof sourceInput !== 'object') {
+                throw new Error('Unsupported source input');
+            }
+
+            const descriptorType = String(sourceInput.type || sourceInput.kind || sourceInput.sourceKind || '').trim().toLowerCase();
+            const blobSource = sourceInput.file || sourceInput.blob || sourceInput.sourceFile;
+            if (isPresentationFileLike(blobSource)) {
+                return {
+                    sourceType,
+                    sourceBlob: blobSource,
+                    inlineText: null,
+                    locator: ''
+                };
+            }
+
+            const mimeType = firstDefinedString(
+                sourceInput.mimeType,
+                sourceInput.mime_type,
+                sourceInput.contentType,
+                sourceInput.content_type
+            );
+            const fileName = firstDefinedString(
+                sourceInput.filename,
+                sourceInput.fileName,
+                sourceInput.name,
+                sourceInput.original_filename,
+                sourceInput.originalFilename
+            );
+            const locator = firstDefinedString(
+                sourceInput.sourceUrl,
+                sourceInput.url,
+                sourceInput.href,
+                sourceInput.uri,
+                sourceInput.src,
+                sourceInput.pdfUrl,
+                sourceInput.path,
+                sourceInput.filePath,
+                sourceInput.relative_path,
+                sourceInput.relativePath,
+                descriptorType === 'url' || descriptorType === 'path' || descriptorType === 'attachment' || descriptorType === 'file'
+                    ? sourceInput.value
+                    : '',
+                descriptorType === 'attachment' ? sourceInput.name : ''
+            );
+            const inlineText = firstDefinedString(
+                sourceInput.markdown,
+                sourceInput.text,
+                descriptorType === 'inline' || descriptorType === 'markdown' || descriptorType === 'text'
+                    ? sourceInput.value
+                    : '',
+                sourceInput.content
+            );
+            const encodedContent = firstDefinedString(
+                sourceInput.contentBase64,
+                sourceInput.content_base64,
+                sourceInput.base64
+            );
+
+            if (
+                sourceType === 'markdown' &&
+                inlineText &&
+                (descriptorType === 'inline' || descriptorType === 'markdown' || descriptorType === 'text' || !locator)
+            ) {
+                return {
+                    sourceType,
+                    sourceBlob: null,
+                    inlineText,
+                    locator: ''
+                };
+            }
+
+            if (encodedContent) {
+                if (/^data:/i.test(encodedContent)) {
+                    return {
+                        sourceType,
+                        sourceBlob: null,
+                        inlineText: null,
+                        locator: encodedContent
+                    };
+                }
+                return {
+                    sourceType,
+                    sourceBlob: decodeBase64SourceToBlob(
+                        encodedContent,
+                        mimeType || (sourceType === 'markdown' ? 'text/markdown' : 'application/pdf')
+                    ),
+                    inlineText: null,
+                    locator: ''
+                };
+            }
+
+            if (locator) {
+                return {
+                    sourceType: inferPresentationSourceType(
+                        {
+                            name: fileName,
+                            type: mimeType,
+                            sourceUrl: locator
+                        },
+                        explicitType || sourceType
+                    ),
+                    sourceBlob: null,
+                    inlineText: null,
+                    locator
+                };
+            }
+
+            throw new Error('Unsupported source input. Use a URL, scratch-relative path, attachment, uploaded file, inline Markdown, or base64 content.');
+        }
+
+        function isPresentationFileLike(value) {
+            return typeof Blob !== 'undefined' && value instanceof Blob;
+        }
+
+        function firstDefinedString(...values) {
+            for (const value of values) {
+                if (typeof value === 'string' && value.trim()) {
+                    return value.trim();
+                }
+            }
+            return '';
+        }
+
+        function decodeBase64SourceToBlob(encodedContent, mimeType) {
+            const normalized = String(encodedContent || '').trim();
+            if (!normalized) {
+                throw new Error('Missing base64 source content');
+            }
+            const binary = atob(normalized);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            return new Blob([bytes], { type: mimeType || 'application/octet-stream' });
+        }
+
+        function inferPresentationSourceType(sourceInput, explicitType = '') {
+            const normalizedType = String(explicitType || '').trim().toLowerCase();
+            if (normalizedType === 'md') return 'markdown';
+            if (normalizedType === 'pdf' || normalizedType === 'markdown') {
+                return normalizedType;
+            }
+            if (normalizedType) {
+                throw new Error(`Unsupported source type: ${explicitType}`);
+            }
+
+            const descriptorType = sourceInput && typeof sourceInput === 'object'
+                ? String(
+                    (typeof sourceInput.type === 'string' && !sourceInput.type.includes('/') ? sourceInput.type : '') ||
+                    sourceInput.kind ||
+                    sourceInput.sourceKind ||
+                    ''
+                ).toLowerCase()
+                : '';
+            const fileName = sourceInput && typeof sourceInput === 'object'
+                ? firstDefinedString(
+                    sourceInput.name,
+                    sourceInput.filename,
+                    sourceInput.fileName,
+                    sourceInput.original_filename,
+                    sourceInput.originalFilename
+                ).toLowerCase()
+                : '';
+            const mimeType = sourceInput && typeof sourceInput === 'object'
+                ? firstDefinedString(
+                    sourceInput.mimeType,
+                    sourceInput.mime_type,
+                    sourceInput.contentType,
+                    sourceInput.content_type,
+                    typeof sourceInput.type === 'string' && sourceInput.type.includes('/') ? sourceInput.type : ''
+                ).toLowerCase()
+                : '';
+            const source = typeof sourceInput === 'string'
+                ? sourceInput.trim().toLowerCase()
+                : sourceInput && typeof sourceInput === 'object'
+                    ? firstDefinedString(
+                        sourceInput.sourceUrl,
+                        sourceInput.url,
+                        sourceInput.href,
+                        sourceInput.uri,
+                        sourceInput.src,
+                        sourceInput.pdfUrl,
+                        sourceInput.path,
+                        sourceInput.filePath,
+                        sourceInput.relative_path,
+                        sourceInput.relativePath,
+                        descriptorType === 'url' || descriptorType === 'path' || descriptorType === 'attachment' || descriptorType === 'file'
+                            ? sourceInput.value
+                            : '',
+                        sourceInput.filename,
+                        sourceInput.fileName,
+                        sourceInput.original_filename,
+                        sourceInput.originalFilename
+                    ).toLowerCase()
+                    : '';
+            const inlineText = sourceInput && typeof sourceInput === 'object'
+                ? firstDefinedString(
+                    sourceInput.markdown,
+                    sourceInput.text,
+                    descriptorType === 'inline' || descriptorType === 'markdown' || descriptorType === 'text'
+                        ? sourceInput.value
+                        : '',
+                    sourceInput.content
+                )
+                : '';
+
+            if (mimeType === 'application/pdf' || fileName.endsWith('.pdf') || /^data:application\/pdf[;,]/i.test(source)) {
+                return 'pdf';
+            }
+            if (
+                (descriptorType === 'inline' || descriptorType === 'markdown' || descriptorType === 'text') && inlineText ||
+                mimeType === 'text/markdown' ||
+                mimeType === 'text/x-markdown' ||
+                (mimeType === 'text/plain' && (fileName.endsWith('.md') || fileName.endsWith('.markdown'))) ||
+                fileName.endsWith('.md') ||
+                fileName.endsWith('.markdown') ||
+                /\.md(?:[?#].*)?$/i.test(source) ||
+                /\.markdown(?:[?#].*)?$/i.test(source) ||
+                /^data:text\/markdown[;,]/i.test(source)
+            ) {
+                return 'markdown';
+            }
+
+            if (typeof sourceInput === 'string' && sourceInput.trim()) {
+                return 'pdf';
+            }
+
+            throw new Error('Unable to determine source type. Use sourceType with "pdf" or "markdown".');
+        }
+
+        async function resolveMarkdownInputToTextSource(sourceUrl) {
+            const source = String(sourceUrl || '').trim();
+            if (!source) {
+                throw new Error('Missing Markdown source');
+            }
+
+            let response;
+            if (source.startsWith('data:') || source.startsWith('blob:') || /^https?:\/\//i.test(source)) {
+                response = await fetch(source, {
+                    method: 'GET',
+                    cache: 'no-store'
+                });
+            } else {
+                response = await fetch(`${PROXY_BASE_URL}/v1/files/content?path=${encodeURIComponent(source)}`, {
+                    method: 'GET',
+                    cache: 'no-store'
+                });
+            }
+
+            if (!response.ok) {
+                const message = await response.text().catch(() => '');
+                throw new Error(message || `Missing Markdown source: ${source}`);
+            }
+            return await response.text();
+        }
+
         // Reads a File or Blob as a data URL
         function readFileAsDataUrl(file) {
             return new Promise((resolve, reject) => {
@@ -14173,6 +14691,30 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 reader.onload = () => resolve(reader.result);
                 reader.readAsDataURL(file);
             });
+        }
+
+        function readFileAsText(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onerror = () => reject(new Error('Failed to read file'));
+                reader.onload = () => resolve(reader.result);
+                reader.readAsText(file);
+            });
+        }
+
+        function normalizeMarkdownForPresentation(markdownText) {
+            return String(markdownText || '')
+                .replace(/^---[\r\n]+[\s\S]*?[\r\n]+---[\r\n]*/m, '')
+                .replace(/<!--[\s\S]*?-->/g, ' ')
+                .replace(/\r\n/g, '\n')
+                .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1 ')
+                .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1')
+                .replace(/`([^`]+)`/g, '$1')
+                .replace(/^#{1,6}\s+/gm, '')
+                .replace(/^\s*[-*+]\s+/gm, '- ')
+                .replace(/^\s*\d+\.\s+/gm, '- ')
+                .replace(/^\s*>\s?/gm, '')
+                .trim();
         }
 
         // Process images in batches to avoid overwhelming local models
@@ -14299,7 +14841,7 @@ IMPORTANT: Respond with ONLY the JSON object.`
         }
 
         // Generate structured presentation content using OpenAI LLM
-        async function generateStructuredPresentation(fullText, title, maxSlides = 15, availableImages = [], imageAnalysis = []) {
+        async function generateStructuredPresentation(fullText, title, maxSlides = 15, availableImages = [], imageAnalysis = [], sourceType = 'pdf') {
             try {
                 // Route through proxy to avoid mixed content (HTTPS page calling HTTP LLM)
                 const originalEndpoint = endpointInput.value;
@@ -14318,6 +14860,7 @@ IMPORTANT: Respond with ONLY the JSON object.`
                 console.log(`Using ${availableImages.length > 0 ? 'vision' : 'standard'} model for presentation generation:`, modelToUse);
 
                 // Create CONCISE image information for the prompt using pre-analyzed data
+                const sourceLabel = sourceType === 'markdown' ? 'Markdown document' : 'PDF';
                 let imageInfo = '';
                 if (availableImages.length > 0) {
                     // Group images by type and summarize to keep prompt manageable
@@ -14382,11 +14925,11 @@ IMPORTANT: Respond with ONLY the JSON object.`
                     
                     imageInfo += `\nNote: Additional ${availableImages.length - importantImages.length} images available for placement.`;
                 } else {
-                    imageInfo = '\n\nNo images were found in the PDF.';
+                    imageInfo = '\n\nNo images were found in the source document.';
                 }
 
                 // Create a comprehensive prompt for OpenAI to structure the content
-                const systemPrompt = `You are an expert presentation designer. Your task is to analyze the provided PDF content and create a well-structured PowerPoint presentation outline${availableImages.length > 0 ? ', including intelligent placement of extracted images' : ''}. 
+                const systemPrompt = `You are an expert presentation designer. Your task is to analyze the provided ${sourceLabel} content and create a well-structured PowerPoint presentation outline${availableImages.length > 0 ? ', including intelligent placement of extracted images' : ''}. 
 
 ${availableImages.length > 0 ? 'Each image has been pre-analyzed by a vision model to understand its content, type, and relevant topics. Use this analysis information to make smart placement decisions.' : ''}
 
@@ -14422,9 +14965,9 @@ IMPORTANT: Respond with ONLY the JSON object, no additional text or formatting.`
                 const maxTextLength = availableImages.length > 100 ? 8000 : 
                                      availableImages.length > 50 ? 10000 : 12000;
                 
-                const userPrompt = `Please analyze the following PDF content and create a structured presentation outline for a presentation titled "${title}":
+                const userPrompt = `Please analyze the following ${sourceLabel} content and create a structured presentation outline for a presentation titled "${title}":
 
-PDF Content:
+${sourceLabel} Content:
 ${fullText.length > maxTextLength ? fullText.substring(0, maxTextLength) + '...' : fullText}${imageInfo}`;
 
                 // Use text-only messages since images have been pre-analyzed
@@ -14467,9 +15010,9 @@ ${fullText.length > maxTextLength ? fullText.substring(0, maxTextLength) + '...'
                         // Create ultra-minimal image info
                         const minimalImageInfo = `\n\nImages Available: ${availableImages.length} total (types: chart, diagram, screenshot, photo, other)`;
                         
-                        const minimalUserPrompt = `Please analyze the following PDF content and create a structured presentation outline for a presentation titled "${title}":
+                        const minimalUserPrompt = `Please analyze the following ${sourceLabel} content and create a structured presentation outline for a presentation titled "${title}":
 
-PDF Content:
+${sourceLabel} Content:
 ${fullText.substring(0, 6000)}...${minimalImageInfo}`;
 
                         const retryResponse = await fetch(endpoint, {

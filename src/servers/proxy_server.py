@@ -28,7 +28,7 @@ import shutil
 from typing import Dict, List, Optional, Any, Set, Tuple
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse, unquote_to_bytes
 from dataclasses import dataclass
 from contextlib import suppress
 
@@ -713,11 +713,11 @@ COMPANIONS_DIR = _PROJECT_ROOT / "config" / "companions"
 
 # Allowed file extensions for scratch file operations (path traversal mitigation)
 TEXT_FILE_EXTENSIONS = {".txt", ".md", ".csv", ".py", ".js", ".html"}
-READ_ALLOWED_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
-WRITE_ALLOWED_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf"}
+READ_ALLOWED_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf", ".pptx", ".png", ".jpg", ".jpeg"}
+WRITE_ALLOWED_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf", ".pptx"}
 SEARCHABLE_TEXT_EXTENSIONS = TEXT_FILE_EXTENSIONS | {".docx", ".xlsx", ".xls", ".pdf"}
 # Allowed extensions for Google Drive upload (scratch workspace only; path exfiltration mitigation)
-DRIVE_UPLOAD_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".png", ".jpg", ".jpeg"}
+DRIVE_UPLOAD_EXTENSIONS = {".txt", ".md", ".docx", ".xlsx", ".xls", ".pdf", ".pptx", ".png", ".jpg", ".jpeg"}
 ATTACHMENT_ALLOWED_EXTENSIONS = READ_ALLOWED_EXTENSIONS
 # Max file size for read/write in bytes (10MB default), configurable via env
 FILE_OPS_MAX_SIZE_BYTES = int(os.getenv("FILE_OPS_MAX_SIZE", "10485760"))
@@ -1346,6 +1346,7 @@ def _format_telegram_tool_status(tool_name: Any) -> str:
         "healthcheck": "On it. I'm checking the browser task status now.",
         "runworkflow": "On it. I'm running that workflow now.",
         "createslidespresentation": "On it. I'm building the presentation now.",
+        "pdftopowerpoint": "On it. I'm converting the document into a PowerPoint now.",
     }
     if lowered in status_map:
         return status_map[lowered]
@@ -3229,10 +3230,26 @@ def _get_telegram_native_tools_mcp_schema() -> List[Dict[str, Any]]:
         },
         {
             "name": "pdfToPowerPoint",
-            "description": "Telegram-only placeholder that redirects users to the web UI for PDF to PowerPoint conversion.",
+            "description": "Convert a PDF or Markdown document into a PowerPoint (.pptx). Supports uploaded attachments, scratch-relative paths, URLs, inline Markdown, and base64 content.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "source": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "value": {"type": "string"},
+                            "url": {"type": "string"},
+                            "path": {"type": "string"},
+                            "relativePath": {"type": "string"},
+                            "content": {"type": "string"},
+                            "contentBase64": {"type": "string"},
+                            "mimeType": {"type": "string"},
+                            "filename": {"type": "string"},
+                        },
+                    },
+                    "sourceUrl": {"type": "string"},
+                    "sourceType": {"type": "string"},
                     "pdfUrl": {"type": "string"},
                     "title": {"type": "string"},
                     "filename": {"type": "string"},
@@ -3559,6 +3576,10 @@ def _build_telegram_native_tools_prompt_block() -> str:
         "For presentation requests in Telegram, use createSlidesPresentation. "
         "Do not call googleworkspace_cli.slides_create_presentation_from_markdown directly."
     )
+    lines.append(
+        "Use pdfToPowerPoint when the user explicitly wants a .pptx file from a PDF or Markdown source. "
+        "Use createSlidesPresentation when the user wants a Google Slides deck."
+    )
 
     for item in native_tools:
         schema_text = json.dumps(item["inputSchema"], ensure_ascii=False, separators=(",", ":"), default=str)
@@ -3712,6 +3733,647 @@ async def _generate_telegram_slides_markdown(
     if not content:
         raise RuntimeError("Slide markdown generation returned empty content.")
     return content
+
+
+def _coerce_pdf_to_powerpoint_max_slides(value: Any, *, default: int = 10) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(3, min(parsed, 20))
+
+
+def _first_non_empty_presentation_string(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _looks_like_http_url(value: str) -> bool:
+    return bool(re.match(r"^https?://", str(value or "").strip(), flags=re.IGNORECASE))
+
+
+def _decode_data_url_bytes(value: str) -> Tuple[str, bytes]:
+    raw = str(value or "").strip()
+    match = re.match(r"^data:(?P<mime>[^;,]+)?(?P<params>(?:;[^,]+)*?),(?P<data>.*)$", raw, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        raise RuntimeError("Invalid data URL source.")
+    mime_type = str(match.group("mime") or "application/octet-stream").strip() or "application/octet-stream"
+    params = str(match.group("params") or "").lower()
+    payload = str(match.group("data") or "")
+    if ";base64" in params:
+        try:
+            return mime_type, base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise RuntimeError("Invalid base64 data URL source.") from exc
+    return mime_type, unquote_to_bytes(payload)
+
+
+def _infer_presentation_source_type(source_input: Any, explicit_type: str = "") -> str:
+    normalized_type = str(explicit_type or "").strip().lower()
+    if normalized_type == "md":
+        return "markdown"
+    if normalized_type in {"pdf", "markdown"}:
+        return normalized_type
+    if normalized_type:
+        raise RuntimeError(f"Unsupported source type: {explicit_type}")
+
+    descriptor_type = ""
+    file_name = ""
+    mime_type = ""
+    source_value = ""
+    inline_text = ""
+    if isinstance(source_input, dict):
+        raw_descriptor_type = source_input.get("type")
+        if isinstance(raw_descriptor_type, str) and "/" not in raw_descriptor_type:
+            descriptor_type = raw_descriptor_type.strip().lower()
+        file_name = _first_non_empty_presentation_string(
+            source_input.get("filename"),
+            source_input.get("fileName"),
+            source_input.get("name"),
+            source_input.get("original_filename"),
+            source_input.get("originalFilename"),
+        ).lower()
+        mime_type = _first_non_empty_presentation_string(
+            source_input.get("mimeType"),
+            source_input.get("mime_type"),
+            source_input.get("contentType"),
+            source_input.get("content_type"),
+            raw_descriptor_type if isinstance(raw_descriptor_type, str) and "/" in raw_descriptor_type else "",
+        ).lower()
+        source_value = _first_non_empty_presentation_string(
+            source_input.get("sourceUrl"),
+            source_input.get("url"),
+            source_input.get("href"),
+            source_input.get("uri"),
+            source_input.get("src"),
+            source_input.get("pdfUrl"),
+            source_input.get("path"),
+            source_input.get("filePath"),
+            source_input.get("relative_path"),
+            source_input.get("relativePath"),
+            source_input.get("value") if descriptor_type in {"url", "path", "attachment", "file"} else "",
+        ).lower()
+        inline_text = _first_non_empty_presentation_string(
+            source_input.get("markdown"),
+            source_input.get("text"),
+            source_input.get("value") if descriptor_type in {"inline", "markdown", "text"} else "",
+            source_input.get("content"),
+        )
+    elif isinstance(source_input, str):
+        source_value = source_input.strip().lower()
+
+    if mime_type == "application/pdf" or file_name.endswith(".pdf") or re.match(r"^data:application/pdf[;,]", source_value, flags=re.IGNORECASE):
+        return "pdf"
+    if (
+        ((descriptor_type in {"inline", "markdown", "text"}) and inline_text)
+        or mime_type in {"text/markdown", "text/x-markdown"}
+        or (mime_type == "text/plain" and (file_name.endswith(".md") or file_name.endswith(".markdown")))
+        or file_name.endswith(".md")
+        or file_name.endswith(".markdown")
+        or re.search(r"\.md(?:[?#].*)?$", source_value, flags=re.IGNORECASE)
+        or re.search(r"\.markdown(?:[?#].*)?$", source_value, flags=re.IGNORECASE)
+        or re.match(r"^data:text/markdown[;,]", source_value, flags=re.IGNORECASE)
+    ):
+        return "markdown"
+    if isinstance(source_input, str) and source_input.strip():
+        return "pdf"
+    raise RuntimeError('Unable to determine source type. Use sourceType with "pdf" or "markdown".')
+
+
+def _normalize_presentation_source_input(source_input: Any, explicit_type: str = "") -> Dict[str, Any]:
+    source_type = _infer_presentation_source_type(source_input, explicit_type)
+    if isinstance(source_input, str):
+        locator = source_input.strip()
+        if not locator:
+            raise RuntimeError("Missing source document.")
+        return {
+            "source_type": source_type,
+            "locator": locator,
+            "inline_text": None,
+            "content_bytes": None,
+            "mime_type": "",
+            "filename": Path(locator).name,
+        }
+
+    if not isinstance(source_input, dict):
+        raise RuntimeError("Unsupported source input.")
+
+    descriptor_type = str(source_input.get("type") or source_input.get("kind") or source_input.get("sourceKind") or "").strip().lower()
+    mime_type = _first_non_empty_presentation_string(
+        source_input.get("mimeType"),
+        source_input.get("mime_type"),
+        source_input.get("contentType"),
+        source_input.get("content_type"),
+    )
+    file_name = _first_non_empty_presentation_string(
+        source_input.get("filename"),
+        source_input.get("fileName"),
+        source_input.get("name"),
+        source_input.get("original_filename"),
+        source_input.get("originalFilename"),
+    )
+    locator = _first_non_empty_presentation_string(
+        source_input.get("sourceUrl"),
+        source_input.get("url"),
+        source_input.get("href"),
+        source_input.get("uri"),
+        source_input.get("src"),
+        source_input.get("pdfUrl"),
+        source_input.get("path"),
+        source_input.get("filePath"),
+        source_input.get("relative_path"),
+        source_input.get("relativePath"),
+        source_input.get("value") if descriptor_type in {"url", "path", "attachment", "file"} else "",
+        source_input.get("name") if descriptor_type == "attachment" else "",
+    )
+    inline_text = _first_non_empty_presentation_string(
+        source_input.get("markdown"),
+        source_input.get("text"),
+        source_input.get("value") if descriptor_type in {"inline", "markdown", "text"} else "",
+        source_input.get("content"),
+    )
+    encoded_content = _first_non_empty_presentation_string(
+        source_input.get("contentBase64"),
+        source_input.get("content_base64"),
+        source_input.get("base64"),
+    )
+
+    if source_type == "markdown" and inline_text and (descriptor_type in {"inline", "markdown", "text"} or not locator):
+        return {
+            "source_type": source_type,
+            "locator": "",
+            "inline_text": inline_text,
+            "content_bytes": None,
+            "mime_type": mime_type,
+            "filename": file_name,
+        }
+
+    if encoded_content:
+        if re.match(r"^data:", encoded_content, flags=re.IGNORECASE):
+            decoded_mime, content_bytes = _decode_data_url_bytes(encoded_content)
+        else:
+            try:
+                content_bytes = base64.b64decode(encoded_content, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise RuntimeError("Invalid base64 source content.") from exc
+            decoded_mime = mime_type or ("text/markdown" if source_type == "markdown" else "application/pdf")
+        return {
+            "source_type": source_type,
+            "locator": "",
+            "inline_text": None,
+            "content_bytes": content_bytes,
+            "mime_type": decoded_mime,
+            "filename": file_name,
+        }
+
+    if locator:
+        return {
+            "source_type": _infer_presentation_source_type(
+                {"name": file_name, "type": mime_type, "sourceUrl": locator},
+                explicit_type or source_type,
+            ),
+            "locator": locator,
+            "inline_text": None,
+            "content_bytes": None,
+            "mime_type": mime_type,
+            "filename": file_name or Path(locator).name,
+        }
+
+    raise RuntimeError("Unsupported source input. Use a URL, scratch-relative path, attachment, inline Markdown, or base64 content.")
+
+
+async def _fetch_presentation_source_url(source_url: str) -> Tuple[str, bytes]:
+    timeout = httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        response = await client.get(source_url)
+    if response.status_code != 200:
+        raise RuntimeError(f"Failed to fetch source URL: HTTP {response.status_code}")
+    content = response.content
+    if len(content) > FILE_OPS_MAX_SIZE_BYTES:
+        raise RuntimeError(f"Source file is too large. Limit is {FILE_OPS_MAX_SIZE_BYTES} bytes.")
+    mime_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    return mime_type, content
+
+
+def _decode_text_bytes(content_bytes: bytes) -> str:
+    try:
+        return content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return content_bytes.decode("latin-1")
+
+
+def _extract_pdf_text_from_bytes(content_bytes: bytes) -> str:
+    try:
+        from PyPDF2 import PdfReader
+    except ImportError as exc:
+        raise RuntimeError("PyPDF2 is required for PDF to PowerPoint conversion.") from exc
+    reader = PdfReader(io.BytesIO(content_bytes))
+    parts: List[str] = []
+    for page_index, page in enumerate(reader.pages, start=1):
+        page_text = (page.extract_text() or "").strip()
+        if page_text:
+            parts.append(f"=== Page {page_index} ===\n{page_text}")
+    return "\n\n".join(parts).strip()
+
+
+def _clean_markdown_for_presentation_text(markdown_text: str) -> str:
+    return (
+        str(markdown_text or "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("<!--", "\n<!--")
+    )
+
+
+def _build_markdown_from_slide_sections(
+    slides: List[Dict[str, Any]],
+    *,
+    title: str,
+    max_slides: int,
+) -> str:
+    normalized_slides = list(slides or [])
+    if normalized_slides:
+        first_slide = normalized_slides[0]
+        first_bullets = [str(item).strip() for item in (first_slide.get("bullets") or []) if str(item).strip()]
+        first_title = str(first_slide.get("title") or "").strip().lower()
+        if not first_bullets and first_title and first_title == str(title or "").strip().lower():
+            normalized_slides = normalized_slides[1:]
+    lines = [f"# {title or 'Presentation'}"]
+    for slide in normalized_slides[:max_slides]:
+        slide_title = str(slide.get("title") or "").strip() or "Slide"
+        bullets = [str(item).strip() for item in (slide.get("bullets") or []) if str(item).strip()]
+        lines.append("")
+        lines.append(f"## {slide_title}")
+        if bullets:
+            lines.extend(f"- {bullet}" for bullet in bullets[:6])
+        else:
+            lines.append("- Key point")
+    return "\n".join(lines).strip()
+
+
+def _build_fallback_presentation_markdown(
+    document_text: str,
+    *,
+    title: str,
+    max_slides: int,
+) -> str:
+    text = re.sub(r"\s+", " ", str(document_text or "")).strip()
+    if not text:
+        raise RuntimeError("Source document is empty.")
+    sentences = [
+        sentence.strip(" -•\t\r\n")
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        if sentence and sentence.strip()
+    ]
+    if not sentences:
+        sentences = [text]
+    section_count = max(3, min(max_slides, max(3, min(8, (len(sentences) + 2) // 3))))
+    title_bank = [
+        "Overview",
+        "Key Points",
+        "Details",
+        "Evidence",
+        "Implications",
+        "Recommendations",
+        "Summary",
+        "Next Steps",
+    ]
+    chunk_size = max(1, (len(sentences) + section_count - 1) // section_count)
+    lines = [f"# {title or 'Presentation'}"]
+    cursor = 0
+    for index in range(section_count):
+        chunk = sentences[cursor : cursor + chunk_size]
+        cursor += chunk_size
+        if not chunk:
+            break
+        section_title = title_bank[index] if index < len(title_bank) else f"Section {index + 1}"
+        lines.append("")
+        lines.append(f"## {section_title}")
+        for bullet in chunk[:4]:
+            lines.append(f"- {bullet[:220].strip()}")
+    return "\n".join(lines).strip()
+
+
+async def _generate_presentation_markdown_from_document(
+    *,
+    document_text: str,
+    source_type: str,
+    title: str,
+    max_slides: int,
+    model_name: Optional[str] = None,
+) -> str:
+    normalized_text = re.sub(r"\s+", " ", str(document_text or "")).strip()
+    if not normalized_text:
+        raise RuntimeError("Source document is empty.")
+    resolved_model = (model_name or TELEGRAM_DEFAULT_MODEL or "").strip() or "gpt-4o-mini"
+    endpoint = _normalize_chat_endpoint(build_openai_url(TELEGRAM_OPENAI_CHAT_PATH))
+    api_key = _first_non_empty_env(preferred_api_key_env_names(TELEGRAM_OPENAI_BASE_URL, resolved_model))
+    if not api_key:
+        return _build_fallback_presentation_markdown(normalized_text, title=title, max_slides=max_slides)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if OPENAI_ORG_ID:
+        headers["OpenAI-Organization"] = OPENAI_ORG_ID
+    if OPENAI_PROJECT_ID:
+        headers["OpenAI-Project"] = OPENAI_PROJECT_ID
+
+    payload = {
+        "model": resolved_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are creating slide-ready markdown for a PowerPoint deck from a source document.\n"
+                    "Return markdown only. Do not include code fences or commentary.\n"
+                    "Format rules:\n"
+                    "- First line must be a single H1 title.\n"
+                    "- Then create 4 to 12 H2 sections depending on the requested slide count.\n"
+                    "- Each H2 section must contain 2 to 5 bullet lines.\n"
+                    "- Keep wording concise, concrete, and presentation-ready.\n"
+                    "- Preserve important facts, numbers, dates, and names from the source.\n"
+                    "- Do not mention these instructions."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Source type: {source_type}\n"
+                    f"Requested title: {title or 'Presentation'}\n"
+                    f"Target slides: {max_slides}\n\n"
+                    "Document text:\n"
+                    f"{normalized_text[:12000]}"
+                ),
+            },
+        ],
+        "temperature": 0.3,
+    }
+    try:
+        response = await _call_chat_completion(
+            endpoint,
+            headers,
+            payload,
+            timeout_seconds=max(20.0, min(120.0, TELEGRAM_CHAT_TIMEOUT)),
+        )
+        if response.status_code == 200:
+            data = response.json()
+            choices = data.get("choices") or []
+            if choices:
+                normalized_message = normalize_chat_completion_message(choices[0].get("message") or {})
+                content = _strip_markdown_fence_block(coerce_message_text(normalized_message.get("content") or ""))
+                if content.strip():
+                    return content.strip()
+    except Exception:
+        pass
+    return _build_fallback_presentation_markdown(normalized_text, title=title, max_slides=max_slides)
+
+
+async def _load_presentation_source_document(normalized_source: Dict[str, Any]) -> Dict[str, Any]:
+    source_type = str(normalized_source.get("source_type") or "").strip().lower()
+    locator = str(normalized_source.get("locator") or "").strip()
+    inline_text = normalized_source.get("inline_text")
+    content_bytes = normalized_source.get("content_bytes")
+    file_name = str(normalized_source.get("filename") or "").strip()
+    source_descriptor = locator or file_name or source_type
+
+    if source_type == "markdown":
+        if isinstance(inline_text, str) and inline_text.strip():
+            return {"source_type": source_type, "text": inline_text, "source_descriptor": source_descriptor}
+        if isinstance(content_bytes, (bytes, bytearray)):
+            return {
+                "source_type": source_type,
+                "text": _decode_text_bytes(bytes(content_bytes)),
+                "source_descriptor": source_descriptor,
+            }
+        if locator:
+            if re.match(r"^data:", locator, flags=re.IGNORECASE):
+                _, raw_bytes = _decode_data_url_bytes(locator)
+                return {"source_type": source_type, "text": _decode_text_bytes(raw_bytes), "source_descriptor": source_descriptor}
+            if _looks_like_http_url(locator):
+                _, raw_bytes = await _fetch_presentation_source_url(locator)
+                return {"source_type": source_type, "text": _decode_text_bytes(raw_bytes), "source_descriptor": locator}
+            filepath = resolve_scratch_path(locator, READ_ALLOWED_EXTENSIONS)
+            if not filepath.exists() or not filepath.is_file():
+                raise RuntimeError(f"Markdown source not found: {locator}")
+            return {"source_type": source_type, "text": read_text_file(filepath), "source_descriptor": locator}
+        raise RuntimeError("Missing Markdown source.")
+
+    if source_type != "pdf":
+        raise RuntimeError(f"Unsupported source type: {source_type}")
+    if isinstance(content_bytes, (bytes, bytearray)):
+        return {
+            "source_type": source_type,
+            "text": _extract_pdf_text_from_bytes(bytes(content_bytes)),
+            "source_descriptor": source_descriptor,
+        }
+    if not locator:
+        raise RuntimeError("Missing PDF source.")
+    if re.match(r"^data:", locator, flags=re.IGNORECASE):
+        _, raw_bytes = _decode_data_url_bytes(locator)
+        return {"source_type": source_type, "text": _extract_pdf_text_from_bytes(raw_bytes), "source_descriptor": source_descriptor}
+    if _looks_like_http_url(locator):
+        _, raw_bytes = await _fetch_presentation_source_url(locator)
+        return {"source_type": source_type, "text": _extract_pdf_text_from_bytes(raw_bytes), "source_descriptor": locator}
+    filepath = resolve_scratch_path(locator, READ_ALLOWED_EXTENSIONS)
+    if not filepath.exists() or not filepath.is_file():
+        raise RuntimeError(f"PDF source not found: {locator}")
+    return {"source_type": source_type, "text": read_pdf_file(filepath), "source_descriptor": locator}
+
+
+def _choose_pdf_to_powerpoint_output_path(filename: str, *, title: str) -> Tuple[str, Path]:
+    logical_name = str(filename or "").strip()
+    if not logical_name:
+        slug = _slugify_telegram_slides_component(title, fallback="presentation")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        logical_name = f"presentations/{slug}-{timestamp}.pptx"
+    logical_name = _normalize_scratch_relative_input(logical_name)
+    if not logical_name.lower().endswith(".pptx"):
+        logical_name = f"{logical_name}.pptx"
+    filepath = resolve_scratch_path(logical_name, WRITE_ALLOWED_EXTENSIONS)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    return logical_name.replace("\\", "/"), filepath
+
+
+def _pick_latest_presentation_attachment(attachment_records: List[Dict[str, Any]]) -> str:
+    for item in reversed(list(attachment_records or [])):
+        relative_path = str(item.get("relative_path") or "").strip()
+        suffix = Path(relative_path).suffix.lower()
+        if suffix in {".pdf", ".md", ".markdown"}:
+            return relative_path
+    return ""
+
+
+def _render_markdown_to_powerpoint(
+    markdown: str,
+    *,
+    title: str,
+    output_path: Path,
+    max_slides: int,
+    source_label: str,
+) -> Dict[str, Any]:
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+    except ImportError as exc:
+        raise RuntimeError("python-pptx is required for PowerPoint generation.") from exc
+
+    from src.skills.builtin.googleworkspace_slides_support import _parse_markdown_to_slides
+
+    slides = _parse_markdown_to_slides(
+        markdown,
+        fallback_title=title or "Presentation",
+        scratch_root=SCRATCH_DIR,
+        source_dir=SCRATCH_DIR / "presentations",
+    )[:max_slides]
+    if not slides:
+        raise RuntimeError("No slide content could be generated from the source document.")
+
+    presentation = Presentation()
+    presentation.slide_width = Inches(13.333)
+    presentation.slide_height = Inches(7.5)
+
+    title_slide_hint = slides[0]
+    title_hint_bullets = [str(item).strip() for item in (title_slide_hint.get("bullets") or []) if str(item).strip()]
+    use_first_slide_as_title = not title_hint_bullets
+
+    title_slide = presentation.slides.add_slide(presentation.slide_layouts[0])
+    title_slide.shapes.title.text = str(title or title_slide_hint.get("title") or "Presentation").strip() or "Presentation"
+    subtitle = title_slide.placeholders[1]
+    subtitle.text = f"Generated from {source_label}"
+
+    content_slides = slides[1:] if use_first_slide_as_title else slides
+    if not content_slides:
+        content_slides = slides[:1]
+
+    rendered_slide_count = 0
+    for slide_data in content_slides[:max_slides]:
+        slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+        slide.shapes.title.text = str(slide_data.get("title") or "Slide").strip() or "Slide"
+        text_frame = slide.placeholders[1].text_frame
+        text_frame.clear()
+        bullets = [str(item).strip() for item in (slide_data.get("bullets") or []) if str(item).strip()]
+        if not bullets:
+            bullets = ["Key point"]
+        for index, bullet in enumerate(bullets[:6]):
+            paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+            paragraph.text = bullet[:240]
+            paragraph.level = 0
+            if paragraph.runs:
+                paragraph.runs[0].font.size = Pt(20)
+        rendered_slide_count += 1
+
+    presentation.save(str(output_path))
+    return {
+        "rendered_slide_count": rendered_slide_count,
+        "parsed_slide_count": len(slides),
+    }
+
+
+async def _handle_pdf_to_powerpoint_internal(
+    arguments: Dict[str, Any],
+    *,
+    conversation_id: str,
+    user_id: str,
+    attachment_records: Optional[List[Dict[str, Any]]] = None,
+    model_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    source = arguments.get("source")
+    source_url = _first_non_empty_presentation_string(
+        arguments.get("sourceUrl"),
+        arguments.get("pdfUrl"),
+    )
+    title = str(arguments.get("title") or "").strip() or "Presentation"
+    filename = str(arguments.get("filename") or "").strip()
+    max_slides = _coerce_pdf_to_powerpoint_max_slides(arguments.get("maxSlides") or arguments.get("max_slides"))
+
+    try:
+        resolved_source_input: Any = source if source is not None else source_url
+        if resolved_source_input in (None, ""):
+            latest_attachment = _pick_latest_presentation_attachment(attachment_records or [])
+            if latest_attachment:
+                resolved_source_input = latest_attachment
+        if resolved_source_input in (None, ""):
+            return {
+                "success": False,
+                "message": "Provide a PDF or Markdown source via upload, scratch path, or URL.",
+            }
+
+        normalized_source = _normalize_presentation_source_input(
+            resolved_source_input,
+            str(arguments.get("sourceType") or "").strip(),
+        )
+        source_document = await _load_presentation_source_document(normalized_source)
+        source_type = str(source_document.get("source_type") or "").strip().lower()
+        document_text = str(source_document.get("text") or "").strip()
+        if len(document_text) < 40:
+            raise RuntimeError(f"Could not extract sufficient text content from the {source_type or 'source'} document.")
+
+        markdown_output_path: Optional[str] = None
+        markdown_to_render = ""
+        if source_type == "markdown":
+            from src.skills.builtin.googleworkspace_slides_support import _parse_markdown_to_slides
+
+            parsed_slides = _parse_markdown_to_slides(
+                document_text,
+                fallback_title=title or "Presentation",
+                scratch_root=SCRATCH_DIR,
+                source_dir=SCRATCH_DIR,
+            )[:max_slides]
+            if len(parsed_slides) >= 2:
+                markdown_to_render = _build_markdown_from_slide_sections(parsed_slides, title=title, max_slides=max_slides)
+            else:
+                cleaned_markdown_text = _clean_markdown_for_presentation_text(document_text)
+                markdown_to_render = await _generate_presentation_markdown_from_document(
+                    document_text=cleaned_markdown_text,
+                    source_type=source_type,
+                    title=title,
+                    max_slides=max_slides,
+                    model_name=model_name,
+                )
+                markdown_output_path = _write_telegram_slides_markdown(markdown_to_render, title=title)
+        else:
+            markdown_to_render = await _generate_presentation_markdown_from_document(
+                document_text=document_text,
+                source_type=source_type,
+                title=title,
+                max_slides=max_slides,
+                model_name=model_name,
+            )
+            markdown_output_path = _write_telegram_slides_markdown(markdown_to_render, title=title)
+
+        relative_output_path, output_path = _choose_pdf_to_powerpoint_output_path(filename, title=title)
+        render_stats = _render_markdown_to_powerpoint(
+            markdown_to_render,
+            title=title,
+            output_path=output_path,
+            max_slides=max_slides,
+            source_label="Markdown" if source_type == "markdown" else "PDF",
+        )
+        data: Dict[str, Any] = {
+            "file_path": relative_output_path,
+            "source_type": source_type,
+            "source_descriptor": str(source_document.get("source_descriptor") or ""),
+            "requested_max_slides": max_slides,
+            **render_stats,
+        }
+        if markdown_output_path:
+            data["generated_markdown_path"] = markdown_output_path
+        return {
+            "success": True,
+            "message": (
+                f"Created {relative_output_path} from {source_type or 'document'} with "
+                f"{render_stats.get('rendered_slide_count', 0)} content slide(s)."
+            ),
+            "data": data,
+        }
+    except HTTPException as exc:
+        return {"success": False, "message": str(exc.detail or "Invalid presentation source.")}
+    except Exception as exc:
+        return {"success": False, "message": f"PowerPoint conversion failed: {exc}"}
 
 
 async def _create_telegram_slides_presentation_internal(
@@ -8783,6 +9445,14 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     user_id=request.user_id or "",
                     model_name=model_name,
                 ),
+                "pdf_to_powerpoint_internal": lambda tool_args: _handle_pdf_to_powerpoint_internal(
+                    tool_args if isinstance(tool_args, dict) else {},
+                    conversation_id=conversation_id,
+                    user_id=request.user_id or "",
+                    attachment_records=attachment_records,
+                    model_name=model_name,
+                ),
+                "attachment_records": attachment_records,
                 "execute_skill_tool": lambda tool_name, tool_args: _execute_skill_framework_tool(
                     tool_name=tool_name,
                     arguments=tool_args,
@@ -12501,8 +13171,8 @@ def _build_attachment_manifest(attachments: List[Dict[str, Any]]) -> str:
             f"- {rel_path} (original: {original}, type: {mime_type}, size: {size_bytes} bytes)"
         )
     lines.append("Use filesystem.read_text with these scratch-relative filenames to inspect attachments before answering.")
-    lines.append("For attached PDFs, DOCX, XLSX, text files, and images, inspect the attachment first instead of guessing.")
-    lines.append("Do not use pdfToPowerPoint unless the user explicitly asks to convert a PDF into a PowerPoint or slide deck.")
+    lines.append("For attached PDFs, DOCX, XLSX, text files, Markdown files, and images, inspect the attachment first instead of guessing.")
+    lines.append("Do not use pdfToPowerPoint unless the user explicitly asks to convert a PDF or Markdown document into a PowerPoint or slide deck.")
     return "\n".join(lines)
 
 

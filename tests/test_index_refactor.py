@@ -89,6 +89,7 @@ class TestIndexRefactorAssets:
         assert "/v1/files/attachments" in content
         assert "clearPendingAttachments()" in content
         assert "Do not call pdfToPowerPoint unless the user explicitly asks" in content
+        assert "PDF or Markdown document" in content
 
     def test_app_js_contains_attachment_vision_flow(self):
         """app.js should forward image attachments as image_url parts for vision-capable models."""
@@ -99,9 +100,17 @@ class TestIndexRefactorAssets:
         assert "hasPendingImageAttachments" in content
 
     def test_app_js_can_resolve_scratch_relative_pdfs_for_pdf_to_powerpoint(self):
-        """pdfToPowerPoint should be able to fetch uploaded scratch PDFs via the proxy."""
+        """pdfToPowerPoint should resolve PDF and Markdown sources from multiple source types."""
         path = PROJECT_ROOT / "js" / "app.js"
         content = path.read_text(encoding="utf-8")
+        assert '"source": {' in content
+        assert "structured source descriptor" in content
+        assert "function normalizePresentationSourceInput(sourceInput, explicitType = '')" in content
         assert "async function resolvePdfInputToDocumentSource(pdfUrl)" in content
+        assert "async function resolveMarkdownInputToTextSource(sourceUrl)" in content
+        assert "decodeBase64SourceToBlob" in content
+        assert "relativePath" in content
+        assert "contentBase64" in content
         assert "/v1/files/content?path=" in content
-        assert "pdfUrl = await resolvePdfInputToDocumentSource(pdfUrl);" in content
+        assert "sourceUrl" in content
+        assert ".pdf,.md,.markdown,application/pdf,text/markdown,text/plain" in content

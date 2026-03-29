@@ -7,6 +7,7 @@ Uses mocks for external OpenAI and memory; no real API calls.
 import os
 import base64
 import time
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -54,6 +55,125 @@ def test_compose_system_prompt_with_context_includes_soul_prompt():
     assert "Soul prompt" in prompt
     assert prompt.endswith("Base prompt")
     assert prompt.index("Soul prompt") < prompt.index("Base prompt")
+
+
+@pytest.mark.asyncio
+async def test_handle_pdf_to_powerpoint_internal_supports_scratch_markdown():
+    from src.servers import proxy_server as ps
+
+    markdown_rel = f"presentations/test-markdown-{uuid.uuid4().hex}.md"
+    pptx_rel = f"presentations/test-markdown-{uuid.uuid4().hex}.pptx"
+    markdown_path = ps.SCRATCH_DIR / markdown_rel
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    markdown_path.write_text(
+        "# Quarterly Update\n\n## Revenue\n- ARR grew 18%\n- Pipeline improved\n\n## Roadmap\n- Release v2 in Q3\n- Expand integrations\n",
+        encoding="utf-8",
+    )
+
+    result = await ps._handle_pdf_to_powerpoint_internal(
+        {
+            "sourceUrl": markdown_rel,
+            "sourceType": "markdown",
+            "title": "Quarterly Update",
+            "filename": pptx_rel,
+        },
+        conversation_id="tg-md-test",
+        user_id="user-1",
+    )
+    assert result.get("success") is True, result
+    data = result.get("data") or {}
+    output_rel = data.get("file_path")
+    assert output_rel == pptx_rel
+    assert (ps.SCRATCH_DIR / output_rel).exists()
+
+
+@pytest.mark.asyncio
+async def test_handle_pdf_to_powerpoint_internal_supports_markdown_url():
+    from src.servers import proxy_server as ps
+
+    pptx_rel = f"presentations/test-url-{uuid.uuid4().hex}.pptx"
+    fake_markdown = (
+        "# URL Deck\n\n## Market\n- Demand is rising\n- Competition is fragmented\n\n"
+        "## Plan\n- Launch pilot\n- Measure retention\n"
+    ).encode("utf-8")
+
+    with patch.object(ps, "_fetch_presentation_source_url", new=AsyncMock(return_value=("text/markdown", fake_markdown))):
+        result = await ps._handle_pdf_to_powerpoint_internal(
+            {
+                "sourceUrl": "https://example.com/deck.md",
+                "sourceType": "markdown",
+                "title": "URL Deck",
+                "filename": pptx_rel,
+            },
+            conversation_id="tg-url-test",
+            user_id="user-1",
+        )
+
+    assert result.get("success") is True, result
+    data = result.get("data") or {}
+    assert data.get("file_path") == pptx_rel
+    assert (ps.SCRATCH_DIR / pptx_rel).exists()
+
+
+@pytest.mark.asyncio
+async def test_handle_pdf_to_powerpoint_internal_uses_uploaded_attachment_when_source_missing():
+    from src.servers import proxy_server as ps
+
+    markdown_rel = f"attachments/telegram/test-attach/{uuid.uuid4().hex}.md"
+    pptx_rel = f"presentations/test-attach-{uuid.uuid4().hex}.pptx"
+    markdown_path = ps.SCRATCH_DIR / markdown_rel
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    markdown_path.write_text(
+        "# Attachment Deck\n\n## Input\n- Came from upload\n- Stored in scratch\n\n## Output\n- Generate pptx\n- Send to user\n",
+        encoding="utf-8",
+    )
+
+    result = await ps._handle_pdf_to_powerpoint_internal(
+        {
+            "title": "Attachment Deck",
+            "filename": pptx_rel,
+        },
+        conversation_id="tg-attach-test",
+        user_id="user-1",
+        attachment_records=[{"relative_path": markdown_rel}],
+    )
+
+    assert result.get("success") is True, result
+    data = result.get("data") or {}
+    assert data.get("source_descriptor") == markdown_rel
+    assert (ps.SCRATCH_DIR / pptx_rel).exists()
+
+
+@pytest.mark.asyncio
+async def test_handle_pdf_to_powerpoint_internal_supports_pdf_source():
+    pytest.importorskip("reportlab.pdfgen.canvas")
+    from reportlab.pdfgen import canvas
+    from src.servers import proxy_server as ps
+
+    pdf_rel = f"presentations/test-pdf-{uuid.uuid4().hex}.pdf"
+    pptx_rel = f"presentations/test-pdf-{uuid.uuid4().hex}.pptx"
+    pdf_path = ps.SCRATCH_DIR / pdf_rel
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(str(pdf_path))
+    c.drawString(72, 720, "Quarterly performance improved across revenue, margin, and customer growth.")
+    c.drawString(72, 700, "Priorities include partner rollout, hiring, and retention improvements.")
+    c.save()
+
+    result = await ps._handle_pdf_to_powerpoint_internal(
+        {
+            "sourceUrl": pdf_rel,
+            "sourceType": "pdf",
+            "title": "PDF Deck",
+            "filename": pptx_rel,
+        },
+        conversation_id="tg-pdf-test",
+        user_id="user-1",
+    )
+
+    assert result.get("success") is True, result
+    data = result.get("data") or {}
+    assert data.get("source_type") == "pdf"
+    assert (ps.SCRATCH_DIR / pptx_rel).exists()
 
 
 class TestTelegramChatEndpoint:
@@ -224,7 +344,7 @@ class TestTelegramChatEndpoint:
         assert "Attached files saved in scratch:" in user_message
         assert "attachments/telegram/attach-only/" in user_message
         assert "filesystem.read_text" in user_message
-        assert "Do not use pdfToPowerPoint unless the user explicitly asks" in user_message
+        assert "Do not use pdfToPowerPoint unless the user explicitly asks to convert a PDF or Markdown document" in user_message
         saved_dir = os.path.join(scratch_path, "attachments", "telegram", "attach-only")
         try:
             saved_files = []
@@ -567,6 +687,7 @@ class TestTelegramChatEndpoint:
         assert payload["tool_choice"] == "auto"
         assert "runBrowserAgent" in tool_names
         assert "createSlidesPresentation" in tool_names
+        assert "pdfToPowerPoint" in tool_names
         assert "filesystem.read_text" in tool_names
 
     def test_telegram_combined_openai_tools_excludes_raw_slides_skill(self):
@@ -669,6 +790,7 @@ class TestTelegramChatEndpoint:
         tool_names = {tool["function"]["name"] for tool in followup_payload["tools"]}
         assert followup_payload["tool_choice"] == "auto"
         assert "webSearch" in tool_names
+        assert "pdfToPowerPoint" in tool_names
         assert "filesystem.read_text" in tool_names
 
     def test_no_api_key_returns_503(self):
@@ -785,6 +907,7 @@ class TestTelegramToolsLoop:
         assert ps._format_telegram_tool_status("webSearch") == "On it. I'm looking for the best sources now."
         assert ps._format_telegram_tool_status("runDeepResearch") == "On it. I'm gathering sources and comparing them now."
         assert ps._format_telegram_tool_status("createSlidesPresentation") == "On it. I'm building the presentation now."
+        assert ps._format_telegram_tool_status("pdfToPowerPoint") == "On it. I'm converting the document into a PowerPoint now."
         assert ps._format_telegram_tool_status("googleworkspace_cli.gmail_list_unread") == (
             "On it. I'm checking your Google Workspace data now."
         )

@@ -1840,7 +1840,32 @@ async def execute_telegram_tool(
 
     # --- pdfToPowerPoint ---
     if name == "pdfToPowerPoint":
-        return {"success": True, "message": "PDF to PowerPoint is only available in the CATBot web interface. Please use the web app for this feature."}
+        pdf_to_powerpoint_internal = context.get("pdf_to_powerpoint_internal")
+        if not pdf_to_powerpoint_internal:
+            return {"success": False, "message": "PDF or Markdown to PowerPoint is not available."}
+        out = await pdf_to_powerpoint_internal(arguments if isinstance(arguments, dict) else {})
+        if not isinstance(out, dict):
+            return {"success": False, "message": "PDF to PowerPoint returned an invalid response."}
+        success = bool(out.get("success", False))
+        message = str(out.get("message") or ("PowerPoint conversion finished." if success else "PowerPoint conversion failed."))
+        data = out.get("data")
+        file_path = ""
+        if isinstance(data, dict):
+            file_path = str(data.get("file_path") or data.get("filePath") or "").strip()
+        send_file_internal = context.get("send_telegram_file_internal")
+        if success and file_path and send_file_internal:
+            send_result = await send_file_internal(file_path, caption=f"{arguments.get('title') or 'Presentation'}")
+            if isinstance(send_result, dict) and send_result.get("success", False):
+                message = f"{message} Sent the PowerPoint to Telegram."
+            elif isinstance(send_result, dict):
+                send_message = str(send_result.get("message") or "").strip()
+                if send_message:
+                    message = f"{message} Created the file but could not send it to Telegram: {send_message}"
+        return {
+            "success": success,
+            "message": message,
+            "data": data,
+        }
 
     # --- uploadToGoogleDrive ---
     if name == "uploadToGoogleDrive":

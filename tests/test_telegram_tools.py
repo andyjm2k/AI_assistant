@@ -7,6 +7,7 @@ import json
 import base64
 import uuid
 from pathlib import Path
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1402,11 +1403,39 @@ class TestExecuteTelegramTool:
         assert "explicit final findings" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
-    async def test_pdf_to_power_point_returns_web_only_message(self):
-        """pdfToPowerPoint returns message directing user to web interface."""
+    async def test_pdf_to_power_point_requires_backend_callback(self):
         r = await tg.execute_telegram_tool("pdfToPowerPoint", {"title": "T", "filename": "f.pptx"}, {})
+        assert r.get("success") is False
+        assert "not available" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_pdf_to_power_point_uses_internal_backend_and_sends_file(self):
+        captured: Dict[str, Any] = {}
+
+        async def fake_create(args):
+            captured["args"] = args
+            return {
+                "success": True,
+                "message": "Created presentations/test-deck.pptx from markdown.",
+                "data": {"file_path": "presentations/test-deck.pptx"},
+            }
+
+        async def fake_send(file_path, caption=None):
+            captured["sent"] = {"file_path": file_path, "caption": caption}
+            return {"success": True, "message": "sent"}
+
+        r = await tg.execute_telegram_tool(
+            "pdfToPowerPoint",
+            {"title": "T", "filename": "f.pptx"},
+            {
+                "pdf_to_powerpoint_internal": fake_create,
+                "send_telegram_file_internal": fake_send,
+            },
+        )
         assert r.get("success") is True
-        assert "web" in r.get("message", "").lower()
+        assert captured["args"] == {"title": "T", "filename": "f.pptx"}
+        assert captured["sent"]["file_path"] == "presentations/test-deck.pptx"
+        assert "sent the powerpoint to telegram" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
     async def test_create_slides_presentation_uses_internal_backend(self):

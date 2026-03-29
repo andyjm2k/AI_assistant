@@ -861,6 +861,9 @@
             border: 1px solid #ff5c5c;
             box-shadow: inset 0 0 0 1px rgba(255, 92, 92, 0.22);
         }
+        .companion-list li.companion-default {
+            border-color: rgba(232, 179, 109, 0.4);
+        }
         .companion-list li.companion-active-dirty {
             border-color: #d89a42;
             box-shadow: inset 0 0 0 1px rgba(216, 154, 66, 0.28);
@@ -868,8 +871,15 @@
         .companion-list li.companion-active:hover {
             background-color: #341010;
         }
+        .companion-list-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            flex-shrink: 0;
+        }
         .companion-list-copy {
             min-width: 0;
+            flex: 1 1 auto;
             display: flex;
             flex-direction: column;
             gap: 4px;
@@ -887,13 +897,34 @@
             font-size: 0.76rem;
             line-height: 1.3;
         }
+        .companion-list .companion-default-btn,
         .companion-list .companion-delete-btn {
             background: none;
             border: none;
             color: #a78a8a;
-            padding: 4px 8px;
+            padding: 6px 8px;
             cursor: pointer;
             font-size: 0.85rem;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .companion-list .companion-default-btn {
+            border: 1px solid rgba(232, 179, 109, 0.24);
+            color: #d8c3a2;
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .companion-list .companion-default-btn.is-default {
+            border-color: rgba(232, 179, 109, 0.48);
+            color: #f0cf97;
+            background: rgba(232, 179, 109, 0.08);
+        }
+        .companion-list .companion-default-btn:hover {
+            color: #ffe2ae;
+            border-color: rgba(232, 179, 109, 0.55);
         }
         .companion-list .companion-delete-btn:hover {
             color: #ff7b7b;
@@ -1305,6 +1336,17 @@
             .companion-add-btn {
                 width: 100%;
                 justify-content: center;
+            }
+
+            .companion-list li {
+                align-items: flex-start;
+                gap: 12px;
+                flex-wrap: wrap;
+            }
+
+            .companion-list-actions {
+                width: 100%;
+                justify-content: flex-end;
             }
 
             .companion-modal-actions {

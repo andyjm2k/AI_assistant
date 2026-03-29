@@ -130,6 +130,15 @@ class TestResolveScratchPath:
         read_result.resolve().relative_to(SCRATCH_DIR.resolve())
         write_result.resolve().relative_to(SCRATCH_DIR.resolve())
 
+    def test_pptx_extension_allowed_for_read_and_write(self):
+        """Scratch directory allows .pptx for Telegram PowerPoint generation and download."""
+        read_result = resolve_scratch_path("presentation.pptx", READ_ALLOWED_EXTENSIONS)
+        write_result = resolve_scratch_path("presentation.pptx", WRITE_ALLOWED_EXTENSIONS)
+        assert read_result.suffix.lower() == ".pptx"
+        assert write_result.suffix.lower() == ".pptx"
+        read_result.resolve().relative_to(SCRATCH_DIR.resolve())
+        write_result.resolve().relative_to(SCRATCH_DIR.resolve())
+
     def test_resolve_without_extension_allowlist_allows_any_extension(self):
         """When allowed_extensions is None, any extension is accepted (containment still enforced)."""
         # Still reject traversal
