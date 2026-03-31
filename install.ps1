@@ -69,7 +69,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Fail early if pip resolved an AutoGen API that CATBot does not support.
-$autogenCompatCheck = @"
+$autogenCompatCheck = @'
 import importlib.metadata as m
 import inspect
 from autogen_agentchat.agents import AssistantAgent
@@ -91,9 +91,9 @@ if missing:
         + versions
     )
 print("AutoGen compatibility OK (" + versions + ")")
-"@
+'@
 Write-Host 'Validating AutoGen package compatibility...' -ForegroundColor Yellow
-& $venvPython -c $autogenCompatCheck
+$autogenCompatCheck | & $venvPython -
 if ($LASTEXITCODE -ne 0) {
     Write-Host 'AutoGen compatibility check failed. Re-run install after recreating the venv or updating requirements.' -ForegroundColor Red
     exit 1
