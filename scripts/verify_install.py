@@ -49,10 +49,23 @@ def check_core(python_exe: str | None = None) -> tuple[bool, str]:
 
 
 def check_autogen(python_exe: str | None = None) -> tuple[bool, str]:
-    """Verify AutoGen is importable."""
+    """Verify AutoGen imports and CATBot's required AssistantAgent API are present."""
     return _run_python_check(
         "AutoGen",
-        "import autogen_agentchat; print('AutoGen OK')",
+        (
+            "import importlib.metadata as m; "
+            "import inspect; "
+            "import autogen_agentchat; "
+            "from autogen_agentchat.agents import AssistantAgent; "
+            "from autogen_core.model_context import BufferedChatCompletionContext; "
+            "BufferedChatCompletionContext(buffer_size=1); "
+            "sig = inspect.signature(AssistantAgent.__init__); "
+            "required = ('max_tool_iterations', 'reflect_on_tool_use', 'tool_call_summary_format'); "
+            "missing = [name for name in required if name not in sig.parameters]; "
+            "versions = ', '.join(f\"{pkg}={m.version(pkg)}\" for pkg in ('autogen-agentchat', 'autogen-core', 'autogen-ext')); "
+            "missing and (_ for _ in ()).throw(SystemExit('Incompatible AutoGen install: AssistantAgent.__init__ missing ' + ', '.join(missing) + '; ' + versions)); "
+            "print('AutoGen OK (' + versions + ')')"
+        ),
         python_exe,
     )
 

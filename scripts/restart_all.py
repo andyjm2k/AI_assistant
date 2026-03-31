@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -29,16 +30,17 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 START_ALL_SCRIPT = SCRIPTS_DIR / "start_all.py"
 
 # Services started by scripts/start_all.py that expose ports.
-REQUIRED_PORTS = {8000, 8002, 5001, 8084, 8383}
-REQUIRED_SERVICE_SIGNATURES = {
+BASE_REQUIRED_PORTS = {8000, 8002, 5001, 8383}
+STUDIO_PORT = 8084
+BASE_REQUIRED_SERVICE_SIGNATURES = {
     "src.servers.https_server",
     "src.servers.proxy_server",
     "src.servers.scheduled_task_poller",
     "src.integrations.telegram_bot",
-    "autogenstudio serve --team config/team-config.json",
     "scripts/start_mcp_browser_use_http_server.py",
     "scripts/start_mcp_browser_server.py",
 }
+STUDIO_SERVICE_SIGNATURE = "autogenstudio serve --team config/team-config.json"
 
 STOP_VERIFY_TIMEOUT_SECONDS = 45.0
 START_VERIFY_TIMEOUT_SECONDS = 120.0
@@ -58,6 +60,32 @@ MCP_BROWSER_HEALTH_URLS = (
     "http://127.0.0.1:5001/api/health",
     "http://localhost:5001/api/health",
 )
+
+
+def _studio_available() -> bool:
+    configured = (os.getenv("AUTOGENSTUDIO_CMD") or "").strip()
+    if configured:
+        return True
+
+    venv_studio = PROJECT_ROOT / "venv" / "Scripts" / "autogenstudio.exe"
+    if venv_studio.exists():
+        return True
+
+    return shutil.which("autogenstudio") is not None
+
+
+def _required_ports() -> Set[int]:
+    ports = set(BASE_REQUIRED_PORTS)
+    if _studio_available():
+        ports.add(STUDIO_PORT)
+    return ports
+
+
+def _required_service_signatures() -> Set[str]:
+    signatures = set(BASE_REQUIRED_SERVICE_SIGNATURES)
+    if _studio_available():
+        signatures.add(STUDIO_SERVICE_SIGNATURE)
+    return signatures
 
 
 def _log(message: str) -> None:
@@ -170,11 +198,11 @@ def _force_kill_pids(pids: Set[int]) -> None:
         )
 
 
-def _wait_for_ports_down(timeout_seconds: float) -> Tuple[bool, Dict[int, Set[int]]]:
+def _wait_for_ports_down(timeout_seconds: float, required_ports: Set[int]) -> Tuple[bool, Dict[int, Set[int]]]:
     deadline = time.time() + timeout_seconds
     last_seen: Dict[int, Set[int]] = {}
     while time.time() < deadline:
-        listening = _listening_pids_by_port(REQUIRED_PORTS)
+        listening = _listening_pids_by_port(required_ports)
         if not listening:
             return True, listening
         last_seen = listening
@@ -182,20 +210,20 @@ def _wait_for_ports_down(timeout_seconds: float) -> Tuple[bool, Dict[int, Set[in
     return False, last_seen
 
 
-def _wait_for_started_health(timeout_seconds: float) -> Tuple[bool, str]:
+def _wait_for_started_health(timeout_seconds: float, required_ports: Set[int]) -> Tuple[bool, str]:
     deadline = time.time() + timeout_seconds
     last_ports: Dict[int, Set[int]] = {}
     while time.time() < deadline:
-        listening = _listening_pids_by_port(REQUIRED_PORTS)
+        listening = _listening_pids_by_port(required_ports)
         last_ports = listening
-        all_ports_up = REQUIRED_PORTS.issubset(set(listening.keys()))
+        all_ports_up = required_ports.issubset(set(listening.keys()))
         proxy_ok = _proxy_monitor_summary_ok()
         mcp_ok = _mcp_browser_health_ok()
         if all_ports_up and proxy_ok and mcp_ok:
             return True, "all required checks passed"
         time.sleep(POLL_INTERVAL_SECONDS)
 
-    missing_ports = sorted(REQUIRED_PORTS - set(last_ports.keys()))
+    missing_ports = sorted(required_ports - set(last_ports.keys()))
     details = []
     if missing_ports:
         details.append(f"missing ports: {missing_ports}")
@@ -231,7 +259,10 @@ def _load_stop_all_module():
     return stop_all
 
 
-def _get_service_signature_hits(stop_all_module) -> Optional[Set[str]]:
+def _get_service_signature_hits(
+    stop_all_module,
+    required_service_signatures: Set[str],
+) -> Optional[Set[str]]:
     """
     Return matching service signatures found in process command lines.
 
@@ -248,18 +279,23 @@ def _get_service_signature_hits(stop_all_module) -> Optional[Set[str]]:
         if not cmd:
             continue
         normalized_cmd = cmd.replace("\\", "/")
-        for signature in REQUIRED_SERVICE_SIGNATURES:
+        for signature in required_service_signatures:
             if signature in normalized_cmd:
                 hits.add(signature)
     return hits
 
 
-def _stop_with_retries(stop_all_module, max_attempts: int) -> Tuple[bool, str]:
+def _stop_with_retries(
+    stop_all_module,
+    max_attempts: int,
+    required_ports: Set[int],
+    required_service_signatures: Set[str],
+) -> Tuple[bool, str]:
     for attempt in range(1, max_attempts + 1):
         _log(f"Stop attempt {attempt}/{max_attempts}")
         stop_rc = int(stop_all_module.main())
-        stopped, remaining = _wait_for_ports_down(STOP_VERIFY_TIMEOUT_SECONDS)
-        signature_hits = _get_service_signature_hits(stop_all_module)
+        stopped, remaining = _wait_for_ports_down(STOP_VERIFY_TIMEOUT_SECONDS, required_ports)
+        signature_hits = _get_service_signature_hits(stop_all_module, required_service_signatures)
         signatures_stopped = signature_hits is None or len(signature_hits) == 0
         if stopped:
             if signatures_stopped:
@@ -272,8 +308,11 @@ def _stop_with_retries(stop_all_module, max_attempts: int) -> Tuple[bool, str]:
         if remaining_pids:
             _log(f"Self-heal: force-killing remaining listener PIDs: {sorted(remaining_pids)}")
             _force_kill_pids(remaining_pids)
-            stopped_after_force, _ = _wait_for_ports_down(15.0)
-            signature_hits_after_force = _get_service_signature_hits(stop_all_module)
+            stopped_after_force, _ = _wait_for_ports_down(15.0, required_ports)
+            signature_hits_after_force = _get_service_signature_hits(
+                stop_all_module,
+                required_service_signatures,
+            )
             signatures_stopped_after_force = (
                 signature_hits_after_force is None or len(signature_hits_after_force) == 0
             )
@@ -282,21 +321,26 @@ def _stop_with_retries(stop_all_module, max_attempts: int) -> Tuple[bool, str]:
 
         _log("Stop verification failed; retrying.")
 
-    final_remaining = _listening_pids_by_port(REQUIRED_PORTS)
+    final_remaining = _listening_pids_by_port(required_ports)
     return False, f"ports still listening after retries: {final_remaining}"
 
 
-def _start_with_retries(stop_all_module, max_attempts: int) -> Tuple[bool, str]:
+def _start_with_retries(
+    stop_all_module,
+    max_attempts: int,
+    required_ports: Set[int],
+    required_service_signatures: Set[str],
+) -> Tuple[bool, str]:
     for attempt in range(1, max_attempts + 1):
         _log(f"Start attempt {attempt}/{max_attempts}")
         start_ok, start_output = _run_start_all()
         if not start_ok:
             _log(f"start_all.py exited non-zero. Output: {start_output or '(none)'}")
 
-        healthy, detail = _wait_for_started_health(START_VERIFY_TIMEOUT_SECONDS)
-        signature_hits = _get_service_signature_hits(stop_all_module)
+        healthy, detail = _wait_for_started_health(START_VERIFY_TIMEOUT_SECONDS, required_ports)
+        signature_hits = _get_service_signature_hits(stop_all_module, required_service_signatures)
         signatures_ok = (
-            signature_hits is None or REQUIRED_SERVICE_SIGNATURES.issubset(signature_hits)
+            signature_hits is None or required_service_signatures.issubset(signature_hits)
         )
         if healthy and signatures_ok:
             return True, "startup verification passed"
@@ -309,7 +353,12 @@ def _start_with_retries(stop_all_module, max_attempts: int) -> Tuple[bool, str]:
         _log(f"Startup verification failed: {detail}")
         if attempt < max_attempts:
             _log("Self-heal: stopping partially started services before retry.")
-            _stop_with_retries(stop_all_module, max_attempts=1)
+            _stop_with_retries(
+                stop_all_module,
+                max_attempts=1,
+                required_ports=required_ports,
+                required_service_signatures=required_service_signatures,
+            )
 
     return False, "services failed to become healthy after retries"
 
@@ -336,8 +385,12 @@ def main() -> int:
     requested_by = (args.requested_by or "").strip() or "unknown"
     stop_attempts = max(1, int(args.stop_attempts))
     start_attempts = max(1, int(args.start_attempts))
+    required_ports = _required_ports()
+    required_service_signatures = _required_service_signatures()
 
     _log(f"Restart requested by telegram user {requested_by}")
+    if STUDIO_PORT not in required_ports:
+        _log("AutoGen Studio not installed; restart health checks will skip port 8084.")
     _send_telegram_message(chat_id, "Restart requested. Stopping CATBot services now.")
 
     try:
@@ -348,7 +401,12 @@ def main() -> int:
         _send_telegram_message(chat_id, message)
         return 1
 
-    stopped, stop_detail = _stop_with_retries(stop_all_module, stop_attempts)
+    stopped, stop_detail = _stop_with_retries(
+        stop_all_module,
+        stop_attempts,
+        required_ports,
+        required_service_signatures,
+    )
     if not stopped:
         message = f"Restart failed during stop phase: {stop_detail}"
         _log(message)
@@ -358,7 +416,12 @@ def main() -> int:
     _log(f"Stop phase complete: {stop_detail}")
     _send_telegram_message(chat_id, "Stop phase complete. Starting CATBot services now.")
 
-    started, start_detail = _start_with_retries(stop_all_module, start_attempts)
+    started, start_detail = _start_with_retries(
+        stop_all_module,
+        start_attempts,
+        required_ports,
+        required_service_signatures,
+    )
     if not started:
         message = f"Restart failed during start phase: {start_detail}"
         _log(message)

@@ -62,14 +62,15 @@ pyperclip>=1.8.0
 # FastMCP HTTP client for mcp-server-browser-use (align with mcp-browser-use submodule)
 fastmcp @ git+https://github.com/jlowin/fastmcp.git@3d6fd4650c4c59465fbd6983693952946259d354
 
-# AutoGen team chat, code execution, and Studio UI.
+# AutoGen team chat and code execution.
 # CATBot's team builder relies on AssistantAgent kwargs such as max_tool_iterations.
 # Keep the core AutoGen packages on the tested 0.7.x line so install does not drift to
 # an incompatible API family.
+# AutoGen Studio is intentionally excluded from the main venv because current releases
+# still pin older autogen-core ranges and conflict with CATBot's runtime packages.
 autogen-agentchat>=0.7.5,<0.8
 autogen-core>=0.7.5,<0.8
 autogen-ext[docker]>=0.7.5,<0.8
-autogenstudio>=0.4.2.2,<0.5
 
 # LangChain (used by proxy_server for MCP connect / LLM backends)
 langchain-core>=0.3.0

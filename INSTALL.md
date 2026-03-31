@@ -45,6 +45,11 @@ The installer now does the full dependency path:
 - runs the interactive configuration wizard
 - runs `scripts/verify_install.py`
 
+Note:
+
+- AutoGen Studio is not installed into the main CATBot `venv`. Current `autogenstudio` releases still conflict with CATBot's pinned `autogen-core 0.7.x` packages.
+- If you want the Studio UI on port `8084`, install `autogenstudio` separately and either add it to `PATH` or set `AUTOGENSTUDIO_CMD` to the Studio executable before running `scripts/start_all.py`.
+
 ## Configuration
 
 The installer wizard writes the core `.env` entries for you and now mirrors provider settings into the standard env names that older CATBot modules still read directly.

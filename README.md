@@ -512,7 +512,11 @@ python -m src.servers.proxy_server
 # Export the current Python-defined team for Studio
 python scripts/export_autogen_team_config.py
 
-# Start AutoGen Studio
+# Start AutoGen Studio (optional)
+# The main CATBot venv intentionally does not install autogenstudio because current
+# releases conflict with CATBot's pinned autogen-core 0.7.x stack.
+# If you installed Studio separately, either put `autogenstudio` on PATH or set
+# `AUTOGENSTUDIO_CMD` to its executable path before using scripts/start_all.py.
 autogenstudio serve --team config/team-config.json --port 8084
 
 # Start MCP Browser-Use HTTP server (required; stdio is deprecated).
@@ -529,7 +533,7 @@ python scripts/start_mcp_browser_server.py
 #### Local Access (localhost)
 
 1. **Web Interface**: Open `index-dev.html` in your browser (served on port 8000)
-2. **AutoGen Studio**: Navigate to `http://localhost:8084`
+2. **AutoGen Studio (optional)**: Navigate to `http://localhost:8084` if you installed Studio separately
 3. **Proxy Server API**: `http://localhost:8002` (FastAPI with comprehensive endpoints)
 4. **MCP Browser HTTP Server**: `http://localhost:5001` (Flask-based HTTP bridge)
 
