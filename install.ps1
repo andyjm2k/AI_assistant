@@ -68,6 +68,37 @@ if ($LASTEXITCODE -ne 0) {
     if ($LASTEXITCODE -ne 0) { Write-Host 'Kitten TTS install failed.' -ForegroundColor Red; exit 1 }
 }
 
+# Fail early if pip resolved an AutoGen API that CATBot does not support.
+$autogenCompatCheck = @"
+import importlib.metadata as m
+import inspect
+from autogen_agentchat.agents import AssistantAgent
+from autogen_core.model_context import BufferedChatCompletionContext
+
+BufferedChatCompletionContext(buffer_size=1)
+sig = inspect.signature(AssistantAgent.__init__)
+required = ("max_tool_iterations", "reflect_on_tool_use", "tool_call_summary_format")
+missing = [name for name in required if name not in sig.parameters]
+versions = ", ".join(
+    f"{pkg}={m.version(pkg)}"
+    for pkg in ("autogen-agentchat", "autogen-core", "autogen-ext")
+)
+if missing:
+    raise SystemExit(
+        "Incompatible AutoGen install: AssistantAgent.__init__ missing "
+        + ", ".join(missing)
+        + ". Installed versions: "
+        + versions
+    )
+print("AutoGen compatibility OK (" + versions + ")")
+"@
+Write-Host 'Validating AutoGen package compatibility...' -ForegroundColor Yellow
+& $venvPython -c $autogenCompatCheck
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'AutoGen compatibility check failed. Re-run install after recreating the venv or updating requirements.' -ForegroundColor Red
+    exit 1
+}
+
 # 4. Playwright (main venv)
 Write-Host ([Environment]::NewLine + '[4/10] Installing Playwright browsers...') -ForegroundColor Yellow
 & $venvPython -m playwright install

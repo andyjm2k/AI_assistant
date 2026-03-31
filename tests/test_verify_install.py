@@ -46,6 +46,32 @@ def test_check_autogen_returns_tuple():
     assert isinstance(msg, str)
 
 
+def test_check_autogen_validates_required_assistant_agent_kwargs(monkeypatch):
+    """check_autogen should verify the AssistantAgent API CATBot depends on."""
+    from scripts import verify_install
+
+    captured = {}
+
+    def fake_run_python_check(description, code, python_exe=None):
+        captured["description"] = description
+        captured["code"] = code
+        captured["python_exe"] = python_exe
+        return True, "ok"
+
+    monkeypatch.setattr(verify_install, "_run_python_check", fake_run_python_check)
+
+    ok, msg = verify_install.check_autogen("C:/fake/python.exe")
+
+    assert ok is True
+    assert msg == "ok"
+    assert captured["description"] == "AutoGen"
+    assert captured["python_exe"] == "C:/fake/python.exe"
+    assert "AssistantAgent" in captured["code"]
+    assert "max_tool_iterations" in captured["code"]
+    assert "reflect_on_tool_use" in captured["code"]
+    assert "tool_call_summary_format" in captured["code"]
+
+
 def test_check_mcp_returns_tuple():
     """check_mcp returns (bool, str)."""
     ok, msg = check_mcp()
