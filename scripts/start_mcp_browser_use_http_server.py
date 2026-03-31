@@ -17,6 +17,12 @@ from pathlib import Path
 
 # Project root = parent of scripts directory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.runtime_env import build_script_env, resolve_project_root
+
+PROJECT_ROOT = resolve_project_root()
 MCP_BROWSER_USE_DIR = PROJECT_ROOT / "mcp-browser-use"
 RUNTIME_DIR = MCP_BROWSER_USE_DIR / ".runtime"
 TEMP_DIR = RUNTIME_DIR / "tmp"
@@ -46,7 +52,7 @@ def load_project_env(project_root: Path) -> None:
 
 def build_server_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     """Prepare a child-process environment with repo-local runtime paths."""
-    env = dict(base_env or os.environ)
+    env = build_script_env(PROJECT_ROOT, base_env=base_env, include_venv=False)
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)

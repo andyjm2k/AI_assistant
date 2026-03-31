@@ -13,6 +13,12 @@ from typing import Dict, Iterable, List, Set
 
 # Project root = parent of scripts directory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.runtime_env import resolve_project_root, resolve_venv_python
+
+PROJECT_ROOT = resolve_project_root()
 PROJECT_ROOT_STR = str(PROJECT_ROOT).lower()
 
 # Signatures for commands launched by start_all.py
@@ -189,7 +195,7 @@ def _collect_target_pids_fallback(processes: Dict[int, Dict[str, object]]) -> Se
             matched.add(pid)
 
     current_pid = os.getpid()
-    venv_python = str(PROJECT_ROOT / "venv" / "Scripts" / "python.exe").lower()
+    venv_python = resolve_venv_python(PROJECT_ROOT).lower()
 
     for pid, proc in processes.items():
         name = str(proc.get("name") or "").lower()

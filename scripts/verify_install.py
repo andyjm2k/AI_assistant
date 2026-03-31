@@ -11,6 +11,12 @@ from pathlib import Path
 
 # Project root = parent of scripts directory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.runtime_env import build_script_env, resolve_project_root
+
+PROJECT_ROOT = resolve_project_root()
 MCP_BROWSER_USE_DIR = PROJECT_ROOT / "mcp-browser-use"
 MCP_BROWSER_USE_RUNTIME_DIR = MCP_BROWSER_USE_DIR / ".runtime"
 MCP_BROWSER_USE_TEMP_DIR = MCP_BROWSER_USE_RUNTIME_DIR / "tmp"
@@ -111,7 +117,7 @@ def check_runtime_optional_deps(python_exe: str | None = None) -> tuple[bool, st
 
 def _build_browser_use_env() -> dict[str, str]:
     """Prepare a child-process environment that matches the Windows-safe launcher settings."""
-    env = os.environ.copy()
+    env = build_script_env(PROJECT_ROOT, include_venv=False)
     env.pop("VIRTUAL_ENV", None)
 
     MCP_BROWSER_USE_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)

@@ -26,8 +26,15 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.runtime_env import build_script_env, resolve_project_root, resolve_venv_dir, resolve_venv_python
+
+PROJECT_ROOT = resolve_project_root()
 SCRIPTS_DIR = Path(__file__).resolve().parent
 START_ALL_SCRIPT = SCRIPTS_DIR / "start_all.py"
+VENV_PYTHON = resolve_venv_python(PROJECT_ROOT)
 
 # Services started by scripts/start_all.py that expose ports.
 BASE_REQUIRED_PORTS = {8000, 8002, 5001, 8383}
@@ -67,9 +74,11 @@ def _studio_available() -> bool:
     if configured:
         return True
 
-    venv_studio = PROJECT_ROOT / "venv" / "Scripts" / "autogenstudio.exe"
-    if venv_studio.exists():
-        return True
+    venv_dir = resolve_venv_dir(PROJECT_ROOT, VENV_PYTHON)
+    if venv_dir:
+        venv_studio = venv_dir / "Scripts" / "autogenstudio.exe"
+        if venv_studio.exists():
+            return True
 
     return shutil.which("autogenstudio") is not None
 
@@ -241,10 +250,11 @@ def _run_start_all() -> Tuple[bool, str]:
     # console processes that may inherit pipe handles and prevent EOF.
     try:
         result = subprocess.run(
-            [sys.executable, str(START_ALL_SCRIPT)],
+            [VENV_PYTHON, str(START_ALL_SCRIPT)],
             cwd=str(PROJECT_ROOT),
             check=False,
             timeout=START_ALL_LAUNCH_TIMEOUT_SECONDS,
+            env=build_script_env(PROJECT_ROOT, python_exe=VENV_PYTHON),
         )
         return result.returncode == 0, f"start_all rc={result.returncode}"
     except subprocess.TimeoutExpired:

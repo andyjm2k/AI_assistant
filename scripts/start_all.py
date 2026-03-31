@@ -7,17 +7,21 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 # Project root = parent of scripts directory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.runtime_env import build_script_env, resolve_project_root, resolve_venv_dir, resolve_venv_python
+
+PROJECT_ROOT = resolve_project_root()
 
 
 def _resolve_venv_python() -> str:
-    venv_python = PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
-    if venv_python.exists():
-        return str(venv_python)
-    return "python"
+    return resolve_venv_python(PROJECT_ROOT)
 
 
 VENV_PYTHON = _resolve_venv_python()
@@ -28,17 +32,24 @@ def _resolve_autogenstudio_command() -> str | None:
     if configured:
         return configured
 
-    venv_studio = PROJECT_ROOT / "venv" / "Scripts" / "autogenstudio.exe"
-    if venv_studio.exists():
-        return str(venv_studio)
+    venv_dir = resolve_venv_dir(PROJECT_ROOT, VENV_PYTHON)
+    if venv_dir:
+        venv_studio = venv_dir / "Scripts" / "autogenstudio.exe"
+        if venv_studio.exists():
+            return str(venv_studio)
 
     return shutil.which("autogenstudio")
 
 
-def _launch_in_new_cmd(command_line: str) -> None:
+def _build_child_env() -> dict[str, str]:
+    return build_script_env(PROJECT_ROOT, python_exe=VENV_PYTHON)
+
+
+def _launch_in_new_cmd(command_line: str, env: dict[str, str] | None = None) -> None:
     subprocess.Popen(
         ["cmd", "/c", "start", "", "cmd", "/k", command_line],
         cwd=str(PROJECT_ROOT),
+        env=env or _build_child_env(),
     )
 
 
@@ -61,10 +72,12 @@ def _build_command_lines(studio_command: str | None) -> list[str]:
 
 def main() -> int:
     # Keep AutoGen Studio's JSON input in sync with the Python source of truth.
+    child_env = _build_child_env()
     subprocess.run(
         [VENV_PYTHON, str(PROJECT_ROOT / "scripts" / "export_autogen_team_config.py")],
         cwd=str(PROJECT_ROOT),
         check=False,
+        env=child_env,
     )
 
     studio_command = _resolve_autogenstudio_command()
@@ -72,7 +85,7 @@ def main() -> int:
         print("AutoGen Studio not installed; skipping Studio UI on port 8084.")
 
     for command_line in _build_command_lines(studio_command):
-        _launch_in_new_cmd(command_line)
+        _launch_in_new_cmd(command_line, env=child_env)
 
     print("All processes have been started.")
     return 0
