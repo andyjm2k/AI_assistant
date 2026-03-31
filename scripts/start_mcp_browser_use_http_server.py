@@ -22,6 +22,13 @@ RUNTIME_DIR = MCP_BROWSER_USE_DIR / ".runtime"
 TEMP_DIR = RUNTIME_DIR / "tmp"
 UV_CACHE_DIR = RUNTIME_DIR / "uv-cache"
 BROWSER_DOWNLOADS_DIR = RUNTIME_DIR / "browser-use-downloads"
+BROWSER_USER_DATA_DIR = RUNTIME_DIR / "chrome-user-data"
+COMMON_BROWSER_EXECUTABLES = [
+    Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+    Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+    Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+    Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+]
 
 
 def load_project_env(project_root: Path) -> None:
@@ -45,6 +52,7 @@ def build_server_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     UV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     BROWSER_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    BROWSER_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # Force UTF-8 so browser-use "extract" and other code don't hit cp1252.
     env["PYTHONUTF8"] = "1"
@@ -60,6 +68,39 @@ def build_server_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
 
     # uv gets confused by the parent CATBot venv; force it to use mcp-browser-use's environment.
     env.pop("VIRTUAL_ENV", None)
+
+    configured_browser = str(env.get("MCP_BROWSER_EXECUTABLE_PATH", "")).strip()
+    configured_path = Path(configured_browser) if configured_browser else None
+    if configured_path and configured_path.exists():
+        pass
+    else:
+        fallback_path = next((path for path in COMMON_BROWSER_EXECUTABLES if path.exists()), None)
+        if fallback_path:
+            env["MCP_BROWSER_EXECUTABLE_PATH"] = str(fallback_path)
+            if configured_browser:
+                print(
+                    "Configured MCP_BROWSER_EXECUTABLE_PATH was not found; "
+                    f"falling back to {fallback_path}"
+                )
+        elif configured_browser:
+            print(
+                "Warning: configured MCP_BROWSER_EXECUTABLE_PATH was not found and "
+                "no common Chrome/Edge executable could be resolved."
+            )
+
+    configured_user_data_dir = str(env.get("MCP_BROWSER_USER_DATA_DIR", "")).strip()
+    normalized_user_data_dir = configured_user_data_dir.replace("/", "\\").lower()
+    shared_profile_markers = (
+        "\\appdata\\local\\google\\chrome\\user data",
+        "\\appdata\\local\\microsoft\\edge\\user data",
+    )
+    if not configured_user_data_dir or normalized_user_data_dir.endswith(shared_profile_markers):
+        env["MCP_BROWSER_USER_DATA_DIR"] = str(BROWSER_USER_DATA_DIR)
+        if configured_user_data_dir and env["MCP_BROWSER_USER_DATA_DIR"] != configured_user_data_dir:
+            print(
+                "Using repo-local MCP_BROWSER_USER_DATA_DIR for browser automation stability: "
+                f"{BROWSER_USER_DATA_DIR}"
+            )
     return env
 
 

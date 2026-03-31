@@ -8,16 +8,19 @@
     :root{--bg:#07111c;--panel:#0c1827;--panel2:#102033;--line:rgba(165,188,211,.16);--text:#edf4fb;--muted:#98adc3;--cyan:#5bd3ff;--mint:#67efc2;--gold:#ffc86e;--rose:#ff7c90;--violet:#a88fff;--shadow:0 22px 60px rgba(0,0,0,.3)}
     *{box-sizing:border-box}html{color-scheme:dark}body{margin:0;min-height:100vh;color:var(--text);font-family:"Space Grotesk","IBM Plex Sans","Segoe UI Variable",sans-serif;background:radial-gradient(circle at top left,rgba(91,211,255,.18),transparent 28%),radial-gradient(circle at top right,rgba(168,143,255,.18),transparent 30%),linear-gradient(180deg,#06101a 0%,#07111c 100%)}
     body:before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:26px 26px;mask-image:radial-gradient(circle at center,black 40%,transparent 100%);opacity:.45}
-    header{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;padding:32px 34px 10px}.eyebrow{display:inline-flex;padding:7px 12px;border-radius:999px;background:rgba(91,211,255,.1);border:1px solid rgba(91,211,255,.24);color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}
+    header{display:flex;justify-content:space-between;gap:28px;align-items:flex-start;padding:32px 0 10px}.eyebrow{display:inline-flex;padding:7px 12px;border-radius:999px;background:rgba(91,211,255,.1);border:1px solid rgba(91,211,255,.24);color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}
     h1{margin:10px 0 0;font-size:clamp(34px,6vw,56px);line-height:.94;letter-spacing:-.05em}.subtitle{max-width:760px;color:var(--muted);font-size:15px;line-height:1.6}.refresh{display:inline-flex;gap:10px;align-items:center;padding:10px 14px;border-radius:999px;border:1px solid rgba(103,239,194,.28);background:rgba(103,239,194,.12);color:var(--mint);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.dot{width:10px;height:10px;border-radius:999px;background:currentColor;box-shadow:0 0 0 0 rgba(103,239,194,.6);animation:pulse 2s infinite}.top-meta{max-width:420px;margin-top:12px;color:var(--muted);font-size:12px;text-align:right;line-height:1.6;overflow-wrap:anywhere}
     @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(103,239,194,.55)}70%{box-shadow:0 0 0 14px rgba(103,239,194,0)}100%{box-shadow:0 0 0 0 rgba(103,239,194,0)}}
-    .layout{display:grid;grid-template-columns:1.08fr .92fr;gap:20px;padding:8px 34px 34px}.col{display:flex;flex-direction:column;gap:20px;min-width:0}.panel{position:relative;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,.02),transparent 120%),var(--panel);border:1px solid var(--line);border-radius:24px;box-shadow:var(--shadow)}.panel:after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.05),transparent 30%,transparent 70%,rgba(255,255,255,.02))}.inner{position:relative;z-index:1;padding:20px}
+    header,.page{width:min(calc(100% - 48px),1400px);margin:0 auto}.page{display:flex;flex-direction:column;gap:22px;padding:8px 0 34px}.layout{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(0,.92fr);gap:22px;align-items:start}.col{display:flex;flex-direction:column;gap:22px;min-width:0}.panel{position:relative;overflow:hidden;background:linear-gradient(180deg,rgba(255,255,255,.02),transparent 120%),var(--panel);border:1px solid var(--line);border-radius:24px;box-shadow:var(--shadow)}.panel:after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(135deg,rgba(255,255,255,.05),transparent 30%,transparent 70%,rgba(255,255,255,.02))}.inner{position:relative;z-index:1;padding:22px}
+    body.overview-mode #overview-panel .inner{padding:24px}body.overview-mode .layout{grid-auto-rows:minmax(0,auto)}
+    body.detail-mode header,body.detail-mode .page{width:min(calc(100% - 48px),1240px)}body.detail-mode .page{gap:18px}body.detail-mode .layout{grid-template-columns:1fr;gap:18px}body.detail-mode .col{display:contents}body.detail-mode .panel{width:100%}body.detail-mode .section{margin-bottom:16px}
     .section{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:14px}.section h2{margin:0;font-size:15px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#c6d6e8}.note{color:var(--muted);font-size:12px}.title{display:flex;align-items:center;gap:12px}.icon{width:36px;height:36px;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;background:rgba(91,211,255,.1);border:1px solid rgba(91,211,255,.22);color:var(--cyan);flex:0 0 auto}.icon svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-    .hero{display:grid;grid-template-columns:minmax(220px,.78fr) minmax(420px,1.22fr);gap:16px;align-items:start}.uptime-label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em}.uptime{font-size:clamp(32px,5vw,54px);font-weight:700;line-height:.92;letter-spacing:-.05em;margin-top:10px}.uptime-sub{margin-top:12px;color:#c0d2e4;font-size:13px;line-height:1.6}
-    .chips{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr))}.chip{background:linear-gradient(160deg,rgba(255,255,255,.035),rgba(255,255,255,.015)),var(--panel2);border:1px solid rgba(165,188,211,.12);border-radius:18px;padding:14px;display:flex;flex-direction:column;gap:10px;min-height:112px}.chip-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.chip-title{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px;letter-spacing:.08em;text-transform:uppercase}.chip-title strong{font-size:14px;text-transform:none;letter-spacing:0;color:#d8e4ef}.chip-value{font-size:28px;font-weight:700;letter-spacing:-.04em}.chip-sub{min-height:33px;color:var(--muted);font-size:12px;line-height:1.45}
+    .hero{display:grid;grid-template-columns:minmax(260px,.76fr) minmax(0,1.24fr);gap:18px;align-items:start}.uptime-label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.12em}.uptime{font-size:clamp(32px,5vw,54px);font-weight:700;line-height:.92;letter-spacing:-.05em;margin-top:10px}.uptime-sub{margin-top:12px;color:#c0d2e4;font-size:13px;line-height:1.6}
+    .chips{display:grid;gap:12px;grid-template-columns:repeat(2,minmax(0,1fr))}.chip{width:100%;text-align:left;color:inherit;text-decoration:none;font:inherit;cursor:pointer;background:linear-gradient(160deg,rgba(255,255,255,.035),rgba(255,255,255,.015)),var(--panel2);border:1px solid rgba(165,188,211,.12);border-radius:18px;padding:14px;display:flex;flex-direction:column;gap:10px;min-height:112px;transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease,background .18s ease}.chip:hover{transform:translateY(-2px);border-color:rgba(165,188,211,.22);box-shadow:0 18px 30px rgba(0,0,0,.18)}.chip:focus-visible{outline:2px solid rgba(91,211,255,.75);outline-offset:2px}.chip-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.chip-title{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px;letter-spacing:.08em;text-transform:uppercase}.chip-title strong{font-size:14px;text-transform:none;letter-spacing:0;color:#d8e4ef}.chip-value{font-size:28px;font-weight:700;letter-spacing:-.04em}.chip-sub{min-height:33px;color:var(--muted);font-size:12px;line-height:1.45}
     .badge{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:7px 11px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05)}.badge:before{content:"";width:8px;height:8px;border-radius:999px;background:currentColor;box-shadow:0 0 12px currentColor}.idle{color:var(--muted)}.running{color:var(--cyan);background:rgba(91,211,255,.12);border-color:rgba(91,211,255,.28)}.done{color:var(--mint);background:rgba(103,239,194,.12);border-color:rgba(103,239,194,.28)}.warn{color:var(--gold);background:rgba(255,200,110,.12);border-color:rgba(255,200,110,.24)}.error{color:var(--rose);background:rgba(255,124,144,.12);border-color:rgba(255,124,144,.24)}
     .meter{width:100%;height:7px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden}.meter>span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,rgba(91,211,255,.55),rgba(103,239,194,.95));box-shadow:0 0 22px rgba(91,211,255,.35);transition:width .22s ease}
     .cols2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}.stack{display:flex;flex-direction:column;gap:14px;min-height:220px;max-height:690px;overflow:auto;padding-right:2px}.health{padding:14px 16px;border-radius:18px;border:1px solid rgba(91,211,255,.14);background:radial-gradient(circle at right top,rgba(91,211,255,.12),transparent 40%),rgba(255,255,255,.025);color:#d7e7f7;font-size:13px;line-height:1.55;margin-bottom:12px}
+    #detail-layout{align-items:start}
     .card{background:linear-gradient(160deg,rgba(255,255,255,.035),rgba(255,255,255,.012));border:1px solid rgba(165,188,211,.14);border-radius:20px;padding:16px;display:flex;flex-direction:column;gap:14px}.top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.left{display:flex;gap:12px;min-width:0}.run-icon{width:42px;height:42px;border-radius:14px;display:inline-flex;align-items:center;justify-content:center;background:rgba(91,211,255,.1);border:1px solid rgba(91,211,255,.18);color:var(--cyan)}.run-icon svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.run-title{margin:0;font-size:16px;font-weight:700;line-height:1.3;word-break:break-word}.run-sub{margin-top:4px;color:var(--muted);font-size:12px;line-height:1.55}.summary{color:#d7e4ef;font-size:13px;line-height:1.55}
     .metrics{display:flex;flex-wrap:wrap;gap:8px}.pill{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:var(--muted);font-size:11px}.pill strong{color:#e6f1fb}.p-head{display:flex;justify-content:space-between;gap:12px;align-items:center;font-size:12px;color:var(--muted)}.track{height:10px;border-radius:999px;overflow:hidden;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.06)}.track>span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--violet),var(--cyan),var(--mint));box-shadow:0 0 24px rgba(91,211,255,.24)}
     .stages{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.stage{position:relative;padding-top:18px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;text-align:center}.stage:before{content:"";position:absolute;top:0;left:50%;transform:translateX(-50%);width:11px;height:11px;border-radius:999px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.05)}.stage:after{content:"";position:absolute;top:5px;left:calc(50% + 12px);width:calc(100% - 24px);height:1px;background:rgba(255,255,255,.08)}.stage:last-child:after{display:none}.stage.on,.stage.done{color:#edf4fb}.stage.done:before{background:var(--mint);border-color:rgba(103,239,194,.6);box-shadow:0 0 16px rgba(103,239,194,.4)}.stage.on:before{background:var(--cyan);border-color:rgba(91,211,255,.7);box-shadow:0 0 18px rgba(91,211,255,.5)}
@@ -26,8 +29,9 @@
     .event-list{display:flex;flex-direction:column;gap:14px;max-height:480px;overflow:auto;padding-right:4px}.event{display:grid;grid-template-columns:60px 1fr;gap:14px;align-items:start}.e-time{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em;padding-top:2px}.e-card{position:relative;border-radius:18px;padding:14px 14px 14px 18px;background:linear-gradient(160deg,rgba(255,255,255,.035),rgba(255,255,255,.012));border:1px solid rgba(165,188,211,.12)}.e-card:before{content:"";position:absolute;left:-7px;top:18px;width:12px;height:12px;border-radius:999px;background:var(--violet);box-shadow:0 0 18px rgba(168,143,255,.35)}.e-meta{color:var(--muted);font-size:11px;margin-bottom:6px}.e-state{color:#eef6ff;font-size:13px;line-height:1.5;font-weight:600}
     .logbox{background:rgba(5,10,18,.74);border:1px solid rgba(255,255,255,.06);border-radius:20px;overflow:hidden}.loghead{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.02)}.logtitle{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#ccdae9}.logstatus{color:var(--muted);font-size:11px}.logs{max-height:360px;overflow:auto;white-space:pre-wrap;font-family:"IBM Plex Mono","JetBrains Mono",Consolas,monospace;font-size:12px;line-height:1.6;padding:16px;color:#cfe0f2}.logline{display:block;padding:4px 0;border-bottom:1px dashed rgba(255,255,255,.05)}
     .empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;min-height:180px;text-align:center;color:var(--muted);padding:24px;border:1px dashed rgba(165,188,211,.16);border-radius:18px;background:rgba(255,255,255,.02)}.empty svg{width:34px;height:34px;stroke:currentColor;fill:none;stroke-width:1.6}
+    .detail-shell .inner{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.detail-copy{display:flex;flex-direction:column;gap:8px}.crumbs{display:flex;flex-wrap:wrap;align-items:center;gap:10px;color:var(--muted);font-size:12px;letter-spacing:.08em;text-transform:uppercase}.crumbs a{color:var(--cyan);text-decoration:none}.crumbs a:hover{text-decoration:underline}.detail-kicker{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--cyan)}.detail-title{margin:0;font-size:clamp(24px,4vw,34px);line-height:1;letter-spacing:-.04em}.detail-note{color:#d2e1ef;font-size:14px;line-height:1.6;max-width:720px}.detail-actions{display:flex;flex-direction:column;align-items:flex-end;gap:10px}.detail-link{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:10px 14px;border:1px solid rgba(91,211,255,.24);background:rgba(91,211,255,.1);color:var(--cyan);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;text-decoration:none}.detail-link:hover{background:rgba(91,211,255,.16);border-color:rgba(91,211,255,.34)}body.detail-mode .detail-shell .inner{align-items:center;padding:4px 0 2px}body.detail-mode .detail-note{max-width:820px}body.detail-mode .cols2{grid-template-columns:1fr}[data-drill-panel][hidden],[data-drill-lane][hidden]{display:none!important}
     .refresh.fail{color:var(--rose);border-color:rgba(255,124,144,.28);background:rgba(255,124,144,.12)}.refresh.fail .dot{box-shadow:0 0 0 0 rgba(255,124,144,.6)}.refresh.warn{color:var(--gold);border-color:rgba(255,200,110,.24);background:rgba(255,200,110,.12)}
-    @media (max-width:1480px){.layout{grid-template-columns:1fr}.hero{grid-template-columns:minmax(220px,.75fr) minmax(0,1.25fr)}}@media (max-width:920px){header{flex-direction:column;align-items:flex-start;padding:28px 20px 8px}.top-meta{text-align:left}.layout{padding:8px 20px 28px}.hero,.chips,.cols2{grid-template-columns:1fr}}@media (max-width:640px){.inner{padding:18px}.event{grid-template-columns:1fr;gap:8px}.top,.p-head,.section{flex-direction:column;align-items:flex-start}.stages{grid-template-columns:repeat(2,minmax(0,1fr))}.stage:after{display:none}}
+    @media (max-width:1480px){.layout{grid-template-columns:1fr}.hero{grid-template-columns:minmax(220px,.75fr) minmax(0,1.25fr)}}@media (max-width:920px){header{flex-direction:column;align-items:flex-start;padding:28px 0 8px}.top-meta{text-align:left}header,.page{width:min(calc(100% - 32px),1400px)}body.detail-mode header,body.detail-mode .page{width:min(calc(100% - 32px),1240px)}.hero,.chips,.cols2{grid-template-columns:1fr}.detail-shell .inner,.detail-actions{align-items:flex-start}}@media (max-width:640px){header,.page{width:min(calc(100% - 24px),1400px)}body.detail-mode header,body.detail-mode .page{width:min(calc(100% - 24px),1240px)}.inner{padding:18px}.event{grid-template-columns:1fr;gap:8px}.top,.p-head,.section,.detail-shell .inner{flex-direction:column;align-items:flex-start}.stages{grid-template-columns:repeat(2,minmax(0,1fr))}.stage:after{display:none}}
   </style>
 </head>
 <body>
@@ -48,107 +52,115 @@
     </div>
   </header>
 
-  <main class="layout">
-    <div class="col">
-      <section class="panel">
+  <main class="page">
+      <section class="panel" id="overview-panel">
         <div class="inner">
           <div class="section">
             <div class="title">
               <span class="icon" id="overview-icon"></span>
               <h2>System Overview</h2>
             </div>
-            <div class="note" id="uptime-caption">Live infrastructure snapshot</div>
+            <div class="note" id="uptime-caption">Choose a tile to drill into that system.</div>
           </div>
-          <div class="hero">
-            <div>
-              <div class="uptime-label">Proxy Uptime</div>
-              <div class="uptime" id="uptime">--</div>
-              <div class="uptime-sub">
-                <div id="memory-status">Memory: --</div>
-                <div id="telegram-tools-status">Telegram tools: --</div>
-                <div id="openai-key-status">Model key: --</div>
-                <div id="active-sessions">Sessions: --</div>
+          <div class="chips">
+            <a class="chip" href="/monitor/detail?view=memory">
+              <div class="chip-head">
+                <div class="chip-title" id="memory-title"><strong>Memory</strong></div>
+                <div class="badge idle" id="memory-badge">Unknown</div>
               </div>
-            </div>
-            <div class="chips">
-              <div class="chip">
-                <div class="chip-head">
-                  <div class="chip-title" id="memory-title"><strong>Memory</strong></div>
-                  <div class="badge idle" id="memory-badge">Unknown</div>
-                </div>
-                <div class="chip-value" id="memory-value">--</div>
-                <div class="chip-sub" id="memory-sub">Checking memory tools.</div>
-                <div class="meter"><span id="memory-meter" style="width:32%"></span></div>
+              <div class="chip-value" id="memory-value">--</div>
+              <div class="chip-sub" id="memory-sub">Checking memory tools.</div>
+              <div class="meter"><span id="memory-meter" style="width:32%"></span></div>
+            </a>
+            <a class="chip" href="/monitor/detail?view=telegram">
+              <div class="chip-head">
+                <div class="chip-title" id="telegram-title"><strong>Telegram Tools</strong></div>
+                <div class="badge idle" id="telegram-badge">Unknown</div>
               </div>
-              <div class="chip">
-                <div class="chip-head">
-                  <div class="chip-title" id="telegram-title"><strong>Telegram Tools</strong></div>
-                  <div class="badge idle" id="telegram-badge">Unknown</div>
-                </div>
-                <div class="chip-value" id="telegram-value">--</div>
-                <div class="chip-sub" id="telegram-sub">Checking integrations.</div>
-                <div class="meter"><span id="telegram-meter" style="width:32%"></span></div>
+              <div class="chip-value" id="telegram-value">--</div>
+              <div class="chip-sub" id="telegram-sub">Checking integrations.</div>
+              <div class="meter"><span id="telegram-meter" style="width:32%"></span></div>
+            </a>
+            <a class="chip" href="/monitor/detail?view=openai">
+              <div class="chip-head">
+                <div class="chip-title" id="openai-title"><strong>Model Key</strong></div>
+                <div class="badge idle" id="openai-badge">Unknown</div>
               </div>
-              <div class="chip">
-                <div class="chip-head">
-                  <div class="chip-title" id="openai-title"><strong>Model Key</strong></div>
-                  <div class="badge idle" id="openai-badge">Unknown</div>
-                </div>
-                <div class="chip-value" id="openai-value">--</div>
-                <div class="chip-sub" id="openai-sub">Checking API configuration.</div>
-                <div class="meter"><span id="openai-meter" style="width:32%"></span></div>
+              <div class="chip-value" id="openai-value">--</div>
+              <div class="chip-sub" id="openai-sub">Checking API configuration.</div>
+              <div class="meter"><span id="openai-meter" style="width:32%"></span></div>
+            </a>
+            <a class="chip" href="/monitor/detail?view=session">
+              <div class="chip-head">
+                <div class="chip-title" id="session-title"><strong>Sessions</strong></div>
+                <div class="badge idle" id="session-badge">Idle</div>
               </div>
-              <div class="chip">
-                <div class="chip-head">
-                  <div class="chip-title" id="session-title"><strong>Sessions</strong></div>
-                  <div class="badge idle" id="session-badge">Idle</div>
-                </div>
-                <div class="chip-value" id="session-value">--</div>
-                <div class="chip-sub" id="session-sub">No session activity yet.</div>
-                <div class="meter"><span id="session-meter" style="width:12%"></span></div>
+              <div class="chip-value" id="session-value">--</div>
+              <div class="chip-sub" id="session-sub">No session activity yet.</div>
+              <div class="meter"><span id="session-meter" style="width:12%"></span></div>
+            </a>
+            <a class="chip" href="/monitor/detail?view=autogen">
+              <div class="chip-head">
+                <div class="chip-title" id="autogen-title"><strong>AutoGen</strong></div>
+                <div class="badge idle" id="autogen-badge">Idle</div>
               </div>
-              <div class="chip">
-                <div class="chip-head">
-                  <div class="chip-title" id="autogen-title"><strong>AutoGen</strong></div>
-                  <div class="badge idle" id="autogen-badge">Idle</div>
-                </div>
-                <div class="chip-value" id="autogen-active-runs">0</div>
-                <div class="chip-sub" id="autogen-sub">No active orchestration runs.</div>
-                <div class="meter"><span id="autogen-meter" style="width:0%"></span></div>
+              <div class="chip-value" id="autogen-active-runs">0</div>
+              <div class="chip-sub" id="autogen-sub">No active orchestration runs.</div>
+              <div class="meter"><span id="autogen-meter" style="width:0%"></span></div>
+            </a>
+            <a class="chip" href="/monitor/detail?view=browser">
+              <div class="chip-head">
+                <div class="chip-title" id="browser-title"><strong>Browser-use</strong></div>
+                <div class="badge idle" id="browser-badge">Idle</div>
               </div>
-              <div class="chip">
-                <div class="chip-head">
-                  <div class="chip-title" id="browser-title"><strong>Browser-use</strong></div>
-                  <div class="badge idle" id="browser-badge">Idle</div>
-                </div>
-                <div class="chip-value" id="browser-use-active-runs">0</div>
-                <div class="chip-sub" id="browser-sub">Browser automation ready.</div>
-                <div class="meter"><span id="browser-meter" style="width:0%"></span></div>
+              <div class="chip-value" id="browser-use-active-runs">0</div>
+              <div class="chip-sub" id="browser-sub">Browser automation ready.</div>
+              <div class="meter"><span id="browser-meter" style="width:0%"></span></div>
+            </a>
+            <a class="chip" href="/monitor/detail?view=philosopher">
+              <div class="chip-head">
+                <div class="chip-title" id="philosopher-title"><strong>Philosopher</strong></div>
+                <div class="badge idle" id="philosopher-badge">Idle</div>
               </div>
-              <div class="chip">
-                <div class="chip-head">
-                  <div class="chip-title" id="philosopher-title"><strong>Philosopher</strong></div>
-                  <div class="badge idle" id="philosopher-badge">Idle</div>
-                </div>
-                <div class="chip-value" id="philosopher-active-runs">0</div>
-                <div class="chip-sub" id="philosopher-sub">Reflective loop standing by.</div>
-                <div class="meter"><span id="philosopher-meter" style="width:0%"></span></div>
+              <div class="chip-value" id="philosopher-active-runs">0</div>
+              <div class="chip-sub" id="philosopher-sub">Reflective loop standing by.</div>
+              <div class="meter"><span id="philosopher-meter" style="width:0%"></span></div>
+            </a>
+            <a class="chip" href="/monitor/detail?view=task">
+              <div class="chip-head">
+                <div class="chip-title" id="task-title"><strong>Task Execution</strong></div>
+                <div class="badge idle" id="task-badge">Idle</div>
               </div>
-              <div class="chip">
-                <div class="chip-head">
-                  <div class="chip-title" id="task-title"><strong>Task Execution</strong></div>
-                  <div class="badge idle" id="task-badge">Idle</div>
-                </div>
-                <div class="chip-value" id="task-execution-active-runs">0</div>
-                <div class="chip-sub" id="task-sub">Task loop waiting for work.</div>
-                <div class="meter"><span id="task-meter" style="width:0%"></span></div>
-              </div>
-            </div>
+              <div class="chip-value" id="task-execution-active-runs">0</div>
+              <div class="chip-sub" id="task-sub">Task loop waiting for work.</div>
+              <div class="meter"><span id="task-meter" style="width:0%"></span></div>
+            </a>
           </div>
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel detail-shell" id="detail-shell" hidden>
+        <div class="inner">
+          <div class="detail-copy">
+            <nav class="crumbs" id="detail-breadcrumb" aria-label="Breadcrumb">
+              <a href="/monitor">Monitoring</a>
+              <span>/</span>
+              <span id="detail-crumb-current">Detail</span>
+            </nav>
+            <div class="detail-kicker">Drilldown</div>
+            <h2 class="detail-title" id="detail-view-title">Detail View</h2>
+            <div class="detail-note" id="detail-view-note">Focused monitoring detail for the selected system.</div>
+          </div>
+          <div class="detail-actions">
+            <div class="note" id="detail-view-context">Use the breadcrumb to return to the overview.</div>
+            <a class="detail-link" href="/monitor">Back to overview</a>
+          </div>
+        </div>
+      </section>
+
+    <div class="layout" id="detail-layout" hidden>
+    <div class="col">
+      <section class="panel" id="status-events-panel" data-drill-panel data-views="memory telegram openai session">
         <div class="inner">
           <div class="section">
             <div class="title">
@@ -161,7 +173,7 @@
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="proxy-log-panel" data-drill-panel data-views="memory telegram openai session">
         <div class="inner">
           <div class="section">
             <div class="title">
@@ -185,7 +197,7 @@
     </div>
 
     <div class="col">
-      <section class="panel">
+      <section class="panel" id="workflow-panel" data-drill-panel data-views="autogen browser">
         <div class="inner">
           <div class="section">
             <div class="title">
@@ -195,7 +207,7 @@
             <div class="note">Operational lanes for orchestration and browser automation</div>
           </div>
           <div class="cols2">
-            <div>
+            <div data-drill-lane="autogen">
               <div class="section">
                 <div class="title">
                   <span class="icon" id="autogen-lane-icon"></span>
@@ -205,7 +217,7 @@
               </div>
               <div class="stack" id="autogen-runs-list"></div>
             </div>
-            <div>
+            <div data-drill-lane="browser">
               <div class="section">
                 <div class="title">
                   <span class="icon" id="browser-lane-icon"></span>
@@ -220,7 +232,7 @@
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="loops-panel" data-drill-panel data-views="philosopher task">
         <div class="inner">
           <div class="section">
             <div class="title">
@@ -230,7 +242,7 @@
             <div class="note">Step-aware monitoring for internal reasoning systems</div>
           </div>
           <div class="cols2">
-            <div>
+            <div data-drill-lane="philosopher">
               <div class="section">
                 <div class="title">
                   <span class="icon" id="philosopher-lane-icon"></span>
@@ -240,7 +252,7 @@
               </div>
               <div class="stack" id="philosopher-runs-list"></div>
             </div>
-            <div>
+            <div data-drill-lane="task">
               <div class="section">
                 <div class="title">
                   <span class="icon" id="task-lane-icon"></span>
@@ -254,7 +266,7 @@
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="browser-log-panel" data-drill-panel data-views="browser">
         <div class="inner">
           <div class="section">
             <div class="title">
@@ -276,12 +288,63 @@
         </div>
       </section>
     </div>
+    </div>
   </main>
   <script>
     const POLL_MS = 15000;
+    const DETAIL_MODE = window.location.pathname.endsWith("/detail");
+    const DETAIL_VIEW = new URLSearchParams(window.location.search).get("view") || "all";
     let latestWorkflows = null;
+    let activeDrilldown = "all";
     const openRunLogs = new Set();
     const runLogCache = new Map();
+    const DRILLDOWN_META = {
+      all: {
+        title: "All Systems",
+        note: "Full monitoring coverage across infrastructure, workflow execution, reflective loops, and runtime logs.",
+        context: "Showing every monitoring panel."
+      },
+      memory: {
+        title: "Memory Detail",
+        note: "Infrastructure-oriented detail for memory readiness, event traffic, and proxy diagnostics.",
+        context: "Infra view: status timeline and proxy runtime log."
+      },
+      telegram: {
+        title: "Telegram Tools Detail",
+        note: "Integration-focused detail for Telegram tooling, session activity, and proxy diagnostics.",
+        context: "Infra view: status timeline and proxy runtime log."
+      },
+      openai: {
+        title: "Model Key Detail",
+        note: "Configuration and runtime signals tied to model access, event traffic, and proxy health.",
+        context: "Infra view: status timeline and proxy runtime log."
+      },
+      session: {
+        title: "Sessions Detail",
+        note: "Live session activity, recent status broadcasts, and the proxy log that backs the status stream.",
+        context: "Infra view: status timeline and proxy runtime log."
+      },
+      autogen: {
+        title: "AutoGen Detail",
+        note: "Planner and team execution runs with progress stages, metrics, and full conversation drill-through.",
+        context: "Workflow view: AutoGen lane."
+      },
+      browser: {
+        title: "Browser-use Detail",
+        note: "Browser automation runs, health snapshots, and the browser-use runtime log in one focused view.",
+        context: "Workflow view: browser lane plus browser log."
+      },
+      philosopher: {
+        title: "Philosopher Detail",
+        note: "Reflective loop progress, step tracking, and recent internal reasoning notes.",
+        context: "Loop view: philosopher lane."
+      },
+      task: {
+        title: "Task Execution Detail",
+        note: "Task loop state, step progress, and execution-specific notes for the active task system.",
+        context: "Loop view: task execution lane."
+      }
+    };
     const ICONS = {
       activity: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h3l2.2-5 4.1 10 2.2-5H20"/></svg>',
       chip: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="16" height="12" rx="2"/><path d="M9 6V4M15 6V4M9 20v-2M15 20v-2"/></svg>',
@@ -316,6 +379,52 @@
       const el = document.getElementById(id);
       if (!el) return;
       el.innerHTML = `<span class="icon">${ICONS[name] || ICONS.chip}</span><strong>${esc(label)}</strong>`;
+    }
+
+    function drilldownMeta(view) {
+      return DRILLDOWN_META[view] || DRILLDOWN_META.all;
+    }
+
+    function applyDrilldown() {
+      document.body.classList.toggle("detail-mode", DETAIL_MODE);
+      document.body.classList.toggle("overview-mode", !DETAIL_MODE);
+
+      const overviewPanel = document.getElementById("overview-panel");
+      const detailShell = document.getElementById("detail-shell");
+      const detailLayout = document.getElementById("detail-layout");
+      if (overviewPanel) overviewPanel.hidden = DETAIL_MODE;
+      if (detailShell) detailShell.hidden = !DETAIL_MODE;
+      if (detailLayout) detailLayout.hidden = !DETAIL_MODE;
+
+      if (!DETAIL_MODE) {
+        return;
+      }
+
+      const meta = drilldownMeta(activeDrilldown);
+      const titleEl = document.getElementById("detail-view-title");
+      const noteEl = document.getElementById("detail-view-note");
+      const contextEl = document.getElementById("detail-view-context");
+      const crumbEl = document.getElementById("detail-crumb-current");
+      if (titleEl) titleEl.textContent = meta.title;
+      if (noteEl) noteEl.textContent = meta.note;
+      if (contextEl) contextEl.textContent = meta.context;
+      if (crumbEl) crumbEl.textContent = meta.title;
+
+      document.querySelectorAll("[data-drill-panel]").forEach((panel) => {
+        const views = String(panel.getAttribute("data-views") || "").split(/\s+/).filter(Boolean);
+        panel.hidden = activeDrilldown !== "all" && !views.includes(activeDrilldown);
+      });
+
+      document.querySelectorAll("[data-drill-lane]").forEach((lane) => {
+        const laneView = lane.getAttribute("data-drill-lane");
+        lane.hidden = activeDrilldown !== "all" && laneView !== activeDrilldown;
+      });
+    }
+
+    function setDrilldown(view) {
+      const nextView = DRILLDOWN_META[view] ? view : "all";
+      activeDrilldown = nextView;
+      applyDrilldown();
     }
 
     function fmtDur(seconds) {
@@ -599,10 +708,15 @@
 
     async function fetchSummary() {
       const data = await fetchJson("/monitor/summary");
-      document.getElementById("uptime").textContent = fmtDur(data.uptime_seconds || 0);
-      document.getElementById("uptime-caption").textContent = `Last refresh ${timeLabel(Date.now())}`;
-      document.getElementById("top-meta").textContent =
-        `Events file: ${data.status_events_file || "unknown"} | Browser log file ${data.browser_use_log_file_configured ? "configured" : "not configured"}`;
+      const uptimeEl = document.getElementById("uptime");
+      const uptimeCaptionEl = document.getElementById("uptime-caption");
+      const topMetaEl = document.getElementById("top-meta");
+      if (uptimeEl) uptimeEl.textContent = fmtDur(data.uptime_seconds || 0);
+      if (uptimeCaptionEl) uptimeCaptionEl.textContent = `Last refresh ${timeLabel(Date.now())}`;
+      if (topMetaEl) {
+        topMetaEl.textContent =
+          `Events file: ${data.status_events_file || "unknown"} | Browser log file ${data.browser_use_log_file_configured ? "configured" : "not configured"}`;
+      }
 
       setChip(
         "memory",
@@ -665,6 +779,7 @@
         const meterEl = document.getElementById(`${base}-meter`);
         if (meterEl) meterEl.style.width = `${isActive ? Math.min(100, 28 + count * 18) : 0}%`;
       }
+
     }
 
     async function fetchEvents() {
@@ -732,17 +847,22 @@
       renderEvents([]);
       renderLogs("logs-list", "logs-hint", "proxy-log-status", { available: false, lines: [] }, "Proxy log file is not configured.");
       renderLogs("browser-logs-list", "browser-logs-hint", "browser-log-status", { available: false, lines: [] }, "Browser-use log file is not configured or not present.");
+      applyDrilldown();
     }
 
     async function refreshAll() {
       setRefreshState("", "Refreshing");
-      const jobs = [
-        ["summary", fetchSummary()],
-        ["events", fetchEvents()],
-        ["logs", fetchLogs()],
-        ["workflows", fetchWorkflows()],
-        ["browserLogs", fetchBrowserLogs()]
-      ];
+      const jobs = DETAIL_MODE
+        ? [
+            ["summary", fetchSummary()],
+            ["events", fetchEvents()],
+            ["logs", fetchLogs()],
+            ["workflows", fetchWorkflows()],
+            ["browserLogs", fetchBrowserLogs()]
+          ]
+        : [
+            ["summary", fetchSummary()]
+          ];
       const results = await Promise.allSettled(jobs.map(([, promise]) => promise));
       const failed = [];
       results.forEach((result, index) => {
@@ -802,6 +922,7 @@
 
     initIcons();
     seedEmptyPanels();
+    setDrilldown(DETAIL_VIEW);
     refreshAll();
     setInterval(refreshAll, POLL_MS);
   </script>

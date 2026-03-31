@@ -161,6 +161,28 @@ def test_monitor_workflows_refreshes_stale_browser_health_snapshot(monkeypatch):
     assert data["browser_use"]["health"]["result"]["running_tasks"] == 0
 
 
+def test_monitor_dashboard_html_links_tiles_to_detail_route():
+    from src.servers import proxy_server as ps
+
+    html = (ps._PROJECT_ROOT / "docs" / "monitoring_dashboard.html").read_text(encoding="utf-8")
+
+    assert 'href="/monitor/detail?view=autogen"' in html
+    assert 'href="/monitor/detail?view=browser"' in html
+    assert 'data-drill-panel' in html
+    assert 'id="detail-breadcrumb"' in html
+    assert 'Back to overview' in html
+    assert 'if (detailLayout) detailLayout.hidden = !DETAIL_MODE;' in html
+    assert "Proxy Uptime" not in html
+
+
+def test_monitor_detail_route_serves_dashboard_shell():
+    client = _client()
+    response = client.get("/monitor/detail?view=autogen")
+
+    assert response.status_code == 200, response.text
+    assert 'id="detail-breadcrumb"' in response.text
+
+
 def test_monitor_browser_use_logs_tails_configured_file():
     from src.servers import proxy_server as ps
 

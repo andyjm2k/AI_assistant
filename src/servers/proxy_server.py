@@ -10943,13 +10943,49 @@ async def test_endpoint():
     return {"message": "test successful", "timestamp": time.time()}
 
 # Monitoring dashboard (standalone)
+def _load_monitor_dashboard_html(*, detail_mode: bool) -> str:
+    """Load the monitoring dashboard HTML, optionally stripping detail-only sections."""
+    dashboard_file = _PROJECT_ROOT / "docs" / "monitoring_dashboard.html"
+    if not dashboard_file.exists():
+        return ""
+
+    html = dashboard_file.read_text(encoding="utf-8")
+    if detail_mode:
+        return html
+
+    html = re.sub(
+        r'\s*<section class="panel detail-shell" id="detail-shell" hidden>.*?</section>',
+        "",
+        html,
+        count=1,
+        flags=re.S,
+    )
+    html = re.sub(
+        r'\s*<div class="layout" id="detail-layout" hidden>.*?</main>',
+        "\n  </main>",
+        html,
+        count=1,
+        flags=re.S,
+    )
+    return html
+
+
 @app.get("/monitor")
 async def monitor_dashboard():
     """Serve the monitoring dashboard HTML."""
-    dashboard_file = _PROJECT_ROOT / "docs" / "monitoring_dashboard.html"
-    if not dashboard_file.exists():
+    html = _load_monitor_dashboard_html(detail_mode=False)
+    if not html:
         return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
-    return HTMLResponse(content=dashboard_file.read_text(encoding="utf-8"), status_code=200)
+    return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/monitor/detail")
+async def monitor_dashboard_detail():
+    """Serve the monitoring detail HTML shell."""
+    html = _load_monitor_dashboard_html(detail_mode=True)
+    if not html:
+        return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
+    return HTMLResponse(content=html, status_code=200)
 
 
 @app.get("/monitor/summary")
