@@ -71,6 +71,7 @@ def build_server_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     env["TMPDIR"] = str(TEMP_DIR)
     env["MCP_BROWSER_DOWNLOADS_DIR"] = str(BROWSER_DOWNLOADS_DIR)
     env["CATBOT_BROWSER_USE_RUNTIME_DIR"] = str(RUNTIME_DIR)
+    env["CATBOT_BROWSER_USE_STATE_DIR"] = str(RUNTIME_DIR / "mcp-server-browser-use")
 
     # uv gets confused by the parent CATBot venv; force it to use mcp-browser-use's environment.
     env.pop("VIRTUAL_ENV", None)

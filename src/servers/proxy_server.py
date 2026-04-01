@@ -2718,6 +2718,7 @@ load_users_db()
 
 # Global AutoGen team instance
 autogen_team = None
+_autogen_team_warmup_task = None
 
 # Global memory manager instance
 memory_manager = None
@@ -4596,11 +4597,28 @@ if skill_manager is not None and create_skill_router is not None:
     app.include_router(create_skill_router(skill_manager, auth_dependency=get_current_user))
 
 # Startup event to verify app initialization
+async def _warm_autogen_team_after_startup():
+    """Warm AutoGen team state in the background so proxy bind is not delayed."""
+    global autogen_team
+    try:
+        team = await asyncio.to_thread(load_autogen_team_runtime)
+        if team is not None:
+            autogen_team = team
+            print("âœ… AutoGen team loaded successfully in background startup warmup")
+    except Exception as e:
+        import traceback
+        print(f"Ã¢Å¡Â Ã¯Â¸Â Warning: Could not warm AutoGen team after startup: {e}")
+        print(traceback.format_exc())
+
+
 @app.on_event("startup")
 async def startup_event():
     """Log that the application has started successfully."""
     import sys
     await _get_shared_chat_http_client()
+    global _autogen_team_warmup_task
+    if _autogen_team_warmup_task is None or _autogen_team_warmup_task.done():
+        _autogen_team_warmup_task = asyncio.create_task(_warm_autogen_team_after_startup())
     print("🚀 FastAPI application startup event fired", flush=True)
     sys.stdout.flush()
     print(f"🚀 App routes registered: {len(app.routes)} routes", flush=True)
@@ -5314,7 +5332,7 @@ except Exception as e:
 
 # Load AutoGen team on startup (with error handling to prevent startup failures)
 try:
-    autogen_team = load_autogen_team_runtime()
+    autogen_team = None
     if autogen_team is not None:
         print("✅ AutoGen team loaded successfully on startup")
 except Exception as e:

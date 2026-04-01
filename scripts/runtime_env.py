@@ -78,16 +78,16 @@ def resolve_venv_dir(
     root = (project_root or resolve_project_root()).resolve()
     env = base_env or os.environ
 
-    for raw in (env.get("CATBOT_VENV_DIR"), env.get("VIRTUAL_ENV")):
-        candidate = _coerce_existing_path(raw)
-        if candidate and _venv_python_from_dir(candidate):
-            return candidate
-
     python_path = _coerce_existing_path(python_exe or resolve_venv_python(root, env))
     if python_path:
         parent = python_path.parent
         if parent.name.lower() in {"scripts", "bin"}:
             return parent.parent
+
+    for raw in (env.get("CATBOT_VENV_DIR"), env.get("VIRTUAL_ENV")):
+        candidate = _coerce_existing_path(raw)
+        if candidate and _venv_python_from_dir(candidate):
+            return candidate
 
     project_venv = root / "venv"
     if _venv_python_from_dir(project_venv):
@@ -119,18 +119,20 @@ def build_script_env(
     root = (project_root or resolve_project_root()).resolve()
     env = dict(base_env or os.environ)
     resolved_python = python_exe or resolve_venv_python(root, env)
+    resolved_venv_dir = resolve_venv_dir(root, resolved_python, {"CATBOT_VENV_PYTHON": resolved_python})
 
     env["CATBOT_PROJECT_ROOT"] = str(root)
     env["CATBOT_INSTALL_ROOT"] = str(root)
     env["CATBOT_WORKSPACE"] = str(root)
     env["CATBOT_VENV_PYTHON"] = resolved_python
     env["PYTHONPATH"] = _prepend_env_path(env.get("PYTHONPATH"), str(root))
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
 
-    venv_dir = resolve_venv_dir(root, resolved_python, env)
-    if include_venv and venv_dir:
-        env["CATBOT_VENV_DIR"] = str(venv_dir)
-        env["VIRTUAL_ENV"] = str(venv_dir)
-        scripts_dir = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+    if include_venv and resolved_venv_dir:
+        env["CATBOT_VENV_DIR"] = str(resolved_venv_dir)
+        env["VIRTUAL_ENV"] = str(resolved_venv_dir)
+        scripts_dir = resolved_venv_dir / ("Scripts" if os.name == "nt" else "bin")
         if scripts_dir.exists():
             env["PATH"] = _prepend_env_path(env.get("PATH"), str(scripts_dir))
 

@@ -41,6 +41,18 @@ HOST = '0.0.0.0'  # Allow network access
 CERT_FILE = f"{_CERT_HOSTNAME}+2.pem"
 KEY_FILE = f"{_CERT_HOSTNAME}+2-key.pem"
 
+
+def _configure_console_output() -> None:
+    """Prefer UTF-8 console streams so Windows startup logs don't crash on emoji."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
 class MyHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Custom request handler with CORS headers for cross-origin requests."""
     
@@ -389,6 +401,8 @@ def generate_self_signed_cert():
 def main():
     """Start the HTTPS server."""
     global CERT_FILE, KEY_FILE
+
+    _configure_console_output()
     
     # Change to project root so static files (index.html, libs/, etc.) are served correctly
     os.chdir(_PROJECT_ROOT)

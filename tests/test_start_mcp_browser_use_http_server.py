@@ -32,6 +32,7 @@ def test_build_server_env_sets_repo_local_runtime_paths(monkeypatch):
         assert env["TMPDIR"] == str(tmp_path / ".runtime" / "tmp")
         assert env["MCP_BROWSER_DOWNLOADS_DIR"] == str(tmp_path / ".runtime" / "browser-use-downloads")
         assert env["CATBOT_BROWSER_USE_RUNTIME_DIR"] == str(tmp_path / ".runtime")
+        assert env["CATBOT_BROWSER_USE_STATE_DIR"] == str(tmp_path / ".runtime" / "mcp-server-browser-use")
         assert env["CATBOT_PROJECT_ROOT"] == str(tmp_path)
         assert env["CATBOT_INSTALL_ROOT"] == str(tmp_path)
         assert "VIRTUAL_ENV" not in env

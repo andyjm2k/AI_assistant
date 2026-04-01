@@ -82,3 +82,150 @@ def test_build_child_env_sets_project_root_and_active_venv(monkeypatch):
         assert env["PYTHONPATH"].split(";")[0] == str(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_launch_in_new_cmd_uses_new_console_flag_on_windows(monkeypatch):
+    from scripts import start_all
+
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+
+        class DummyProc:
+            def poll(self):
+                return None
+
+        return DummyProc()
+
+    monkeypatch.setattr(start_all.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(start_all.os, "name", "nt")
+    monkeypatch.setattr(start_all.subprocess, "CREATE_NEW_CONSOLE", 16, raising=False)
+
+    start_all._launch_in_new_cmd(["python", "-m", "example"], env={"X": "1"})
+
+    assert captured["command"] == ["python", "-m", "example"]
+    assert captured["kwargs"]["creationflags"] == 16
+
+
+def test_main_fails_when_service_exits_immediately(monkeypatch):
+    from scripts import start_all
+
+    class DeadProc:
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(start_all.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(start_all, "_build_child_env", lambda: {"X": "1"})
+    monkeypatch.setattr(start_all, "_resolve_autogenstudio_command", lambda: None)
+    monkeypatch.setattr(
+        start_all,
+        "_build_launch_specs",
+        lambda studio: [("svc-a", ["python", "svc-a.py"], True), ("svc-b", ["python", "svc-b.py"], True)],
+    )
+    monkeypatch.setattr(
+        start_all,
+        "_launch_in_new_cmd",
+        lambda command, env=None, new_console=True: DeadProc(),
+    )
+    monkeypatch.setattr(start_all, "_wait_for_required_ports", lambda ports, timeout_seconds=20.0: set())
+    monkeypatch.setattr(start_all.time, "sleep", lambda _: None)
+
+    assert start_all.main() == 1
+
+
+def test_main_retries_without_new_console_after_immediate_exit(monkeypatch):
+    from scripts import start_all
+
+    class DeadProc:
+        def poll(self):
+            return 1
+
+    class LiveProc:
+        def poll(self):
+            return None
+
+    launches = []
+
+    def fake_launch(command_line, env=None, new_console=True):
+        launches.append((command_line, new_console))
+        if new_console:
+            return DeadProc()
+        return LiveProc()
+
+    monkeypatch.setattr(start_all.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(start_all, "_build_child_env", lambda: {"X": "1"})
+    monkeypatch.setattr(start_all, "_resolve_autogenstudio_command", lambda: None)
+    monkeypatch.setattr(
+        start_all,
+        "_build_launch_specs",
+        lambda studio: [("svc-a", ["python", "svc-a.py"], True)],
+    )
+    monkeypatch.setattr(start_all, "_launch_in_new_cmd", fake_launch)
+    monkeypatch.setattr(start_all, "_wait_for_required_ports", lambda ports, timeout_seconds=20.0: set())
+    monkeypatch.setattr(start_all.time, "sleep", lambda _: None)
+
+    assert start_all.main() == 0
+    assert launches == [(["python", "svc-a.py"], True), (["python", "svc-a.py"], False)]
+
+
+def test_main_fails_when_ports_never_open(monkeypatch):
+    from scripts import start_all
+
+    class LiveProc:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(start_all.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(start_all, "_build_child_env", lambda: {"X": "1"})
+    monkeypatch.setattr(start_all, "_resolve_autogenstudio_command", lambda: None)
+    monkeypatch.setattr(
+        start_all,
+        "_build_launch_specs",
+        lambda studio: [("svc-a", ["python", "svc-a.py"], True)],
+    )
+    monkeypatch.setattr(
+        start_all,
+        "_launch_in_new_cmd",
+        lambda command, env=None, new_console=True: LiveProc(),
+    )
+    monkeypatch.setattr(start_all, "_wait_for_required_ports", lambda ports, timeout_seconds=20.0: {8000})
+    monkeypatch.setattr(start_all.time, "sleep", lambda _: None)
+
+    assert start_all.main() == 1
+
+
+def test_main_warns_for_optional_service_exit_but_succeeds(monkeypatch):
+    from scripts import start_all
+
+    class DeadProc:
+        def poll(self):
+            return 1
+
+    class LiveProc:
+        def poll(self):
+            return None
+
+    launch_results = iter([LiveProc(), DeadProc(), DeadProc()])
+
+    monkeypatch.setattr(start_all.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(start_all, "_build_child_env", lambda: {"X": "1"})
+    monkeypatch.setattr(start_all, "_resolve_autogenstudio_command", lambda: None)
+    monkeypatch.setattr(
+        start_all,
+        "_build_launch_specs",
+        lambda studio: [
+            ("svc-a", ["python", "svc-a.py"], True),
+            ("svc-optional", ["python", "svc-optional.py"], False),
+        ],
+    )
+    monkeypatch.setattr(
+        start_all,
+        "_launch_in_new_cmd",
+        lambda command, env=None, new_console=True: next(launch_results),
+    )
+    monkeypatch.setattr(start_all, "_wait_for_required_ports", lambda ports, timeout_seconds=20.0: set())
+    monkeypatch.setattr(start_all.time, "sleep", lambda _: None)
+
+    assert start_all.main() == 0

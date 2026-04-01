@@ -15,10 +15,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def test_https_cert_hostname_default_without_env():
     """When HTTPS_CERT_HOSTNAME is unset, module uses default anton.local for cert filenames."""
-    # Run in subprocess so we get a fresh import with no env set (__file__ not defined in -c)
+    # Run in subprocess so we get a fresh import with no env set and no .env loading.
     root = str(PROJECT_ROOT)
     code = (
-        "import sys, os; sys.path.insert(0, %r); os.environ.pop('HTTPS_CERT_HOSTNAME', None); "
+        "import sys, os, types; sys.path.insert(0, %r); os.environ.pop('HTTPS_CERT_HOSTNAME', None); "
+        "dotenv = types.ModuleType('dotenv'); dotenv.load_dotenv = lambda *a, **k: None; sys.modules['dotenv'] = dotenv; "
         "import src.servers.https_server as m; "
         "assert m.CERT_FILE == 'anton.local+2.pem'; assert m.KEY_FILE == 'anton.local+2-key.pem'; "
         "assert m._CERT_HOSTNAME == 'anton.local'"
@@ -79,3 +80,24 @@ def test_check_mkcert_certificates_uses_hostname_glob():
     import src.servers.https_server as m
     assert "*" not in m._CERT_HOSTNAME_GLOB, "Glob part should not contain *"
     assert "?" not in m._CERT_HOSTNAME_GLOB, "Glob part should not contain ?"
+
+
+def test_configure_console_output_prefers_utf8(monkeypatch):
+    """HTTPS startup should reconfigure console streams to UTF-8 when possible."""
+    import src.servers.https_server as m
+
+    calls = []
+
+    class FakeStream:
+        def reconfigure(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(m.sys, "stdout", FakeStream())
+    monkeypatch.setattr(m.sys, "stderr", FakeStream())
+
+    m._configure_console_output()
+
+    assert calls == [
+        {"encoding": "utf-8", "errors": "replace"},
+        {"encoding": "utf-8", "errors": "replace"},
+    ]

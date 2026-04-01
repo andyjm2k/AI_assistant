@@ -133,6 +133,7 @@ def _build_browser_use_env() -> dict[str, str]:
     env["TMPDIR"] = str(MCP_BROWSER_USE_TEMP_DIR)
     env["MCP_BROWSER_DOWNLOADS_DIR"] = str(MCP_BROWSER_USE_DOWNLOADS_DIR)
     env["CATBOT_BROWSER_USE_RUNTIME_DIR"] = str(MCP_BROWSER_USE_RUNTIME_DIR)
+    env["CATBOT_BROWSER_USE_STATE_DIR"] = str(MCP_BROWSER_USE_RUNTIME_DIR / "mcp-server-browser-use")
     return env
 
 
