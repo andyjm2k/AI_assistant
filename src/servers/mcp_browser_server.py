@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import hmac
 from typing import Optional
 from pathlib import Path
 
@@ -34,8 +35,85 @@ logger = logging.getLogger(__name__)
 
 # Create Flask application instance
 app = Flask(__name__)
-# Enable CORS for all routes to allow frontend access
-CORS(app)
+
+_PROTECTED_API_PATHS = {"/api/browser-agent", "/api/deep-research"}
+
+
+def _get_browser_server_secret() -> str:
+    """Return the shared secret used for internal proxy-to-bridge requests."""
+    return (
+        os.environ.get("MCP_BROWSER_SERVER_SECRET")
+        or os.environ.get("CATBOT_AGENT_SECRET")
+        or os.environ.get("AUTOGEN_TEAM_SECRET")
+        or ""
+    ).strip()
+
+
+def _get_allowed_origins() -> list[str]:
+    """Parse an explicit comma-separated CORS allowlist for direct browser access."""
+    raw_value = os.environ.get("MCP_BROWSER_SERVER_ALLOWED_ORIGINS", "")
+    return [origin.strip() for origin in raw_value.split(",") if origin.strip()]
+
+
+def _configure_cors(flask_app: Flask) -> None:
+    """Enable CORS only when a direct browser-access allowlist is configured."""
+    allowed_origins = _get_allowed_origins()
+    if not allowed_origins:
+        logger.info(
+            "CORS disabled for MCP browser API routes; set MCP_BROWSER_SERVER_ALLOWED_ORIGINS to allow direct browser access."
+        )
+        return
+
+    CORS(flask_app, resources={r"/api/*": {"origins": allowed_origins}})
+    logger.info("Enabled MCP browser API CORS allowlist for origins: %s", ", ".join(allowed_origins))
+
+
+def _request_has_valid_secret() -> bool:
+    """Return True when the request carries the configured shared secret."""
+    expected_secret = _get_browser_server_secret()
+    if not expected_secret:
+        return False
+
+    secret_header = request.headers.get("X-Agent-Secret")
+    if secret_header is not None and hmac.compare_digest(secret_header.strip(), expected_secret):
+        return True
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.strip().startswith("Bearer "):
+        token = auth_header.strip()[7:].strip()
+        if hmac.compare_digest(token, expected_secret):
+            return True
+
+    return False
+
+
+@app.before_request
+def _require_internal_secret_for_expensive_routes():
+    """Protect browser automation routes with a shared secret."""
+    if request.path not in _PROTECTED_API_PATHS:
+        return None
+
+    if not _get_browser_server_secret():
+        logger.error(
+            "Rejected %s because MCP_BROWSER_SERVER_SECRET/CATBOT_AGENT_SECRET is not configured.",
+            request.path,
+        )
+        return jsonify({
+            "success": False,
+            "error": "Browser server shared secret is not configured."
+        }), 503
+
+    if not _request_has_valid_secret():
+        logger.warning("Rejected unauthorized request to %s from %s", request.path, request.remote_addr)
+        return jsonify({
+            "success": False,
+            "error": "Missing or invalid browser server shared secret."
+        }), 401
+
+    return None
+
+
+_configure_cors(app)
 
 # Note: We don't maintain a global persistent client because Flask's synchronous
 # nature with asyncio.run() creates new event loops per request, which conflicts
@@ -259,7 +337,8 @@ def health_check():
     
     return jsonify({
         'status': 'healthy',
-        'mcp_available': mcp_available
+        'mcp_available': mcp_available,
+        'auth_configured': bool(_get_browser_server_secret()),
     })
 
 
@@ -288,9 +367,19 @@ def main():
     """
     # Get port from environment or use default
     port = int(os.environ.get('PORT', 5001))
-    host = os.environ.get('HOST', '0.0.0.0')  # Default to 0.0.0.0 for network access
+    host = os.environ.get('HOST', '127.0.0.1').strip() or '127.0.0.1'
+    shared_secret_configured = bool(_get_browser_server_secret())
     
     logger.info(f"Starting MCP Browser HTTP Server on {host}:{port}")
+    if not shared_secret_configured:
+        logger.warning(
+            "MCP browser automation routes are disabled until MCP_BROWSER_SERVER_SECRET, CATBOT_AGENT_SECRET, or AUTOGEN_TEAM_SECRET is configured."
+        )
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        logger.warning(
+            "MCP browser server is bound to a non-loopback host (%s). Keep MCP_BROWSER_SERVER_ALLOWED_ORIGINS strict and use a strong shared secret.",
+            host,
+        )
     logger.info("Available endpoints:")
     logger.info("  POST /api/browser-agent - Execute browser automation task")
     logger.info("  POST /api/deep-research - Execute deep research task")

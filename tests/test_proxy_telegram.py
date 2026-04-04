@@ -1346,16 +1346,19 @@ class TestBrowserAgentProxy:
         post_client.__aenter__ = AsyncMock(return_value=post_client)
         post_client.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("src.servers.proxy_server.os.getenv") as m_getenv:
-            m_getenv.side_effect = lambda k, d=None: (
-                "http://127.0.0.1:5001" if k == "MCP_BROWSER_SERVER_URL" else os.environ.get(k, d)
-            )
-            with patch("src.servers.proxy_server.httpx.AsyncClient", side_effect=[health_client, post_client]):
-                result = await ps._do_browser_agent({"instruction": "Open example.com"})
+        with patch("src.servers.proxy_server._get_mcp_browser_server_url", return_value="http://127.0.0.1:5001"), patch(
+            "src.servers.proxy_server.MCP_BROWSER_SERVER_SHARED_SECRET",
+            "bridge-secret",
+        ), patch("src.servers.proxy_server.httpx.AsyncClient", side_effect=[health_client, post_client]):
+            result = await ps._do_browser_agent({"instruction": "Open example.com"})
 
         assert result["success"] is True
         posted_json = post_client.post.await_args.kwargs["json"]
         assert posted_json["task"] == "Open example.com"
+        assert post_client.post.await_args.kwargs["headers"] == {
+            "Content-Type": "application/json",
+            "X-Agent-Secret": "bridge-secret",
+        }
 
     def test_tool_loop_does_not_infer_next_tool_from_planning_text(self):
         """
@@ -2667,12 +2670,11 @@ class TestDeepResearchProxy:
 
         with patch.object(ps, "_monitor_run_start", return_value="deep-research-test"), patch.object(
             ps, "_monitor_run_note"
-        ), patch.object(ps, "_monitor_run_finish"), patch.object(ps.os, "getenv") as mock_getenv, patch.object(
+        ), patch.object(ps, "_monitor_run_finish"), patch.object(
+            ps, "_get_mcp_browser_server_url", return_value="http://127.0.0.1:5001"
+        ), patch.object(ps, "MCP_BROWSER_SERVER_SHARED_SECRET", "bridge-secret"), patch.object(
             ps.httpx, "AsyncClient", return_value=_Client()
         ):
-            mock_getenv.side_effect = lambda key, default=None: (
-                "http://127.0.0.1:5001" if key == "MCP_BROWSER_SERVER_URL" else os.environ.get(key, default)
-            )
             result = await ps._do_deep_research(
                 {"researchTask": "Find competitor pricing", "maxParallelBrowsers": 4}
             )
@@ -2682,6 +2684,10 @@ class TestDeepResearchProxy:
         assert captured["json"] == {
             "research_task": "Find competitor pricing",
             "max_parallel_browsers": 4,
+        }
+        assert captured["headers"] == {
+            "Content-Type": "application/json",
+            "X-Agent-Secret": "bridge-secret",
         }
 
     @pytest.mark.asyncio
@@ -2705,12 +2711,11 @@ class TestDeepResearchProxy:
 
         with patch.object(ps, "_monitor_run_start", return_value="deep-research-test"), patch.object(
             ps, "_monitor_run_note"
-        ), patch.object(ps, "_monitor_run_finish"), patch.object(ps.os, "getenv") as mock_getenv, patch.object(
+        ), patch.object(ps, "_monitor_run_finish"), patch.object(
+            ps, "_get_mcp_browser_server_url", return_value="http://127.0.0.1:5001"
+        ), patch.object(ps, "MCP_BROWSER_SERVER_SHARED_SECRET", "bridge-secret"), patch.object(
             ps.httpx, "AsyncClient", return_value=_Client()
         ):
-            mock_getenv.side_effect = lambda key, default=None: (
-                "http://127.0.0.1:5001" if key == "MCP_BROWSER_SERVER_URL" else os.environ.get(key, default)
-            )
             result = await ps._do_deep_research({"researchTask": "Find competitor pricing"})
 
         assert result["message"] == "Final research report"
@@ -2750,14 +2755,17 @@ class TestBrowserAgentProxy:
 
         with patch.object(ps, "_monitor_run_start", return_value="browser-agent-test"), patch.object(
             ps, "_monitor_run_note"
-        ), patch.object(ps, "_monitor_run_finish"), patch.object(ps.os, "getenv") as mock_getenv, patch.object(
+        ), patch.object(ps, "_monitor_run_finish"), patch.object(
+            ps, "_get_mcp_browser_server_url", return_value="http://127.0.0.1:5001"
+        ), patch.object(ps, "MCP_BROWSER_SERVER_SHARED_SECRET", "bridge-secret"), patch.object(
             ps.httpx, "AsyncClient", return_value=_Client()
         ):
-            mock_getenv.side_effect = lambda key, default=None: (
-                "http://127.0.0.1:5001" if key == "MCP_BROWSER_SERVER_URL" else os.environ.get(key, default)
-            )
             result = await ps._do_browser_agent({"instruction": "Open the page and find the answer"})
 
         assert captured["url"] == "http://127.0.0.1:5001/api/browser-agent"
         assert captured["json"] == {"instruction": "Open the page and find the answer", "task": "Open the page and find the answer"}
+        assert captured["headers"] == {
+            "Content-Type": "application/json",
+            "X-Agent-Secret": "bridge-secret",
+        }
         assert result["message"] == "Explicit browser result"

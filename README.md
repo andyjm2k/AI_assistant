@@ -469,7 +469,13 @@ python scripts/export_autogen_team_config.py
 
 `scripts/start_all.py` runs that export automatically before launching AutoGen Studio.
 
-Ensure Docker is installed and running if you use the lead engineer's injected code execution tool. The proxy server manages that executor lifecycle (start before first run, stop on reload or app shutdown).
+Security defaults:
+
+- The install wizard generates a real `JWT_SECRET`. If you replace it later, rotate any previously issued JWTs.
+- `AUTOGEN_REQUIRE_AUTH=true` keeps `POST /v1/proxy/autogen` behind authentication by default.
+- Browser users should call it with their normal JWT. Internal AutoGen/browser-bridge callers can use `CATBOT_AGENT_SECRET` (or the legacy `AUTOGEN_TEAM_SECRET`) via `X-Agent-Secret`.
+- `AUTOGEN_ENABLE_CODE_EXECUTION=false` leaves the Docker-backed Python execution tool disabled even when the optional AutoGen Docker extras are installed.
+- If you enable code execution later, ensure Docker is installed and running. The proxy server manages that executor lifecycle (start before first run, stop on reload or app shutdown).
 
 **Resources:**
 - [AutoGen Documentation](https://microsoft.github.io/autogen/)
@@ -491,7 +497,7 @@ This will start (each in a separate command window):
 - Proxy server (port 8002)
 - AutoGen Studio (port 8084)
 - MCP Browser-Use HTTP server (port 8383; run `uv run mcp-server-browser-use server` in mcp-browser-use directory)
-- MCP Browser HTTP server (port 5001; Flask bridge; connects to browser-use via `MCP_BROWSER_USE_HTTP_URL`, default http://127.0.0.1:8383/mcp)
+- MCP Browser HTTP server (port 5001; localhost-only by default; internal Flask bridge to browser-use via `MCP_BROWSER_USE_HTTP_URL`, default http://127.0.0.1:8383/mcp)
 - **Telegram bot** (polling; requires `python-telegram-bot` and `TELEGRAM_BOT_TOKEN` in `.env`)
 
 #### Option 1b: Stop All Services (Windows)
@@ -535,11 +541,13 @@ python scripts/start_mcp_browser_server.py
 1. **Web Interface**: Open `index-dev.html` in your browser (served on port 8000)
 2. **AutoGen Studio (optional)**: Navigate to `http://localhost:8084` if you installed Studio separately
 3. **Proxy Server API**: `http://localhost:8002` (FastAPI with comprehensive endpoints)
-4. **MCP Browser HTTP Server**: `http://localhost:5001` (Flask-based HTTP bridge)
+4. **MCP Browser HTTP Server**: `http://localhost:5001` (internal Flask bridge; browser/deep-research routes require `X-Agent-Secret` and are normally accessed through the proxy)
 
 #### Remote Network Access
 
-All services are configured to accept connections from devices on your local network. To access from a remote device:
+The web server, proxy, and optional Studio can accept connections from devices on your local network. The MCP Browser HTTP bridge on port `5001` now binds to loopback by default and is intended as an internal proxy hop, not a public/LAN API.
+
+To access from a remote device:
 
 1. **Find your server's IP address:**
    - **Windows**: Run `ipconfig` in Command Prompt and look for "IPv4 Address" under your active network adapter
@@ -550,18 +558,17 @@ All services are configured to accept connections from devices on your local net
    - **Web Interface**: `http://<server-ip>:8000` (e.g., `http://192.168.1.100:8000`)
    - **AutoGen Studio**: `http://<server-ip>:8084`
    - **Proxy Server API**: `http://<server-ip>:8002`
-   - **MCP Browser HTTP Server**: `http://<server-ip>:5001`
 
 3. **Frontend auto-detection:**
    - The web interface automatically detects if it's being accessed remotely and adjusts API endpoints accordingly
    - You can also manually specify the server IP using a URL parameter: `http://<server-ip>:8000?server=<server-ip>`
 
 4. **Firewall configuration:**
-   - Ensure your firewall allows incoming connections on ports: 8000, 8002, 5001, and 8084
+   - Ensure your firewall allows incoming connections on ports: 8000, 8002, and 8084
    - **Windows Firewall**: Add inbound rules for these ports
    - **Linux**: Use `ufw` or `iptables` to allow the ports
 
-**Security Note**: This configuration allows any device on your local network to access the services. For production use, consider adding authentication or restricting access via firewall rules.
+**Security Note**: If you intentionally expose the MCP Browser HTTP bridge, set a strong `MCP_BROWSER_SERVER_SECRET`, keep a strict `MCP_BROWSER_SERVER_ALLOWED_ORIGINS` allowlist, and override its host binding explicitly instead of relying on the default localhost-only mode.
 
 ### API Endpoints
 
@@ -575,7 +582,7 @@ All services are configured to accept connections from devices on your local net
 - `GET /v1/proxy/weather` - Weather info (Open-Meteo: current, forecast, summary; supports memory fallback)
 
 **AI & Chat:**
-- `POST /v1/proxy/autogen` - AutoGen team-based chat endpoint
+- `POST /v1/proxy/autogen` - AutoGen team-based chat endpoint (auth required by default; accepts JWT or internal agent secret)
 - `POST /v1/proxy/codex` - Codex CLI non-interactive runner (auth required; writes summary to scratch)
 - `POST /v1/proxy/restart` - Restart proxy server process to reload tool/code changes (auth required)
 - `POST /v1/telegram/chat` - Telegram bot chat endpoint
@@ -625,17 +632,24 @@ All services are configured to accept connections from devices on your local net
 
 #### MCP Browser HTTP Server Endpoints (Port 5001)
 
-- `POST /api/browser-agent` - Execute browser automation task
-- `POST /api/deep-research` - Execute deep research task
-- `GET /api/health` - Check server health and MCP availability
+- `POST /api/browser-agent` - Execute browser automation task (`X-Agent-Secret` or `Authorization: Bearer <shared-secret>` required)
+- `POST /api/deep-research` - Execute deep research task (`X-Agent-Secret` or `Authorization: Bearer <shared-secret>` required)
+- `GET /api/health` - Check server health, MCP availability, and whether bridge auth is configured
 - `POST /api/disconnect` - Disconnect MCP client
 
 ### Using Browser Automation
 
 ```bash
-# Via HTTP API (MCP Browser HTTP Server)
+# Preferred: via proxy routes / tools
+curl -X POST http://localhost:8002/v1/proxy/browser-agent \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <jwt>" \
+  -d '{"task": "Go to example.com and get the page title"}'
+
+# Direct bridge access for local/internal callers only
 curl -X POST http://localhost:5001/api/browser-agent \
   -H "Content-Type: application/json" \
+  -H "X-Agent-Secret: <MCP_BROWSER_SERVER_SECRET>" \
   -d '{"task": "Go to example.com and get the page title"}'
 
 # Via Proxy Server MCP endpoints
@@ -860,15 +874,22 @@ Install all Python dependencies with: `pip install -r requirements.txt`
    - If the model returns tool calls inside fenced code blocks (```), Telegram will ignore them.
    - Check proxy logs for `Codex CLI not found` or `Codex CLI tool is disabled`.
 
-9. **MCP Browser Server Connection Issues**
+9. **AutoGen Workflow Returns 401**
+   - Confirm you are signed in before calling `/v1/proxy/autogen` from the web UI.
+   - For internal callers, set `CATBOT_AGENT_SECRET` (or `AUTOGEN_TEAM_SECRET`) and send it as `X-Agent-Secret`.
+   - Leave `AUTOGEN_REQUIRE_AUTH=true` unless you intentionally want a public endpoint.
+   - Leave `AUTOGEN_ENABLE_CODE_EXECUTION=false` unless you intentionally want Docker-backed execution inside the AutoGen team.
+
+10. **MCP Browser Server Connection Issues**
    - Verify MCP Browser-Use server is running
-   - Check environment variables in `.env` file
+   - Check environment variables in `.env` file, especially `MCP_BROWSER_SERVER_SECRET`
    - Ensure `MCP_RESEARCH_TOOL_SAVE_DIR` directory exists
    - Review `start_mcp_browser_server.py` output for configuration errors
 
 10. **CORS Errors in Browser**
    - Proxy server includes CORS middleware - ensure it's running
-   - Check that requests are going to the correct port (8002 for proxy, 5001 for MCP browser server)
+   - Browser UI requests should go to port `8002` via the proxy, not directly to port `5001`
+   - Direct browser access to port `5001` requires `MCP_BROWSER_SERVER_ALLOWED_ORIGINS` to include the calling origin
    - Verify browser console for specific CORS error messages
 
 11. **Todo list not syncing / Task execution not starting**

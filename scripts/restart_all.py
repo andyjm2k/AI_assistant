@@ -39,15 +39,23 @@ VENV_PYTHON = resolve_venv_python(PROJECT_ROOT)
 # Services started by scripts/start_all.py that expose ports.
 BASE_REQUIRED_PORTS = {8000, 8002, 5001, 8383}
 STUDIO_PORT = 8084
-BASE_REQUIRED_SERVICE_SIGNATURES = {
-    "src.servers.https_server",
-    "src.servers.proxy_server",
-    "src.servers.scheduled_task_poller",
-    "src.integrations.telegram_bot",
-    "scripts/start_mcp_browser_use_http_server.py",
-    "scripts/start_mcp_browser_server.py",
+BASE_REQUIRED_SERVICE_SIGNATURES: Dict[str, Set[str]] = {
+    "https_server": {"src.servers.https_server"},
+    "proxy_server": {"src.servers.proxy_server"},
+    "scheduled_task_poller": {"src.servers.scheduled_task_poller"},
+    "telegram_bot": {"src.integrations.telegram_bot"},
+    "mcp_browser_use_http_server": {
+        "scripts/start_mcp_browser_use_http_server.py",
+        "mcp-server-browser-use server",
+        "mcp_server_browser_use.cli server",
+    },
+    "mcp_browser_server": {"scripts/start_mcp_browser_server.py"},
 }
-STUDIO_SERVICE_SIGNATURE = "autogenstudio serve --team config/team-config.json"
+STUDIO_SERVICE_KEY = "autogen_studio"
+STUDIO_SERVICE_SIGNATURES = {
+    "serve --team config/team-config.json --host 0.0.0.0 --port 8084",
+    "serve --team config/team-config.json",
+}
 
 STOP_VERIFY_TIMEOUT_SECONDS = 45.0
 START_VERIFY_TIMEOUT_SECONDS = 120.0
@@ -90,10 +98,13 @@ def _required_ports() -> Set[int]:
     return ports
 
 
-def _required_service_signatures() -> Set[str]:
-    signatures = set(BASE_REQUIRED_SERVICE_SIGNATURES)
+def _required_service_signatures() -> Dict[str, Set[str]]:
+    signatures = {
+        service_name: set(service_signatures)
+        for service_name, service_signatures in BASE_REQUIRED_SERVICE_SIGNATURES.items()
+    }
     if _studio_available():
-        signatures.add(STUDIO_SERVICE_SIGNATURE)
+        signatures[STUDIO_SERVICE_KEY] = set(STUDIO_SERVICE_SIGNATURES)
     return signatures
 
 
@@ -271,7 +282,7 @@ def _load_stop_all_module():
 
 def _get_service_signature_hits(
     stop_all_module,
-    required_service_signatures: Set[str],
+    required_service_signatures: Dict[str, Set[str]],
 ) -> Optional[Set[str]]:
     """
     Return matching service signatures found in process command lines.
@@ -288,10 +299,10 @@ def _get_service_signature_hits(
         cmd = str(proc.get("cmd") or "").lower()
         if not cmd:
             continue
-        normalized_cmd = cmd.replace("\\", "/")
-        for signature in required_service_signatures:
-            if signature in normalized_cmd:
-                hits.add(signature)
+        normalized_cmd = re.sub(r"\s+", " ", cmd.replace("\\", "/")).strip()
+        for service_name, signature_variants in required_service_signatures.items():
+            if any(signature in normalized_cmd for signature in signature_variants):
+                hits.add(service_name)
     return hits
 
 
@@ -299,7 +310,7 @@ def _stop_with_retries(
     stop_all_module,
     max_attempts: int,
     required_ports: Set[int],
-    required_service_signatures: Set[str],
+    required_service_signatures: Dict[str, Set[str]],
 ) -> Tuple[bool, str]:
     for attempt in range(1, max_attempts + 1):
         _log(f"Stop attempt {attempt}/{max_attempts}")
@@ -339,7 +350,7 @@ def _start_with_retries(
     stop_all_module,
     max_attempts: int,
     required_ports: Set[int],
-    required_service_signatures: Set[str],
+    required_service_signatures: Dict[str, Set[str]],
 ) -> Tuple[bool, str]:
     for attempt in range(1, max_attempts + 1):
         _log(f"Start attempt {attempt}/{max_attempts}")
@@ -350,7 +361,7 @@ def _start_with_retries(
         healthy, detail = _wait_for_started_health(START_VERIFY_TIMEOUT_SECONDS, required_ports)
         signature_hits = _get_service_signature_hits(stop_all_module, required_service_signatures)
         signatures_ok = (
-            signature_hits is None or required_service_signatures.issubset(signature_hits)
+            signature_hits is None or set(required_service_signatures).issubset(signature_hits)
         )
         if healthy and signatures_ok:
             return True, "startup verification passed"

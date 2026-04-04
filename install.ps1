@@ -164,6 +164,8 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ([Environment]::NewLine + 'CATBot install complete.') -ForegroundColor Green
 Write-Host 'Next steps:' -ForegroundColor Cyan
 Write-Host '  If you skipped the wizard or need to change settings: edit .env'
+Write-Host '  AutoGen workflow requests now require auth by default (`AUTOGEN_REQUIRE_AUTH=true`).'
+Write-Host '  Docker-backed AutoGen code execution stays off until you explicitly set AUTOGEN_ENABLE_CODE_EXECUTION=true.'
 Write-Host '  If using Telegram tools/file attachments, set TELEGRAM_SECRET on both bot and proxy.'
 Write-Host '  Telegram listFiles now supports path/recursive; sendTelegramFile accepts subdirectory paths under scratch/.'
 Write-Host '  Built-in image_generation skill is available (see docs/SKILL_FRAMEWORK.md).'

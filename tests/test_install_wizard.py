@@ -128,3 +128,36 @@ def test_run_wizard_sets_standard_google_aliases():
         assert "MCP_MODEL_NAME=gemini-3-flash-preview" in content
     finally:
         env_path.unlink(missing_ok=True)
+
+
+def test_run_wizard_provisions_browser_server_secret():
+    """run_wizard provisions MCP_BROWSER_SERVER_SECRET when none exists."""
+    scratch_root = DEFAULT_PROJECT_ROOT / "scratch"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    env_path = scratch_root / f"test_wizard_{next(tempfile._get_candidate_names())}.env"
+    try:
+        with patch("scripts.install_wizard.secrets.token_urlsafe", return_value="browser-secret"), patch(
+            "builtins.input",
+            side_effect=["1", "", "", "", "", "n", "n", "", "", "", ""],
+        ):
+            run_wizard(scratch_root, env_path)
+        content = env_path.read_text(encoding="utf-8")
+        assert "MCP_BROWSER_SERVER_SECRET=browser-secret" in content
+    finally:
+        env_path.unlink(missing_ok=True)
+
+
+def test_run_wizard_reuses_existing_autogen_secret_for_browser_server():
+    """run_wizard reuses AUTOGEN_TEAM_SECRET for MCP_BROWSER_SERVER_SECRET when present."""
+    scratch_root = DEFAULT_PROJECT_ROOT / "scratch"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    env_path = scratch_root / f"test_wizard_{next(tempfile._get_candidate_names())}.env"
+    try:
+        env_path.write_text("AUTOGEN_TEAM_SECRET=team-secret\n", encoding="utf-8")
+        with patch("builtins.input", side_effect=["1", "", "", "", "", "n", "n", "", "", "", ""]):
+            run_wizard(scratch_root, env_path)
+        content = env_path.read_text(encoding="utf-8")
+        assert "AUTOGEN_TEAM_SECRET=team-secret" in content
+        assert "MCP_BROWSER_SERVER_SECRET=team-secret" in content
+    finally:
+        env_path.unlink(missing_ok=True)

@@ -172,6 +172,7 @@ MCP_BROWSER_USE_HTTP_URL = os.environ.get("MCP_BROWSER_USE_HTTP_URL", "http://12
 BROWSER_USE_HTTP_UNAVAILABLE_MSG = (
     "Browser-use HTTP server not available. Start it with: uv run mcp-server-browser-use server (in mcp-browser-use directory)."
 )
+MCP_BROWSER_SERVER_DEFAULT_URL = "http://127.0.0.1:5001"
 OPEN_METEO_FORECAST_BASE_URL = os.environ.get("OPEN_METEO_FORECAST_BASE_URL", "https://api.open-meteo.com/v1/forecast").strip().rstrip("/")
 OPEN_METEO_GEOCODING_BASE_URL = os.environ.get("OPEN_METEO_GEOCODING_BASE_URL", "https://geocoding-api.open-meteo.com/v1/search").strip().rstrip("/")
 _open_meteo_timeout_value = os.environ.get("OPEN_METEO_TIMEOUT_SECONDS", os.environ.get("BOM_API_TIMEOUT_SECONDS", "12"))
@@ -1938,9 +1939,130 @@ def _compose_system_prompt_with_context(system_prompt: Optional[str]) -> str:
 def _normalize_chat_endpoint(endpoint: str) -> str:
     if not endpoint:
         return ""
-    if endpoint.endswith("/chat/completions"):
-        return endpoint
-    return endpoint.rstrip("/") + "/chat/completions"
+    normalized = endpoint.rstrip("/")
+    for suffix in ("/chat/completions", "/models"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized.rstrip("/") + "/chat/completions"
+
+
+def _normalize_models_endpoint(endpoint: str) -> str:
+    if not endpoint:
+        return ""
+    normalized = endpoint.rstrip("/")
+    for suffix in ("/chat/completions", "/models"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized.rstrip("/") + "/models"
+
+
+def _sanitize_openai_proxy_endpoint(endpoint: str) -> str:
+    raw = str(endpoint or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Endpoint is required.")
+    if "://" not in raw:
+        raw = f"http://{raw}"
+
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Endpoint must use http or https.")
+    if not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Endpoint must include a hostname.")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="Endpoint URLs must not include embedded credentials.")
+
+    sanitized = urlunparse((scheme, parsed.netloc, parsed.path or "", "", "", ""))
+    return sanitized.rstrip("/")
+
+
+def _canonical_openai_proxy_base(endpoint: str) -> Optional[str]:
+    try:
+        sanitized = _sanitize_openai_proxy_endpoint(endpoint)
+    except HTTPException:
+        return None
+
+    parsed = urlparse(sanitized)
+    path = (parsed.path or "").rstrip("/")
+    for suffix in ("/chat/completions", "/models"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    path = path.rstrip("/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
+
+
+def _get_trusted_openai_proxy_bases() -> Set[str]:
+    candidates: List[str] = []
+    for env_name in ("OPENAI_API_BASE", "LARGE_PAYLOAD_ENDPOINT", "MCP_LLM_BASE_URL"):
+        value = os.getenv(env_name, "")
+        if value and value.strip():
+            candidates.append(value.strip())
+
+    extra_trusted = os.getenv("OPENAI_PROXY_TRUSTED_BASE_URLS", "")
+    if extra_trusted.strip():
+        candidates.extend(part for part in re.split(r"[\r\n,]+", extra_trusted) if part.strip())
+
+    trusted: Set[str] = set()
+    for candidate in candidates:
+        canonical = _canonical_openai_proxy_base(candidate)
+        if canonical:
+            trusted.add(canonical)
+    return trusted
+
+
+def _is_trusted_openai_proxy_endpoint(endpoint: str) -> bool:
+    canonical = _canonical_openai_proxy_base(endpoint)
+    return bool(canonical and canonical in _get_trusted_openai_proxy_bases())
+
+
+def _resolve_openai_proxy_request(
+    requested_endpoint: Optional[str],
+    *,
+    default_endpoint: str,
+    endpoint_kind: str,
+    request_auth_header: Optional[str],
+    model_name: Optional[str] = None,
+) -> Tuple[str, bool, str, bool]:
+    raw_endpoint = str(requested_endpoint or "").strip()
+    using_default_endpoint = not raw_endpoint
+    candidate_endpoint = default_endpoint if using_default_endpoint else raw_endpoint
+    sanitized_endpoint = _sanitize_openai_proxy_endpoint(candidate_endpoint)
+
+    if endpoint_kind == "chat":
+        resolved_endpoint = _normalize_chat_endpoint(sanitized_endpoint)
+    elif endpoint_kind == "models":
+        resolved_endpoint = _normalize_models_endpoint(sanitized_endpoint)
+    else:
+        raise ValueError(f"Unsupported endpoint kind: {endpoint_kind}")
+
+    trusted_endpoint = _is_trusted_openai_proxy_endpoint(resolved_endpoint)
+    auth_header = str(request_auth_header or "").strip()
+    using_server_credentials = False
+
+    if using_default_endpoint and not trusted_endpoint:
+        raise HTTPException(
+            status_code=500,
+            detail="Configured proxy endpoint is not trusted. Set OPENAI_API_BASE or OPENAI_PROXY_TRUSTED_BASE_URLS correctly.",
+        )
+
+    if not auth_header:
+        if not trusted_endpoint:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Endpoint override requires an Authorization header unless the endpoint is trusted via "
+                    "OPENAI_API_BASE or OPENAI_PROXY_TRUSTED_BASE_URLS."
+                ),
+            )
+        primary_api_key = _first_non_empty_env(preferred_api_key_env_names(resolved_endpoint, model_name))
+        if primary_api_key:
+            auth_header = f"Bearer {primary_api_key}"
+            using_server_credentials = True
+
+    return resolved_endpoint, trusted_endpoint, auth_header, using_server_credentials
 
 
 def _estimate_total_tokens(messages: List[Dict[str, Any]], max_tokens: int) -> int:
@@ -2348,7 +2470,20 @@ OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")
 # TELEGRAM_SECRET protects Telegram-specific flows.
 # AUTOGEN_TEAM_SECRET protects internal AutoGen team tool calls to selected proxy routes.
 TELEGRAM_SECRET = os.getenv("TELEGRAM_SECRET")
-AUTOGEN_TEAM_SECRET = (os.getenv("AUTOGEN_TEAM_SECRET") or os.getenv("CATBOT_AGENT_SECRET") or "").strip() or None
+AUTOGEN_TEAM_SECRET = (
+    os.getenv("AUTOGEN_TEAM_SECRET")
+    or os.getenv("CATBOT_AGENT_SECRET")
+    or os.getenv("MCP_BROWSER_SERVER_SECRET")
+    or ""
+).strip() or None
+AUTOGEN_REQUIRE_AUTH = os.getenv("AUTOGEN_REQUIRE_AUTH", "true").lower() == "true"
+AUTOGEN_ENABLE_CODE_EXECUTION = os.getenv("AUTOGEN_ENABLE_CODE_EXECUTION", "false").lower() == "true"
+MCP_BROWSER_SERVER_SHARED_SECRET = (
+    os.getenv("MCP_BROWSER_SERVER_SECRET")
+    or os.getenv("CATBOT_AGENT_SECRET")
+    or os.getenv("AUTOGEN_TEAM_SECRET")
+    or ""
+).strip() or None
 
 # Large payload model fallback (optional)
 LARGE_PAYLOAD_MODEL = (os.getenv("LARGE_PAYLOAD_MODEL") or "").strip() or None
@@ -2525,6 +2660,16 @@ def get_current_user_or_autogen_team(
     if _autogen_team_secret_matches(request):
         return {"username": "autogen_team", "auth_type": "agent_secret"}
     return get_current_user_from_headers(authorization, x_auth_token)
+
+
+def get_current_user_or_autogen_team_if_configured(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+) -> Dict[str, Any]:
+    if not AUTOGEN_REQUIRE_AUTH:
+        return {"username": "anonymous", "auth_type": "anonymous"}
+    return get_current_user_or_autogen_team(request, authorization, x_auth_token)
 
 
 def _spotify_redirect_uri() -> str:
@@ -2709,6 +2854,19 @@ def _autogen_team_secret_matches(request: Request) -> bool:
         if token == AUTOGEN_TEAM_SECRET:
             return True
     return False
+
+
+def _get_mcp_browser_server_url() -> str:
+    """Return the internal browser bridge base URL."""
+    return (os.getenv("MCP_BROWSER_SERVER_URL") or MCP_BROWSER_SERVER_DEFAULT_URL).strip() or MCP_BROWSER_SERVER_DEFAULT_URL
+
+
+def _browser_server_forward_headers() -> Dict[str, str]:
+    """Build headers for proxy-to-browser-server requests."""
+    headers = {'Content-Type': 'application/json'}
+    if MCP_BROWSER_SERVER_SHARED_SECRET:
+        headers['X-Agent-Secret'] = MCP_BROWSER_SERVER_SHARED_SECRET
+    return headers
 
 
 # Create scratch and companions directories if they don't exist
@@ -4728,7 +4886,6 @@ async def require_auth_for_v1_routes(request: Request, call_next):
         "/v1/audio/voices",  # Embedded OpenAI-compatible TTS voices endpoint
         "/v1/proxy/chat/completions",  # Chat completions proxy - public to avoid mixed content
         "/v1/proxy/models",  # Models list proxy - public to avoid mixed content
-        "/v1/proxy/autogen",  # AutoGen workflow proxy - public to avoid mixed content
         "/v1/proxy/tts/voices",  # TTS voices endpoint - public
         "/v1/proxy/tts/speech",  # TTS speech endpoint - public
         "/v1/proxy/search",  # Search proxy - public
@@ -4739,7 +4896,10 @@ async def require_auth_for_v1_routes(request: Request, call_next):
         "/v1/status/latest",
         "/v1/status/events",
     }
+    if not AUTOGEN_REQUIRE_AUTH:
+        exempt_paths.add("/v1/proxy/autogen")
     autogen_team_secret_paths = {
+        "/v1/proxy/autogen",
         "/v1/proxy/browser-agent",
         "/v1/proxy/deep-research",
         "/v1/proxy/browser-health",
@@ -5024,8 +5184,13 @@ def load_autogen_team():
         loader = ComponentLoader()
         team = loader.load_component(team_config)
 
-        # Inject PythonCodeExecutionTool (Docker) into the lead engineer when available
-        if AUTOGEN_CODE_EXEC_AVAILABLE and PythonCodeExecutionTool and DockerCommandLineCodeExecutor:
+        # Inject PythonCodeExecutionTool (Docker) into the lead engineer only when explicitly enabled.
+        if (
+            AUTOGEN_ENABLE_CODE_EXECUTION
+            and AUTOGEN_CODE_EXEC_AVAILABLE
+            and PythonCodeExecutionTool
+            and DockerCommandLineCodeExecutor
+        ):
             coding_dir = _PROJECT_ROOT / "coding"
             try:
                 coding_dir.mkdir(exist_ok=True)
@@ -5213,7 +5378,12 @@ def load_autogen_team_runtime():
         if team is None:
             return None
 
-        if AUTOGEN_CODE_EXEC_AVAILABLE and PythonCodeExecutionTool and DockerCommandLineCodeExecutor:
+        if (
+            AUTOGEN_ENABLE_CODE_EXECUTION
+            and AUTOGEN_CODE_EXEC_AVAILABLE
+            and PythonCodeExecutionTool
+            and DockerCommandLineCodeExecutor
+        ):
             coding_dir = _PROJECT_ROOT / "coding"
             try:
                 coding_dir.mkdir(exist_ok=True)
@@ -6933,7 +7103,10 @@ async def _run_codex_cli(prompt: str, *, isolated_workspace: bool = False) -> Di
 
 # AutoGen team chat endpoint (integrated directly)
 @app.post("/v1/proxy/autogen")
-async def autogen_chat(request: Request):
+async def autogen_chat(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user_or_autogen_team_if_configured),
+):
     """Run AutoGen team conversation directly (no separate service needed)."""
     try:
         body = await request.json()
@@ -11145,13 +11318,13 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
         if not endpoint:
             endpoint = request.query_params.get('endpoint', '')
 
-        if not endpoint:
-            endpoint = os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/models')
-        else:
-            if not endpoint.endswith('/models'):
-                endpoint = endpoint.rstrip('/') + '/models'
+        endpoint, _trusted_endpoint, auth_header, _using_server_credentials = _resolve_openai_proxy_request(
+            endpoint,
+            default_endpoint=os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/models'),
+            endpoint_kind="models",
+            request_auth_header=request.headers.get('Authorization', ''),
+        )
 
-        auth_header = request.headers.get('Authorization', '')
         headers = {}
         if auth_header:
             headers['Authorization'] = auth_header
@@ -11189,6 +11362,8 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
                 status_code=500,
             )
 
+    except HTTPException:
+        raise
     except httpx.ConnectError:
         print("Connection error: Could not connect to LLM service")
         raise HTTPException(
@@ -11211,20 +11386,18 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
         normalized_body.get("task") or normalized_body.get("instruction") or normalized_body.get("url") or ""
     )
     monitor_run_id = _monitor_run_start("browser_use", "browser-agent", input_text=instruction_preview)
-    mcp_browser_url = os.getenv('MCP_BROWSER_SERVER_URL', None)
-    if not mcp_browser_url:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            mcp_browser_url = f"http://{local_ip}:5001"
-            print(f"   Detected local IP: {local_ip}, using {mcp_browser_url}")
-        except Exception:
-            mcp_browser_url = "http://127.0.0.1:5001"
-            print(f"   Using default: {mcp_browser_url}")
-    else:
-        print(f"   Using configured MCP_BROWSER_SERVER_URL: {mcp_browser_url}")
+    if not MCP_BROWSER_SERVER_SHARED_SECRET:
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary="MCP browser server shared secret is not configured.",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="MCP browser server secret is not configured. Set MCP_BROWSER_SERVER_SECRET or CATBOT_AGENT_SECRET.",
+        )
+    mcp_browser_url = _get_mcp_browser_server_url()
+    print(f"   Using MCP browser server URL: {mcp_browser_url}")
     endpoint = f"{mcp_browser_url.rstrip('/')}/api/browser-agent"
     _monitor_run_note(monitor_run_id, f"Proxying browser-agent request to {endpoint}")
     print(f"ðŸŒ Proxying browser-agent request to: {endpoint}")
@@ -11238,8 +11411,8 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as health_err:
         _monitor_run_note(monitor_run_id, f"Health check warning: {health_err}")
         print(f"   âš ï¸  MCP browser server health check failed: {health_err}")
-        if not mcp_browser_url.startswith("http://127.0.0.1"):
-            mcp_browser_url = "http://127.0.0.1:5001"
+        if not mcp_browser_url.startswith(MCP_BROWSER_SERVER_DEFAULT_URL):
+            mcp_browser_url = MCP_BROWSER_SERVER_DEFAULT_URL
             endpoint = f"{mcp_browser_url.rstrip('/')}/api/browser-agent"
             try:
                 async with httpx.AsyncClient(timeout=5.0) as hc:
@@ -11257,7 +11430,7 @@ async def _do_browser_agent(body: Dict[str, Any]) -> Dict[str, Any]:
             response = await client.post(
                 endpoint,
                 json=normalized_body,
-                headers={'Content-Type': 'application/json'},
+                headers=_browser_server_forward_headers(),
             )
         except httpx.ConnectError as conn_err:
             _monitor_run_finish(monitor_run_id, status="error", summary=f"Browser-agent connection error: {conn_err}")
@@ -11340,27 +11513,25 @@ async def _do_deep_research(body: Dict[str, Any]) -> Dict[str, Any]:
     normalized_body = _normalize_deep_research_body(body)
     research_preview = str(normalized_body.get("research_task") or normalized_body.get("topic") or "")
     monitor_run_id = _monitor_run_start("browser_use", "deep-research", input_text=research_preview)
-    mcp_browser_url = os.getenv('MCP_BROWSER_SERVER_URL', None)
-    if not mcp_browser_url:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            mcp_browser_url = f"http://{local_ip}:5001"
-            print(f"   Detected local IP: {local_ip}, using {mcp_browser_url}")
-        except Exception:
-            mcp_browser_url = "http://127.0.0.1:5001"
-            print(f"   Using default: {mcp_browser_url}")
-    else:
-        print(f"   Using configured MCP_BROWSER_SERVER_URL: {mcp_browser_url}")
+    if not MCP_BROWSER_SERVER_SHARED_SECRET:
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary="MCP browser server shared secret is not configured.",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="MCP browser server secret is not configured. Set MCP_BROWSER_SERVER_SECRET or CATBOT_AGENT_SECRET.",
+        )
+    mcp_browser_url = _get_mcp_browser_server_url()
+    print(f"   Using MCP browser server URL: {mcp_browser_url}")
     endpoint = f"{mcp_browser_url.rstrip('/')}/api/deep-research"
     _monitor_run_note(monitor_run_id, f"Proxying deep-research request to {endpoint}")
     print(f"🔬 Proxying deep-research request to: {endpoint}")
     timeout = httpx.Timeout(connect=10.0, read=10800.0, write=10.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
-            response = await client.post(endpoint, json=normalized_body, headers={'Content-Type': 'application/json'})
+            response = await client.post(endpoint, json=normalized_body, headers=_browser_server_forward_headers())
         except httpx.ConnectError as conn_err:
             print(f"âŒ Connection error to MCP browser server: {conn_err}")
             raise HTTPException(
@@ -11600,11 +11771,6 @@ async def proxy_chat_completions(request: Request):
         if not endpoint:
             endpoint = body.get('_endpoint', '')
 
-        # If still no endpoint, use default from environment or localhost
-        if not endpoint:
-            endpoint = os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/chat/completions')
-        endpoint = _normalize_chat_endpoint(endpoint)
-
         # Remove internal endpoint parameter from body before forwarding
         body_clean = {k: v for k, v in body.items() if k != '_endpoint'}
         if not body_clean.get("model"):
@@ -11612,14 +11778,14 @@ async def proxy_chat_completions(request: Request):
             if default_openai_model:
                 body_clean["model"] = default_openai_model
 
-        # Get Authorization header from the request (or server default key)
-        auth_header = (request.headers.get('Authorization', '') or "").strip()
-        if not auth_header:
-            primary_api_key = _first_non_empty_env(
-                preferred_api_key_env_names(endpoint, body_clean.get("model"))
-            )
-            if primary_api_key:
-                auth_header = f"Bearer {primary_api_key}"
+        endpoint, _trusted_endpoint, auth_header, using_server_credentials = _resolve_openai_proxy_request(
+            endpoint,
+            default_endpoint=os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/chat/completions'),
+            endpoint_kind="chat",
+            request_auth_header=request.headers.get('Authorization', ''),
+            model_name=body_clean.get("model"),
+        )
+        allow_server_side_fallbacks = using_server_credentials
 
         # Build headers for the forwarded request
         headers = {
@@ -11665,6 +11831,11 @@ async def proxy_chat_completions(request: Request):
 
         if response is None:
             print(f"Primary chat request error: {primary_request_error}")
+            if not allow_server_side_fallbacks:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Could not connect to LLM service: {primary_request_error}",
+                )
             fallback_response, fallback_error = await _attempt_mcp_chat_fallback(
                 primary_headers=headers,
                 payload=body_clean,
@@ -11705,6 +11876,8 @@ async def proxy_chat_completions(request: Request):
                     try:
                         response = await _call_chat_completion(endpoint, headers, body_clean, timeout_seconds=120.0)
                     except httpx.RequestError:
+                        if not allow_server_side_fallbacks:
+                            raise
                         fallback_response, _ = await _attempt_mcp_chat_fallback(
                             primary_headers=headers,
                             payload=body_clean,
@@ -11715,12 +11888,23 @@ async def proxy_chat_completions(request: Request):
                             raise
                         response = fallback_response
                 # Retry with large payload model if configured
-                if response.status_code != 200 and LARGE_PAYLOAD_MODEL:
+                large_retry_endpoint = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or endpoint)
+                allow_large_model_retry = (
+                    response.status_code != 200
+                    and LARGE_PAYLOAD_MODEL
+                    and (
+                        allow_server_side_fallbacks
+                        or _canonical_openai_proxy_base(large_retry_endpoint) == _canonical_openai_proxy_base(endpoint)
+                    )
+                )
+                if allow_large_model_retry:
                     body_clean["model"] = LARGE_PAYLOAD_MODEL
-                    large_endpoint = _normalize_chat_endpoint(LARGE_PAYLOAD_ENDPOINT or endpoint)
+                    large_endpoint = large_retry_endpoint
                     try:
                         response = await _call_chat_completion(large_endpoint, headers, body_clean, timeout_seconds=120.0)
                     except httpx.RequestError:
+                        if not allow_server_side_fallbacks:
+                            raise
                         fallback_response, _ = await _attempt_mcp_chat_fallback(
                             primary_headers=headers,
                             payload=body_clean,
@@ -11738,14 +11922,15 @@ async def proxy_chat_completions(request: Request):
                         print(f"Failed to parse JSON response after retry: {json_error}")
                         return JSONResponse(content={"error": "Invalid JSON response from LLM service"}, status_code=500)
 
-            fallback_response, _fallback_error = await _attempt_mcp_chat_fallback(
-                primary_headers=headers,
-                payload=body_clean,
-                timeout_seconds=120.0,
-                source_label="proxy_chat_completions_non_200",
-            )
-            if fallback_response is not None:
-                response = fallback_response
+            if allow_server_side_fallbacks:
+                fallback_response, _fallback_error = await _attempt_mcp_chat_fallback(
+                    primary_headers=headers,
+                    payload=body_clean,
+                    timeout_seconds=120.0,
+                    source_label="proxy_chat_completions_non_200",
+                )
+                if fallback_response is not None:
+                    response = fallback_response
 
             return JSONResponse(
                 content=response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text},

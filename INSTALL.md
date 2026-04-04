@@ -53,6 +53,7 @@ Note:
 ## Configuration
 
 The installer wizard writes the core `.env` entries for you and now mirrors provider settings into the standard env names that older CATBot modules still read directly.
+It also generates a real `JWT_SECRET`, configures a shared internal agent secret, keeps `AUTOGEN_REQUIRE_AUTH=true`, and leaves `AUTOGEN_ENABLE_CODE_EXECUTION=false` unless you opt in later.
 
 Required for a basic install:
 
@@ -64,6 +65,12 @@ Recommended for day-one usability:
 
 - `BRAVE_API_KEY` for web search
 - `HTTPS_CERT_HOSTNAME` for local HTTPS/cert generation
+
+Recommended for a private deployment:
+
+- keep `AUTOGEN_REQUIRE_AUTH=true` so `/v1/proxy/autogen` is not public
+- leave `AUTOGEN_ENABLE_CODE_EXECUTION=false` unless you intentionally want the Docker execution tool
+- treat `JWT_SECRET` and `CATBOT_AGENT_SECRET` as secrets and rotate existing JWTs if you replace `JWT_SECRET`
 
 Optional sections in [.env.example](/C:/Users/pc/CATBot/.env.example) to review before first full test:
 

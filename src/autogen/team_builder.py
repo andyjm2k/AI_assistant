@@ -433,7 +433,12 @@ def _candidate_proxy_bases() -> list[str]:
 
 def _proxy_headers() -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    agent_secret = (os.getenv("AUTOGEN_TEAM_SECRET") or os.getenv("CATBOT_AGENT_SECRET") or "").strip()
+    agent_secret = (
+        os.getenv("AUTOGEN_TEAM_SECRET")
+        or os.getenv("CATBOT_AGENT_SECRET")
+        or os.getenv("MCP_BROWSER_SERVER_SECRET")
+        or ""
+    ).strip()
     if agent_secret:
         headers["X-Agent-Secret"] = agent_secret
     return headers

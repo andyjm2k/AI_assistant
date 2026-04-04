@@ -152,7 +152,7 @@ flowchart TD
 - Telegram TTS sanitization behavior: `tests/test_telegram_tts_sanitization.py`.
 
 ## Residual Risk Notes (Observed)
-- CORS is currently very permissive (`allow_origins=["*"]`) in proxy and MCP browser server; this is operationally convenient but broad: `src/servers/proxy_server.py:1783`, `src/servers/mcp_browser_server.py:38`.
+- Proxy CORS is still intentionally broad for the web UI, but the separate MCP browser server now keeps CORS disabled unless `MCP_BROWSER_SERVER_ALLOWED_ORIGINS` is explicitly configured.
 - Several proxy endpoints are intentionally exempt from auth (chat/models/fetch/news/search/tts); this may be expected for UX, but should be considered exposed surface: `src/servers/proxy_server.py:1798`.
 - Frontend stores JWT in `localStorage`, which is vulnerable to XSS-based token theft if XSS is introduced: `js/app.js:264`, `290`.
 - Auth debug logs include token previews in middleware logs; useful for debugging, but should be limited in production: `src/servers/proxy_server.py:1855`.

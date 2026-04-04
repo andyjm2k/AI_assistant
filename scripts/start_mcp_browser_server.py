@@ -79,7 +79,18 @@ print(f"Agent Use Vision: {os.environ.get('MCP_AGENT_USE_VISION', 'true')}")
 print(f"Research Save Directory: {os.environ.get('MCP_RESEARCH_SAVE_DIRECTORY', '(not set)')}")
 print(f"Research Max Searches: {os.environ.get('MCP_RESEARCH_MAX_SEARCHES', '5')}")
 print(f"Server Port: {os.environ.get('PORT', '5001')}")
-print(f"Server Host: {os.environ.get('HOST', '0.0.0.0')}")
+print(f"Server Host: {os.environ.get('HOST', '127.0.0.1')}")
+print(
+    "Browser Server Secret: "
+    + ("configured" if (
+        os.environ.get("MCP_BROWSER_SERVER_SECRET")
+        or os.environ.get("CATBOT_AGENT_SECRET")
+        or os.environ.get("AUTOGEN_TEAM_SECRET")
+    ) else "missing")
+)
+print(
+    f"CORS Allowlist: {os.environ.get('MCP_BROWSER_SERVER_ALLOWED_ORIGINS', '(disabled)')}"
+)
 print("Note: Browser tasks run on the MCP server. Start it with start_mcp_browser_use_http_server.py so it uses this same LLM.")
 print("="*50 + "\n")
 

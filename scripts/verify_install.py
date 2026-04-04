@@ -245,6 +245,22 @@ def check_feature_env() -> tuple[bool, str]:
     if not jwt_secret or jwt_secret == "change-this-secret-in-production":
         warnings.append("JWT_SECRET is still using the default value")
 
+    autogen_require_auth = values.get("AUTOGEN_REQUIRE_AUTH", "true")
+    if not _is_truthy(autogen_require_auth):
+        warnings.append("AUTOGEN_REQUIRE_AUTH=false leaves /v1/proxy/autogen publicly reachable")
+
+    autogen_code_exec_enabled = _is_truthy(values.get("AUTOGEN_ENABLE_CODE_EXECUTION"))
+    if autogen_code_exec_enabled and not _is_truthy(autogen_require_auth):
+        warnings.append("AUTOGEN_ENABLE_CODE_EXECUTION=true while AUTOGEN_REQUIRE_AUTH=false exposes code execution to anonymous callers")
+
+    agent_secret = (
+        values.get("CATBOT_AGENT_SECRET", "").strip()
+        or values.get("AUTOGEN_TEAM_SECRET", "").strip()
+        or values.get("MCP_BROWSER_SERVER_SECRET", "").strip()
+    )
+    if not agent_secret:
+        warnings.append("CATBOT_AGENT_SECRET/AUTOGEN_TEAM_SECRET is not configured for internal AutoGen and browser bridge calls")
+
     if warnings:
         return True, "WARN: " + "; ".join(warnings)
     return True, "Feature env sanity OK"
