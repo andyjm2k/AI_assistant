@@ -1382,6 +1382,30 @@
                         addMessageToHistory('assistant', 'Philosopher Mode deactivated.');
                     }
                 }
+                if (!data.choices || data.choices.length === 0) {
+                    console.warn('LLM returned no choices');
+                    const lastToolMsg = messages.slice().reverse().find(m => m.role === 'tool')?.content;
+                    if (lastToolMsg) {
+                        let fallbackText = '';
+                        try {
+                            const parsed = typeof lastToolMsg === 'string' ? JSON.parse(lastToolMsg) : lastToolMsg;
+                            fallbackText = parsed?.message || '';
+                        } catch (_) {
+                            fallbackText = typeof lastToolMsg === 'string' ? lastToolMsg : '';
+                        }
+                        if (fallbackText) {
+                            responseOutput.value = fallbackText;
+                            addMessageToHistory('assistant', fallbackText); // Add to message history (also updates chatHistory)
+                            extractMemoriesFromConversation().catch(err => {
+                                console.warn('Memory extraction failed:', err);
+                            });
+                            if (uploadedAttachments.length) {
+                                clearPendingAttachments();
+                            }
+                            textToSpeech(fallbackText);
+                        }
+                    }
+                }
             } catch (error) {
                 console.error('Error stopping philosopher mode:', error);
                 // Still deactivate locally even if API call fails
@@ -2050,13 +2074,157 @@
             });
         }
 
+        function buildOptionalAuthorizationHeaders(apiKey = '') {
+            const normalizedApiKey = String(apiKey || '').trim();
+            return normalizedApiKey ? { 'Authorization': `Bearer ${normalizedApiKey}` } : {};
+        }
+
+        function normalizeOpenAiCompatibleEndpointPath(endpoint = '', targetPath = 'chat/completions') {
+            const rawEndpoint = String(endpoint || '').trim();
+            if (!rawEndpoint) return '';
+            try {
+                const parsed = new URL(rawEndpoint, window.location.href);
+                const trimmedPath = parsed.pathname.replace(/\/+$/g, '').replace(/\/(chat\/completions|models)$/i, '');
+                parsed.pathname = `${trimmedPath}/${targetPath}`.replace(/\/{2,}/g, '/');
+                parsed.search = '';
+                parsed.hash = '';
+                return parsed.toString().replace(/\/$/, '');
+            } catch (_) {
+                const trimmedEndpoint = rawEndpoint.replace(/\/+$/g, '').replace(/\/(chat\/completions|models)$/i, '');
+                return `${trimmedEndpoint}/${targetPath}`.replace(/\/{2,}/g, '/');
+            }
+        }
+
+        function normalizeAvailableModelsResponse(responseData) {
+            const candidates = Array.isArray(responseData?.data)
+                ? responseData.data
+                : Array.isArray(responseData?.models)
+                    ? responseData.models
+                    : Array.isArray(responseData)
+                        ? responseData
+                        : [];
+
+            return candidates
+                .map((model) => {
+                    if (typeof model === 'string') {
+                        const trimmedId = model.trim();
+                        return trimmedId ? { id: trimmedId } : null;
+                    }
+                    if (!model || typeof model !== 'object') return null;
+                    const resolvedId = [model.id, model.model, model.name]
+                        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+                        .find(Boolean);
+                    return resolvedId ? { ...model, id: resolvedId } : null;
+                })
+                .filter(Boolean);
+        }
+
+        function formatApiErrorDetail(detail) {
+            if (!detail) return '';
+            if (Array.isArray(detail)) {
+                const firstItem = detail[0];
+                if (typeof firstItem === 'string') return firstItem;
+                if (firstItem && typeof firstItem === 'object') {
+                    return firstItem.msg || firstItem.message || firstItem.loc?.join('.') || JSON.stringify(firstItem);
+                }
+            }
+            if (typeof detail === 'object') {
+                return detail.message || detail.error || JSON.stringify(detail);
+            }
+            return String(detail).trim();
+        }
+
+        function extractApiErrorMessage(payload, rawText = '') {
+            if (payload && typeof payload === 'object') {
+                const nestedError = payload.error;
+                if (typeof nestedError === 'string' && nestedError.trim()) return nestedError.trim();
+                if (nestedError && typeof nestedError === 'object') {
+                    const nestedMessage = formatApiErrorDetail(nestedError.message || nestedError.detail || nestedError.error);
+                    if (nestedMessage) return nestedMessage;
+                }
+
+                const topLevelMessage = formatApiErrorDetail(payload.detail || payload.message || payload.error_description);
+                if (topLevelMessage) return topLevelMessage;
+            }
+            return String(rawText || '').trim();
+        }
+
+        function inferLlmSettingsHint(detail = '', statusCode = 0) {
+            const normalizedDetail = String(detail || '').toLowerCase();
+            if (statusCode === 401 || statusCode === 403 || /unauthori[sz]ed|forbidden|api key|authentication|invalid key/.test(normalizedDetail)) {
+                return 'Check the API key or provider credentials in Tool Settings.';
+            }
+            if (/model/.test(normalizedDetail) && /not found|does not exist|unknown|invalid|unsupported/.test(normalizedDetail)) {
+                return 'The selected model does not look valid for this endpoint.';
+            }
+            if (statusCode === 404 || /not found|unknown path|no route|unsupported path/.test(normalizedDetail)) {
+                return 'Check the endpoint URL. Some OpenAI-compatible providers do not expose every standard path.';
+            }
+            if (statusCode === 400 || statusCode === 422 || /validation|parameter|temperature|top_p|max_tokens|tool_choice|messages/.test(normalizedDetail)) {
+                return 'One of the request settings is invalid for this provider.';
+            }
+            return 'Check the endpoint URL, selected model, and provider-specific settings in Tool Settings.';
+        }
+
+        function buildLlmEndpointErrorMessage(response, payload, rawText = '', context = {}) {
+            const statusCode = Number(response?.status || 0);
+            const statusLabel = statusCode
+                ? `${statusCode}${response?.statusText ? ` ${response.statusText}` : ''}`
+                : 'request failed';
+            const detail = extractApiErrorMessage(payload, rawText) || response?.statusText || 'The endpoint did not return a usable error message.';
+            const hint = inferLlmSettingsHint(detail, statusCode);
+            const requestedModel = typeof context?.model === 'string' ? context.model.trim() : '';
+            const modelSuffix = requestedModel ? ` Model: ${requestedModel}.` : '';
+            const actionLabel = context?.action === 'models'
+                ? 'The model list could not be refreshed.'
+                : 'The assistant could not get a response from the model endpoint.';
+            return `${actionLabel} ${statusLabel}.${modelSuffix} ${hint} Details: ${detail}`;
+        }
+
+        async function parseJsonResponseWithErrors(response, context = {}) {
+            const rawText = await response.text().catch(() => '');
+            let payload = {};
+            if (rawText) {
+                try {
+                    payload = JSON.parse(rawText);
+                } catch (parseError) {
+                    if (!response.ok) {
+                        throw new Error(buildLlmEndpointErrorMessage(response, null, rawText, context));
+                    }
+                    throw new Error('The model endpoint returned an invalid JSON response. Check the endpoint URL in Tool Settings.');
+                }
+            }
+
+            if (!response.ok) {
+                throw new Error(buildLlmEndpointErrorMessage(response, payload, rawText, context));
+            }
+
+            return payload;
+        }
+
         // Refresh available models when API key or endpoint changes
         apiKeyInput.addEventListener('change', fetchAvailableModels);
         endpointInput.addEventListener('change', fetchAvailableModels);
+        let fetchAvailableModelsDebounceId = null;
+        const queueAvailableModelsRefresh = () => {
+            if (fetchAvailableModelsDebounceId) {
+                window.clearTimeout(fetchAvailableModelsDebounceId);
+            }
+            fetchAvailableModelsDebounceId = window.setTimeout(() => {
+                fetchAvailableModels().catch((error) => {
+                    console.warn('Debounced model refresh failed:', error);
+                });
+            }, 350);
+        };
+        apiKeyInput.addEventListener('input', queueAvailableModelsRefresh);
+        endpointInput.addEventListener('input', queueAvailableModelsRefresh);
 
         // Add this function to fetch available models
         async function fetchAvailableModels(preferredSettings = null) {
-            const originalEndpoint = endpointInput.value.replace('/chat/completions', '/models');
+            const originalEndpoint = endpointInput.value.trim();
+            if (!originalEndpoint) {
+                return;
+            }
             const apiKey = apiKeyInput.value.trim();
             const desiredBaseModel = hasMeaningfulValue(preferredSettings?.baseModel)
                 ? preferredSettings.baseModel
@@ -2089,13 +2257,23 @@
                 }
                 const response = await fetch(endpoint, {
                     method: 'GET',
-                    headers: {
-                        'Authorization': `Bearer ${apiKey}`
-                    }
+                    headers: buildOptionalAuthorizationHeaders(apiKey)
                 });
 
-                const data = await response.json();
-                availableModels = data.data || [];
+                const data = await parseJsonResponseWithErrors(response, {
+                    action: 'models',
+                    endpoint: normalizeOpenAiCompatibleEndpointPath(originalEndpoint, 'models')
+                });
+                const normalizedModels = normalizeAvailableModelsResponse(data);
+                if (!normalizedModels.length) {
+                    throw new Error(
+                        `The model list could not be refreshed. No models were returned by ${normalizeOpenAiCompatibleEndpointPath(originalEndpoint, 'models') || 'the configured endpoint'}. Check the endpoint URL and provider settings in Tool Settings.`
+                    );
+                }
+                availableModels = normalizedModels;
+                if (typeof data.warning === 'string' && data.warning.trim()) {
+                    status.textContent = data.warning.trim();
+                }
                 
                 // Update tool model dropdown
                 if (toolModelDropdown) {
@@ -2355,6 +2533,7 @@
                 }
             } catch (error) {
                 console.error('Error fetching models:', error);
+                status.textContent = error.message || 'The model list could not be refreshed. Check Tool Settings.';
                 if (toolModelDropdown) {
                     toolModel = populateModelDropdown(
                         toolModelDropdown,
@@ -2906,8 +3085,42 @@
             return out;
         }
 
+        function getChoiceMessage(choice = {}) {
+            if (choice && typeof choice === 'object' && choice.message && typeof choice.message === 'object') {
+                return choice.message;
+            }
+            if (choice && typeof choice === 'object') {
+                return {
+                    role: 'assistant',
+                    content: choice.cleanContent ?? choice.content ?? choice.text ?? ''
+                };
+            }
+            return { role: 'assistant', content: '' };
+        }
+
+        function extractChoiceRawText(choice = {}) {
+            const message = getChoiceMessage(choice);
+            const content = coerceMessageText(message?.content ?? '');
+            if (content) return content;
+            if (choice && typeof choice === 'object') {
+                return coerceMessageText(choice.cleanContent ?? choice.content ?? choice.text ?? '');
+            }
+            return '';
+        }
+
+        function extractChoiceVisibleText(choice = {}) {
+            return stripThinkTags(extractChoiceRawText(choice));
+        }
+
         function getVisibleAssistantText(message = {}) {
             return stripThinkTags(coerceMessageText(message?.content || ''));
+        }
+
+        function renderAssistantErrorResponse(message = '') {
+            const normalizedMessage = String(message || '').trim();
+            if (!normalizedMessage) return;
+            responseOutput.value = normalizedMessage;
+            addMessageToHistory('assistant', normalizedMessage);
         }
 	
         // Function to create smooth head movement
@@ -9468,7 +9681,7 @@ function saveWAVFile(wavBlob) {
                                 }))
                             });
                             const data = await response.json();
-                            content = data.choices[0].message.content;
+                            content = extractChoiceVisibleText(data?.choices?.[0] || {});
                         } else {
                             content = lastResult.result.message || '';
                         }
@@ -10356,17 +10569,22 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${apiKey}`
+                        ...buildOptionalAuthorizationHeaders(apiKey)
                     },
                     signal: chatRequestSignal,
                     body: JSON.stringify(body)
                 });
 
-                const data = await response.json();
+                const data = await parseJsonResponseWithErrors(response, {
+                    action: 'chat',
+                    endpoint: originalEndpoint,
+                    model: getCurrentModel()
+                });
                 console.log('Response from LLM:', JSON.stringify(data, null, 2));
 
                 if (data.choices && data.choices.length > 0) {
-                    const message = data.choices[0].message;
+                    const firstChoice = data.choices[0] || {};
+                    const message = getChoiceMessage(firstChoice);
                     console.log('Processing message:', message);
                     const initialAssistantMessage = buildAssistantHistoryMessage(message);
 
@@ -10399,7 +10617,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                 method: 'POST',
                                 headers: {
                                     'Content-Type': 'application/json',
-                                    'Authorization': `Bearer ${apiKey}`
+                                    ...buildOptionalAuthorizationHeaders(apiKey)
                                 },
                                 signal: chatRequestSignal,
                                 body: JSON.stringify(buildCompatibleChatBody(endpoint, {
@@ -10411,7 +10629,11 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     tool_choice: 'auto'
                                 }))
                             });
-                            const followupData = await followupResponse.json();
+                            const followupData = await parseJsonResponseWithErrors(followupResponse, {
+                                action: 'chat',
+                                endpoint: originalEndpoint,
+                                model: getCurrentModel()
+                            });
                             let finalMessage = followupData?.choices?.[0]?.message || {};
                             let finalContent = getVisibleAssistantText(finalMessage);
                             let followupToolIterations = 0;
@@ -10459,7 +10681,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     method: 'POST',
                                     headers: {
                                         'Content-Type': 'application/json',
-                                        'Authorization': `Bearer ${apiKey}`
+                                        ...buildOptionalAuthorizationHeaders(apiKey)
                                     },
                                     signal: chatRequestSignal,
                                     body: JSON.stringify(buildCompatibleChatBody(endpoint, {
@@ -10471,7 +10693,11 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                         tool_choice: 'auto'
                                     }))
                                 });
-                                const chainedFollowupData = await chainedFollowupResponse.json();
+                                const chainedFollowupData = await parseJsonResponseWithErrors(chainedFollowupResponse, {
+                                    action: 'chat',
+                                    endpoint: originalEndpoint,
+                                    model: getCurrentModel()
+                                });
                                 finalMessage = chainedFollowupData?.choices?.[0]?.message || {};
                                 finalContent = getVisibleAssistantText(finalMessage);
                                 followupToolIterations += 1;
@@ -10753,7 +10979,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         }
                     }
 
-                    const rawContent = coerceMessageText(message.content || '');
+                    const rawContent = extractChoiceRawText(firstChoice);
                     const cleanContent = stripThinkTags(rawContent);
                     if (cleanContent) {
                         // Check for tool calls in Qwen's XML format
@@ -11102,42 +11328,15 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         messageHistory.classList.remove('responding'); // Remove pulsing effect from message history
                     }
                 }
-                } else {
-                    // No choices returned; ensure UI is not left waiting
-                    console.warn('LLM returned no choices');
-                    const lastToolMsg = messages.slice().reverse().find(m => m.role === 'tool')?.content;
-                    if (lastToolMsg) {
-                        let fallbackText = '';
-                        try {
-                            const parsed = typeof lastToolMsg === 'string' ? JSON.parse(lastToolMsg) : lastToolMsg;
-                            fallbackText = parsed?.message || '';
-                        } catch (_) {
-                            fallbackText = typeof lastToolMsg === 'string' ? lastToolMsg : '';
-                        }
-                        if (fallbackText) {
-                            responseOutput.value = fallbackText;
-                            addMessageToHistory('assistant', fallbackText); // Add to message history (also updates chatHistory)
-                            
-                            // Automatically extract memories from conversation (async, non-blocking)
-                            extractMemoriesFromConversation().catch(err => {
-                                console.warn('Memory extraction failed:', err);
-                            });
-                            
-                            if (uploadedAttachments.length) {
-                                clearPendingAttachments();
-                            }
-                            textToSpeech(fallbackText);
-                        }
-                    }
                 }
             } catch (error) {
                 console.error('Error:', error);
                 const isTimeoutAbort = error?.name === 'AbortError';
                 const userErrorMessage = isTimeoutAbort
                     ? `Error: Request timed out after ${Math.round(CHAT_REQUEST_TIMEOUT_MS / 1000)} seconds. Please try again.`
-                    : `Error: ${error.message}. Please try again.`;
-                responseOutput.value = userErrorMessage;
-                addMessageToHistory('assistant', userErrorMessage); // Add to message history
+                    : `${error.message}`;
+                status.textContent = userErrorMessage;
+                renderAssistantErrorResponse(userErrorMessage);
             } finally {
                 responseOutput.classList.remove('responding');
                 messageHistory.classList.remove('responding'); // Remove pulsing effect from message history
@@ -11148,9 +11347,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 const isTimeoutAbort = outerError?.name === 'AbortError';
                 const userErrorMessage = isTimeoutAbort
                     ? `Error: Request timed out after ${Math.round(CHAT_REQUEST_TIMEOUT_MS / 1000)} seconds. Please try again.`
-                    : `Error: ${outerError.message}. Please try again.`;
-                responseOutput.value = userErrorMessage;
-                addMessageToHistory('assistant', userErrorMessage);
+                    : `${outerError.message}`;
+                status.textContent = userErrorMessage;
+                renderAssistantErrorResponse(userErrorMessage);
                 responseOutput.classList.remove('responding');
                 messageHistory.classList.remove('responding');
                 stopProgressUpdates();
@@ -13368,7 +13567,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
 
                 const data = await response.json();
                 if (data.choices && data.choices.length > 0) {
-                    const message = data.choices[0].cleanContent.trim();
+                    const message = extractChoiceVisibleText(data.choices[0] || {});
+                    if (!message) {
+                        throw new Error('Model returned no visible text for webcam analysis.');
+                    }
                     
                     // Update response output
                     responseOutput.value = message;
@@ -14822,7 +15024,7 @@ IMPORTANT: Respond with ONLY the JSON object.`
             }
             
             const data = await response.json();
-            const content = data.choices[0].message.content.trim();
+            const content = extractChoiceVisibleText(data?.choices?.[0] || {});
             
             try {
                 const jsonMatch = content.match(/\{[\s\S]*\}/);
@@ -15044,7 +15246,7 @@ ${fullText.substring(0, 6000)}...${minimalImageInfo}`;
                             throw new Error('Invalid response format from retry API call');
                         }
                         
-                        const retryContent = retryData.choices[0].message.content.trim();
+                        const retryContent = extractChoiceVisibleText(retryData?.choices?.[0] || {});
                         console.log('Raw LLM response (minimal retry):', retryContent.substring(0, 200) + '...');
                         
                         // Parse the retry response
@@ -15122,7 +15324,7 @@ ${fullText.substring(0, 6000)}...${minimalImageInfo}`;
                     throw new Error('Invalid response format from API');
                 }
 
-                const content = data.choices[0].message.content.trim();
+                const content = extractChoiceVisibleText(data?.choices?.[0] || {});
                 console.log('Raw LLM response:', content);
 
                 // Parse the JSON response

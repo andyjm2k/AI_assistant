@@ -43,6 +43,17 @@ DONE_PHRASES = [
     "i have finished the work for this task",
     "completed the task", "task has been completed", "i've completed", "i have completed the task",
 ]
+_GENERIC_DONE_MESSAGE_MAX_CHARS = 140
+_GENERIC_DONE_PHRASES = tuple(
+    sorted(
+        {
+            phrase.strip().lower().strip(" .!?:;")
+            for phrase in DONE_PHRASES
+            if isinstance(phrase, str) and phrase.strip()
+        }
+        | {"done"}
+    )
+)
 
 _NO_KEY_LLM_PROVIDERS = frozenset({"ollama", "bedrock"})
 _MCP_PROVIDER_API_KEY_ENV_CANDIDATES: Dict[str, List[str]] = {
@@ -169,6 +180,30 @@ def _extract_llm_error_text(response: httpx.Response) -> str:
         else:
             detail = str(payload.get("message") or payload.get("detail") or message or detail)
     return detail
+
+
+def _normalize_completion_text(text: str) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _completion_message_is_generic_done(text: str) -> bool:
+    normalized = _normalize_completion_text(text)
+    if not normalized:
+        return False
+    if len(normalized) > _GENERIC_DONE_MESSAGE_MAX_CHARS:
+        return False
+    stripped = normalized.strip(" .!?:;")
+    if stripped in _GENERIC_DONE_PHRASES:
+        return True
+    return any(phrase in normalized for phrase in DONE_PHRASES)
+
+
+def _select_completion_message(content: str, last_tool_result: str) -> str:
+    body = str(content or "").strip()
+    tool_text = str(last_tool_result or "").strip()
+    if tool_text and (not body or _completion_message_is_generic_done(body)):
+        return tool_text
+    return body
 
 
 class TodoTaskExecutor:
@@ -677,6 +712,7 @@ class TodoTaskExecutor:
         """
         tools = await self._get_tools()
         last_message = ""
+        last_successful_tool_result = ""
         await self._emit_progress(
             "workflow_start",
             task_id=self.task_id,
@@ -730,6 +766,7 @@ class TodoTaskExecutor:
             if content:
                 status = self._check_pause_or_done(content)
                 if status and not tool_calls:
+                    final_message = _select_completion_message(content, last_successful_tool_result)
                     self.messages.append(
                         llm_response.get("message") or {"role": "assistant", "content": content}
                     )
@@ -739,11 +776,11 @@ class TodoTaskExecutor:
                         task_id=self.task_id,
                         workflow_name=self.task_description,
                         phase=status,
-                        message=content,
+                        message=final_message or content,
                         current_step=self.iteration_count,
                         total_steps=self.max_iterations,
                     )
-                    return (status, content)
+                    return (status, final_message or content)
                 pending_status = status
             if tool_calls and self.tool_executor:
                 await self._emit_progress(
@@ -782,6 +819,9 @@ class TodoTaskExecutor:
                     try:
                         result = await self.tool_executor(name, args)
                         self._record_tool_usage(name, result, errored=False)
+                        result_text = str(result).strip()
+                        if result_text:
+                            last_successful_tool_result = result_text
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": tc.get("id"),
@@ -796,6 +836,7 @@ class TodoTaskExecutor:
                         })
                 last_message = content or last_message
                 if pending_status:
+                    final_message = _select_completion_message(last_message or content or "", last_successful_tool_result)
                     print(
                         f"[TASK_EXEC] Detected {pending_status} in assistant message after tool execution "
                         f"(iteration {self.iteration_count})"
@@ -805,28 +846,29 @@ class TodoTaskExecutor:
                         task_id=self.task_id,
                         workflow_name=self.task_description,
                         phase=pending_status,
-                        message=last_message or content or "",
+                        message=final_message or last_message or content or "",
                         current_step=self.iteration_count,
                         total_steps=self.max_iterations,
                     )
-                    return (pending_status, last_message or content or "")
+                    return (pending_status, final_message or last_message or content or "")
                 continue
             self.messages.append({"role": "assistant", "content": content or "(No content)"})
             last_message = content
             if content:
                 status = self._check_pause_or_done(content)
                 if status:
+                    final_message = _select_completion_message(last_message, last_successful_tool_result)
                     print(f"[TASK_EXEC] Detected {status} in assistant message (iteration {self.iteration_count})")
                     await self._emit_progress(
                         "status_detected",
                         task_id=self.task_id,
                         workflow_name=self.task_description,
                         phase=status,
-                        message=last_message,
+                        message=final_message or last_message,
                         current_step=self.iteration_count,
                         total_steps=self.max_iterations,
                     )
-                    return (status, last_message)
+                    return (status, final_message or last_message)
             if self.iteration_count >= self.max_iterations:
                 print(f"[TASK_EXEC] Reached max iterations ({self.max_iterations}), returning awaiting_confirmation")
                 await self._emit_progress(

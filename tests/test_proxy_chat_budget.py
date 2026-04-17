@@ -127,6 +127,28 @@ def test_proxy_chat_completions_uses_server_key_for_trusted_default(monkeypatch)
     assert response.json()["id"] == "chatcmpl-test"
 
 
+def test_proxy_chat_completions_blank_bearer_uses_server_key_for_trusted_default(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "server-key")
+
+    async def fake_call(endpoint, headers, payload, timeout_seconds):
+        assert endpoint == "https://trusted.example/v1/chat/completions"
+        assert headers["Authorization"] == "Bearer server-key"
+        return httpx.Response(200, json={"id": "chatcmpl-test", "choices": []})
+
+    monkeypatch.setattr(proxy_server, "_call_chat_completion", fake_call)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.post(
+            "/v1/proxy/chat/completions",
+            headers={"Authorization": "Bearer"},
+            json={"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "chatcmpl-test"
+
+
 def test_proxy_chat_completions_rejects_untrusted_override_without_auth(monkeypatch):
     monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "server-key")
@@ -199,6 +221,72 @@ def test_proxy_models_uses_server_key_for_trusted_default(monkeypatch):
     assert response.status_code == 200
     assert captured["endpoint"] == "https://trusted.example/v1/models"
     assert captured["headers"]["Authorization"] == "Bearer server-key"
+
+
+def test_proxy_models_blank_bearer_uses_server_key_for_trusted_default(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "server-key")
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            self.is_closed = True
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            self.is_closed = True
+
+        async def get(self, endpoint, headers=None):
+            captured["endpoint"] = endpoint
+            captured["headers"] = dict(headers or {})
+            return httpx.Response(200, json={"data": []}, headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(proxy_server.httpx, "AsyncClient", FakeAsyncClient)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.get("/v1/proxy/models", headers={"Authorization": "Bearer"})
+
+    assert response.status_code == 200
+    assert captured["endpoint"] == "https://trusted.example/v1/models"
+    assert captured["headers"]["Authorization"] == "Bearer server-key"
+
+
+def test_proxy_models_returns_minimax_fallback_when_upstream_models_endpoint_fails(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://api.minimax.io/v1")
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-key")
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            self.is_closed = True
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            self.is_closed = True
+
+        async def get(self, endpoint, headers=None):
+            return httpx.Response(404, text="not found", headers={"content-type": "text/plain"})
+
+    monkeypatch.setattr(proxy_server.httpx, "AsyncClient", FakeAsyncClient)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.get("/v1/proxy/models")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["warning"].startswith("MiniMax does not currently expose a standard OpenAI-compatible /models response")
+    model_ids = [entry["id"] for entry in payload["data"]]
+    assert "MiniMax-M2.5" in model_ids
+    assert "MiniMax-M2.7" in model_ids
 
 
 def test_proxy_models_rejects_untrusted_override_without_auth(monkeypatch):

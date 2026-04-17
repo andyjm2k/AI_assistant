@@ -33,7 +33,7 @@ def test_app_js_has_conversational_progress_tts_hooks():
     assert "const PROGRESS_VOICE_REPEAT_DELAY_MS = 5000;" in content
     assert "function getConversationalProgressPrompt(stateText, announcementCount = 0)" in content
     assert "function announceConversationalProgress(force = false)" in content
-    assert "textToSpeechFallback(prompt.text" in content
+    assert "textToSpeech(prompt.text, { preserveThinkingPose: true });" in content
 
 
 def test_app_js_uses_thinking_fillers_for_non_tool_progress_and_specific_tool_prompts():
@@ -52,14 +52,14 @@ def test_app_js_has_small_talk_progress_suppression_helpers():
 
 def test_app_js_only_starts_progress_updates_for_request_like_prompts():
     content = _app_js_text()
-    assert "if (shouldStartProgressUpdatesForPrompt(promptText)) {" in content
+    assert "if (shouldStartProgressUpdatesForPrompt(promptTextForModel)) {" in content
     assert "startProgressUpdates('Analyzing request');" in content
 
 
 def test_app_js_refreshes_model_dropdowns_for_initial_and_companion_settings():
     content = _app_js_text()
     assert "function populateModelDropdown(dropdown, models, preferredValue, fallbackValue)" in content
-    assert "await fetchAvailableModels(persistedToolSettings);" in content
+    assert "await fetchAvailableModels(initialToolSettings);" in content
     assert "await fetchAvailableModels(data.settings);" in content
 
 
@@ -88,3 +88,43 @@ def test_app_js_refreshes_tts_voices_when_model_changes():
     content = _app_js_text()
     assert "ttsModelDropdown.addEventListener('change', () => {" in content
     assert "if (ttsServiceOpenAI && ttsServiceOpenAI.checked) fetchTtsVoices();" in content
+
+
+def test_app_js_normalizes_non_string_choice_content_before_rendering():
+    content = _app_js_text()
+    assert "function getChoiceMessage(choice = {})" in content
+    assert "function extractChoiceRawText(choice = {})" in content
+    assert "function extractChoiceVisibleText(choice = {})" in content
+    assert "const message = getChoiceMessage(firstChoice);" in content
+    assert "const rawContent = extractChoiceRawText(firstChoice);" in content
+
+
+def test_app_js_reuses_choice_visible_text_helper_in_auxiliary_flows():
+    content = _app_js_text()
+    assert "content = extractChoiceVisibleText(data?.choices?.[0] || {});" in content
+    assert "const message = extractChoiceVisibleText(data.choices[0] || {});" in content
+    assert "const content = extractChoiceVisibleText(data?.choices?.[0] || {});" in content
+    assert "data.choices[0].cleanContent.trim()" not in content
+    assert "data.choices[0].message.content.trim()" not in content
+
+
+def test_app_js_surfaces_llm_endpoint_errors_and_model_refresh_failures():
+    content = _app_js_text()
+    assert "function buildOptionalAuthorizationHeaders(apiKey = '')" in content
+    assert "function parseJsonResponseWithErrors(response, context = {})" in content
+    assert "function buildLlmEndpointErrorMessage(response, payload, rawText = '', context = {})" in content
+    assert "function renderAssistantErrorResponse(message = '')" in content
+    assert "The assistant could not get a response from the model endpoint." in content
+    assert "The model list could not be refreshed." in content
+    assert "status.textContent = error.message || 'The model list could not be refreshed. Check Tool Settings.';" in content
+    assert "renderAssistantErrorResponse(userErrorMessage);" in content
+
+
+def test_app_js_debounces_model_refresh_and_normalizes_model_payloads():
+    content = _app_js_text()
+    assert "let fetchAvailableModelsDebounceId = null;" in content
+    assert "const queueAvailableModelsRefresh = () => {" in content
+    assert "apiKeyInput.addEventListener('input', queueAvailableModelsRefresh);" in content
+    assert "endpointInput.addEventListener('input', queueAvailableModelsRefresh);" in content
+    assert "function normalizeAvailableModelsResponse(responseData)" in content
+    assert "const normalizedModels = normalizeAvailableModelsResponse(data);" in content

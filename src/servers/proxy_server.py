@@ -1958,6 +1958,90 @@ def _normalize_models_endpoint(endpoint: str) -> str:
     return normalized.rstrip("/") + "/models"
 
 
+_MINIMAX_FALLBACK_MODEL_IDS: Tuple[str, ...] = (
+    "MiniMax-M2.7",
+    "MiniMax-M2.7-highspeed",
+    "MiniMax-M2.5",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.1",
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2",
+)
+
+
+def _normalize_openai_proxy_auth_header(auth_header: Optional[str]) -> str:
+    raw = str(auth_header or "").strip()
+    if not raw:
+        return ""
+    if re.fullmatch(r"bearer\s*", raw, flags=re.IGNORECASE):
+        return ""
+    if raw.lower().startswith("bearer "):
+        token = raw[7:].strip()
+        return f"Bearer {token}" if token else ""
+    return raw
+
+
+def _build_openai_compatible_models_payload(
+    model_ids: List[str],
+    *,
+    owner: str = "openai-compatible",
+    warning: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "owned_by": owner,
+            }
+            for model_id in model_ids
+            if str(model_id or "").strip()
+        ],
+    }
+    if warning:
+        payload["warning"] = warning
+    return payload
+
+
+def _extract_openai_compatible_model_ids(payload: Any) -> List[str]:
+    candidates: List[Any]
+    if isinstance(payload, dict):
+        if isinstance(payload.get("data"), list):
+            candidates = payload["data"]
+        elif isinstance(payload.get("models"), list):
+            candidates = payload["models"]
+        else:
+            candidates = []
+    elif isinstance(payload, list):
+        candidates = payload
+    else:
+        candidates = []
+
+    model_ids: List[str] = []
+    for item in candidates:
+        if isinstance(item, str):
+            normalized = item.strip()
+        elif isinstance(item, dict):
+            normalized = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+        else:
+            normalized = ""
+        if normalized and normalized not in model_ids:
+            model_ids.append(normalized)
+    return model_ids
+
+
+def _build_minimax_models_fallback_payload() -> Dict[str, Any]:
+    return _build_openai_compatible_models_payload(
+        list(_MINIMAX_FALLBACK_MODEL_IDS),
+        owner="minimax",
+        warning=(
+            "MiniMax does not currently expose a standard OpenAI-compatible /models response here; "
+            "CATBot returned a built-in compatible model list instead."
+        ),
+    )
+
+
 def _sanitize_openai_proxy_endpoint(endpoint: str) -> str:
     raw = str(endpoint or "").strip()
     if not raw:
@@ -2039,7 +2123,7 @@ def _resolve_openai_proxy_request(
         raise ValueError(f"Unsupported endpoint kind: {endpoint_kind}")
 
     trusted_endpoint = _is_trusted_openai_proxy_endpoint(resolved_endpoint)
-    auth_header = str(request_auth_header or "").strip()
+    auth_header = _normalize_openai_proxy_auth_header(request_auth_header)
     using_server_credentials = False
 
     if using_default_endpoint and not trusted_endpoint:
@@ -11324,6 +11408,7 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
             endpoint_kind="models",
             request_auth_header=request.headers.get('Authorization', ''),
         )
+        minimax_compatible = is_minimax_chat_request(endpoint, None)
 
         headers = {}
         if auth_header:
@@ -11347,6 +11432,8 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
         if response.status_code != 200:
             print(f"LLM service returned error: {response.status_code}")
             print(f"   Response text: {response.text[:500]}")
+            if minimax_compatible:
+                return JSONResponse(content=_build_minimax_models_fallback_payload(), status_code=200)
             return JSONResponse(
                 content=response.json() if response.headers.get('content-type', '').startswith('application/json') else {"error": response.text},
                 status_code=response.status_code,
@@ -11354,9 +11441,14 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
 
         try:
             response_data = response.json()
+            model_ids = _extract_openai_compatible_model_ids(response_data)
+            if minimax_compatible and not model_ids:
+                return JSONResponse(content=_build_minimax_models_fallback_payload(), status_code=200)
             return JSONResponse(content=response_data, status_code=200)
         except Exception as json_error:
             print(f"Failed to parse JSON response: {json_error}")
+            if minimax_compatible:
+                return JSONResponse(content=_build_minimax_models_fallback_payload(), status_code=200)
             return JSONResponse(
                 content={"error": "Invalid JSON response from LLM service"},
                 status_code=500,

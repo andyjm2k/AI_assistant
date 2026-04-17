@@ -139,6 +139,80 @@ class TestTodoTaskExecutorCancel:
             {"path": "done.txt", "content": "ok"},
         )
 
+    @pytest.mark.asyncio
+    async def test_run_loop_uses_last_tool_result_when_done_text_is_generic_after_tool_call(self):
+        """Generic done text should yield the concrete tool result for completion reporting."""
+        tool_executor = AsyncMock(return_value="Created scratch/done.txt with the final report.")
+        executor = TodoTaskExecutor(
+            api_key="test-key",
+            task_id=1,
+            task_description="Test",
+            tool_executor=tool_executor,
+            get_tools_func=AsyncMock(return_value=[]),
+        )
+
+        async def mock_llm_done_with_tool(*args, **kwargs):
+            return {
+                "content": "I have finished the work for this task.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "filesystem.write_text",
+                            "arguments": "{\"path\":\"done.txt\",\"content\":\"ok\"}",
+                        },
+                    }
+                ],
+            }
+
+        with patch.object(executor, "_call_llm", side_effect=mock_llm_done_with_tool):
+            status, message = await executor.run_loop()
+
+        assert status == STATUS_AWAITING_CONFIRMATION
+        assert message == "Created scratch/done.txt with the final report."
+
+    @pytest.mark.asyncio
+    async def test_run_loop_uses_previous_tool_result_when_followup_done_text_is_generic(self):
+        """A later generic done message should still surface the last successful tool result."""
+        tool_executor = AsyncMock(return_value="Read notes.txt and extracted the deployment checklist.")
+        executor = TodoTaskExecutor(
+            api_key="test-key",
+            task_id=1,
+            task_description="Test",
+            tool_executor=tool_executor,
+            get_tools_func=AsyncMock(return_value=[]),
+        )
+
+        responses = [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "filesystem.read_text",
+                            "arguments": "{\"path\":\"notes.txt\"}",
+                        },
+                    }
+                ],
+            },
+            {
+                "content": "Task complete.",
+                "tool_calls": None,
+            },
+        ]
+
+        async def _mock_llm(*args, **kwargs):
+            return responses.pop(0)
+
+        with patch.object(executor, "_call_llm", side_effect=_mock_llm):
+            status, message = await executor.run_loop()
+
+        assert status == STATUS_AWAITING_CONFIRMATION
+        assert message == "Read notes.txt and extracted the deployment checklist."
+
 
 @pytest.mark.asyncio
 async def test_ensure_token_budget_summarizes_when_over_limit(monkeypatch):
