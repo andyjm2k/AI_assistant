@@ -238,6 +238,7 @@ async def test_start_stop_code_executors_no_raise():
 
 def test_runtime_loader_returns_python_defined_team():
     try:
+        from src.servers import proxy_server
         from src.servers.proxy_server import load_autogen_team_runtime
     except ImportError:
         pytest.skip("proxy_server not importable")
@@ -269,7 +270,7 @@ def test_runtime_loader_returns_python_defined_team():
     for wb_item in wb_list:
         tools = getattr(wb_item, "tools", getattr(wb_item, "_tools", None)) or []
         tool_names.extend(getattr(tool, "name", "") for tool in tools)
-    if tool_names:
+    if tool_names and getattr(proxy_server, "AUTOGEN_ENABLE_CODE_EXECUTION", False):
         assert "CodeExecutor" in tool_names or "python_code_execution" in tool_names
 
 

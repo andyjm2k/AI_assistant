@@ -3,8 +3,10 @@ OpenAI-compatible embeddings client for generating vector embeddings.
 Supports both local and cloud embeddings endpoints.
 """
 
+import inspect
 import os
 from typing import List, Optional
+
 import httpx
 from pydantic import BaseModel
 
@@ -60,6 +62,14 @@ class EmbeddingsClient:
         # Build embeddings endpoint URL
         self.embeddings_url = f"{self.api_base}/embeddings"
 
+    @staticmethod
+    async def _read_response_json(response) -> dict:
+        """Handle both real httpx responses and async-mocked response.json callables."""
+        data = response.json()
+        if inspect.isawaitable(data):
+            data = await data
+        return data
+
     async def get_embedding(self, text: str) -> List[float]:
         """
         Get embedding vector for a text string.
@@ -105,7 +115,7 @@ class EmbeddingsClient:
                     )
                 
                 # Parse response
-                data = response.json()
+                data = await self._read_response_json(response)
                 
                 # Handle OpenAI format: data[0].embedding
                 if "data" in data and len(data["data"]) > 0:
@@ -168,7 +178,7 @@ class EmbeddingsClient:
                     )
                 
                 # Parse response
-                data = response.json()
+                data = await self._read_response_json(response)
                 
                 # Handle OpenAI format: data array with multiple embeddings
                 if "data" in data:

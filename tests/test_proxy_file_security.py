@@ -689,7 +689,10 @@ class TestUploadToDriveSecurity:
         mock_files = MagicMock(return_value=MagicMock(create=mock_create))
         mock_drive = MagicMock(files=mock_files)
         try:
-            with patch("googleapiclient.discovery.build", return_value=mock_drive):
+            with (
+                patch("google.oauth2.service_account.Credentials.from_service_account_info", return_value=object()),
+                patch("googleapiclient.discovery.build", return_value=mock_drive),
+            ):
                 response = client_with_auth.post(
                     "/v1/proxy/upload-to-drive",
                     data={"filePath": "security_test_drive_upload.txt", "folderId": "fake-folder-id"},
