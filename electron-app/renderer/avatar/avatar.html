@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title></title>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../vendor/three/build/three.module.js",
+        "three/examples/jsm/loaders/GLTFLoader.js": "../vendor/three/examples/jsm/loaders/GLTFLoader.js",
+        "@pixiv/three-vrm": "../vendor/@pixiv/three-vrm/lib/three-vrm.module.js",
+        "@pixiv/three-vrm-animation": "../vendor/@pixiv/three-vrm-animation/lib/three-vrm-animation.module.js"
+      }
+    }
+  </script>
+  <script src="../vendor/live2dcubismcore/live2dcubismcore.min.js"></script>
+  <script src="../vendor/live2dcubismcore/live2d.min.js"></script>
+  <script src="../vendor/pixi.js/pixi.min.js"></script>
+  <script src="../vendor/eventemitter3/eventemitter3.min.js"></script>
+  <script src="../vendor/pixi-live2d-display/index.min.js"></script>
+  <link rel="stylesheet" href="./avatar.css">
+</head>
+<body>
+  <div class="speech-bubble" id="speech-bubble"></div>
+  <section class="quick-hud" id="quick-hud" aria-label="Avatar quick actions">
+    <div class="quick-action-bar">
+      <button type="button" data-quick-action="microphone" title="Speech to text" aria-label="Speech to text">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15c1.7 0 3-1.3 3-3V6c0-1.7-1.3-3-3-3S9 4.3 9 6v6c0 1.7 1.3 3 3 3Z"/><path d="M5 11c0 3.5 2.6 6.4 6 6.9V21h2v-3.1c3.4-.5 6-3.4 6-6.9h-2c0 2.8-2.2 5-5 5s-5-2.2-5-5H5Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="screen" title="Attach screen snapshot" aria-label="Attach screen snapshot">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H4V5Zm2 2v6h12V7H6Z"/><path d="M10 17h4l1 2h3v2H6v-2h3l1-2Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="focus-chat" title="Focus prompt" aria-label="Focus prompt">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H7.8L4 18.8V5Zm2 2v7l1-1h11V7H6Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="models" title="Models and expressions" aria-label="Models and expressions">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 6v7c0 4.4 3.3 8.2 8 9 4.7-.8 8-4.6 8-9V6l-8-4Zm0 3.2L18 8v5c0 3-2.1 5.6-6 6.6C8.1 18.6 6 16 6 13V8l6-2.8Z"/><path d="M9 10.5A1.5 1.5 0 1 0 9 7.5a1.5 1.5 0 0 0 0 3Zm6 0a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM8.5 13.5c1 1.2 2.1 1.8 3.5 1.8s2.5-.6 3.5-1.8l1.5 1.3c-1.3 1.7-3 2.5-5 2.5s-3.7-.8-5-2.5l1.5-1.3Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="move" title="Move avatar" aria-label="Move avatar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 4 4h-3v5h5V8l4 4-4 4v-3h-5v5h3l-4 4-4-4h3v-5H6v3l-4-4 4-4v3h5V6H8l4-4Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="controls" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m19.4 13.5.1-1.5-.1-1.5 2-1.5-2-3.5-2.4 1a7 7 0 0 0-2.6-1.5L14 2h-4l-.4 2.5A7 7 0 0 0 7 6l-2.4-1-2 3.5 2 1.5-.1 1.5.1 1.5-2 1.5 2 3.5L7 17a7 7 0 0 0 2.6 1.5L10 21h4l.4-2.5A7 7 0 0 0 17 17l2.4 1 2-3.5-2-1ZM12 15.5A3.5 3.5 0 1 1 12 8a3.5 3.5 0 0 1 0 7.5Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="speak" title="Toggle spoken replies" aria-label="Toggle spoken replies">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4V9Z"/><path d="M16 8.4v2.2c.6.4 1 1 1 1.9s-.4 1.5-1 1.9v2.2c1.8-.6 3-2.2 3-4.1s-1.2-3.5-3-4.1Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="close" title="Close" aria-label="Close quick actions">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6.4 5 12.6 12.6-1.4 1.4L5 6.4 6.4 5Z"/><path d="M19 6.4 6.4 19 5 17.6 17.6 5 19 6.4Z"/></svg>
+      </button>
+    </div>
+    <form class="quick-chat" id="quick-chat-form">
+      <input id="quick-chat-input" type="text" maxlength="250" placeholder="Ask CATBot..." autocomplete="off">
+      <button id="quick-chat-send" type="submit" title="Send" aria-label="Send prompt">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 20 22 12 3 4v6l11 2-11 2v6Z"/></svg>
+      </button>
+    </form>
+    <div class="quick-hud-status" id="quick-hud-status">Ready</div>
+  </section>
+  <section class="hud-sheet" id="hud-sheet" aria-label="Avatar controls">
+    <div class="sheet-grip" aria-hidden="true"></div>
+    <div class="sheet-tabs" role="tablist" aria-label="Avatar control sections">
+      <button type="button" data-hud-panel-button="chat">Chat</button>
+      <button type="button" data-hud-panel-button="auth">Auth</button>
+      <button type="button" data-hud-panel-button="models">Model</button>
+      <button type="button" data-hud-panel-button="settings">Settings</button>
+      <button type="button" data-hud-panel-button="status">Status</button>
+      <button type="button" data-hud-panel-close aria-label="Close panel">Close</button>
+    </div>
+
+    <div class="sheet-panel" data-hud-panel="chat">
+      <div class="sheet-title">
+        <span>Desktop Chat</span>
+        <button id="hud-clear-chat-btn" type="button">Clear</button>
+      </div>
+      <div id="hud-chat-log" class="hud-chat-log" aria-live="polite"></div>
+      <p class="sheet-hint">Use the prompt bar below. Replies can drive expression, speech bubble, and lip sync.</p>
+    </div>
+
+    <div class="sheet-panel" data-hud-panel="auth">
+      <div class="sheet-title">
+        <span>Proxy Sign-In</span>
+        <strong id="hud-auth-chip">Not signed in</strong>
+      </div>
+      <label>Username <input id="hud-auth-username" type="text" autocomplete="username" placeholder="CATBot username"></label>
+      <label>Password <input id="hud-auth-password" type="password" autocomplete="current-password" placeholder="CATBot password"></label>
+      <div class="sheet-actions">
+        <button id="hud-auth-login-btn" type="button">Log In</button>
+        <button id="hud-auth-signup-btn" type="button">Sign Up</button>
+        <button id="hud-auth-logout-btn" type="button">Log Out</button>
+      </div>
+      <p id="hud-auth-status" class="sheet-hint">Sign in with the same CATBot account used by the browser client.</p>
+    </div>
+
+    <div class="sheet-panel" data-hud-panel="models">
+      <div class="sheet-title">
+        <span>Model and Expression</span>
+      </div>
+      <label>Avatar mode
+        <select id="hud-avatar-mode">
+          <option value="vrm">VRM 3D</option>
+          <option value="live2d">Live2D 2D</option>
+        </select>
+      </label>
+      <label>Model <select id="hud-avatar-model"></select></label>
+      <div class="hud-expression-grid" id="hud-expression-grid">
+        <button type="button" data-hud-expression="neutral">Neutral</button>
+        <button type="button" data-hud-expression="happy">Happy</button>
+        <button type="button" data-hud-expression="love">Love</button>
+        <button type="button" data-hud-expression="think">Think</button>
+        <button type="button" data-hud-expression="sad">Sad</button>
+        <button type="button" data-hud-expression="angry">Angry</button>
+        <button type="button" data-hud-expression="surprised">Surprised</button>
+      </div>
+      <label>Scale <span id="hud-scale-value">1.00x</span><input id="hud-scale-range" type="range" min="0.25" max="2.5" step="0.05" value="1"></label>
+      <label>Opacity <span id="hud-opacity-value">1.00</span><input id="hud-opacity-range" type="range" min="0.35" max="1" step="0.05" value="1"></label>
+      <div class="sheet-title">
+        <span>VRM Placement</span>
+        <button id="hud-reset-vrm-btn" type="button">Reset</button>
+      </div>
+      <label>Position X <span id="hud-vrm-x-value">0.00</span><input id="hud-vrm-x-range" type="range" min="-2.5" max="2.5" step="0.05" value="0"></label>
+      <label>Position Y <span id="hud-vrm-y-value">0.00</span><input id="hud-vrm-y-range" type="range" min="-3.5" max="2.5" step="0.05" value="0"></label>
+      <label>Rotation <span id="hud-vrm-rotation-value">0°</span><input id="hud-vrm-rotation-range" type="range" min="-180" max="180" step="1" value="0"></label>
+      <button id="hud-rescan-models-btn" type="button">Rescan Models</button>
+    </div>
+
+    <div class="sheet-panel" data-hud-panel="settings">
+      <div class="sheet-title">
+        <span>Connection and Voice</span>
+      </div>
+      <label>Proxy URL <input id="hud-proxy-url" type="url" placeholder="http://127.0.0.1:8000"></label>
+      <label>Web client URL <input id="hud-web-url" type="url" placeholder="http://127.0.0.1:8000"></label>
+      <label>Chat endpoint <input id="hud-chat-endpoint" type="url" placeholder="Blank uses proxy default"></label>
+      <label>Chat model <input id="hud-chat-model" type="text" placeholder="Use proxy default"></label>
+      <label>Provider API key <input id="hud-chat-api-key" type="password" placeholder="Leave blank to keep saved key"></label>
+      <label>TTS endpoint <input id="hud-tts-endpoint" type="url" placeholder="http://localhost:4123/v1"></label>
+      <div class="sheet-field-pair">
+        <label>TTS model <input id="hud-tts-model" type="text" placeholder="tts-1"></label>
+        <label>TTS voice <input id="hud-tts-voice" type="text" placeholder="alloy"></label>
+      </div>
+      <div class="sheet-actions">
+        <button id="hud-save-settings-btn" type="button">Save</button>
+        <button id="hud-toggle-speak-btn" type="button">Speak Replies: On</button>
+        <button id="hud-clear-provider-key-btn" type="button">Clear Key</button>
+        <button id="hud-open-web-btn" type="button">Web Client</button>
+      </div>
+      <div class="sheet-actions">
+        <button id="hud-toggle-clickthrough-btn" type="button">Click-Through: On</button>
+        <button id="hud-toggle-topmost-btn" type="button">Always On Top: On</button>
+        <button id="hud-center-avatar-btn" type="button">Center</button>
+      </div>
+      <div class="sheet-actions">
+        <button id="hud-toggle-start-tray-btn" type="button">Start To Tray: Off</button>
+        <button id="hud-toggle-launch-login-btn" type="button">Launch Login: Off</button>
+        <button id="hud-hide-avatar-btn" type="button">Hide Avatar</button>
+      </div>
+      <p class="sheet-hint">Endpoint override requires a provider API key unless the proxy trusts that endpoint.</p>
+    </div>
+
+    <div class="sheet-panel" data-hud-panel="status">
+      <div class="sheet-title">
+        <span>Voice and Diagnostics</span>
+      </div>
+      <label>Speech preview <input id="hud-speech-text" type="text" maxlength="220" placeholder="Type a short line for the avatar to say"></label>
+      <div class="sheet-actions">
+        <button id="hud-preview-speech-btn" type="button">Preview</button>
+        <button id="hud-clear-speech-btn" type="button">Clear Bubble</button>
+        <button id="hud-open-browser-btn" type="button">Browser</button>
+      </div>
+      <pre id="hud-status-output" class="hud-status-output"></pre>
+      <p class="sheet-hint">This compact state view replaces the normal control-panel diagnostics for day-to-day use.</p>
+    </div>
+  </section>
+  <div class="move-overlay" id="move-overlay" aria-label="Move mode drag surface"></div>
+  <div class="render-fallback" id="render-fallback" aria-live="polite">
+    <img id="render-fallback-image" alt="CATBot avatar fallback">
+    <div id="render-fallback-status">Preparing avatar...</div>
+  </div>
+  <canvas id="avatar-canvas"></canvas>
+  <div id="live2d-container">
+    <canvas id="live2d-canvas"></canvas>
+  </div>
+  <script type="module" src="./avatar.js"></script>
+</body>
+</html>

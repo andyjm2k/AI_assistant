@@ -132,6 +132,50 @@ venv\Scripts\python.exe scripts/start_all.py
 
 Linux/macOS: start the same Python entrypoints documented in [README.md](/C:/Users/pc/CATBot/README.md) with your preferred process manager.
 
+## Electron Desktop Avatar
+
+The Windows Electron desktop companion is now scaffolded as a separate app under [electron-app](/C:/Users/pc/CATBot/electron-app).
+
+Use it when you want the floating desktop avatar experience without modifying the existing browser client.
+
+Install and configure it from its own workspace:
+
+```powershell
+cd electron-app
+.\install.ps1
+```
+
+That installer follows the same interactive pattern as the main CATBot installer:
+
+- checks prerequisites
+- installs Electron dependencies
+- creates `electron-app/.env`
+- runs an interactive wizard for desktop-avatar defaults, launch behavior, and desktop speech-preview TTS settings
+- verifies the Electron workspace
+- optionally builds the Windows NSIS installer
+
+The Electron control panel currently supports:
+
+- a transparent floating avatar window with move mode and click-through mode
+- VRM and Live2D model switching
+- in-app or external launch of the CATBot web client
+- start-to-tray and launch-at-login toggles
+- speech bubble preview with TTS-driven lip sync when a CATBot proxy URL and TTS endpoint are configured
+
+Run the desktop app after install:
+
+```powershell
+cd electron-app
+npm start
+```
+
+Build the Windows installer later:
+
+```powershell
+cd electron-app
+npm run dist:win
+```
+
 ## Troubleshooting
 
 - `uv not found`: install `uv` first, then rerun the installer

@@ -1,0 +1,48 @@
+{
+  "mode": "vrm",
+  "modelPath": "model_avatar/CATBot/CATBot.vrm",
+  "scale": 1,
+  "opacity": 1,
+  "clickThrough": true,
+  "alwaysOnTop": true,
+  "moveMode": false,
+  "visible": true,
+  "quickHudVisible": false,
+  "showControlPanelOnLaunch": false,
+  "startToTray": false,
+  "launchAtLogin": false,
+  "expression": "neutral",
+  "speechBubbleText": "",
+  "speechTriggerId": 0,
+  "speechDurationMs": 2600,
+  "proxyBaseUrl": "http://127.0.0.1:8000",
+  "ttsEndpoint": "",
+  "ttsModel": "tts-1",
+  "ttsVoice": "alloy",
+  "chatEndpoint": "",
+  "chatModel": "",
+  "chatSystemPrompt": "You are CATBot, a concise desktop companion. Give helpful, practical answers in a few sentences unless the user asks for detail.",
+  "desktopChatHistory": [],
+  "speakChatReplies": true,
+  "trustLocalCertificates": true,
+  "vrmTransforms": {},
+  "windowBounds": {
+    "x": 80,
+    "y": 80,
+    "width": 480,
+    "height": 640
+  },
+  "controlBounds": {
+    "x": 620,
+    "y": 120,
+    "width": 420,
+    "height": 720
+  },
+  "webClientBounds": {
+    "x": 1080,
+    "y": 80,
+    "width": 1120,
+    "height": 820
+  },
+  "webClientUrl": "http://127.0.0.1:8000"
+}

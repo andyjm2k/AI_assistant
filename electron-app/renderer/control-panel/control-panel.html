@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CATBot Desktop Avatar</title>
+  <link rel="stylesheet" href="./control-panel.css">
+</head>
+<body>
+  <main class="panel-shell">
+    <section class="hero-card">
+      <div>
+        <p class="eyebrow">Desktop Companion</p>
+        <h1>CATBot Avatar Console</h1>
+        <p class="hero-copy">Control the floating avatar, desktop window behavior, model pose, speech preview, and CATBot web bridge without touching the browser client.</p>
+      </div>
+      <div class="hero-actions">
+        <button id="open-web-client-btn" class="primary-btn" type="button">Open Client</button>
+        <button id="open-external-web-client-btn" class="ghost-btn" type="button">Browser</button>
+      </div>
+    </section>
+
+    <section class="status-rail" aria-label="Current desktop avatar status">
+      <div class="status-pill">
+        <span>Mode</span>
+        <strong id="runtime-mode-chip">VRM</strong>
+      </div>
+      <div class="status-pill">
+        <span>Model</span>
+        <strong id="runtime-model-chip">Loading</strong>
+      </div>
+      <div class="status-pill">
+        <span>Window</span>
+        <strong id="runtime-window-chip">Visible</strong>
+      </div>
+      <div class="status-pill">
+        <span>TTS</span>
+        <strong id="runtime-tts-chip">Not Set</strong>
+      </div>
+    </section>
+
+    <section class="command-card">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Quick Actions</p>
+          <h2>Window Control</h2>
+        </div>
+      </div>
+      <div class="toggle-grid quick-grid">
+        <button id="toggle-move-btn" class="toggle-btn" type="button">Enable Move Mode</button>
+        <button id="toggle-clickthrough-btn" class="toggle-btn" type="button">Disable Click-Through</button>
+        <button id="toggle-visibility-btn" class="toggle-btn" type="button">Hide Avatar</button>
+        <button id="toggle-topmost-btn" class="toggle-btn" type="button">Disable Always On Top</button>
+        <button id="center-avatar-btn" class="toggle-btn" type="button">Center Avatar</button>
+        <button id="toggle-quick-hud-btn" class="toggle-btn" type="button">Show Avatar Actions</button>
+      </div>
+      <div class="shortcut-strip" aria-label="Global shortcuts">
+        <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>M</kbd> Move</span>
+        <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>A</kbd> Show/Hide</span>
+        <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>X</kbd> Click</span>
+        <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>Space</kbd> Actions</span>
+        <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>C</kbd> Controls</span>
+        <span><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>W</kbd> Web</span>
+      </div>
+    </section>
+
+    <section class="workspace-grid">
+      <section class="control-card">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Model Desk</p>
+            <h2>Avatar</h2>
+          </div>
+          <button id="rescan-models-btn" class="ghost-btn compact-btn" type="button">Rescan</button>
+        </div>
+
+        <label class="field-label" for="avatar-mode-select">Avatar mode</label>
+        <select id="avatar-mode-select">
+          <option value="vrm">VRM 3D</option>
+          <option value="live2d">Live2D 2D</option>
+        </select>
+
+        <label class="field-label" for="avatar-model-select">Avatar model</label>
+        <select id="avatar-model-select"></select>
+
+        <div class="meter-row">
+          <label class="field-label" for="scale-range">Scale <span id="scale-value">1.00x</span></label>
+          <input id="scale-range" type="range" min="0.25" max="2.5" step="0.05" value="1">
+        </div>
+
+        <div class="meter-row">
+          <label class="field-label" for="opacity-range">Opacity <span id="opacity-value">1.00</span></label>
+          <input id="opacity-range" type="range" min="0.35" max="1" step="0.05" value="1">
+        </div>
+
+        <div class="expression-pad" id="expression-preset-grid" aria-label="Expression presets">
+          <button class="preset-btn" type="button" data-expression="neutral">Neutral</button>
+          <button class="preset-btn" type="button" data-expression="happy">Happy</button>
+          <button class="preset-btn" type="button" data-expression="love">Love</button>
+          <button class="preset-btn" type="button" data-expression="think">Think</button>
+          <button class="preset-btn" type="button" data-expression="sad">Sad</button>
+          <button class="preset-btn" type="button" data-expression="angry">Angry</button>
+          <button class="preset-btn" type="button" data-expression="surprised">Surprised</button>
+        </div>
+
+        <label class="field-label sr-only" for="expression-select">Expression preset</label>
+        <select id="expression-select" class="sr-only" aria-hidden="true" tabindex="-1">
+          <option value="neutral">Neutral</option>
+          <option value="happy">Happy</option>
+          <option value="love">Love</option>
+          <option value="think">Think</option>
+          <option value="sad">Sad</option>
+          <option value="angry">Angry</option>
+          <option value="surprised">Surprised</option>
+        </select>
+      </section>
+
+      <section class="control-card" id="vrm-transform-panel">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Pose Lab</p>
+            <h2>VRM Placement</h2>
+          </div>
+          <button id="reset-vrm-transform-btn" class="ghost-btn compact-btn" type="button">Reset</button>
+        </div>
+
+        <div class="meter-row">
+          <label class="field-label" for="vrm-position-x-range">Position X <span id="vrm-position-x-value">0.00</span></label>
+          <input id="vrm-position-x-range" type="range" min="-2.5" max="2.5" step="0.05" value="0">
+        </div>
+
+        <div class="meter-row">
+          <label class="field-label" for="vrm-position-y-range">Position Y <span id="vrm-position-y-value">0.00</span></label>
+          <input id="vrm-position-y-range" type="range" min="-3.5" max="2.5" step="0.05" value="0">
+        </div>
+
+        <div class="meter-row">
+          <label class="field-label" for="vrm-rotation-range">Rotation <span id="vrm-rotation-value">0&deg;</span></label>
+          <input id="vrm-rotation-range" type="range" min="-180" max="180" step="1" value="0">
+        </div>
+
+        <p class="hint-copy">These placement values are saved per VRM model, so each character can keep its own screen composition.</p>
+      </section>
+    </section>
+
+    <section class="workspace-grid">
+      <section class="control-card chat-card">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Ask CATBot</p>
+            <h2>Desktop Chat</h2>
+          </div>
+          <button id="speak-chat-replies-toggle" class="toggle-btn compact-btn" type="button">Speak Replies: On</button>
+        </div>
+
+        <div id="desktop-chat-log" class="chat-log" aria-live="polite"></div>
+
+        <label class="field-label" for="chat-prompt-input">Message</label>
+        <textarea id="chat-prompt-input" rows="4" placeholder="Ask CATBot something from the desktop..."></textarea>
+        <div class="action-row action-row-wide">
+          <button id="send-chat-btn" class="primary-btn" type="button">Send To CATBot</button>
+          <button id="clear-chat-btn" class="ghost-btn" type="button">Clear Chat</button>
+        </div>
+        <p class="hint-copy">Replies can drive the speech bubble, lip sync, and expression changes on the floating avatar.</p>
+      </section>
+
+      <section class="control-card">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Voice Line</p>
+            <h2>Speech Preview</h2>
+          </div>
+        </div>
+
+        <label class="field-label" for="speech-text-input">Speech bubble text</label>
+        <input id="speech-text-input" type="text" placeholder="Type a short line for the avatar to say">
+        <div class="action-row action-row-wide">
+          <button id="preview-speech-btn" class="primary-btn" type="button">Preview Speech</button>
+          <button id="clear-speech-btn" class="ghost-btn" type="button">Clear Bubble</button>
+        </div>
+      </section>
+
+      <section class="control-card">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Bridge</p>
+            <h2>CATBot Web</h2>
+          </div>
+        </div>
+
+        <label class="field-label" for="web-url-input">Configured web client URL</label>
+        <input id="web-url-input" type="url" placeholder="http://127.0.0.1:8000">
+
+        <label class="field-label" for="proxy-url-input">CATBot API/proxy URL</label>
+        <input id="proxy-url-input" type="url" placeholder="http://127.0.0.1:8000">
+
+        <label class="field-label" for="chat-endpoint-input">Chat completions endpoint</label>
+        <input id="chat-endpoint-input" type="url" placeholder="Leave blank to use proxy default">
+
+        <label class="field-label" for="chat-model-input">Chat model</label>
+        <input id="chat-model-input" type="text" placeholder="Use server default">
+
+        <label class="field-label" for="chat-api-key-input">Chat provider API key</label>
+        <input id="chat-api-key-input" type="password" placeholder="Leave blank to keep saved key">
+
+        <label class="field-label" for="tts-endpoint-input">TTS endpoint</label>
+        <input id="tts-endpoint-input" type="url" placeholder="http://localhost:4123/v1">
+
+        <div class="field-pair">
+          <div>
+            <label class="field-label" for="tts-model-input">TTS model</label>
+            <input id="tts-model-input" type="text" placeholder="tts-1">
+          </div>
+          <div>
+            <label class="field-label" for="tts-voice-input">TTS voice</label>
+            <input id="tts-voice-input" type="text" placeholder="alloy">
+          </div>
+        </div>
+
+        <div class="toggle-grid">
+          <button id="start-to-tray-toggle" class="toggle-btn" type="button">Start To Tray: Off</button>
+          <button id="launch-at-login-toggle" class="toggle-btn" type="button">Launch At Login: Off</button>
+        </div>
+
+        <div class="action-row">
+          <button id="save-web-url-btn" class="primary-btn" type="button">Save Settings</button>
+          <button id="clear-provider-key-btn" class="ghost-btn" type="button">Clear Provider Key</button>
+        </div>
+      </section>
+
+      <section class="control-card">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Proxy Auth</p>
+            <h2>Desktop Sign-In</h2>
+          </div>
+          <strong id="auth-status-chip" class="mini-chip">Checking</strong>
+        </div>
+
+        <label class="field-label" for="auth-username-input">Username</label>
+        <input id="auth-username-input" type="text" autocomplete="username" placeholder="CATBot username">
+
+        <label class="field-label" for="auth-password-input">Password</label>
+        <input id="auth-password-input" type="password" autocomplete="current-password" placeholder="CATBot password">
+
+        <div class="action-row">
+          <button id="auth-login-btn" class="primary-btn" type="button">Log In</button>
+          <button id="auth-signup-btn" class="ghost-btn" type="button">Sign Up</button>
+          <button id="auth-logout-btn" class="ghost-btn" type="button">Log Out</button>
+        </div>
+        <p id="auth-status-text" class="hint-copy">Sign in with the same CATBot account used by the browser client.</p>
+      </section>
+    </section>
+
+    <section class="control-card status-card">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Diagnostics</p>
+          <h2>Runtime State</h2>
+        </div>
+      </div>
+      <pre id="status-output"></pre>
+    </section>
+  </main>
+
+  <script type="module" src="./control-panel.js"></script>
+</body>
+</html>

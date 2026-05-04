@@ -426,6 +426,11 @@ class ToolCallRequest(BaseModel):
     toolName: str
     parameters: Optional[Dict[str, Any]] = None
 
+class ProxyToolExecuteRequest(BaseModel):
+    tool_name: str = Field(validation_alias=AliasChoices("tool_name", "toolName", "name"))
+    arguments: Optional[Dict[str, Any]] = Field(default=None, validation_alias=AliasChoices("arguments", "parameters", "args"))
+    context: Optional[Dict[str, Any]] = None
+
 # Pydantic models for file operations
 class ReadFileRequest(BaseModel):
     filename: str = Field(validation_alias=AliasChoices("filename", "path", "file"))
@@ -2108,6 +2113,7 @@ def _resolve_openai_proxy_request(
     default_endpoint: str,
     endpoint_kind: str,
     request_auth_header: Optional[str],
+    request_proxy_auth_token: Optional[str] = None,
     model_name: Optional[str] = None,
 ) -> Tuple[str, bool, str, bool]:
     raw_endpoint = str(requested_endpoint or "").strip()
@@ -2132,15 +2138,26 @@ def _resolve_openai_proxy_request(
             detail="Configured proxy endpoint is not trusted. Set OPENAI_API_BASE or OPENAI_PROXY_TRUSTED_BASE_URLS correctly.",
         )
 
+    proxy_user_authenticated = False
+    if request_proxy_auth_token:
+        try:
+            get_current_user_from_headers(None, request_proxy_auth_token)
+            proxy_user_authenticated = True
+        except HTTPException:
+            proxy_user_authenticated = False
+
     if not auth_header:
         if not trusted_endpoint:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Endpoint override requires an Authorization header unless the endpoint is trusted via "
-                    "OPENAI_API_BASE or OPENAI_PROXY_TRUSTED_BASE_URLS."
-                ),
-            )
+            if not proxy_user_authenticated:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Endpoint override requires a provider Authorization header, a valid CATBot "
+                        "X-Auth-Token, or a trusted endpoint via OPENAI_API_BASE or "
+                        "OPENAI_PROXY_TRUSTED_BASE_URLS."
+                    ),
+                )
+            return resolved_endpoint, trusted_endpoint, "", False
         primary_api_key = _first_non_empty_env(preferred_api_key_env_names(resolved_endpoint, model_name))
         if primary_api_key:
             auth_header = f"Bearer {primary_api_key}"
@@ -3772,6 +3789,78 @@ def _merge_openai_tool_lists(*tool_lists: List[Dict[str, Any]]) -> List[Dict[str
             seen_names.add(name)
             merged.append(item)
     return merged
+
+_OPENAI_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _sanitize_openai_tool_name(value: str) -> str:
+    """Return a provider-compatible OpenAI tool name."""
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(value or "").strip())
+    normalized = re.sub(r"_+", "_", normalized).strip("_-")
+    return (normalized or "tool")[:64]
+
+
+def _build_proxy_tool_openai_payload(
+    tools: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Convert all proxy/MCP/skill tools to OpenAI schemas with stable executable aliases."""
+    counts: Dict[str, int] = {}
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+
+    openai_tools: List[Dict[str, Any]] = []
+    alias_map: Dict[str, Dict[str, Any]] = {}
+    used_aliases: Set[str] = set()
+
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        server_id = str(item.get("server_id") or "").strip()
+        alias_seed = name
+        if not _OPENAI_TOOL_NAME_PATTERN.match(name) or counts.get(name, 0) > 1:
+            alias_seed = f"{server_id}_{name}" if server_id else name
+        alias = _sanitize_openai_tool_name(alias_seed)
+        if alias in used_aliases:
+            suffix = 2
+            base = alias[:58]
+            while f"{base}_{suffix}" in used_aliases:
+                suffix += 1
+            alias = f"{base}_{suffix}"
+        used_aliases.add(alias)
+
+        input_schema = item.get("inputSchema")
+        if not isinstance(input_schema, dict):
+            input_schema = {"type": "object", "properties": {}}
+        description = str(item.get("description") or "").strip()
+        if alias != name:
+            mapped_label = f"Maps to proxy tool '{name}'"
+            if server_id:
+                mapped_label += f" on '{server_id}'"
+            description = f"{description}\n\n{mapped_label}.".strip()
+
+        openai_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": alias,
+                    "description": description,
+                    "parameters": input_schema,
+                },
+            }
+        )
+        alias_map[alias] = {
+            "tool_name": name,
+            "server_id": server_id,
+        }
+
+    return openai_tools, alias_map
 
 
 def _get_telegram_native_tools_openai_schema() -> List[Dict[str, Any]]:
@@ -7593,6 +7682,60 @@ async def log_tool_invocation(request: Request):
     return {"success": True}
 
 
+@app.get("/v1/tools/openai")
+async def list_proxy_tools_openai():
+    """List all proxy-server, skill, and connected MCP tools as OpenAI-compatible schemas."""
+    tools = await get_all_available_tools()
+    openai_tools, alias_map = _build_proxy_tool_openai_payload(tools)
+    prompt_lines = []
+    for tool in openai_tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        description = str(function.get("description") or "").strip()
+        if name:
+            prompt_lines.append(f"- {name}: {description or 'No description.'}")
+    return {
+        "tools": openai_tools,
+        "tool_count": len(openai_tools),
+        "name_map": alias_map,
+        "prompt_lines": prompt_lines,
+    }
+
+
+@app.post("/v1/tools/execute")
+async def execute_proxy_tool(request: ProxyToolExecuteRequest):
+    """Execute a tool exposed by /v1/tools/openai using its OpenAI alias or raw tool name."""
+    raw_name = str(request.tool_name or "").strip()
+    if not raw_name:
+        raise HTTPException(status_code=400, detail="tool_name is required")
+    arguments = request.arguments if isinstance(request.arguments, dict) else {}
+    tools = await get_all_available_tools()
+    _, alias_map = _build_proxy_tool_openai_payload(tools)
+    mapping = alias_map.get(raw_name)
+    tool_name = str(mapping.get("tool_name") if mapping else raw_name).strip()
+    server_id = str(mapping.get("server_id") if mapping else "").strip()
+    execute_args = dict(arguments)
+    if server_id and "server_id" not in execute_args and "_server_id" not in execute_args:
+        execute_args["_server_id"] = server_id
+    if isinstance(request.context, dict):
+        if request.context.get("conversation_id") and "conversation_id" not in execute_args:
+            execute_args["conversation_id"] = request.context.get("conversation_id")
+        if request.context.get("user_id") and "user_id" not in execute_args:
+            execute_args["user_id"] = request.context.get("user_id")
+
+    result = await execute_tool_for_philosopher(tool_name, execute_args)
+    return {
+        "success": not str(result or "").lower().startswith("error"),
+        "tool_name": tool_name,
+        "alias": raw_name,
+        "server_id": server_id,
+        "message": str(result),
+        "content": str(result),
+    }
+
+
 # Browser automation tool endpoint (browser-use via HTTP; other servers via MCP client)
 @app.post("/v1/mcp/servers/{server_id}/tools/call")
 async def call_tool(server_id: str, request: ToolCallRequest):
@@ -11407,6 +11550,7 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
             default_endpoint=os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/models'),
             endpoint_kind="models",
             request_auth_header=request.headers.get('Authorization', ''),
+            request_proxy_auth_token=request.headers.get('X-Auth-Token', ''),
         )
         minimax_compatible = is_minimax_chat_request(endpoint, None)
 
@@ -11875,6 +12019,7 @@ async def proxy_chat_completions(request: Request):
             default_endpoint=os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/chat/completions'),
             endpoint_kind="chat",
             request_auth_header=request.headers.get('Authorization', ''),
+            request_proxy_auth_token=request.headers.get('X-Auth-Token', ''),
             model_name=body_clean.get("model"),
         )
         allow_server_side_fallbacks = using_server_credentials

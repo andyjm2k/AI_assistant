@@ -1,0 +1,522 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent !important;
+  background-color: rgba(0, 0, 0, 0) !important;
+  overflow: hidden;
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+  position: relative;
+  border: 0;
+  outline: 0;
+  --hud-bg: rgba(7, 8, 14, 0.88);
+  --hud-line: rgba(230, 236, 255, 0.14);
+  --hud-text: #f8fcff;
+  --hud-muted: rgba(248, 252, 255, 0.68);
+  --hud-accent: #ef4fc6;
+  --hud-good: #52d68b;
+}
+
+#avatar-canvas,
+#live2d-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+  -webkit-app-region: no-drag;
+}
+
+#live2d-container {
+  position: absolute;
+  inset: 0;
+  display: none;
+  pointer-events: none;
+}
+
+.render-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: none;
+  place-items: center;
+  padding: 22px;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+body.render-fallback-visible .render-fallback {
+  display: grid;
+}
+
+body.render-fallback-visible #avatar-canvas,
+body.render-fallback-visible #live2d-container {
+  display: none !important;
+}
+
+.render-fallback img {
+  display: block;
+  max-width: min(78vw, 280px);
+  max-height: min(70vh, 360px);
+  object-fit: contain;
+  filter: drop-shadow(0 18px 34px rgba(0, 0, 0, 0.32));
+}
+
+.render-fallback div {
+  align-self: end;
+  max-width: min(360px, calc(100vw - 32px));
+  padding: 8px 11px;
+  border: 1px solid var(--hud-line);
+  border-radius: 12px;
+  background: rgba(7, 8, 14, 0.82);
+  color: rgba(248, 252, 255, 0.86);
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: center;
+  backdrop-filter: blur(14px);
+}
+
+.speech-bubble {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 28px;
+  z-index: 3;
+  display: block;
+  box-sizing: border-box;
+  max-width: min(360px, calc(100vw - 36px));
+  margin: 0 auto;
+  padding: 14px 16px;
+  border-radius: 22px 22px 22px 10px;
+  background: rgba(248, 252, 255, 0.92);
+  color: #112033;
+  font-size: 14px;
+  line-height: 1.45;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.22);
+  opacity: 0;
+  transform: translateY(10px) scale(0.98);
+  transition: opacity 180ms ease, transform 180ms ease;
+  backdrop-filter: blur(12px);
+}
+
+body.quick-hud-visible .speech-bubble {
+  bottom: min(188px, 42vh);
+}
+
+.speech-bubble:empty,
+body:not(.speech-active) .speech-bubble {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  background: transparent !important;
+}
+
+body.speech-active .speech-bubble.is-visible:not(:empty) {
+  display: block;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.quick-hud {
+  position: absolute;
+  left: 50%;
+  bottom: max(12px, env(safe-area-inset-bottom));
+  z-index: 18;
+  display: grid;
+  justify-items: center;
+  width: min(420px, calc(100% - 16px));
+  gap: 8px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(14px) scale(0.98);
+  transition: opacity 160ms ease, transform 160ms ease;
+  -webkit-app-region: no-drag;
+}
+
+body.quick-hud-visible .quick-hud {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+
+.quick-action-bar,
+.quick-chat,
+.quick-hud-status {
+  border: 1px solid var(--hud-line);
+  background: var(--hud-bg);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(16px);
+}
+
+.quick-action-bar {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 6px;
+  width: min(420px, 100%);
+  padding: 7px;
+  border-radius: 14px;
+}
+
+.quick-action-bar button,
+.quick-chat button {
+  min-height: 40px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(248, 252, 255, 0.9);
+  font: 700 12px/1 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+}
+
+.quick-action-bar button:hover,
+.quick-chat button:hover,
+.quick-action-bar button.is-active {
+  background: linear-gradient(135deg, rgba(79, 215, 184, 0.84), rgba(229, 70, 178, 0.72));
+  color: #061014;
+}
+
+.quick-action-bar button:active,
+.quick-chat button:active {
+  transform: translateY(1px);
+}
+
+.quick-action-bar button:focus-visible,
+.quick-chat button:focus-visible,
+.sheet-tabs button:focus-visible,
+.sheet-actions button:focus-visible,
+.hud-expression-grid button:focus-visible,
+.sheet-title button:focus-visible,
+#hud-rescan-models-btn:focus-visible {
+  outline: 2px solid rgba(82, 214, 139, 0.88);
+  outline-offset: 2px;
+}
+
+.quick-chat button[aria-busy="true"] {
+  opacity: 0.68;
+  cursor: wait;
+}
+
+.quick-action-bar button.has-attachment {
+  background: linear-gradient(135deg, rgba(244, 193, 92, 0.92), rgba(229, 70, 178, 0.72));
+  color: #140610;
+}
+
+.quick-action-bar button.is-muted {
+  color: rgba(248, 252, 255, 0.44);
+}
+
+.quick-action-bar button.is-muted svg {
+  opacity: 0.62;
+}
+
+.quick-action-bar svg,
+.quick-chat svg {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+}
+
+.quick-chat {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 46px;
+  gap: 8px;
+  width: min(420px, 100%);
+  padding: 8px;
+  border-radius: 14px;
+}
+
+.quick-chat input {
+  min-width: 0;
+  border: 1px solid rgba(220, 232, 255, 0.16);
+  border-radius: 8px;
+  outline: none;
+  background: transparent;
+  color: #f8fcff;
+  padding: 11px 12px;
+  font: 14px/1.25 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.quick-chat input:focus {
+  border-color: rgba(229, 70, 178, 0.75);
+  box-shadow: 0 0 0 3px rgba(229, 70, 178, 0.16);
+}
+
+.quick-hud-status {
+  justify-self: center;
+  max-width: 100%;
+  min-height: 24px;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  border-radius: 999px;
+  color: rgba(248, 252, 255, 0.78);
+  font-size: 11px;
+  line-height: 1.3;
+  text-align: center;
+}
+
+.hud-sheet {
+  position: absolute;
+  left: 50%;
+  bottom: 176px;
+  z-index: 17;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  width: min(420px, calc(100% - 14px));
+  max-height: min(390px, calc(100% - 194px));
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 10px;
+  border: 1px solid var(--hud-line);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 22% 0%, rgba(82, 214, 139, 0.14), transparent 36%),
+    radial-gradient(circle at 80% 12%, rgba(239, 79, 198, 0.16), transparent 32%),
+    rgba(7, 8, 14, 0.9);
+  box-shadow: 0 28px 70px rgba(0, 0, 0, 0.42);
+  color: var(--hud-text);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(16px) scale(0.98);
+  transition: opacity 140ms ease, transform 140ms ease;
+  backdrop-filter: blur(18px);
+  -webkit-app-region: no-drag;
+}
+
+body.hud-sheet-visible .hud-sheet {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+
+.sheet-grip {
+  justify-self: center;
+  width: 46px;
+  height: 4px;
+  margin-bottom: 8px;
+  border-radius: 999px;
+  background: rgba(248, 252, 255, 0.28);
+}
+
+.sheet-tabs {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.sheet-tabs button,
+.sheet-actions button,
+.hud-expression-grid button,
+.sheet-title button,
+#hud-rescan-models-btn {
+  min-height: 34px;
+  border: 1px solid var(--hud-line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--hud-text);
+  font: 700 11px/1 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  cursor: pointer;
+}
+
+.sheet-tabs button.is-active,
+.sheet-actions button:hover,
+.hud-expression-grid button.is-active,
+.hud-expression-grid button:hover,
+.sheet-title button:hover,
+#hud-rescan-models-btn:hover {
+  border-color: rgba(239, 79, 198, 0.55);
+  background: linear-gradient(135deg, rgba(239, 79, 198, 0.38), rgba(82, 214, 139, 0.18));
+}
+
+.sheet-panel {
+  display: none;
+  min-height: 0;
+  max-height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 2px 2px 4px;
+  scrollbar-color: rgba(239, 79, 198, 0.55) rgba(255, 255, 255, 0.08);
+  scrollbar-width: thin;
+  touch-action: pan-y;
+}
+
+.sheet-panel.is-active {
+  display: grid;
+  align-content: start;
+  gap: 9px;
+}
+
+.sheet-panel::-webkit-scrollbar,
+.hud-chat-log::-webkit-scrollbar,
+.hud-status-output::-webkit-scrollbar {
+  width: 8px;
+}
+
+.sheet-panel::-webkit-scrollbar-track,
+.hud-chat-log::-webkit-scrollbar-track,
+.hud-status-output::-webkit-scrollbar-track {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.sheet-panel::-webkit-scrollbar-thumb,
+.hud-chat-log::-webkit-scrollbar-thumb,
+.hud-status-output::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(239, 79, 198, 0.55);
+}
+
+.sheet-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--hud-text);
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.sheet-title strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--hud-good);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sheet-panel label {
+  display: grid;
+  gap: 5px;
+  color: var(--hud-muted);
+  font-size: 11px;
+}
+
+.sheet-panel input,
+.sheet-panel select {
+  min-width: 0;
+  box-sizing: border-box;
+  width: 100%;
+  border: 1px solid rgba(220, 232, 255, 0.16);
+  border-radius: 11px;
+  outline: none;
+  background: rgba(3, 6, 12, 0.72);
+  color: var(--hud-text);
+  padding: 9px 10px;
+  font: 12px/1.2 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.sheet-panel input:focus,
+.sheet-panel select:focus {
+  border-color: rgba(239, 79, 198, 0.75);
+  box-shadow: 0 0 0 3px rgba(239, 79, 198, 0.14);
+}
+
+.sheet-actions,
+.sheet-field-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+  gap: 7px;
+}
+
+.sheet-actions + .sheet-actions {
+  margin-top: -2px;
+}
+
+.sheet-field-pair {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.sheet-hint {
+  margin: 0;
+  color: var(--hud-muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.hud-chat-log {
+  display: grid;
+  gap: 7px;
+  max-height: 150px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.hud-status-output {
+  max-height: 150px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.24);
+  color: rgba(248, 252, 255, 0.78);
+  font: 10px/1.45 "Cascadia Mono", "Consolas", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.hud-chat-message,
+.hud-chat-empty {
+  padding: 8px 9px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--hud-muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.hud-chat-message strong {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--hud-accent);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.hud-chat-message.user {
+  justify-self: end;
+  max-width: 86%;
+  background: rgba(82, 214, 139, 0.14);
+  color: var(--hud-text);
+}
+
+.hud-chat-message.assistant {
+  justify-self: start;
+  max-width: 90%;
+}
+
+.hud-expression-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.move-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: none;
+  background: transparent;
+  cursor: move;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-app-region: no-drag;
+}
+
+body.move-mode .move-overlay {
+  display: block;
+}

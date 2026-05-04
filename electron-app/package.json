@@ -1,0 +1,77 @@
+{
+  "name": "catbot-desktop-avatar",
+  "version": "0.1.0",
+  "description": "Windows Electron desktop avatar companion for CATBot",
+  "main": "main/main.js",
+  "author": "CATBot",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "wizard": "python scripts/install_electron_wizard.py",
+    "verify": "python scripts/verify_electron_install.py",
+    "dist:win": "electron-builder --win nsis",
+    "pack:win": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "@pixiv/three-vrm": "^3.4.3",
+    "@pixiv/three-vrm-animation": "^3.4.3",
+    "electron": "^35.1.5",
+    "electron-builder": "^25.1.8",
+    "eventemitter3": "^4.0.7",
+    "live2dcubismcore": "^1.0.2",
+    "pixi-live2d-display": "^0.4.0",
+    "pixi.js": "^6.5.2",
+    "three": "^0.150.1"
+  },
+  "build": {
+    "appId": "com.catbot.desktopavatar",
+    "productName": "CATBot Desktop Avatar",
+    "asar": true,
+    "compression": "store",
+    "files": [
+      "main/**/*",
+      "renderer/**/*",
+      "assets/**/*",
+      "config/**/*",
+      ".env",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../model_avatar",
+        "to": "model_avatar",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../CATBot_logo.png",
+        "to": "CATBot_logo.png"
+      }
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/app-icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "CATBot Desktop Avatar"
+    }
+  }
+}
