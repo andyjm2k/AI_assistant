@@ -227,7 +227,9 @@ def test_poller_poll_once_skips_tls_verify_for_local_https_proxy(monkeypatch):
 def test_load_config_from_env_default_proxy_url_is_https_localhost(monkeypatch):
     monkeypatch.setattr("src.servers.scheduled_task_poller._load_project_env_file", lambda: None)
     monkeypatch.delenv("SCHEDULED_TASK_POLLER_PROXY_URL", raising=False)
+    monkeypatch.delenv("JWT_EXPIRATION_SECONDS", raising=False)
 
     cfg = load_config_from_env()
 
     assert cfg.proxy_base_url == "https://localhost:8002"
+    assert cfg.jwt_expiration_seconds == 23 * 60 * 60

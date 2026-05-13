@@ -35,6 +35,7 @@ const chatApiKeyInput = document.getElementById("chat-api-key-input");
 const ttsEndpointInput = document.getElementById("tts-endpoint-input");
 const ttsModelInput = document.getElementById("tts-model-input");
 const ttsVoiceInput = document.getElementById("tts-voice-input");
+const refreshTtsVoicesBtn = document.getElementById("refresh-tts-voices-btn");
 const statusOutput = document.getElementById("status-output");
 const runtimeModeChip = document.getElementById("runtime-mode-chip");
 const runtimeModelChip = document.getElementById("runtime-model-chip");
@@ -185,6 +186,60 @@ async function populateModels(selectedPath) {
   }
 }
 
+function addSelectOption(select, value, label = value) {
+  const normalizedValue = String(value || "").trim();
+  if (!select || !normalizedValue) {
+    return;
+  }
+  const exists = Array.from(select.options).some((option) => option.value === normalizedValue);
+  if (exists) {
+    return;
+  }
+  const option = document.createElement("option");
+  option.value = normalizedValue;
+  option.textContent = String(label || normalizedValue);
+  select.appendChild(option);
+}
+
+function setTtsVoiceInputValue(value) {
+  const selected = String(value || "alloy").trim() || "alloy";
+  addSelectOption(ttsVoiceInput, selected);
+  ttsVoiceInput.value = selected;
+}
+
+async function populateTtsVoiceOptions(selectedVoice = currentState.ttsVoice) {
+  if (!ttsVoiceInput || typeof window.catbotDesktop.listTtsVoices !== "function") {
+    setTtsVoiceInputValue(selectedVoice);
+    return;
+  }
+  const desiredVoice = String(selectedVoice || ttsVoiceInput.value || currentState.ttsVoice || "alloy").trim() || "alloy";
+  try {
+    const catalog = await window.catbotDesktop.listTtsVoices({
+      proxyBaseUrl: proxyUrlInput.value.trim() || currentState.proxyBaseUrl,
+      ttsEndpoint: ttsEndpointInput.value.trim() || currentState.ttsEndpoint,
+      ttsModel: ttsModelInput.value.trim() || currentState.ttsModel,
+      ttsVoice: desiredVoice
+    });
+    const voices = Array.isArray(catalog?.voices) ? catalog.voices : [];
+    ttsVoiceInput.replaceChildren();
+    for (const voice of voices) {
+      addSelectOption(ttsVoiceInput, voice.id, voice.name || voice.id);
+    }
+    const catalogSelectedVoice = String(catalog?.selectedVoice || "").trim();
+    const nextVoice = desiredVoice === "alloy" && catalogSelectedVoice
+      ? catalogSelectedVoice
+      : (desiredVoice || catalogSelectedVoice || currentState.ttsVoice);
+    setTtsVoiceInputValue(nextVoice);
+    if (!ttsVoiceInput.value && ttsVoiceInput.options.length > 0) {
+      ttsVoiceInput.selectedIndex = 0;
+    }
+  } catch (error) {
+    addSelectOption(ttsVoiceInput, desiredVoice);
+    ttsVoiceInput.value = desiredVoice;
+    statusOutput.textContent = `Could not refresh TTS voices: ${String(error?.message || error)}`;
+  }
+}
+
 function renderExpressionButtons(expression) {
   const normalized = String(expression || "neutral").toLowerCase();
   expressionSelect.value = normalized;
@@ -240,7 +295,7 @@ function renderState(state) {
     : "Optional; server credentials are used when trusted";
   ttsEndpointInput.value = state.ttsEndpoint || "";
   ttsModelInput.value = state.ttsModel || "tts-1";
-  ttsVoiceInput.value = state.ttsVoice || "alloy";
+  setTtsVoiceInputValue(state.ttsVoice || "alloy");
   vrmPositionXRange.value = String(vrmTransform.positionX);
   vrmPositionYRange.value = String(vrmTransform.positionY);
   vrmRotationRange.value = String(vrmTransform.rotation);
@@ -501,6 +556,16 @@ document.getElementById("save-web-url-btn").addEventListener("click", async () =
   await updateDesktopState(getConnectionSettingsPatch());
 });
 
+refreshTtsVoicesBtn?.addEventListener("click", async () => {
+  await populateTtsVoiceOptions(ttsVoiceInput.value || currentState.ttsVoice);
+});
+
+for (const input of [proxyUrlInput, ttsEndpointInput, ttsModelInput]) {
+  input?.addEventListener("change", async () => {
+    await populateTtsVoiceOptions(ttsVoiceInput.value || currentState.ttsVoice);
+  });
+}
+
 clearProviderKeyBtn?.addEventListener("click", async () => {
   const nextState = await window.catbotDesktop.clearProviderApiKey();
   chatApiKeyInput.value = "";
@@ -539,4 +604,5 @@ document.getElementById("open-external-web-client-btn").addEventListener("click"
 
 await populateModels(currentState.modelPath);
 renderState(currentState);
+await populateTtsVoiceOptions(currentState.ttsVoice);
 renderAuthStatus(await window.catbotDesktop.verifyAuth({ proxyBaseUrl: currentState.proxyBaseUrl }));

@@ -203,6 +203,15 @@ def _env_str(name: str) -> Optional[str]:
     value = value.strip()
     return value or None
 
+
+# Project root (two levels up from src/servers/proxy_server.py)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_PROJECT_ENV_PATH = _PROJECT_ROOT / ".env"
+_PROJECT_ENV_LOADED = False
+if DOTENV_AVAILABLE and _PROJECT_ENV_PATH.exists():
+    load_dotenv(_PROJECT_ENV_PATH)
+    _PROJECT_ENV_LOADED = True
+
 PROXY_RELOAD = _env_bool("PROXY_RELOAD", default=False)
 PROXY_RESTART_ENABLED = _env_bool("PROXY_RESTART_ENABLED", default=True)
 try:
@@ -243,13 +252,16 @@ except ValueError:
 # Embedded Pocket TTS settings (disabled by default; set EMBEDDED_POCKET_TTS_ENABLED=true)
 EMBEDDED_POCKET_TTS_ENABLED = _env_bool("EMBEDDED_POCKET_TTS_ENABLED", default=False)
 EMBEDDED_POCKET_MODEL = os.environ.get("EMBEDDED_POCKET_MODEL", "pocket-tts-realtime").strip() or "pocket-tts-realtime"
+EMBEDDED_POCKET_VARIANT = os.environ.get("EMBEDDED_POCKET_VARIANT", "b6369a24").strip() or "b6369a24"
 EMBEDDED_POCKET_DEFAULT_VOICE = os.environ.get("EMBEDDED_POCKET_DEFAULT_VOICE", "alba").strip() or "alba"
+EMBEDDED_POCKET_VOICE_DIR = os.environ.get("EMBEDDED_POCKET_VOICE_DIR", str(_PROJECT_ROOT / "voices")).strip()
 EMBEDDED_POCKET_VOICES = [
     v.strip() for v in os.environ.get(
         "EMBEDDED_POCKET_VOICES",
         "alba,marius,javert,jean,fantine,cosette,eponine,azelma",
     ).split(",") if v.strip()
 ]
+EMBEDDED_POCKET_LOCAL_VOICE_EXTENSIONS = {".wav", ".mp3", ".flac", ".safetensors"}
 try:
     EMBEDDED_POCKET_STREAM_CHUNK_BYTES = max(512, int(os.environ.get("EMBEDDED_POCKET_STREAM_CHUNK_BYTES", "8192")))
 except ValueError:
@@ -391,8 +403,10 @@ except ImportError as e:
 # Load environment variables from .env file in project root
 if DOTENV_AVAILABLE:
     # Load from project root (two levels up from src/servers/)
-    env_path = Path(__file__).resolve().parent.parent.parent / '.env'
-    if env_path.exists():
+    env_path = _PROJECT_ENV_PATH
+    if _PROJECT_ENV_LOADED:
+        print(f"âœ… Loaded environment variables from {env_path}")
+    elif env_path.exists():
         load_dotenv(env_path)
         print(f"✅ Loaded environment variables from {env_path}")
     else:
@@ -598,6 +612,8 @@ class EmbeddedTtsSpeechRequest(BaseModel):
     sample_rate: Optional[int] = None
     channels: Optional[int] = 1
     speed: Optional[float] = None
+    max_tokens: Optional[int] = Field(default=None, validation_alias=AliasChoices("max_tokens", "maxTokens"))
+    frames_after_eos: Optional[int] = Field(default=None, validation_alias=AliasChoices("frames_after_eos", "framesAfterEos"))
 
 
 class StatusStartRequest(BaseModel):
@@ -693,9 +709,6 @@ class ProxyFetchRequest(BaseModel):
     wait_for_selector: Optional[str] = None
     js_wait_ms: int = 2200
 
-
-# Project root (two levels up from src/servers/proxy_server.py)
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # Global state (similar to the Node.js version)
 mcp_clients = {}
@@ -2606,7 +2619,8 @@ AUTH_USERS_FILE = _PROJECT_ROOT / "config" / "auth_users.json"
 ENV_FILE = _PROJECT_ROOT / ".env"
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-in-production")
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_SECONDS = int(os.getenv("JWT_EXPIRATION_SECONDS", "3600"))
+DEFAULT_JWT_EXPIRATION_SECONDS = 23 * 60 * 60
+JWT_EXPIRATION_SECONDS = int(os.getenv("JWT_EXPIRATION_SECONDS", str(DEFAULT_JWT_EXPIRATION_SECONDS)))
 SPOTIFY_ACCOUNTS_BASE = "https://accounts.spotify.com"
 SPOTIFY_AUTH_BASE = "https://accounts.spotify.com/api"
 SPOTIFY_OAUTH_TIMEOUT_SECONDS = 20.0
@@ -12407,7 +12421,68 @@ def _resolve_embedded_tts_backend(model_name: Optional[str] = None) -> str:
 
 def _normalize_embedded_pocket_model_name(model_name: Optional[str]) -> str:
     raw = (model_name or EMBEDDED_POCKET_MODEL or "").strip()
-    return raw or "pocket-tts-realtime"
+    if not raw:
+        return EMBEDDED_POCKET_VARIANT
+    normalized = raw.lower().replace("_", "-")
+    if normalized in EMBEDDED_POCKET_MODEL_ALIASES or normalized.startswith("pocket-tts") or "kyutai/pocket-tts" in normalized:
+        return EMBEDDED_POCKET_VARIANT
+    return raw
+
+
+def _resolve_embedded_pocket_voice_dir() -> Optional[Path]:
+    raw = (EMBEDDED_POCKET_VOICE_DIR or "").strip()
+    if not raw or raw.lower() in {"0", "false", "no", "none", "off"}:
+        return None
+    voice_dir = Path(raw).expanduser()
+    if not voice_dir.is_absolute():
+        voice_dir = _PROJECT_ROOT / voice_dir
+    try:
+        return voice_dir.resolve()
+    except Exception:
+        return voice_dir
+
+
+def _list_embedded_pocket_local_voice_files() -> List[str]:
+    voice_dir = _resolve_embedded_pocket_voice_dir()
+    if not voice_dir or not voice_dir.exists() or not voice_dir.is_dir():
+        return []
+    local_voices: List[str] = []
+    try:
+        for child in voice_dir.rglob("*"):
+            if child.is_file() and child.suffix.lower() in EMBEDDED_POCKET_LOCAL_VOICE_EXTENSIONS:
+                local_voices.append(str(child.resolve()))
+    except Exception as exc:
+        print(f"[WARN] Could not scan embedded Pocket TTS voice dir {voice_dir}: {exc}")
+        return []
+    return sorted(local_voices, key=lambda value: value.lower())
+
+
+def _dedupe_voice_ids(voice_ids: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for voice_id in voice_ids:
+        normalized = str(voice_id or "").strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
+def _embedded_tts_voice_display_name(voice_id: str) -> str:
+    value = str(voice_id or "").strip()
+    if not value:
+        return ""
+    try:
+        voice_path = Path(value)
+        if voice_path.suffix.lower() in EMBEDDED_POCKET_LOCAL_VOICE_EXTENSIONS:
+            return voice_path.stem or voice_path.name or value
+    except Exception:
+        pass
+    return value
 
 
 def _normalize_embedded_pocket_voice_key(prompt: str) -> str:
@@ -12443,13 +12518,58 @@ def _resolve_embedded_pocket_voice(requested_voice: str) -> str:
     )
 
 
+def _runtime_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _runtime_env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    raw = os.environ.get(name, "")
+    if raw == "":
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _runtime_env_optional_float(name: str, default: Optional[float] = None) -> Optional[float]:
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    lowered = raw.strip().lower()
+    if lowered in {"none", "null", "off", "false"}:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _load_embedded_pocket_model_sync() -> Any:
     if not EMBEDDED_POCKET_IMPORT_AVAILABLE or EmbeddedPocketTTSModel is None:
         raise RuntimeError("Embedded Pocket TTS import unavailable.")
 
     load_model = getattr(EmbeddedPocketTTSModel, "load_model", None)
     if callable(load_model):
-        return load_model()
+        return load_model(
+            config=_normalize_embedded_pocket_model_name(None),
+            temp=_runtime_env_float("EMBEDDED_POCKET_TEMPERATURE", 0.7),
+            lsd_decode_steps=_runtime_env_int("EMBEDDED_POCKET_LSD_DECODE_STEPS", 1, minimum=1),
+            noise_clamp=_runtime_env_optional_float("EMBEDDED_POCKET_NOISE_CLAMP", None),
+            eos_threshold=_runtime_env_float("EMBEDDED_POCKET_EOS_THRESHOLD", -4.0),
+        )
     return EmbeddedPocketTTSModel()
 
 
@@ -12516,6 +12636,8 @@ async def _iter_embedded_pocket_pcm_chunks(
     model_name: Optional[str] = None,
     speed: Optional[float] = None,
     sample_rate: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    frames_after_eos: Optional[int] = None,
 ):
     del model_name, speed, sample_rate
     normalized_text = (text or "").strip()
@@ -12525,6 +12647,7 @@ async def _iter_embedded_pocket_pcm_chunks(
     model = await _get_embedded_pocket_model()
     resolved_voice = _resolve_embedded_pocket_voice(voice)
     voice_state = await _get_embedded_pocket_voice_state(resolved_voice)
+    resolved_sample_rate = max(8000, int(getattr(model, "sample_rate", 24000) or 24000))
 
     try:
         stream_factory = getattr(model, "generate_audio_stream", None)
@@ -12538,14 +12661,49 @@ async def _iter_embedded_pocket_pcm_chunks(
         sentinel = object()
 
         def _stream_worker() -> None:
+            started_at = time.monotonic()
+            first_chunk_ms: Optional[float] = None
+            total_pcm_bytes = 0
+            generated_chunk_count = 0
+            error_message: Optional[str] = None
+            stream_kwargs: Dict[str, Any] = {}
             try:
-                for generated_chunk in stream_factory(voice_state, normalized_text):
+                stream_kwargs = {
+                    "max_tokens": max(8, min(256, int(max_tokens or _runtime_env_int("EMBEDDED_POCKET_MAX_TOKENS", 24, minimum=8, maximum=256)))),
+                }
+                resolved_frames_after_eos = frames_after_eos
+                if resolved_frames_after_eos is None:
+                    resolved_frames_after_eos = _runtime_env_int("EMBEDDED_POCKET_FRAMES_AFTER_EOS", 1, minimum=0, maximum=8)
+                stream_kwargs["frames_after_eos"] = max(0, min(8, int(resolved_frames_after_eos)))
+                for generated_chunk in stream_factory(voice_state, normalized_text, **stream_kwargs):
                     chunk_pcm = _float_audio_to_pcm16_bytes(generated_chunk)
                     if chunk_pcm:
+                        if first_chunk_ms is None:
+                            first_chunk_ms = (time.monotonic() - started_at) * 1000.0
+                        total_pcm_bytes += len(chunk_pcm)
+                        generated_chunk_count += 1
                         loop.call_soon_threadsafe(queue.put_nowait, chunk_pcm)
             except Exception as exc:
+                error_message = str(exc)
                 loop.call_soon_threadsafe(queue.put_nowait, exc)
             finally:
+                wall_ms = max(0.001, (time.monotonic() - started_at) * 1000.0)
+                audio_ms = (total_pcm_bytes / (resolved_sample_rate * 2)) * 1000.0
+                _log_tts_rtf(
+                    "embedded_pocket_stream",
+                    text_chars=len(normalized_text),
+                    voice=resolved_voice,
+                    sample_rate=resolved_sample_rate,
+                    pcm_bytes=total_pcm_bytes,
+                    chunks=generated_chunk_count,
+                    first_chunk_ms=round(first_chunk_ms, 2) if first_chunk_ms is not None else None,
+                    wall_ms=round(wall_ms, 2),
+                    audio_ms=round(audio_ms, 2),
+                    rtf=round(audio_ms / wall_ms, 3),
+                    max_tokens=stream_kwargs.get("max_tokens"),
+                    frames_after_eos=stream_kwargs.get("frames_after_eos"),
+                    error=error_message,
+                )
                 loop.call_soon_threadsafe(queue.put_nowait, sentinel)
 
         worker_task = asyncio.create_task(asyncio.to_thread(_stream_worker))
@@ -12566,11 +12724,34 @@ async def _iter_embedded_pocket_pcm_chunks(
             raise RuntimeError("Embedded Pocket TTS generated empty audio.")
         return
     try:
-        generated = await asyncio.to_thread(model.generate_audio, voice_state, normalized_text)
+        started_at = time.monotonic()
+        generate_kwargs: Dict[str, Any] = {
+            "max_tokens": max(8, min(256, int(max_tokens or _runtime_env_int("EMBEDDED_POCKET_MAX_TOKENS", 24, minimum=8, maximum=256)))),
+        }
+        resolved_frames_after_eos = frames_after_eos
+        if resolved_frames_after_eos is None:
+            resolved_frames_after_eos = _runtime_env_int("EMBEDDED_POCKET_FRAMES_AFTER_EOS", 1, minimum=0, maximum=8)
+        generate_kwargs["frames_after_eos"] = max(0, min(8, int(resolved_frames_after_eos)))
+        generated = await asyncio.to_thread(model.generate_audio, voice_state, normalized_text, **generate_kwargs)
+        chunk_pcm = _float_audio_to_pcm16_bytes(generated)
+        wall_ms = max(0.001, (time.monotonic() - started_at) * 1000.0)
+        audio_ms = (len(chunk_pcm) / (resolved_sample_rate * 2)) * 1000.0
+        _log_tts_rtf(
+            "embedded_pocket_buffered",
+            text_chars=len(normalized_text),
+            voice=resolved_voice,
+            sample_rate=resolved_sample_rate,
+            pcm_bytes=len(chunk_pcm),
+            chunks=1 if chunk_pcm else 0,
+            wall_ms=round(wall_ms, 2),
+            audio_ms=round(audio_ms, 2),
+            rtf=round(audio_ms / wall_ms, 3),
+            max_tokens=generate_kwargs.get("max_tokens"),
+            frames_after_eos=generate_kwargs.get("frames_after_eos"),
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Embedded Pocket TTS rejected request: {exc}") from exc
 
-    chunk_pcm = _float_audio_to_pcm16_bytes(generated)
     if not chunk_pcm:
         raise RuntimeError("Embedded Pocket TTS generated empty audio.")
     yield chunk_pcm
@@ -12582,6 +12763,8 @@ async def _generate_embedded_pocket_pcm(
     model_name: Optional[str] = None,
     speed: Optional[float] = None,
     sample_rate: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    frames_after_eos: Optional[int] = None,
 ) -> bytes:
     pcm_parts: List[bytes] = []
     async for piece in _iter_embedded_pocket_pcm_chunks(
@@ -12590,6 +12773,8 @@ async def _generate_embedded_pocket_pcm(
         model_name=model_name,
         speed=speed,
         sample_rate=sample_rate,
+        max_tokens=max_tokens,
+        frames_after_eos=frames_after_eos,
     ):
         pcm_parts.append(piece)
     pcm_bytes = b"".join(pcm_parts)
@@ -12965,12 +13150,15 @@ async def _generate_embedded_kitten_pcm(
 def _list_embedded_tts_voices(model_name: Optional[str] = None) -> List[Dict[str, str]]:
     backend = _resolve_embedded_tts_backend(model_name)
     if backend == "pocket":
-        voices = EMBEDDED_POCKET_VOICES or [EMBEDDED_POCKET_DEFAULT_VOICE]
+        voices = _dedupe_voice_ids(
+            (EMBEDDED_POCKET_VOICES or [EMBEDDED_POCKET_DEFAULT_VOICE])
+            + _list_embedded_pocket_local_voice_files()
+        )
     else:
         voices = EMBEDDED_KITTEN_VOICES or [EMBEDDED_KITTEN_DEFAULT_VOICE]
 
     return [
-        {"id": voice_id, "object": "voice", "name": voice_id}
+        {"id": voice_id, "object": "voice", "name": _embedded_tts_voice_display_name(voice_id)}
         for voice_id in voices
     ]
 
@@ -12988,6 +13176,8 @@ async def _iter_embedded_tts_pcm_chunks(
     model_name: Optional[str] = None,
     speed: Optional[float] = None,
     sample_rate: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    frames_after_eos: Optional[int] = None,
 ):
     backend = _resolve_embedded_tts_backend(model_name)
     if backend == "pocket":
@@ -12997,6 +13187,8 @@ async def _iter_embedded_tts_pcm_chunks(
             model_name=model_name,
             speed=speed,
             sample_rate=sample_rate,
+            max_tokens=max_tokens,
+            frames_after_eos=frames_after_eos,
         ):
             yield piece
         return
@@ -13017,6 +13209,8 @@ async def _generate_embedded_tts_pcm(
     model_name: Optional[str] = None,
     speed: Optional[float] = None,
     sample_rate: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    frames_after_eos: Optional[int] = None,
 ) -> bytes:
     backend = _resolve_embedded_tts_backend(model_name)
     if backend == "pocket":
@@ -13026,6 +13220,8 @@ async def _generate_embedded_tts_pcm(
             model_name=model_name,
             speed=speed,
             sample_rate=sample_rate,
+            max_tokens=max_tokens,
+            frames_after_eos=frames_after_eos,
         )
 
     return await _generate_embedded_kitten_pcm(
@@ -13076,6 +13272,8 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
     headers = {
         "X-Audio-Sample-Rate": str(sample_rate),
         "X-Audio-Channels": str(channels),
+        "X-Audio-Encoding": "signed-integer",
+        "X-Audio-Bits": "16",
         "Cache-Control": "no-store",
     }
 
@@ -13089,6 +13287,8 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
                     model_name=requested_model,
                     speed=payload.speed,
                     sample_rate=sample_rate,
+                    max_tokens=payload.max_tokens,
+                    frames_after_eos=payload.frames_after_eos,
                 ):
                     for i in range(0, len(generated_chunk), stream_chunk_bytes):
                         yield generated_chunk[i:i + stream_chunk_bytes]
@@ -13101,6 +13301,8 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
             model_name=requested_model,
             speed=payload.speed,
             sample_rate=sample_rate,
+            max_tokens=payload.max_tokens,
+            frames_after_eos=payload.frames_after_eos,
         )
         return Response(content=pcm_bytes, media_type=media_type, headers=headers, status_code=200)
 
@@ -13110,6 +13312,8 @@ async def embedded_audio_speech(payload: EmbeddedTtsSpeechRequest):
         model_name=requested_model,
         speed=payload.speed,
         sample_rate=sample_rate,
+        max_tokens=payload.max_tokens,
+        frames_after_eos=payload.frames_after_eos,
     )
     wav_bytes = _build_wav_header(sample_rate=sample_rate, channels=channels, bits_per_sample=16, pcm_bytes_len=len(pcm_bytes)) + pcm_bytes
     if stream_mode:
@@ -13137,6 +13341,111 @@ def _should_skip_tts_tls_verify(base_url: str) -> bool:
         return host.endswith(".local")
     except Exception:
         return False
+
+
+def _copy_tts_audio_headers(response: httpx.Response, content_type: str) -> Dict[str, str]:
+    headers = {"Content-Type": content_type}
+    for header_name in (
+        "x-audio-sample-rate",
+        "x-audio-channels",
+        "x-audio-encoding",
+        "x-audio-bits",
+        "x-audio-bits-per-sample",
+        "cache-control",
+    ):
+        header_value = response.headers.get(header_name)
+        if header_value:
+            headers[header_name] = header_value
+    return headers
+
+
+def _parse_tts_content_type_params(content_type: str) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    for part in str(content_type or "").split(";")[1:]:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        if key:
+            params[key] = value.strip().strip('"')
+    return params
+
+
+def _coerce_positive_int(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else fallback
+    except Exception:
+        return fallback
+
+
+def _tts_header_value(headers: Optional[Any], *names: str) -> Optional[str]:
+    get_header = getattr(headers, "get", None)
+    if not callable(get_header):
+        return None
+    for name in names:
+        value = get_header(name)
+        if value:
+            return str(value)
+    return None
+
+
+def _tts_audio_sample_rate(headers: Optional[Any], content_type: str, fallback: int = 24000) -> int:
+    params = _parse_tts_content_type_params(content_type)
+    return _coerce_positive_int(
+        _tts_header_value(headers, "x-audio-sample-rate", "x-sample-rate")
+        or params.get("rate")
+        or params.get("sample_rate")
+        or fallback,
+        fallback,
+    )
+
+
+def _tts_audio_channels(headers: Optional[Any], content_type: str, fallback: int = 1) -> int:
+    params = _parse_tts_content_type_params(content_type)
+    return _coerce_positive_int(
+        _tts_header_value(headers, "x-audio-channels", "x-channels")
+        or params.get("channels")
+        or fallback,
+        fallback,
+    )
+
+
+def _tts_pcm_bits_per_sample(headers: Optional[Any], content_type: str, fallback: int = 16) -> int:
+    params = _parse_tts_content_type_params(content_type)
+    raw_encoding = str(
+        _tts_header_value(headers, "x-audio-encoding", "x-pcm-encoding")
+        or params.get("encoding")
+        or ""
+    ).lower()
+    if "float" in raw_encoding:
+        fallback = 32
+    return _coerce_positive_int(
+        _tts_header_value(headers, "x-audio-bits", "x-audio-bits-per-sample")
+        or params.get("bits")
+        or fallback,
+        fallback,
+    )
+
+
+def _estimate_pcm_audio_ms(byte_count: int, headers: Optional[Any], content_type: str) -> Optional[float]:
+    normalized = str(content_type or "").lower()
+    if "audio/pcm" not in normalized and "audio/l16" not in normalized and "audio/s16le" not in normalized:
+        return None
+    sample_rate = _tts_audio_sample_rate(headers, content_type)
+    channels = _tts_audio_channels(headers, content_type)
+    bits = _tts_pcm_bits_per_sample(headers, content_type)
+    bytes_per_second = sample_rate * channels * max(1, bits // 8)
+    if bytes_per_second <= 0:
+        return None
+    return (max(0, int(byte_count)) / bytes_per_second) * 1000.0
+
+
+def _log_tts_rtf(label: str, **payload: Any) -> None:
+    try:
+        print(f"[tts rtf] {label} {json.dumps(payload, sort_keys=True)}", flush=True)
+    except Exception:
+        print(f"[tts rtf] {label} {payload}", flush=True)
 
 
 @app.get("/v1/proxy/tts/voices")
@@ -13374,6 +13683,7 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
             print(f"[WARN] TTS speech proxy: TLS verification disabled for local endpoint: {base_url}")
 
         if buffer_response:
+            proxy_started_at = time.monotonic()
             async with httpx.AsyncClient(timeout=TTS_PROXY_TIMEOUT_SECONDS, verify=(not skip_tls_verify)) as client:
                 response = await client.post(
                     speech_url,
@@ -13384,22 +13694,35 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
             # Safari/iOS can fail to decode blobs labeled as audio/mp3; normalize to audio/mpeg.
             if isinstance(content_type, str) and content_type.lower().startswith('audio/mp3'):
                 content_type = 'audio/mpeg'
+            wall_ms = max(0.001, (time.monotonic() - proxy_started_at) * 1000.0)
+            audio_ms = _estimate_pcm_audio_ms(len(response.content), response.headers, content_type)
+            _log_tts_rtf(
+                "proxy_tts_buffered",
+                endpoint=base_url,
+                status=response.status_code,
+                content_type=content_type,
+                bytes=len(response.content),
+                wall_ms=round(wall_ms, 2),
+                audio_ms=round(audio_ms, 2) if audio_ms is not None else None,
+                rtf=round(audio_ms / wall_ms, 3) if audio_ms is not None else None,
+            )
             if response.status_code != 200:
                 print(f"âŒ TTS service returned error (buffered): {response.status_code}")
                 return Response(
                     content=response.content,
-                    media_type=content_type,
+                    headers=_copy_tts_audio_headers(response, content_type),
                     status_code=response.status_code,
                 )
             return Response(
                 content=response.content,
-                media_type=content_type,
+                headers=_copy_tts_audio_headers(response, content_type),
                 status_code=200,
             )
         
         # Open upstream stream first so we can forward the *actual* content-type.
         # This avoids mislabeling MP3 as SSE, which breaks browser playback/parsing.
         client = httpx.AsyncClient(timeout=TTS_PROXY_TIMEOUT_SECONDS, verify=(not skip_tls_verify))
+        proxy_started_at = time.monotonic()
         try:
             upstream_response = await client.send(
                 client.build_request(
@@ -13432,22 +13755,48 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
             return Response(
                 content=error_body,
                 status_code=upstream_response.status_code,
-                headers={"Content-Type": upstream_content_type},
+                headers=_copy_tts_audio_headers(upstream_response, upstream_content_type),
             )
 
         async def stream_upstream():
+            byte_count = 0
+            chunk_count = 0
+            first_chunk_ms: Optional[float] = None
+            error_message: Optional[str] = None
             try:
                 async for chunk in upstream_response.aiter_bytes():
                     if chunk:
+                        if first_chunk_ms is None:
+                            first_chunk_ms = (time.monotonic() - proxy_started_at) * 1000.0
+                        byte_count += len(chunk)
+                        chunk_count += 1
                         yield chunk
+            except Exception as exc:
+                error_message = str(exc)
+                raise
             finally:
+                wall_ms = max(0.001, (time.monotonic() - proxy_started_at) * 1000.0)
+                audio_ms = _estimate_pcm_audio_ms(byte_count, upstream_response.headers, upstream_content_type)
+                _log_tts_rtf(
+                    "proxy_tts_stream",
+                    endpoint=base_url,
+                    status=upstream_response.status_code,
+                    content_type=upstream_content_type,
+                    bytes=byte_count,
+                    chunks=chunk_count,
+                    first_chunk_ms=round(first_chunk_ms, 2) if first_chunk_ms is not None else None,
+                    wall_ms=round(wall_ms, 2),
+                    audio_ms=round(audio_ms, 2) if audio_ms is not None else None,
+                    rtf=round(audio_ms / wall_ms, 3) if audio_ms is not None else None,
+                    error=error_message,
+                )
                 await upstream_response.aclose()
                 await client.aclose()
 
         return StreamingResponse(
             stream_upstream(),
             status_code=200,
-            headers={"Content-Type": upstream_content_type},
+            headers=_copy_tts_audio_headers(upstream_response, upstream_content_type),
         )
     
     except Exception as e:

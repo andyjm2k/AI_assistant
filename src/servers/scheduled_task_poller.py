@@ -317,13 +317,14 @@ def _load_project_env_file() -> None:
 
 def load_config_from_env() -> PollerConfig:
     _load_project_env_file()
+    default_jwt_expiration_seconds = 23 * 60 * 60
     return PollerConfig(
         proxy_base_url=os.getenv("SCHEDULED_TASK_POLLER_PROXY_URL", DEFAULT_PROXY_BASE_URL).strip() or DEFAULT_PROXY_BASE_URL,
         users_file=Path(os.getenv("SCHEDULED_TASK_POLLER_USERS_FILE", str(DEFAULT_USERS_FILE))).expanduser(),
         interval_seconds=_env_int("SCHEDULED_TASK_POLLER_INTERVAL_SECONDS", default=30, minimum=5),
         timeout_seconds=_env_int("SCHEDULED_TASK_POLLER_REQUEST_TIMEOUT_SECONDS", default=15, minimum=3),
         jwt_secret=os.getenv("JWT_SECRET", "change-this-secret-in-production"),
-        jwt_expiration_seconds=_env_int("JWT_EXPIRATION_SECONDS", default=3600, minimum=60),
+        jwt_expiration_seconds=_env_int("JWT_EXPIRATION_SECONDS", default=default_jwt_expiration_seconds, minimum=60),
         run_once=_env_bool("SCHEDULED_TASK_POLLER_RUN_ONCE", default=False),
     )
 

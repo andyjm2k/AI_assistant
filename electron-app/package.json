@@ -49,6 +49,10 @@
       {
         "from": "../CATBot_logo.png",
         "to": "CATBot_logo.png"
+      },
+      {
+        "from": "../config/soul.md",
+        "to": "config/soul.md"
       }
     ],
     "directories": {

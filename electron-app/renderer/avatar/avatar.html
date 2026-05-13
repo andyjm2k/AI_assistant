@@ -23,19 +23,44 @@
 </head>
 <body>
   <div class="speech-bubble" id="speech-bubble"></div>
+  <div class="voice-capture-status" id="voice-capture-status" aria-live="polite">
+    <span class="voice-capture-dot" aria-hidden="true"></span>
+    <span id="voice-capture-status-text">Listening...</span>
+  </div>
+  <section class="auth-gate" id="auth-gate" aria-label="Sign in required" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="auth-gate-card">
+      <p class="auth-gate-kicker">CATBot Desktop</p>
+      <h1>Sign in required</h1>
+      <p class="auth-gate-copy">Use your CATBot proxy account before the desktop avatar can chat, use tools, or load character profiles.</p>
+      <label>Proxy URL <input id="auth-gate-proxy-url" type="url" placeholder="http://127.0.0.1:8000"></label>
+      <label>Username <input id="auth-gate-username" type="text" autocomplete="username" placeholder="CATBot username"></label>
+      <label>Password <input id="auth-gate-password" type="password" autocomplete="current-password" placeholder="Password"></label>
+      <div class="auth-gate-actions">
+        <button id="auth-gate-login-btn" type="button">Log In</button>
+        <button id="auth-gate-signup-btn" type="button">Sign Up</button>
+      </div>
+      <p id="auth-gate-status" class="auth-gate-status" aria-live="polite">Sign in to continue.</p>
+    </div>
+  </section>
   <section class="quick-hud" id="quick-hud" aria-label="Avatar quick actions">
     <div class="quick-action-bar">
-      <button type="button" data-quick-action="microphone" title="Speech to text" aria-label="Speech to text">
+      <button type="button" data-quick-action="microphone" title="Voice chat" aria-label="Voice chat">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15c1.7 0 3-1.3 3-3V6c0-1.7-1.3-3-3-3S9 4.3 9 6v6c0 1.7 1.3 3 3 3Z"/><path d="M5 11c0 3.5 2.6 6.4 6 6.9V21h2v-3.1c3.4-.5 6-3.4 6-6.9h-2c0 2.8-2.2 5-5 5s-5-2.2-5-5H5Z"/></svg>
       </button>
-      <button type="button" data-quick-action="screen" title="Attach screen snapshot" aria-label="Attach screen snapshot">
+      <button type="button" data-quick-action="screen" title="Toggle screen context" aria-label="Toggle screen context">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H4V5Zm2 2v6h12V7H6Z"/><path d="M10 17h4l1 2h3v2H6v-2h3l1-2Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="webcam" title="Toggle webcam context" aria-label="Toggle webcam context">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10v10H4V7Zm2 2v6h6V9H6Z"/><path d="m15 10 5-3v10l-5-3v-4Z"/><path d="M8 5h4l1 2H7l1-2Z"/></svg>
       </button>
       <button type="button" data-quick-action="focus-chat" title="Focus prompt" aria-label="Focus prompt">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H7.8L4 18.8V5Zm2 2v7l1-1h11V7H6Z"/></svg>
       </button>
       <button type="button" data-quick-action="models" title="Models and expressions" aria-label="Models and expressions">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 6v7c0 4.4 3.3 8.2 8 9 4.7-.8 8-4.6 8-9V6l-8-4Zm0 3.2L18 8v5c0 3-2.1 5.6-6 6.6C8.1 18.6 6 16 6 13V8l6-2.8Z"/><path d="M9 10.5A1.5 1.5 0 1 0 9 7.5a1.5 1.5 0 0 0 0 3Zm6 0a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM8.5 13.5c1 1.2 2.1 1.8 3.5 1.8s2.5-.6 3.5-1.8l1.5 1.3c-1.3 1.7-3 2.5-5 2.5s-3.7-.8-5-2.5l1.5-1.3Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="character" title="Character profiles" aria-label="Character profiles">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5 14.7 8l6.1.9-4.4 4.3 1 6.1L12 16.4l-5.4 2.9 1-6.1L3.2 8.9 9.3 8 12 2.5Zm0 4.5-1.3 2.7-3 .4 2.2 2.1-.5 3 2.6-1.4 2.6 1.4-.5-3 2.2-2.1-3-.4L12 7Z"/></svg>
       </button>
       <button type="button" data-quick-action="move" title="Move avatar" aria-label="Move avatar">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 4 4h-3v5h5V8l4 4-4 4v-3h-5v5h3l-4 4-4-4h3v-5H6v3l-4-4 4-4v3h5V6H8l4-4Z"/></svg>
@@ -64,6 +89,7 @@
       <button type="button" data-hud-panel-button="chat">Chat</button>
       <button type="button" data-hud-panel-button="auth">Auth</button>
       <button type="button" data-hud-panel-button="models">Model</button>
+      <button type="button" data-hud-panel-button="character">Character</button>
       <button type="button" data-hud-panel-button="settings">Settings</button>
       <button type="button" data-hud-panel-button="status">Status</button>
       <button type="button" data-hud-panel-close aria-label="Close panel">Close</button>
@@ -125,6 +151,38 @@
       <button id="hud-rescan-models-btn" type="button">Rescan Models</button>
     </div>
 
+    <div class="sheet-panel" data-hud-panel="character">
+      <div class="sheet-title">
+        <span>Character Profiles</span>
+        <button id="hud-refresh-companions-btn" type="button">Refresh</button>
+      </div>
+      <label>Soul prompt
+        <textarea id="hud-soul-prompt" rows="5" readonly placeholder="Loaded from config/soul.md"></textarea>
+      </label>
+      <p class="sheet-hint">This read-only persona layer is prepended to desktop chat prompts before the normal system prompt.</p>
+
+      <div class="hud-companion-current">
+        <div class="hud-companion-current-head">
+          <div>
+            <span>Current setup</span>
+            <strong id="hud-companion-current-name">CATBot</strong>
+          </div>
+          <em id="hud-companion-current-state">Not saved</em>
+        </div>
+        <p id="hud-companion-current-summary">Save the current desktop model, prompt, voice, and avatar setup as a reusable profile.</p>
+        <div class="hud-companion-tags" id="hud-companion-current-tags"></div>
+      </div>
+
+      <label>Profile name <input id="hud-companion-name" type="text" maxlength="128" placeholder="e.g. Work CATBot"></label>
+      <label class="hud-checkbox"><input id="hud-companion-default-checkbox" type="checkbox"> Load this profile when CATBot opens</label>
+      <div class="sheet-actions">
+        <button id="hud-save-companion-btn" type="button">Save Profile</button>
+        <button id="hud-clear-default-companion-btn" type="button">Clear Default</button>
+      </div>
+      <ul class="hud-companion-list" id="hud-companion-list" aria-label="Saved character profiles"></ul>
+      <p class="sheet-hint hud-companion-feedback" id="hud-companion-feedback" aria-live="polite"></p>
+    </div>
+
     <div class="sheet-panel" data-hud-panel="settings">
       <div class="sheet-title">
         <span>Connection and Voice</span>
@@ -137,11 +195,23 @@
       <label>TTS endpoint <input id="hud-tts-endpoint" type="url" placeholder="http://localhost:4123/v1"></label>
       <div class="sheet-field-pair">
         <label>TTS model <input id="hud-tts-model" type="text" placeholder="tts-1"></label>
-        <label>TTS voice <input id="hud-tts-voice" type="text" placeholder="alloy"></label>
+        <label>TTS voice <select id="hud-tts-voice"><option value="alloy">alloy</option></select></label>
+      </div>
+      <div class="sheet-title">
+        <span>Avatar Window</span>
+      </div>
+      <div class="sheet-field-pair">
+        <label>Window width <input id="hud-window-width" type="number" min="240" max="1600" step="10" inputmode="numeric"></label>
+        <label>Window height <input id="hud-window-height" type="number" min="320" max="1800" step="10" inputmode="numeric"></label>
+      </div>
+      <div class="sheet-actions">
+        <button id="hud-apply-window-size-btn" type="button">Apply Size</button>
+        <button id="hud-reset-window-size-btn" type="button">Reset Size</button>
       </div>
       <div class="sheet-actions">
         <button id="hud-save-settings-btn" type="button">Save</button>
         <button id="hud-toggle-speak-btn" type="button">Speak Replies: On</button>
+        <button id="hud-toggle-webcam-btn" type="button">Webcam Context: Off</button>
         <button id="hud-clear-provider-key-btn" type="button">Clear Key</button>
         <button id="hud-open-web-btn" type="button">Web Client</button>
       </div>
@@ -154,6 +224,14 @@
         <button id="hud-toggle-start-tray-btn" type="button">Start To Tray: Off</button>
         <button id="hud-toggle-launch-login-btn" type="button">Launch Login: Off</button>
         <button id="hud-hide-avatar-btn" type="button">Hide Avatar</button>
+      </div>
+      <div class="sheet-title">
+        <span>Companion Autonomy</span>
+      </div>
+      <div class="sheet-actions">
+        <button id="hud-toggle-auto-companion-btn" type="button">Auto Companion: Off</button>
+        <button id="hud-toggle-auto-screen-btn" type="button">Auto Screen: On</button>
+        <button id="hud-toggle-auto-dance-btn" type="button">Auto Dance: On</button>
       </div>
       <p class="sheet-hint">Endpoint override requires a provider API key unless the proxy trusts that endpoint.</p>
     </div>
@@ -177,6 +255,7 @@
     <img id="render-fallback-image" alt="CATBot avatar fallback">
     <div id="render-fallback-status">Preparing avatar...</div>
   </div>
+  <video id="webcam-preview" class="webcam-preview" autoplay muted playsinline aria-hidden="true"></video>
   <canvas id="avatar-canvas"></canvas>
   <div id="live2d-container">
     <canvas id="live2d-canvas"></canvas>

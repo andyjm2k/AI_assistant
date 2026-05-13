@@ -270,6 +270,18 @@ input[type="range"] {
   gap: 12px;
 }
 
+.select-action-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.select-action-row button {
+  padding-inline: 11px;
+  white-space: nowrap;
+}
+
 .toggle-grid,
 .action-row,
 .expression-pad {

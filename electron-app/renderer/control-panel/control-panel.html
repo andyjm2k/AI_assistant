@@ -213,7 +213,12 @@
           </div>
           <div>
             <label class="field-label" for="tts-voice-input">TTS voice</label>
-            <input id="tts-voice-input" type="text" placeholder="alloy">
+            <div class="select-action-row">
+              <select id="tts-voice-input">
+                <option value="alloy">alloy</option>
+              </select>
+              <button id="refresh-tts-voices-btn" class="compact-btn" type="button">Refresh</button>
+            </div>
           </div>
         </div>
 
