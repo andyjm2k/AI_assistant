@@ -1918,17 +1918,31 @@ async function sendQuickChatMessage(options = {}) {
     setVoiceCaptureStatus("Sending...", "sending");
   }
   let screenSnapshot = null;
-  if (!options.screenImageDataUrl && !pendingScreenSnapshot && screenContextModeEnabled) {
+  let screenContextIssueNote = "";
+  const shouldCaptureScreenContext = Boolean(!options.screenImageDataUrl && screenContextModeEnabled);
+  const pendingScreenSnapshotForPrompt = !shouldCaptureScreenContext && !options.screenImageDataUrl
+    ? pendingScreenSnapshot
+    : null;
+  if (shouldCaptureScreenContext) {
     try {
       setQuickHudStatus("Capturing screen context...");
+      if (isVoiceFlow) {
+        setVoiceCaptureStatus("Capturing screen...", "sending");
+      }
       screenSnapshot = await window.catbotDesktop.captureScreenSnapshot();
     } catch (error) {
       console.warn("Persistent screen context capture failed:", error);
-      setQuickHudStatus(formatQuickStatus(error?.message || error || "Screen snapshot failed."));
+      const message = formatQuickStatus(error?.message || error || "Screen snapshot failed.");
+      screenContextIssueNote = `Screen context was toggled on, but no screenshot could be attached because capture failed: ${message}. If the user asks about the screen, say the screenshot is unavailable and answer generally from the spoken prompt.`;
+      setQuickHudStatus(`${message} Sending without screen context.`);
+      if (isVoiceFlow) {
+        setVoiceCaptureStatus("Screenshot unavailable; sending voice prompt...", "sending");
+      }
     }
   }
-  const screenImageDataUrl = options.screenImageDataUrl || pendingScreenSnapshot?.dataUrl || screenSnapshot?.dataUrl || "";
-  const usedPendingScreenSnapshot = Boolean(!options.screenImageDataUrl && pendingScreenSnapshot);
+  const screenImageDataUrl = options.screenImageDataUrl || screenSnapshot?.dataUrl || pendingScreenSnapshotForPrompt?.dataUrl || "";
+  const messageForModel = screenContextIssueNote ? `${text}\n\n[${screenContextIssueNote}]` : text;
+  const usedPendingScreenSnapshot = Boolean(pendingScreenSnapshotForPrompt);
   try {
     const hiddenState = await window.catbotDesktop.setQuickHudVisible(false);
     if (hiddenState) {
@@ -1940,7 +1954,7 @@ async function sendQuickChatMessage(options = {}) {
   }
   try {
     const result = await window.catbotDesktop.sendChatMessage({
-      message: text,
+      message: messageForModel,
       speakReply: currentState.speakChatReplies !== false,
       proxyBaseUrl: currentState.proxyBaseUrl,
       chatEndpoint: currentState.chatEndpoint,
@@ -1948,7 +1962,7 @@ async function sendQuickChatMessage(options = {}) {
       lowLatency: Boolean(options.lowLatency),
       screenImageDataUrl,
       webcamImageDataUrl: webcamSnapshot?.dataUrl || "",
-      historyUserText: options.historyUserText || ""
+      historyUserText: options.historyUserText || text
     });
     if (quickChatInput && options.clearInput !== false) {
       quickChatInput.value = "";
@@ -2005,16 +2019,8 @@ async function attachScreenSnapshot() {
   }
   pendingScreenSnapshot = null;
   updateQuickHudVisualState();
-  setQuickHudStatus("Screen context on. Each prompt will include a fresh screenshot.");
+  setQuickHudStatus("Screen context on. Each prompt will include a fresh screenshot. Voice prompts included.");
   quickChatInput?.focus();
-  try {
-    pendingScreenSnapshot = await window.catbotDesktop.captureScreenSnapshot();
-    updateQuickHudVisualState();
-    setQuickHudStatus("Screen context on. Snapshot ready for the next prompt.");
-  } catch (error) {
-    console.warn("Initial screen context snapshot failed:", error);
-    setQuickHudStatus("Screen context on. A screenshot will be retried when you send.");
-  }
 }
 
 function cleanupMicStream() {

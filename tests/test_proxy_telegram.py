@@ -2260,6 +2260,56 @@ class TestPhilosopherFileTools:
         assert "search_files" not in names
 
     @pytest.mark.asyncio
+    async def test_html_client_native_tools_included_for_desktop_parity(self):
+        """Desktop /v1/tools/openai should include the same native tool names as the HTML client."""
+        from src.servers import proxy_server as ps
+
+        with patch.object(ps, "MCP_AVAILABLE", False):
+            tools = await ps.get_all_available_tools()
+        names = {str(tool.get("name") or "") for tool in tools}
+
+        assert set(ps._HTML_CLIENT_NATIVE_TOOL_NAMES).issubset(names)
+        assert "resumeTodoExecution" in names
+        assert "completeTodoTask" in names
+        assert "health_check" in names
+
+    @pytest.mark.asyncio
+    async def test_html_resume_todo_execution_tool_uses_task_resume_helper(self):
+        """The desktop-compatible resumeTodoExecution alias should execute, not only list."""
+        from src.servers import proxy_server as ps
+
+        with patch.object(
+            ps,
+            "_task_execute_resume",
+            new=AsyncMock(return_value=("awaiting_confirmation", "Task resumed.", 42)),
+        ) as mock_resume:
+            result = await ps.execute_tool_for_philosopher(
+                "resumeTodoExecution",
+                {"userMessage": "continue with that", "taskId": 42, "user_id": "desktop_user"},
+            )
+
+        assert result == "Task resumed."
+        mock_resume.assert_awaited_once_with("desktop_user", "continue with that", 42)
+
+    @pytest.mark.asyncio
+    async def test_html_complete_todo_task_tool_uses_completion_helper(self):
+        """The desktop-compatible completeTodoTask alias should call the authenticated todo completion path."""
+        from src.servers import proxy_server as ps
+
+        with patch.object(
+            ps,
+            "_task_complete_for_tool",
+            new=AsyncMock(return_value={"success": True, "message": "Task completion recorded.", "data": {}}),
+        ) as mock_complete:
+            result = await ps.execute_tool_for_philosopher(
+                "completeTodoTask",
+                {"taskId": 42, "user_id": "desktop_user"},
+            )
+
+        assert result == "Task completion recorded."
+        mock_complete.assert_awaited_once_with("desktop_user", 42)
+
+    @pytest.mark.asyncio
     async def test_filesystem_skill_tools_are_not_filtered(self):
         """Filesystem skill tools should remain visible now that native duplicates are retired."""
         from src.servers import proxy_server as ps

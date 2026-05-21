@@ -3761,6 +3761,169 @@ def _get_telegram_native_tools_mcp_schema() -> List[Dict[str, Any]]:
     ]
 
 
+_HTML_CLIENT_NATIVE_TOOL_NAMES: Tuple[str, ...] = (
+    "calculate",
+    "cancelTodoExecution",
+    "completeTodoTask",
+    "deleteMemory",
+    "executeTodoTask",
+    "fetchNews",
+    "health_check",
+    "listMemories",
+    "manageMemoryCache",
+    "manageTodoList",
+    "navigateToUrl",
+    "openChatToUser",
+    "pdfToPowerPoint",
+    "restartProxyServer",
+    "resumeTodoExecution",
+    "runBrowserAgent",
+    "runCodexCli",
+    "runDeepResearch",
+    "runWorkflow",
+    "scrapeWebsite",
+    "searchMemories",
+    "storeMemory",
+    "uploadToGoogleDrive",
+    "weatherInfo",
+    "webSearch",
+)
+
+
+def _get_html_client_native_tools_mcp_schema() -> List[Dict[str, Any]]:
+    """Return the HTML chat client's native tool surface in MCP-like schema shape."""
+    shared_tools = {
+        str(item.get("name") or "").strip(): item
+        for item in _get_telegram_native_tools_mcp_schema()
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    custom_tools: Dict[str, Dict[str, Any]] = {
+        "resumeTodoExecution": {
+            "name": "resumeTodoExecution",
+            "description": "Resume a paused todo task execution after the user provides feedback.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "userMessage": {"type": "string"},
+                    "taskId": {"type": "integer"},
+                },
+                "required": ["userMessage"],
+            },
+        },
+        "completeTodoTask": {
+            "name": "completeTodoTask",
+            "description": "Mark a todo task complete after user confirmation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"taskId": {"type": "integer"}},
+                "required": ["taskId"],
+            },
+        },
+        "health_check": {
+            "name": "health_check",
+            "description": "Checks browser-use server health and running background tasks.",
+            "inputSchema": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+
+    tools: List[Dict[str, Any]] = []
+    for name in _HTML_CLIENT_NATIVE_TOOL_NAMES:
+        item = custom_tools.get(name) or shared_tools.get(name)
+        if not isinstance(item, dict):
+            continue
+        tools.append(
+            {
+                "name": name,
+                "description": str(item.get("description") or "").strip(),
+                "inputSchema": item.get("inputSchema")
+                if isinstance(item.get("inputSchema"), dict)
+                else {"type": "object", "properties": {}},
+            }
+        )
+    return tools
+
+
+def _is_html_client_native_tool_name(tool_name: str) -> bool:
+    return str(tool_name or "").strip() in set(_HTML_CLIENT_NATIVE_TOOL_NAMES)
+
+
+async def _execute_html_client_native_tool_for_proxy(
+    tool_name: str,
+    parameters: Dict[str, Any],
+) -> str:
+    """Execute an HTML-client native tool through the shared compatibility runner."""
+    telegram_tools_module = globals().get("_telegram_tools")
+    if telegram_tools_module is None:
+        return "Error: HTML-compatible tool runner is not available."
+
+    args = dict(parameters or {})
+    conversation_id = str(args.get("conversation_id") or "desktop-avatar").strip() or "desktop-avatar"
+    user_id = str(args.get("user_id") or args.get("todo_user_key") or conversation_id).strip()
+    todo_user_key = str(args.get("todo_user_key") or user_id or conversation_id).strip()
+
+    tool_context = {
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "todo_user_key": todo_user_key,
+        "task_execute_start": _task_execute_start,
+        "task_execute_resume": _task_execute_resume,
+        "task_execute_cancel": _task_execute_cancel,
+        "task_complete": _task_complete_for_tool,
+        "task_execution_status": _task_execution_status,
+        "do_search": _do_proxy_search,
+        "do_fetch": _do_proxy_fetch,
+        "do_news": _do_proxy_news,
+        "do_weather": _do_proxy_weather,
+        "do_autogen": _do_autogen,
+        "do_codex": _run_codex_cli,
+        "do_restart_proxy": lambda reason=None: _request_proxy_restart(
+            trigger=f"desktop_tool:{(reason or '').strip() or 'requested'}",
+            requested_by=f"desktop:{user_id or conversation_id}",
+        ),
+        "do_browser_agent": _do_browser_agent,
+        "do_deep_research": lambda tool_args: _do_deep_research(tool_args if isinstance(tool_args, dict) else {}),
+        "do_browser_health_check": _do_browser_health_check,
+        "read_file_internal": _read_file_internal,
+        "write_file_internal": _write_file_internal,
+        "list_files_internal": _list_files_internal,
+        "search_files_internal": _search_files_internal,
+        "upload_drive_internal": _upload_drive_internal,
+        "pdf_to_powerpoint_internal": lambda tool_args: _handle_pdf_to_powerpoint_internal(
+            tool_args if isinstance(tool_args, dict) else {},
+            conversation_id=conversation_id,
+            user_id=user_id,
+            attachment_records=[],
+            model_name="",
+        ),
+        "execute_skill_tool": lambda skill_tool_name, tool_args: _execute_skill_framework_tool(
+            tool_name=skill_tool_name,
+            arguments=tool_args,
+            conversation_id=conversation_id,
+            user_id=user_id,
+            metadata={"channel": "desktop"},
+        ),
+        "memory_manager": memory_manager if MEMORY_AVAILABLE else None,
+    }
+
+    try:
+        result = await telegram_tools_module.execute_telegram_tool(tool_name, args, tool_context)
+    except Exception as exc:
+        return f"Error executing {tool_name}: {str(exc)}"
+
+    if not isinstance(result, dict):
+        return str(result)
+    success = bool(result.get("success", False))
+    message = str(result.get("message") or "").strip()
+    if not success:
+        return f"Error executing {tool_name}: {message or 'tool failed'}"
+    if message:
+        return message
+    data = result.get("data")
+    if data is not None:
+        return json.dumps(data, ensure_ascii=False, default=str)
+    return f"{tool_name} executed successfully."
+
+
 def _mcp_tool_entries_to_openai_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert MCP-style tool entries into OpenAI-style tool definitions."""
     converted: List[Dict[str, Any]] = []
@@ -7719,12 +7882,19 @@ async def list_proxy_tools_openai():
 
 
 @app.post("/v1/tools/execute")
-async def execute_proxy_tool(request: ProxyToolExecuteRequest):
+async def execute_proxy_tool(
+    request: ProxyToolExecuteRequest,
+    authorization: Optional[str] = Header(default=None),
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+):
     """Execute a tool exposed by /v1/tools/openai using its OpenAI alias or raw tool name."""
     raw_name = str(request.tool_name or "").strip()
     if not raw_name:
         raise HTTPException(status_code=400, detail="tool_name is required")
     arguments = request.arguments if isinstance(request.arguments, dict) else {}
+    authenticated_user: Optional[Dict[str, Any]] = None
+    if authorization or x_auth_token:
+        authenticated_user = get_current_user_from_headers(authorization, x_auth_token)
     tools = await get_all_available_tools()
     _, alias_map = _build_proxy_tool_openai_payload(tools)
     mapping = alias_map.get(raw_name)
@@ -7738,6 +7908,11 @@ async def execute_proxy_tool(request: ProxyToolExecuteRequest):
             execute_args["conversation_id"] = request.context.get("conversation_id")
         if request.context.get("user_id") and "user_id" not in execute_args:
             execute_args["user_id"] = request.context.get("user_id")
+    if authenticated_user:
+        username = str(authenticated_user.get("username") or "").strip()
+        if username:
+            execute_args["user_id"] = username
+            execute_args["todo_user_key"] = username
 
     result = await execute_tool_for_philosopher(tool_name, execute_args)
     return {
@@ -8868,6 +9043,18 @@ async def todo_task_complete(
     return _build_todo_list_response(meta, completion=completion)
 
 
+async def _task_complete_for_tool(user_key: str, task_id: int) -> Dict[str, Any]:
+    """Mark a task complete for internal tool runners and return a tool-shaped payload."""
+    response = await todo_task_complete(task_id, {"username": user_key})
+    payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+    completion = payload.get("completion") if isinstance(payload, dict) else None
+    message = "Task completion recorded."
+    if isinstance(completion, dict) and completion.get("rescheduled"):
+        next_run = completion.get("nextRunAt") or "the next scheduled run"
+        message = f"Completed task {task_id}. This repeating task was rescheduled for {next_run}."
+    return {"success": True, "message": message, "data": payload}
+
+
 def _task_execute_cancel(user_key: str, task_id: Optional[int] = None) -> tuple:
     """Request soft cancel for an active run. Returns (ok, message, task_id)."""
     active_runs = _active_task_runs(user_key)
@@ -9840,6 +10027,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 "task_execute_start": _task_execute_start,
                 "task_execute_resume": _task_execute_resume,
                 "task_execute_cancel": _task_execute_cancel,
+                "task_complete": _task_complete_for_tool,
                 "task_execution_status": _task_execution_status,
                 "task_execution_register_telegram_target": _task_execution_register_telegram_target,
                 "todo_store": telegram_todo,
@@ -10687,6 +10875,31 @@ async def get_all_available_tools() -> List[Dict]:
         print("[PHILOSOPHER] Added health_check (browser-use status)")
     else:
         print("[PHILOSOPHER] MCP_BROWSER_USE_HTTP_URL not set, skipping run_browser_agent")
+
+    # 6b. HTML client native aliases, used by Electron desktop chat for parity with the web UI.
+    existing_names = {
+        str(tool.get("name") or "").strip()
+        for tool in all_tools
+        if isinstance(tool, dict)
+    }
+    added_html_tool_count = 0
+    for tool in _get_html_client_native_tools_mcp_schema():
+        name = str(tool.get("name") or "").strip()
+        if not name or name in existing_names:
+            continue
+        all_tools.append(
+            {
+                "name": name,
+                "description": str(tool.get("description") or "").strip(),
+                "inputSchema": tool.get("inputSchema")
+                if isinstance(tool.get("inputSchema"), dict)
+                else {"type": "object", "properties": {}},
+                "server_id": "html_client_native",
+            }
+        )
+        existing_names.add(name)
+        added_html_tool_count += 1
+    print(f"[PHILOSOPHER] Added {added_html_tool_count} HTML client native tool aliases")
     
     # Add MCP tools if MCP is available
     if MCP_AVAILABLE:
@@ -10746,6 +10959,11 @@ async def get_all_available_tools() -> List[Dict]:
 async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
     """Execute a tool for philosopher mode. Returns result as string."""
     _log_tool_invocation("philosopher", tool_name, parameters)
+    parameters = parameters if isinstance(parameters, dict) else {}
+    tool_name = str(tool_name or "").strip()
+
+    if tool_name != "health_check" and _is_html_client_native_tool_name(tool_name):
+        return await _execute_html_client_native_tool_for_proxy(tool_name, parameters)
     
     # Handle built-in proxy server tools
     if tool_name == "web_search":

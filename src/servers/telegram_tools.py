@@ -1228,6 +1228,59 @@ async def execute_telegram_tool(
                 return {"success": False, "message": msg or "Invalid request."}
             return {"success": False, "message": msg or "Task execution failed."}
 
+    # --- resumeTodoExecution --- (continue paused task execution with user feedback)
+    if name == "resumeTodoExecution":
+        user_message = (arguments.get("userMessage") or arguments.get("user_message") or "").strip()
+        if not user_message:
+            return {"success": False, "message": "userMessage is required."}
+        task_id = arguments.get("taskId") or arguments.get("task_id")
+        parsed_task_id: Optional[int] = None
+        if task_id is not None:
+            try:
+                parsed_task_id = int(task_id)
+            except (TypeError, ValueError):
+                return {"success": False, "message": "Invalid task ID."}
+        resume_fn = context.get("task_execute_resume")
+        if not resume_fn:
+            return {"success": False, "message": "Task execution resume is not available."}
+        user_key = context.get("todo_user_key") or cid
+        try:
+            status, message, resumed_task_id = await resume_fn(user_key, user_message, parsed_task_id)
+            return {"success": True, "message": message, "status": status, "taskId": resumed_task_id}
+        except Exception as e:
+            return {"success": False, "message": str(e) or "Task resume failed."}
+
+    # --- completeTodoTask --- (mark task complete after user confirmation)
+    if name == "completeTodoTask":
+        task_id = arguments.get("taskId") or arguments.get("task_id")
+        if task_id is None:
+            return {"success": False, "message": "Task ID is required."}
+        try:
+            parsed_task_id = int(task_id)
+        except (TypeError, ValueError):
+            return {"success": False, "message": "Invalid task ID."}
+
+        complete_fn = context.get("task_complete")
+        user_key = context.get("todo_user_key") or cid
+        if callable(complete_fn):
+            try:
+                out = await complete_fn(user_key, parsed_task_id)
+                if isinstance(out, dict):
+                    return {
+                        "success": bool(out.get("success", False)),
+                        "message": str(out.get("message") or "Task completion recorded."),
+                        "data": out.get("data", out),
+                    }
+                return {"success": True, "message": str(out)}
+            except Exception as e:
+                return {"success": False, "message": str(e) or "Task completion failed."}
+
+        return await execute_telegram_tool(
+            "manageTodoList",
+            {"action": "complete", "taskId": parsed_task_id},
+            context,
+        )
+
     # --- cancelTodoExecution --- (request soft cancel for current execution)
     if name == "cancelTodoExecution":
         cancel_fn = context.get("task_execute_cancel")

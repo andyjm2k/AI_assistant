@@ -55,8 +55,21 @@ def test_desktop_screen_context_toggle_persists_across_prompts():
     assert "screenContextModeEnabled = !screenContextModeEnabled;" in avatar
     assert "setState({ screenContextMode: screenContextModeEnabled })" in avatar
     assert "Each prompt will include a fresh screenshot." in avatar
-    assert "!pendingScreenSnapshot && screenContextModeEnabled" in avatar
+    assert "const shouldCaptureScreenContext = Boolean(!options.screenImageDataUrl && screenContextModeEnabled);" in avatar
+    assert "const pendingScreenSnapshotForPrompt = !shouldCaptureScreenContext && !options.screenImageDataUrl" in avatar
     assert 'title="Toggle screen context"' in avatar_html
+
+
+def test_desktop_voice_chat_sends_with_issue_note_when_screen_snapshot_fails():
+    avatar = ELECTRON_AVATAR.read_text(encoding="utf-8")
+
+    assert 'setVoiceCaptureStatus("Capturing screen...", "sending");' in avatar
+    assert "Screen context was toggled on, but no screenshot could be attached because capture failed" in avatar
+    assert 'setVoiceCaptureStatus("Screenshot unavailable; sending voice prompt...", "sending");' in avatar
+    assert "const messageForModel = screenContextIssueNote ? `${text}\\n\\n[${screenContextIssueNote}]` : text;" in avatar
+    assert "message: messageForModel" in avatar
+    assert "historyUserText: options.historyUserText || text" in avatar
+    assert "options.screenImageDataUrl || screenSnapshot?.dataUrl || pendingScreenSnapshotForPrompt?.dataUrl" in avatar
 
 
 def test_desktop_tts_treats_octet_stream_pcm_as_audio_for_pocket_fast_path():

@@ -24,6 +24,10 @@
   "chatSystemPrompt": "You are CATBot, a concise desktop companion. Give helpful, practical answers in a few sentences unless the user asks for detail.",
   "desktopChatHistory": [],
   "speakChatReplies": true,
+  "webcamMode": false,
+  "autoCompanionMode": false,
+  "autoCompanionScreenContext": true,
+  "autoCompanionDance": true,
   "trustLocalCertificates": true,
   "vrmTransforms": {},
   "windowBounds": {

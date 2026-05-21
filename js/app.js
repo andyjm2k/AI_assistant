@@ -361,8 +361,12 @@
         const SERVER_BASE = getServerBase();
         // Get the current protocol (http or https) - use https for secure connections
         const PROTOCOL = window.location.protocol === 'https:' ? 'https:' : 'http:';
+        const PROXY_BASE_PORT = '8002';
+        const PROXY_BASE_URL_STORAGE_KEY = 'catbotProxyBaseUrl';
+        // Opening index.html directly uses the file: protocol. The proxy still runs on HTTPS.
+        const INITIAL_PROXY_PROTOCOL = window.location.protocol === 'http:' ? 'http:' : 'https:';
         // Construct base URLs using the detected server with HTTPS
-        const PROXY_BASE_URL = `${PROTOCOL}//${SERVER_BASE}:8002`;
+        let PROXY_BASE_URL = `${INITIAL_PROXY_PROTOCOL}//${SERVER_BASE}:${PROXY_BASE_PORT}`;
         const MCP_BROWSER_BASE_URL = `${PROTOCOL}//${SERVER_BASE}:5001`;
         
         // Make PROXY_BASE_URL available globally for ai-autogen-call.js
@@ -383,7 +387,33 @@
             return baseUrl + normalizedPath;
         }
         const AUTH_TOKEN_STORAGE_KEY = 'jwtAuthToken';
-        let authToken = localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+
+        function safeLocalStorageGet(key) {
+            try {
+                return window.localStorage?.getItem(key) || '';
+            } catch (error) {
+                console.warn(`Could not read ${key} from localStorage:`, error);
+                return '';
+            }
+        }
+
+        function safeLocalStorageSet(key, value) {
+            try {
+                window.localStorage?.setItem(key, value);
+            } catch (error) {
+                console.warn(`Could not persist ${key} to localStorage:`, error);
+            }
+        }
+
+        function safeLocalStorageRemove(key) {
+            try {
+                window.localStorage?.removeItem(key);
+            } catch (error) {
+                console.warn(`Could not remove ${key} from localStorage:`, error);
+            }
+        }
+
+        let authToken = safeLocalStorageGet(AUTH_TOKEN_STORAGE_KEY) || '';
 
         const authOverlay = document.getElementById('auth-overlay');
         const authUsernameInput = document.getElementById('auth-username');
@@ -408,8 +438,121 @@
 
         function setAuthToken(token) {
             authToken = token || '';
-            if (authToken) localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
-            else localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+            if (authToken) safeLocalStorageSet(AUTH_TOKEN_STORAGE_KEY, authToken);
+            else safeLocalStorageRemove(AUTH_TOKEN_STORAGE_KEY);
+        }
+
+        function normalizeProxyBaseUrl(baseUrl) {
+            const value = String(baseUrl || '').trim();
+            if (!value) return '';
+            if (!/^https?:\/\//i.test(value)) {
+                const host = normalizeProxyHost(value);
+                return host ? `https://${host}:${PROXY_BASE_PORT}` : '';
+            }
+            try {
+                const parsed = new URL(value);
+                return `${parsed.protocol}//${parsed.host}`;
+            } catch {
+                return value.replace(/\/+$/, '');
+            }
+        }
+
+        function setProxyBaseUrl(baseUrl) {
+            const normalized = normalizeProxyBaseUrl(baseUrl);
+            if (!normalized) return;
+            PROXY_BASE_URL = normalized;
+            window.PROXY_BASE_URL = normalized;
+            safeLocalStorageSet(PROXY_BASE_URL_STORAGE_KEY, normalized);
+        }
+
+        function addUniqueProxyBase(candidates, seen, baseUrl) {
+            const normalized = normalizeProxyBaseUrl(baseUrl);
+            if (!normalized || seen.has(normalized)) return;
+            seen.add(normalized);
+            candidates.push(normalized);
+        }
+
+        function normalizeProxyHost(host) {
+            const cleaned = String(host || '')
+                .trim()
+                .replace(/^https?:\/\//i, '')
+                .replace(/\/.*$/, '');
+            if (!cleaned) return '';
+            const withoutPort = cleaned.replace(/:\d+$/, '');
+            return withoutPort || cleaned;
+        }
+
+        function getConfiguredProxyBaseFromPage() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const queryProxyBase = urlParams.get('proxyBaseUrl') || urlParams.get('proxy');
+            if (queryProxyBase) return queryProxyBase;
+            return document.querySelector('meta[name="catbot-proxy-base-url"]')?.content || '';
+        }
+
+        function getProxyBaseCandidates() {
+            const candidates = [];
+            const seen = new Set();
+            const storedProxyBase = safeLocalStorageGet(PROXY_BASE_URL_STORAGE_KEY);
+            const configuredProxyBase = getConfiguredProxyBaseFromPage();
+
+            addUniqueProxyBase(candidates, seen, storedProxyBase);
+            addUniqueProxyBase(candidates, seen, configuredProxyBase);
+            if (PROXY_BASE_URL.startsWith('https://')) {
+                addUniqueProxyBase(candidates, seen, PROXY_BASE_URL);
+            }
+
+            const configuredHttpsHost = normalizeProxyHost(
+                document.querySelector('meta[name="catbot-https-hostname"]')?.content
+            );
+            const hosts = [
+                configuredHttpsHost,
+                normalizeProxyHost(SERVER_BASE),
+                normalizeProxyHost(window.location.hostname),
+                'localhost',
+                '127.0.0.1'
+            ].filter(Boolean);
+
+            for (const host of hosts) {
+                addUniqueProxyBase(candidates, seen, `https://${host}:${PROXY_BASE_PORT}`);
+            }
+            addUniqueProxyBase(candidates, seen, PROXY_BASE_URL);
+            for (const host of hosts) {
+                addUniqueProxyBase(candidates, seen, `http://${host}:${PROXY_BASE_PORT}`);
+            }
+
+            return candidates;
+        }
+
+        async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+            const controller = new AbortController();
+            const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                return await originalFetch(url, { ...options, signal: controller.signal });
+            } finally {
+                window.clearTimeout(timeoutId);
+            }
+        }
+
+        async function fetchProxyEndpoint(path, options = {}) {
+            let lastError = null;
+            for (const baseUrl of getProxyBaseCandidates()) {
+                try {
+                    const response = await fetchWithTimeout(`${baseUrl}${path}`, options);
+                    setProxyBaseUrl(baseUrl);
+                    return response;
+                } catch (error) {
+                    lastError = error;
+                    console.warn(`Could not reach CATBot proxy at ${baseUrl}:`, error);
+                }
+            }
+            throw lastError || new Error('Unable to reach CATBot proxy');
+        }
+
+        function proxyConnectionErrorMessage(error) {
+            if (error?.name === 'AbortError') {
+                return 'Could not reach CATBot proxy before the login request timed out.';
+            }
+            return 'Could not reach CATBot proxy. Check that the CATBot services are running, then try again.';
         }
 
         const originalFetch = window.fetch.bind(window);
@@ -440,12 +583,19 @@
                 return false;
             }
 
-            authStatus.textContent = 'Authenticating...';
-            const response = await originalFetch(`${PROXY_BASE_URL}/v1/auth/${action}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, password })
-            });
+            if (authStatus) authStatus.textContent = 'Authenticating...';
+            let response;
+            try {
+                response = await fetchProxyEndpoint(`/v1/auth/${action}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+            } catch (error) {
+                console.error('Authentication request failed:', error);
+                showAuthOverlay(proxyConnectionErrorMessage(error));
+                return false;
+            }
 
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
@@ -453,10 +603,16 @@
                 return false;
             }
 
-            setAuthToken(data.access_token);
-            hideAuthOverlay();
-            await runAppInitialization();
-            await fetchTodoListFromServer();
+            try {
+                setAuthToken(data.access_token);
+                hideAuthOverlay();
+                await runAppInitialization();
+                await fetchTodoListFromServer();
+            } catch (error) {
+                console.error('Authentication completed but app setup failed:', error);
+                showAuthOverlay('Signed in, but the app could not finish setup. Refresh the page and try again.');
+                return false;
+            }
             return true;
         }
 
@@ -466,9 +622,16 @@
                 return false;
             }
 
-            const response = await originalFetch(`${PROXY_BASE_URL}/v1/auth/me`, {
-                headers: { Authorization: `Bearer ${authToken}` }
-            });
+            let response;
+            try {
+                response = await fetchProxyEndpoint('/v1/auth/me', {
+                    headers: { Authorization: `Bearer ${authToken}` }
+                });
+            } catch (error) {
+                console.error('Session verification failed:', error);
+                showAuthOverlay(proxyConnectionErrorMessage(error));
+                return false;
+            }
 
             if (!response.ok) {
                 setAuthToken('');
