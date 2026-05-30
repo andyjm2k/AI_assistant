@@ -66,7 +66,8 @@ def test_desktop_voice_chat_sends_with_issue_note_when_screen_snapshot_fails():
     assert 'setVoiceCaptureStatus("Capturing screen...", "sending");' in avatar
     assert "Screen context was toggled on, but no screenshot could be attached because capture failed" in avatar
     assert 'setVoiceCaptureStatus("Screenshot unavailable; sending voice prompt...", "sending");' in avatar
-    assert "const messageForModel = screenContextIssueNote ? `${text}\\n\\n[${screenContextIssueNote}]` : text;" in avatar
+    assert "const promptNotes = [screenContextIssueNote, actionHarnessIssueNote].filter(Boolean);" in avatar
+    assert 'const messageForModel = promptNotes.length ? `${text}\\n\\n[${promptNotes.join(" ")}]` : text;' in avatar
     assert "message: messageForModel" in avatar
     assert "historyUserText: options.historyUserText || text" in avatar
     assert "options.screenImageDataUrl || screenSnapshot?.dataUrl || pendingScreenSnapshotForPrompt?.dataUrl" in avatar
@@ -125,6 +126,20 @@ def test_desktop_streaming_scheduler_logs_underruns_and_coalesces_short_chunks()
     assert "flushPendingPcmChunks(false)" in main
     assert "flushPendingPcmChunks(true)" in main
     assert "upstreamChunkCount" in main
+
+
+def test_desktop_streaming_bubble_timing_uses_pcm_playback_schedule():
+    avatar = ELECTRON_AVATAR.read_text(encoding="utf-8")
+
+    assert "let speechPreviewLastPcmSchedule = null;" in avatar
+    assert "speechPreviewLastPcmSchedule = {" in avatar
+    assert "queueSpeechBubbleSentencesForAudioWindow(" in avatar
+    assert "scheduleChunkSpeechBubbleFromPcmTiming();" in avatar
+    assert "chunkAudioStartTime" in avatar
+    assert "chunkAudioEndTime" in avatar
+
+    on_started = avatar.split("onStarted: (data) => {", 1)[1].split("    onChunk: flushPcmBytes", 1)[0]
+    assert "scheduleSpeechBubbleSentences(chunkText, fallbackDurationMs, previewToken)" not in on_started
 
 
 def test_backend_tts_rtf_logging_is_wired():

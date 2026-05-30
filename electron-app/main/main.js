@@ -17,6 +17,7 @@ const {
   desktopCapturer
 } = require("electron");
 
+const actionHarness = require("./action-harness");
 const { deepMerge, loadJsonFile, saveJsonFile } = require("./window-state");
 
 protocol.registerSchemesAsPrivileged([
@@ -37,6 +38,7 @@ const DEV_PROJECT_ROOT = path.resolve(ELECTRON_ROOT, "..");
 const USER_STATE_FILE = path.join(app.getPath("userData"), "desktop-state.json");
 const USER_AUTH_FILE = path.join(app.getPath("userData"), "desktop-auth.json");
 const USER_LOG_FILE = path.join(app.getPath("userData"), "desktop-runtime.log");
+const ACTION_HARNESS_CAPTURE_DIR = path.join(app.getPath("userData"), "action-harness");
 const BOOTSTRAP_CONFIG_FILE = path.join(ELECTRON_ROOT, "config", "default-desktop-config.json");
 const ENV_FILE = path.join(ELECTRON_ROOT, ".env");
 const PROJECT_ENV_FILE = path.join(DEV_PROJECT_ROOT, ".env");
@@ -52,6 +54,30 @@ const DESKTOP_TTS_VOICE_CACHE_MS = 30000;
 const DESKTOP_TOOL_FETCH_TIMEOUT_MS = 5000;
 const DESKTOP_VOICE_TOOL_FETCH_TIMEOUT_MS = 3500;
 const DESKTOP_TOOL_LOOP_MAX_ITERATIONS = 5;
+const DESKTOP_ACTION_HARNESS_DEFAULT_LOOP_BUDGET = 80;
+const DESKTOP_ACTION_HARNESS_DEFAULT_NUDGE_INTERVAL = 5;
+const DESKTOP_ACTION_HARNESS_MAX_LOOP_BUDGET = 1000;
+const DESKTOP_ACTION_HARNESS_MAX_NUDGE_INTERVAL = 50;
+const DESKTOP_TOOL_RESULT_MESSAGE_CHAR_LIMIT = 12000;
+const DESKTOP_CHAT_REQUEST_TIMEOUT_MS = 120000;
+const DESKTOP_ACTION_HARNESS_CHAT_TIMEOUT_MS = 600000;
+const DESKTOP_ACTION_HARNESS_POST_ACTION_CAPTURE_DELAY_MS = 250;
+const DESKTOP_ACTION_HARNESS_MAX_ACTION_DELAY_MS = 3000;
+const DESKTOP_ACTION_HARNESS_ARM_COUNTDOWN_MS = 5000;
+const DESKTOP_ACTION_HARNESS_CONTINUE_NUDGE_LIMIT = 12;
+const DESKTOP_ACTION_HARNESS_CONTEXT_TAIL_MESSAGES = 4;
+const DESKTOP_ACTION_HARNESS_MEMORY_MAX_ITEMS = 40;
+const DESKTOP_ACTION_HARNESS_FOREGROUND_POLL_MS = 150;
+const DESKTOP_ACTION_HARNESS_FOREGROUND_TIMEOUT_MS = 3500;
+const DESKTOP_ACTION_HARNESS_CAPTURE_FORMAT = "jpeg";
+const DESKTOP_ACTION_HARNESS_CAPTURE_EXTENSION = "jpg";
+const DESKTOP_ACTION_HARNESS_CAPTURE_MAX_IMAGE_WIDTH = 800;
+const DESKTOP_ACTION_HARNESS_CAPTURE_MIN_IMAGE_WIDTH = 480;
+const DESKTOP_ACTION_HARNESS_CAPTURE_MAX_ALLOWED_IMAGE_WIDTH = 1600;
+const DESKTOP_ACTION_HARNESS_CAPTURE_JPEG_QUALITY = 62;
+const DESKTOP_ACTION_HARNESS_CAPTURE_MIN_JPEG_QUALITY = 45;
+const DESKTOP_ACTION_HARNESS_CAPTURE_MAX_JPEG_QUALITY = 90;
+const DESKTOP_ACTION_HARNESS_CAPTURE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
 const DESKTOP_REPLY_EMOTION_RESET_DELAY_MS = 2200;
 const DESKTOP_ERROR_EMOTION_RESET_DELAY_MS = 4500;
 const DESKTOP_AUTH_GREETING_TEXT = "Hi, I'm ready when you are.";
@@ -59,6 +85,15 @@ const DESKTOP_JWT_EXPIRY_LEEWAY_SECONDS = 30;
 const CERT_VERIFY_RESULT_DEFAULT = -3;
 const CERT_VERIFY_RESULT_OK = 0;
 const AVATAR_WINDOW_TOP_CHROME_GUARD_PX = 32;
+const ACTION_HARNESS_TOOL_NAMES = new Set([
+  "desktop_action_capture_window",
+  "desktop_action_mouse",
+  "desktop_action_key",
+  "desktop_action_type_text",
+  "desktop_action_wait",
+  "desktop_action_set_goal",
+  "desktop_action_stop"
+]);
 
 let avatarWindow = null;
 let controlWindow = null;
@@ -83,7 +118,86 @@ let desktopTtsVoiceCache = {
   fetchedAt: 0,
   voices: []
 };
+const actionHarnessRuntime = {
+  lastCapture: null,
+  playMemory: [],
+  currentGoal: "",
+  lastCaptureCleanupAt: 0
+};
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
+
+function clipActionHarnessMemoryText(value, maxChars = 360) {
+  return normalizeChatContent(value, maxChars).replace(/\s+/g, " ").trim();
+}
+
+function resetActionHarnessPlayMemory() {
+  actionHarnessRuntime.playMemory = [];
+  actionHarnessRuntime.currentGoal = "";
+}
+
+function appendActionHarnessPlayMemory(entry = {}) {
+  const normalized = {
+    at: Date.now(),
+    type: String(entry.type || "note").slice(0, 40),
+    toolName: String(entry.toolName || "").slice(0, 80),
+    args: entry.args && typeof entry.args === "object" && !Array.isArray(entry.args) ? entry.args : null,
+    observation: clipActionHarnessMemoryText(entry.observation || "", 420),
+    result: clipActionHarnessMemoryText(entry.result || "", 520)
+  };
+  if (!normalized.toolName && !normalized.observation && !normalized.result) {
+    return;
+  }
+  actionHarnessRuntime.playMemory.push(normalized);
+  if (actionHarnessRuntime.playMemory.length > DESKTOP_ACTION_HARNESS_MEMORY_MAX_ITEMS) {
+    actionHarnessRuntime.playMemory.splice(0, actionHarnessRuntime.playMemory.length - DESKTOP_ACTION_HARNESS_MEMORY_MAX_ITEMS);
+  }
+}
+
+function formatActionHarnessPlayMemoryForModel() {
+  const recent = Array.isArray(actionHarnessRuntime.playMemory)
+    ? actionHarnessRuntime.playMemory.slice(-18)
+    : [];
+  if (!recent.length) {
+    return actionHarnessRuntime.currentGoal
+      ? `Current self-goal: ${clipActionHarnessMemoryText(actionHarnessRuntime.currentGoal, 520)}`
+      : "";
+  }
+  const lines = [
+    "Play memory from this session. Use this to learn what is working, avoid repeating failed attempts, and adapt the next action."
+  ];
+  if (actionHarnessRuntime.currentGoal) {
+    lines.push(`Current self-goal: ${clipActionHarnessMemoryText(actionHarnessRuntime.currentGoal, 520)}`);
+  }
+  for (const item of recent) {
+    const args = item.args ? ` ${JSON.stringify(item.args)}` : "";
+    const action = item.toolName ? `${item.toolName}${args}` : item.type;
+    const observation = item.observation ? ` Intent/observation: ${item.observation}` : "";
+    const result = item.result ? ` Result: ${item.result}` : "";
+    lines.push(`- ${action}.${observation}${result}`);
+  }
+  return lines.join("\n");
+}
+
+function injectActionHarnessPlayMemoryMessage(messages = []) {
+  const memory = formatActionHarnessPlayMemoryForModel();
+  if (!memory) {
+    return messages;
+  }
+  const output = [...messages];
+  let lastUserIndex = -1;
+  for (let index = output.length - 1; index >= 0; index -= 1) {
+    if (output[index]?.role === "user") {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  if (lastUserIndex >= 0) {
+    output[lastUserIndex] = appendTextToDesktopMessage(output[lastUserIndex], `\n\n${memory}`);
+    return output;
+  }
+  output.push({ role: "user", content: memory });
+  return output;
+}
 
 if (!hasSingleInstanceLock) {
   app.quit();
@@ -222,7 +336,17 @@ function normalizeChatContent(value, maxChars = DESKTOP_CHAT_MESSAGE_CHAR_LIMIT)
 
 function normalizeDesktopChatMessage(message = {}) {
   const role = message.role === "assistant" ? "assistant" : "user";
-  const content = normalizeChatContent(message.content);
+  const rawText = coerceDesktopMessageText(message.content);
+  let content = role === "assistant"
+    ? normalizeChatContent(getVisibleDesktopAssistantText(message))
+    : normalizeChatContent(rawText);
+  if (!content && role === "assistant") {
+    try {
+      content = parseDesktopToolFallbacks(rawText).length ? "Desktop action completed." : "";
+    } catch (_) {
+      content = "";
+    }
+  }
   if (!content) {
     return null;
   }
@@ -304,21 +428,42 @@ function getVisibleDesktopAssistantText(message = {}) {
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, " ")
     .replace(/<tool>[\s\S]*?<\/tool>/gi, " ")
     .replace(/<parameters>[\s\S]*?<\/parameters>/gi, " ")
+    .replace(/Requested tool calls:\s*(?:\r?\n\s*-\s*desktop_action_[^\r\n]+)+/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function buildDesktopAssistantHistoryMessage(message = {}) {
-  const out = { role: message.role || "assistant" };
-  for (const key of ["content", "tool_calls", "name", "function_call", "refusal", "reasoning_details"]) {
-    if (Object.prototype.hasOwnProperty.call(message, key) && message[key] != null) {
-      out[key] = message[key];
-    }
+function formatDesktopToolCallForTranscript(toolCall = {}) {
+  const name = getDesktopToolCallName(toolCall);
+  if (!name) {
+    return "";
   }
-  if (!Object.prototype.hasOwnProperty.call(out, "content")) {
-    out.content = "";
+  let args = {};
+  try {
+    args = getDesktopToolCallArguments(toolCall);
+  } catch (_) {
+    args = {};
   }
-  return out;
+  return `${name} completed with arguments ${JSON.stringify(args)}`;
+}
+
+function buildDesktopAssistantHistoryMessage(message = {}, options = {}) {
+  const contentParts = [];
+  const assistantText = getVisibleDesktopAssistantText(message);
+  if (assistantText) {
+    contentParts.push(assistantText);
+  }
+
+  const hasToolTranscript = Array.isArray(options.toolCalls) &&
+    options.toolCalls.map(formatDesktopToolCallForTranscript).filter(Boolean).length > 0;
+  if (!assistantText && hasToolTranscript) {
+    contentParts.push("I selected a desktop action for the harness.");
+  }
+
+  return {
+    role: "assistant",
+    content: contentParts.join("\n\n") || "I am calling a tool."
+  };
 }
 
 function stripDesktopThinkBlocks(value) {
@@ -414,6 +559,16 @@ function parseDesktopToolFallbacks(content) {
 
   const legacyToolRegex = /<tool>([\s\S]*?)<\/tool>\s*<parameters>([\s\S]*?)<\/parameters>/gi;
   for (const match of withoutCode.matchAll(legacyToolRegex)) {
+    const name = String(match[1] || "").trim();
+    const parameters = parseDesktopLenientJsonObject(match[2]);
+    const normalized = normalizeDesktopToolCall({ name, arguments: parameters || {} });
+    if (normalized) {
+      calls.push(normalized);
+    }
+  }
+
+  const transcriptToolRegex = /(?:^|\r?\n)\s*-\s*(desktop_action_[A-Za-z0-9_:-]+)\s+({[^\r\n]*})/gi;
+  for (const match of withoutCode.matchAll(transcriptToolRegex)) {
     const name = String(match[1] || "").trim();
     const parameters = parseDesktopLenientJsonObject(match[2]);
     const normalized = normalizeDesktopToolCall({ name, arguments: parameters || {} });
@@ -902,11 +1057,20 @@ function buildDesktopVisualAttachments(payload = {}) {
       label: "webcam snapshot"
     });
   }
+  if (isDataImageUrl(payload.actionHarnessImageDataUrl)) {
+    attachments.push({
+      dataUrl: payload.actionHarnessImageDataUrl,
+      label: "play-mode window screenshot with grid overlay"
+    });
+  }
   return attachments;
 }
 
-function buildDesktopUserMessage(text, visualAttachments = []) {
-  const cleanText = normalizeChatContent(text, 2400);
+function buildDesktopUserMessage(text, visualAttachments = [], options = {}) {
+  const maxChars = Number.isFinite(Number(options.maxChars))
+    ? Math.max(200, Math.round(Number(options.maxChars)))
+    : 2400;
+  const cleanText = normalizeChatContent(text, maxChars);
   const attachments = Array.isArray(visualAttachments)
     ? visualAttachments.filter((item) => isDataImageUrl(item?.dataUrl))
     : [];
@@ -930,6 +1094,297 @@ function buildDesktopUserMessage(text, visualAttachments = []) {
       }))
     ]
   };
+}
+
+function appendTextToDesktopContent(content, text) {
+  const addition = String(text || "").trim();
+  if (!addition) {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    const next = content.map((part) => {
+      if (part && typeof part === "object" && !Array.isArray(part)) {
+        return { ...part };
+      }
+      return part;
+    });
+    const textPart = next.find((part) => part && typeof part === "object" && part.type === "text");
+    if (textPart) {
+      textPart.text = `${String(textPart.text || "").trim()}\n\n${addition}`.trim();
+    } else {
+      next.unshift({ type: "text", text: addition });
+    }
+    return next;
+  }
+  const base = coerceDesktopMessageText(content).trim();
+  return base ? `${base}\n\n${addition}` : addition;
+}
+
+function appendTextToDesktopMessage(message = {}, text) {
+  return {
+    ...message,
+    content: appendTextToDesktopContent(message.content, text)
+  };
+}
+
+function shouldFlattenDesktopVisualContentForFallback(options = {}) {
+  const model = String(options.model || "").toLowerCase();
+  if (!model) {
+    return false;
+  }
+  const isKnownVisionModel = (
+    model.includes("vl") ||
+    model.includes("vision") ||
+    model.includes("ui-tars") ||
+    model.includes("spacethinker") ||
+    model.includes("gemma-3") ||
+    model.includes("gemma3")
+  );
+  return !isKnownVisionModel && (
+    model.includes("qwen") ||
+    model.includes("hermes")
+  );
+}
+
+function sanitizeDesktopUserContentForTextFallback(content, options = {}) {
+  if (!Array.isArray(content)) {
+    return normalizeChatContent(coerceDesktopMessageText(content));
+  }
+
+  const textParts = [];
+  const imageParts = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      const text = normalizeChatContent(part);
+      if (text) {
+        textParts.push(text);
+      }
+      continue;
+    }
+    if (!part || typeof part !== "object" || Array.isArray(part)) {
+      continue;
+    }
+    if (part.type === "text") {
+      const text = normalizeChatContent(part.text ?? part.content ?? "");
+      if (text) {
+        textParts.push(text);
+      }
+      continue;
+    }
+    const imageUrl = typeof part.image_url === "string"
+      ? part.image_url
+      : part.image_url?.url || part.url || part.image;
+    if (isDataImageUrl(imageUrl)) {
+      imageParts.push({
+        type: "image_url",
+        image_url: {
+          url: imageUrl,
+          detail: part.image_url?.detail || part.detail || "auto"
+        }
+      });
+      continue;
+    }
+    const text = normalizeChatContent(part.text ?? part.content ?? "");
+    if (text) {
+      textParts.push(text);
+    }
+  }
+
+  const text = normalizeChatContent(textParts.join("\n\n")) || "Continue.";
+  if (shouldFlattenDesktopVisualContentForFallback(options)) {
+    const imageNote = imageParts.length
+      ? `\n\n${imageParts.length} image attachment${imageParts.length === 1 ? " was" : "s were"} omitted because this local text fallback template does not accept image message parts. Use the latest textual tool result and grid coordinates.`
+      : "";
+    return normalizeChatContent(`${text}${imageNote}`, DESKTOP_TOOL_RESULT_MESSAGE_CHAR_LIMIT);
+  }
+  return [
+    { type: "text", text },
+    ...imageParts
+  ];
+}
+
+function assistantMessageLooksLikeOnlyToolCall(message = {}) {
+  if (Array.isArray(message?.tool_calls) && message.tool_calls.length) {
+    return true;
+  }
+  const text = coerceDesktopMessageText(message?.content || "");
+  try {
+    return parseDesktopToolFallbacks(text).length > 0;
+  } catch (_) {
+    return /<tool_call>[\s\S]*?<\/tool_call>/i.test(text);
+  }
+}
+
+function sanitizeDesktopMessageForTextFallback(message = {}, options = {}) {
+  const rawRole = String(message?.role || "user").trim().toLowerCase();
+  const role = rawRole === "system" || rawRole === "assistant" || rawRole === "user"
+    ? rawRole
+    : "user";
+
+  if (role === "assistant") {
+    const content = normalizeChatContent(getVisibleDesktopAssistantText(message)) ||
+      (assistantMessageLooksLikeOnlyToolCall(message) ? "Desktop action completed." : "");
+    return content ? { role, content } : null;
+  }
+
+  if (role === "system") {
+    const content = normalizeChatContent(coerceDesktopMessageText(message?.content || ""), DESKTOP_TOOL_RESULT_MESSAGE_CHAR_LIMIT);
+    return content ? { role, content } : null;
+  }
+
+  const content = rawRole === "user"
+    ? sanitizeDesktopUserContentForTextFallback(message?.content, options)
+    : normalizeChatContent(coerceDesktopMessageText(message?.content || ""), DESKTOP_TOOL_RESULT_MESSAGE_CHAR_LIMIT);
+  if (Array.isArray(content)) {
+    return content.length ? { role, content } : null;
+  }
+  return content ? { role, content } : null;
+}
+
+function mergeDesktopFallbackContent(left, right) {
+  const mergedText = [coerceDesktopMessageText(left), coerceDesktopMessageText(right)]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join("\n\n");
+  if (!Array.isArray(left) && !Array.isArray(right)) {
+    return normalizeChatContent(mergedText, DESKTOP_TOOL_RESULT_MESSAGE_CHAR_LIMIT);
+  }
+  const imageParts = [];
+  for (const content of [left, right]) {
+    if (!Array.isArray(content)) {
+      continue;
+    }
+    for (const part of content) {
+      const imageUrl = typeof part?.image_url === "string" ? part.image_url : part?.image_url?.url;
+      if (isDataImageUrl(imageUrl)) {
+        imageParts.push({
+          type: "image_url",
+          image_url: {
+            url: imageUrl,
+            detail: part?.image_url?.detail || "auto"
+          }
+        });
+      }
+    }
+  }
+  return [
+    { type: "text", text: normalizeChatContent(mergedText, DESKTOP_TOOL_RESULT_MESSAGE_CHAR_LIMIT) || "Continue." },
+    ...imageParts
+  ];
+}
+
+function isDesktopToolResponseOnlyText(content) {
+  const text = coerceDesktopMessageText(content).trim();
+  return /^<tool_response>[\s\S]*<\/tool_response>$/i.test(text);
+}
+
+function ensureDesktopFallbackHasUserQuery(messages = []) {
+  const output = [...messages];
+  if (!output.length || output[output.length - 1]?.role !== "user") {
+    output.push({
+      role: "user",
+      content: "Continue."
+    });
+    return output;
+  }
+  const last = output[output.length - 1];
+  if (isDesktopToolResponseOnlyText(last.content)) {
+    output[output.length - 1] = appendTextToDesktopMessage(
+      last,
+      "Continue desktop play mode from this tool result and choose the next single action."
+    );
+  }
+  return output;
+}
+
+function sanitizeDesktopMessagesForTextFallback(messages = [], options = {}) {
+  const input = Array.isArray(messages) ? messages : [];
+  const output = [];
+  for (const message of input) {
+    const sanitized = sanitizeDesktopMessageForTextFallback(message, options);
+    if (!sanitized) {
+      continue;
+    }
+    if (sanitized.role === "system" && output.length) {
+      const firstSystemIndex = output.findIndex((item) => item.role === "system");
+      if (firstSystemIndex >= 0) {
+        output[firstSystemIndex] = {
+          role: "system",
+          content: mergeDesktopFallbackContent(output[firstSystemIndex].content, sanitized.content)
+        };
+      } else {
+        output.unshift(sanitized);
+      }
+      continue;
+    }
+    const previous = output[output.length - 1];
+    if (previous && previous.role === sanitized.role && sanitized.role !== "system") {
+      output[output.length - 1] = {
+        role: previous.role,
+        content: mergeDesktopFallbackContent(previous.content, sanitized.content)
+      };
+      continue;
+    }
+    output.push(sanitized);
+  }
+  return ensureDesktopFallbackHasUserQuery(output);
+}
+
+function desktopContentHasImagePart(content) {
+  return Array.isArray(content) && content.some((part) => {
+    const imageUrl = typeof part?.image_url === "string" ? part.image_url : part?.image_url?.url;
+    return isDataImageUrl(imageUrl);
+  });
+}
+
+function countDesktopImagePartsInContent(content) {
+  if (!Array.isArray(content)) {
+    return 0;
+  }
+  return content.reduce((count, part) => {
+    const imageUrl = typeof part?.image_url === "string" ? part.image_url : part?.image_url?.url;
+    return count + (isDataImageUrl(imageUrl) ? 1 : 0);
+  }, 0);
+}
+
+function countDesktopImagePartsInMessages(messages = []) {
+  return (Array.isArray(messages) ? messages : []).reduce(
+    (count, message) => count + countDesktopImagePartsInContent(message?.content),
+    0
+  );
+}
+
+function stripDesktopImagePartsFromContent(content) {
+  if (!Array.isArray(content)) {
+    return content;
+  }
+  const text = coerceDesktopMessageText(content);
+  return normalizeChatContent(text, DESKTOP_TOOL_RESULT_MESSAGE_CHAR_LIMIT) || "Earlier play-mode screenshot omitted for low-latency context.";
+}
+
+function keepLatestDesktopVisualMessageOnly(messages = []) {
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+  let latestVisualIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user" && desktopContentHasImagePart(messages[index]?.content)) {
+      latestVisualIndex = index;
+      break;
+    }
+  }
+  if (latestVisualIndex < 0) {
+    return messages;
+  }
+  return messages.map((message, index) => {
+    if (index === latestVisualIndex || !desktopContentHasImagePart(message?.content)) {
+      return message;
+    }
+    return {
+      ...message,
+      content: stripDesktopImagePartsFromContent(message.content)
+    };
+  });
 }
 
 function getAssetRoot() {
@@ -1172,6 +1627,132 @@ function getBootstrapProviderApiKey() {
   return String(env.ELECTRON_CHAT_API_KEY || process.env.ELECTRON_CHAT_API_KEY || "").trim();
 }
 
+function normalizeActionHarnessWindowInfo(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const hwnd = actionHarness.normalizeHwnd(value.hwnd);
+  const rect = value.rect && typeof value.rect === "object" && !Array.isArray(value.rect) ? value.rect : {};
+  const width = Math.round(Number(rect.width) || 0);
+  const height = Math.round(Number(rect.height) || 0);
+  if (!hwnd || width <= 0 || height <= 0) {
+    return null;
+  }
+  return {
+    hwnd,
+    title: String(value.title || "").trim(),
+    pid: Number.isFinite(Number(value.pid)) ? Number(value.pid) : 0,
+    processName: String(value.processName || value.process || "").trim(),
+    rect: {
+      x: Math.round(Number(rect.x) || 0),
+      y: Math.round(Number(rect.y) || 0),
+      width,
+      height,
+      right: Math.round(Number(rect.right) || Number(rect.x) + width || 0),
+      bottom: Math.round(Number(rect.bottom) || Number(rect.y) + height || 0)
+    }
+  };
+}
+
+function normalizeActionHarnessLoopBudget(value) {
+  const number = Math.round(Number(value));
+  if (number === -1) {
+    return -1;
+  }
+  if (!Number.isFinite(number)) {
+    return DESKTOP_ACTION_HARNESS_DEFAULT_LOOP_BUDGET;
+  }
+  return Math.max(1, Math.min(DESKTOP_ACTION_HARNESS_MAX_LOOP_BUDGET, number));
+}
+
+function normalizeActionHarnessNudgeInterval(value) {
+  const number = Math.round(Number(value));
+  if (!Number.isFinite(number)) {
+    return DESKTOP_ACTION_HARNESS_DEFAULT_NUDGE_INTERVAL;
+  }
+  return Math.max(0, Math.min(DESKTOP_ACTION_HARNESS_MAX_NUDGE_INTERVAL, number));
+}
+
+function normalizeActionHarnessActionDelayMs(value) {
+  const number = Math.round(Number(value));
+  if (!Number.isFinite(number)) {
+    return DESKTOP_ACTION_HARNESS_POST_ACTION_CAPTURE_DELAY_MS;
+  }
+  return Math.max(0, Math.min(DESKTOP_ACTION_HARNESS_MAX_ACTION_DELAY_MS, number));
+}
+
+function normalizeActionHarnessCaptureMaxImageWidth(value) {
+  const number = Math.round(Number(value));
+  if (!Number.isFinite(number)) {
+    return DESKTOP_ACTION_HARNESS_CAPTURE_MAX_IMAGE_WIDTH;
+  }
+  return Math.max(
+    DESKTOP_ACTION_HARNESS_CAPTURE_MIN_IMAGE_WIDTH,
+    Math.min(DESKTOP_ACTION_HARNESS_CAPTURE_MAX_ALLOWED_IMAGE_WIDTH, number)
+  );
+}
+
+function normalizeActionHarnessCaptureJpegQuality(value) {
+  const number = Math.round(Number(value));
+  if (!Number.isFinite(number)) {
+    return DESKTOP_ACTION_HARNESS_CAPTURE_JPEG_QUALITY;
+  }
+  return Math.max(
+    DESKTOP_ACTION_HARNESS_CAPTURE_MIN_JPEG_QUALITY,
+    Math.min(DESKTOP_ACTION_HARNESS_CAPTURE_MAX_JPEG_QUALITY, number)
+  );
+}
+
+function normalizeActionHarnessState(value = {}) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const targetWindow = normalizeActionHarnessWindowInfo(source.targetWindow);
+  const status = String(source.status || (source.playMode ? "ready" : "idle")).trim() || "idle";
+  return {
+    playMode: Boolean(source.playMode),
+    status,
+    targetWindow,
+    grid: actionHarness.normalizeGrid(source.grid || {}),
+    loopBudget: normalizeActionHarnessLoopBudget(source.loopBudget),
+    nudgeInterval: normalizeActionHarnessNudgeInterval(source.nudgeInterval),
+    actionDelayMs: normalizeActionHarnessActionDelayMs(source.actionDelayMs),
+    captureMaxImageWidth: normalizeActionHarnessCaptureMaxImageWidth(source.captureMaxImageWidth),
+    captureJpegQuality: normalizeActionHarnessCaptureJpegQuality(source.captureJpegQuality),
+    armStartedAt: Number.isFinite(Number(source.armStartedAt)) ? Number(source.armStartedAt) : 0,
+    armEndsAt: Number.isFinite(Number(source.armEndsAt)) ? Number(source.armEndsAt) : 0,
+    lastCaptureAt: Number.isFinite(Number(source.lastCaptureAt)) ? Number(source.lastCaptureAt) : 0,
+    lastActionAt: Number.isFinite(Number(source.lastActionAt)) ? Number(source.lastActionAt) : 0,
+    lastAction: String(source.lastAction || "").slice(0, 180),
+    lastError: String(source.lastError || "").slice(0, 300)
+  };
+}
+
+function getDefaultActionHarnessState() {
+  return normalizeActionHarnessState({
+    playMode: false,
+    status: "idle",
+    grid: {
+      columns: actionHarness.DEFAULT_GRID_COLUMNS,
+      rows: actionHarness.DEFAULT_GRID_ROWS
+    },
+    loopBudget: DESKTOP_ACTION_HARNESS_DEFAULT_LOOP_BUDGET,
+    nudgeInterval: DESKTOP_ACTION_HARNESS_DEFAULT_NUDGE_INTERVAL,
+    actionDelayMs: DESKTOP_ACTION_HARNESS_POST_ACTION_CAPTURE_DELAY_MS,
+    captureMaxImageWidth: DESKTOP_ACTION_HARNESS_CAPTURE_MAX_IMAGE_WIDTH,
+    captureJpegQuality: DESKTOP_ACTION_HARNESS_CAPTURE_JPEG_QUALITY,
+    armStartedAt: 0,
+    armEndsAt: 0
+  });
+}
+
+function isOutdatedActionHarnessDefaultGrid(grid = {}) {
+  const columns = Number(grid.columns);
+  const rows = Number(grid.rows);
+  return (
+    columns === 12 && rows === 9 ||
+    columns === 48 && rows === 32
+  );
+}
+
 const DEFAULT_STATE = (() => {
   const bootstrap = readBootstrapConfig();
   const merged = deepMerge(
@@ -1208,6 +1789,7 @@ const DEFAULT_STATE = (() => {
       autoCompanionMode: false,
       autoCompanionScreenContext: true,
       autoCompanionDance: true,
+      actionHarness: getDefaultActionHarnessState(),
       trustLocalCertificates: true,
       defaultCompanionId: "",
       activeCompanionId: "",
@@ -1264,6 +1846,16 @@ state.webcamMode = Boolean(state.webcamMode);
 state.autoCompanionMode = Boolean(state.autoCompanionMode);
 state.autoCompanionScreenContext = state.autoCompanionScreenContext !== false;
 state.autoCompanionDance = state.autoCompanionDance !== false;
+state.actionHarness = normalizeActionHarnessState(state.actionHarness);
+if (isOutdatedActionHarnessDefaultGrid(state.actionHarness.grid)) {
+  state.actionHarness.grid = {
+    columns: actionHarness.DEFAULT_GRID_COLUMNS,
+    rows: actionHarness.DEFAULT_GRID_ROWS
+  };
+}
+state.actionHarness.playMode = false;
+state.actionHarness.status = "idle";
+state.actionHarness.lastError = "";
 state.trustLocalCertificates = state.trustLocalCertificates !== false;
 state.defaultCompanionId = String(state.defaultCompanionId || "").trim();
 state.activeCompanionId = String(state.activeCompanionId || "").trim();
@@ -1286,6 +1878,12 @@ function saveState() {
   if (state.transientExpression) {
     persistedState.expression = "neutral";
   }
+  persistedState.actionHarness = normalizeActionHarnessState({
+    ...(persistedState.actionHarness || {}),
+    playMode: false,
+    status: "idle",
+    lastError: ""
+  });
   saveJsonFile(USER_STATE_FILE, {
     ...persistedState,
     moveMode: false,
@@ -2544,6 +3142,9 @@ function updateState(partialState = {}) {
       patch.transientExpression = false;
     }
   }
+  if (Object.prototype.hasOwnProperty.call(patch, "actionHarness")) {
+    patch.actionHarness = normalizeActionHarnessState(deepMerge(state.actionHarness || getDefaultActionHarnessState(), patch.actionHarness));
+  }
 
   state = deepMerge(state, patch);
   delete state.chatApiKey;
@@ -2602,6 +3203,7 @@ function updateState(partialState = {}) {
   state.autoCompanionMode = Boolean(state.autoCompanionMode);
   state.autoCompanionScreenContext = state.autoCompanionScreenContext !== false;
   state.autoCompanionDance = state.autoCompanionDance !== false;
+  state.actionHarness = normalizeActionHarnessState(state.actionHarness);
   state.trustLocalCertificates = state.trustLocalCertificates !== false;
   state.defaultCompanionId = String(state.defaultCompanionId || "").trim();
   state.activeCompanionId = String(state.activeCompanionId || "").trim();
@@ -2622,6 +3224,796 @@ function updateState(partialState = {}) {
   saveState();
   broadcastState();
   return getSafeState();
+}
+
+function getActionHarnessTargetWindow() {
+  return normalizeActionHarnessWindowInfo(state.actionHarness?.targetWindow);
+}
+
+function getWindowHandleString(browserWindow) {
+  try {
+    if (!browserWindow || browserWindow.isDestroyed()) {
+      return "";
+    }
+    const handle = browserWindow.getNativeWindowHandle();
+    if (!Buffer.isBuffer(handle) || handle.length < 4) {
+      return "";
+    }
+    return handle.length >= 8
+      ? handle.readBigUInt64LE(0).toString()
+      : String(handle.readUInt32LE(0));
+  } catch (_) {
+    return "";
+  }
+}
+
+function isOwnElectronWindowInfo(info = {}) {
+  const hwnd = actionHarness.normalizeHwnd(info.hwnd);
+  if (!hwnd) {
+    return false;
+  }
+  const ownHandles = [
+    getWindowHandleString(avatarWindow),
+    getWindowHandleString(controlWindow),
+    getWindowHandleString(webClientWindow)
+  ].filter(Boolean);
+  if (ownHandles.includes(hwnd)) {
+    return true;
+  }
+  return Number(info.pid) === process.pid;
+}
+
+function getActionHarnessTargetRejectionReason(info = {}) {
+  const target = normalizeActionHarnessWindowInfo(info);
+  if (!target) {
+    return "No usable foreground window was available.";
+  }
+  const title = String(target.title || "").trim();
+  const processName = String(target.processName || info.processName || info.process || "").trim().toLowerCase();
+  const rect = target.rect || {};
+  if (isOwnElectronWindowInfo(target)) {
+    return "Play mode cannot target the CATBot Electron window. Focus the game or app window and try again.";
+  }
+  if (Number(rect.width) < 240 || Number(rect.height) < 160) {
+    return `The foreground window is too small for play mode (${rect.width}x${rect.height}). Focus the game or app window, not the taskbar or a toolbar.`;
+  }
+  if (!title && processName === "explorer") {
+    return "The foreground target is the Windows shell/taskbar, not a playable app window. Focus the game or app window and start play mode again.";
+  }
+  return "";
+}
+
+function requireUsableActionHarnessTarget(info = {}) {
+  const reason = getActionHarnessTargetRejectionReason(info);
+  if (reason) {
+    throw new Error(reason);
+  }
+  return normalizeActionHarnessWindowInfo(info);
+}
+
+async function getUsableForegroundActionHarnessTarget(options = {}) {
+  const timeoutMs = Math.max(500, Math.round(Number(options.timeoutMs) || DESKTOP_ACTION_HARNESS_FOREGROUND_TIMEOUT_MS));
+  const startedAt = Date.now();
+  let lastError = null;
+  do {
+    try {
+      return requireUsableActionHarnessTarget(await actionHarness.getForegroundWindowInfo());
+    } catch (error) {
+      lastError = error;
+      await actionHarness.delay(DESKTOP_ACTION_HARNESS_FOREGROUND_POLL_MS);
+    }
+  } while (Date.now() - startedAt < timeoutMs);
+  throw lastError || new Error("No usable foreground window was available.");
+}
+
+function setActionHarnessState(patch = {}) {
+  state.actionHarness = normalizeActionHarnessState(deepMerge(state.actionHarness || getDefaultActionHarnessState(), patch));
+}
+
+async function withAvatarHiddenForActionCapture(work, options = {}) {
+  if (options.hideAvatar !== true) {
+    return work();
+  }
+  const shouldRestoreAvatar = Boolean(avatarWindow && !avatarWindow.isDestroyed() && avatarWindow.isVisible());
+  try {
+    if (shouldRestoreAvatar) {
+      avatarWindow.hide();
+      await actionHarness.delay(90);
+    }
+    return await work();
+  } finally {
+    if (shouldRestoreAvatar && avatarWindow && !avatarWindow.isDestroyed() && state.visible) {
+      try {
+        avatarWindow.showInactive();
+      } catch (_) {
+        // ignore restore failures
+      }
+      applyAvatarWindowState();
+    }
+  }
+}
+
+function maybeCleanupActionHarnessCaptures(force = false) {
+  const now = Date.now();
+  if (
+    !force &&
+    now - Number(actionHarnessRuntime.lastCaptureCleanupAt || 0) < DESKTOP_ACTION_HARNESS_CAPTURE_CLEANUP_INTERVAL_MS
+  ) {
+    return;
+  }
+  actionHarnessRuntime.lastCaptureCleanupAt = now;
+  actionHarness.cleanupOldCaptures(ACTION_HARNESS_CAPTURE_DIR);
+}
+
+function getActionHarnessCapturePath() {
+  fs.mkdirSync(ACTION_HARNESS_CAPTURE_DIR, { recursive: true });
+  maybeCleanupActionHarnessCaptures();
+  return path.join(ACTION_HARNESS_CAPTURE_DIR, `capture-${Date.now()}.${DESKTOP_ACTION_HARNESS_CAPTURE_EXTENSION}`);
+}
+
+function formatActionHarnessTargetLabel(targetWindow = getActionHarnessTargetWindow()) {
+  if (!targetWindow) {
+    return "no target window";
+  }
+  return targetWindow.title
+    ? `"${targetWindow.title}" (${targetWindow.rect.width}x${targetWindow.rect.height})`
+    : `window ${targetWindow.hwnd} (${targetWindow.rect.width}x${targetWindow.rect.height})`;
+}
+
+function ensureActionHarnessPlayMode() {
+  const harnessState = normalizeActionHarnessState(state.actionHarness);
+  const targetWindow = normalizeActionHarnessWindowInfo(harnessState.targetWindow);
+  if (!harnessState.playMode || !targetWindow) {
+    throw new Error("Desktop play mode is not active. Start play mode and designate a target window first.");
+  }
+  return { harnessState, targetWindow };
+}
+
+async function captureActionHarnessWindow(options = {}) {
+  const { harnessState, targetWindow } = ensureActionHarnessPlayMode();
+  const grid = actionHarness.normalizeGrid(options.grid || harnessState.grid);
+  const outputPath = getActionHarnessCapturePath();
+  const startedAt = Date.now();
+  const capture = await withAvatarHiddenForActionCapture(
+    () => actionHarness.captureWindowWithGrid({
+      hwnd: targetWindow.hwnd,
+      outputPath,
+      grid,
+      overlay: options.overlay !== false,
+      format: options.format || DESKTOP_ACTION_HARNESS_CAPTURE_FORMAT,
+      maxImageWidth: options.maxImageWidth || getActionHarnessCaptureMaxImageWidth(),
+      jpegQuality: options.jpegQuality || getActionHarnessCaptureJpegQuality()
+    }),
+    { hideAvatar: options.hideAvatar === true }
+  );
+  const captureFinishedAt = Date.now();
+  const normalizedTarget = normalizeActionHarnessWindowInfo(capture);
+  if (!normalizedTarget) {
+    throw new Error("The target window capture did not include valid window metadata.");
+  }
+  requireUsableActionHarnessTarget(normalizedTarget);
+  actionHarnessRuntime.lastCapture = {
+    ...normalizedTarget,
+    grid,
+    outputPath,
+    capturedAt: Date.now()
+  };
+  setActionHarnessState({
+    playMode: true,
+    status: "ready",
+    targetWindow: normalizedTarget,
+    grid,
+    lastCaptureAt: actionHarnessRuntime.lastCapture.capturedAt,
+    lastError: ""
+  });
+  saveState();
+  broadcastState();
+  const dataUrlStartedAt = Date.now();
+  const dataUrl = actionHarness.readCaptureDataUrl(outputPath);
+  const dataUrlMs = Date.now() - dataUrlStartedAt;
+  let fileBytes = 0;
+  try {
+    fileBytes = fs.statSync(outputPath).size;
+  } catch (_) {
+    fileBytes = 0;
+  }
+  appendRuntimeLog(`[desktop action harness] capture ready in ${Date.now() - startedAt}ms captureMs=${captureFinishedAt - startedAt} dataUrlMs=${dataUrlMs} fileBytes=${fileBytes} dataUrlChars=${dataUrl.length} image=${capture.image?.width || "?"}x${capture.image?.height || "?"} format=${capture.image?.format || "?"} quality=${capture.image?.jpegQuality || "?"}`);
+  return {
+    ...actionHarnessRuntime.lastCapture,
+    image: capture.image || null,
+    dataUrl
+  };
+}
+
+async function startActionHarness(payload = {}) {
+  const grid = actionHarness.normalizeGrid(payload.grid || state.actionHarness?.grid || {});
+  const requestedArmDelay = Object.prototype.hasOwnProperty.call(payload, "armDelayMs")
+    ? Number(payload.armDelayMs)
+    : DESKTOP_ACTION_HARNESS_ARM_COUNTDOWN_MS;
+  const armDelayMs = Math.max(0, Math.min(10000, Math.round(Number.isFinite(requestedArmDelay) ? requestedArmDelay : DESKTOP_ACTION_HARNESS_ARM_COUNTDOWN_MS)));
+  const armStartedAt = Date.now();
+  const armEndsAt = armDelayMs > 0 ? armStartedAt + armDelayMs : 0;
+  resetActionHarnessPlayMemory();
+  setActionHarnessState({
+    playMode: false,
+    status: "arming",
+    targetWindow: null,
+    grid,
+    armStartedAt,
+    armEndsAt,
+    lastError: armDelayMs
+      ? "Select the required active window now. Play mode will bind to the foreground window when the countdown ends."
+      : ""
+  });
+  state.quickHudVisible = false;
+  state.moveMode = false;
+  state.clickThrough = true;
+  state.visible = true;
+  saveState();
+  applyAvatarWindowState();
+  broadcastState();
+
+  try {
+    if (armDelayMs) {
+      await actionHarness.delay(armDelayMs);
+    }
+    if (state.actionHarness?.status !== "arming" || Number(state.actionHarness?.armStartedAt) !== armStartedAt) {
+      appendRuntimeLog("[desktop action harness] arming cancelled before target bind.");
+      return {
+        state: getSafeState(),
+        capture: null,
+        captureError: ""
+      };
+    }
+    appendRuntimeLog(`[desktop action harness] binding play mode target with grid ${grid.columns}x${grid.rows}`);
+    const foreground = await getUsableForegroundActionHarnessTarget();
+    setActionHarnessState({
+      playMode: true,
+      status: "ready",
+      targetWindow: foreground,
+      grid,
+      armStartedAt: 0,
+      armEndsAt: 0,
+      lastCaptureAt: 0,
+      lastActionAt: 0,
+      lastAction: "",
+      lastError: ""
+    });
+    saveState();
+    broadcastState();
+    let capture = null;
+    let captureError = "";
+    try {
+      capture = await captureActionHarnessWindow({ grid });
+    } catch (error) {
+      captureError = String(error?.message || error || "Initial play-window capture failed.");
+      appendRuntimeLog(`[desktop action harness] initial capture failed after target bind: ${captureError}`);
+      setActionHarnessState({
+        playMode: true,
+        status: "ready",
+        targetWindow: foreground,
+        grid,
+        armStartedAt: 0,
+        armEndsAt: 0,
+        lastError: `Play mode is on, but initial capture failed: ${captureError}`
+      });
+      saveState();
+      broadcastState();
+    }
+    return {
+      state: getSafeState(),
+      capture,
+      captureError
+    };
+  } catch (error) {
+    appendRuntimeLog(`[desktop action harness] start failed: ${String(error?.message || error)}`);
+    actionHarnessRuntime.lastCapture = null;
+    setActionHarnessState({
+      playMode: false,
+      status: "error",
+      targetWindow: null,
+      grid,
+      armStartedAt: 0,
+      armEndsAt: 0,
+      lastError: String(error?.message || error || "Could not start play mode.")
+    });
+    saveState();
+    broadcastState();
+    throw error;
+  }
+}
+
+function stopActionHarness(reason = "Play mode stopped.") {
+  actionHarnessRuntime.lastCapture = null;
+  setActionHarnessState({
+    playMode: false,
+    status: "idle",
+    targetWindow: null,
+    armStartedAt: 0,
+    armEndsAt: 0,
+    lastError: "",
+    lastAction: String(reason || "Play mode stopped.").slice(0, 180)
+  });
+  saveState();
+  broadcastState();
+  return getSafeState();
+}
+
+async function toggleActionHarness(payload = {}) {
+  if (state.actionHarness?.playMode || state.actionHarness?.status === "arming") {
+    return { state: stopActionHarness("Play mode stopped.") };
+  }
+  return startActionHarness(payload);
+}
+
+function getDesktopActionHarnessTooling() {
+  if (!state.actionHarness?.playMode || !getActionHarnessTargetWindow()) {
+    return { tools: [], promptLines: [] };
+  }
+  const grid = actionHarness.normalizeGrid(state.actionHarness.grid);
+  const targetLabel = formatActionHarnessTargetLabel();
+  return {
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "desktop_action_capture_window",
+          description: "Capture the designated play-mode window with an A-Z by 1-N grid overlay and return it as visual context.",
+          parameters: {
+            type: "object",
+            properties: {
+              columns: { type: "integer", minimum: 2, maximum: actionHarness.MAX_GRID_COLUMNS, description: "Optional grid column count. Default keeps the current play-mode grid." },
+              rows: { type: "integer", minimum: 2, maximum: actionHarness.MAX_GRID_ROWS, description: "Optional grid row count. Default keeps the current play-mode grid." }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "desktop_action_mouse",
+          description: "Move or click the mouse in the designated play-mode window by grid cell, or by window screenshot pixel coordinates when needed.",
+          parameters: {
+            type: "object",
+            properties: {
+              cell: { type: "string", description: "Grid cell label from the latest capture, such as A1, C4, or H7." },
+              action: { type: "string", enum: ["move", "left_click", "double_click", "right_click", "middle_click"], description: "Mouse action to perform." },
+              type: { type: "string", description: "Alias for action, accepted for local Qwen/Hermes fallback calls." },
+              x: { type: "number", description: "Optional x coordinate from the play-mode screenshot if cell is not supplied." },
+              y: { type: "number", description: "Optional y coordinate from the play-mode screenshot if cell is not supplied." },
+              coordinateSpace: { type: "string", enum: ["window", "screen"], description: "Use window for screenshot-relative x/y, or screen for absolute desktop x/y." }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "desktop_action_key",
+          description: "Press a discrete key in the designated play-mode window.",
+          parameters: {
+            type: "object",
+            properties: {
+              key: {
+                type: "string",
+                description: "Supported keys include up, down, left, right, space, enter, escape, tab, backspace, delete, w, a, s, d, q, e, r, f, z, x, c, v, and digits 0-9."
+              },
+              repeat: { type: "integer", minimum: 1, maximum: 20, description: "Number of presses." },
+              holdMs: { type: "integer", minimum: 20, maximum: 5000, description: "How long each press is held." }
+            },
+            required: ["key"],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "desktop_action_type_text",
+          description: "Type short text into the designated play-mode window. Use only for text fields, not games.",
+          parameters: {
+            type: "object",
+            properties: {
+              text: { type: "string", maxLength: 1000, description: "Text to type." }
+            },
+            required: ["text"],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "desktop_action_wait",
+          description: "Wait briefly before the next capture or action.",
+          parameters: {
+            type: "object",
+            properties: {
+              ms: { type: "integer", minimum: 50, maximum: 10000, description: "Milliseconds to wait." }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "desktop_action_set_goal",
+          description: "Update the current play-mode self-goal, strategy, and lessons learned from recent action outcomes. Use this at decision checkpoints when the environment or strategy changes.",
+          parameters: {
+            type: "object",
+            properties: {
+              goal: { type: "string", maxLength: 300, description: "Current short self-goal for the target window." },
+              successAssessment: { type: "string", maxLength: 500, description: "What recent actions achieved or failed to achieve." },
+              lesson: { type: "string", maxLength: 500, description: "Useful context to remember to improve future actions." },
+              nextPlan: { type: "string", maxLength: 500, description: "Immediate strategy for the next one or more tool turns." }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "desktop_action_stop",
+          description: "Stop desktop play mode and disable autonomous mouse/keyboard actions.",
+          parameters: {
+            type: "object",
+            properties: {
+              reason: { type: "string", maxLength: 200 }
+            },
+            additionalProperties: false
+          }
+        }
+      }
+    ],
+    promptLines: [
+      `Desktop play mode is ON for ${targetLabel}.`,
+      "Desktop play mode tool format is strict. When taking a desktop action, output exactly one <tool_call> block and no other text.",
+      `Use desktop_action_capture_window to inspect the target window. The overlay grid has columns A-${actionHarness.gridColumnLabel(grid.columns - 1)} and rows 1-${grid.rows}; always prefer grid cells like C4 or AA12 over raw pixels.`,
+      "The grid origin is the top-left of the entire screenshot/window, including menus, score panels, sidebars, and ads. Never restart counting columns or rows at the game board or an app panel.",
+      "Before clicking, verify the intended UI element is actually inside the chosen global grid cell. If the board starts at column M, a board piece cannot be in column F.",
+      "Preferred mouse format: <tool_call>{\"name\":\"desktop_action_mouse\",\"arguments\":{\"cell\":\"G10\",\"action\":\"left_click\"}}</tool_call>.",
+      "Allowed mouse actions are exactly: move, left_click, double_click, right_click, middle_click.",
+      "Do not use x/y if a grid cell can be identified. Do not use type, button, click, screenX, or clientX in generated mouse calls.",
+      "If a grid cell cannot be identified, use screenshot-relative pixels with coordinateSpace:\"window\": <tool_call>{\"name\":\"desktop_action_mouse\",\"arguments\":{\"x\":418,\"y\":424,\"coordinateSpace\":\"window\",\"action\":\"left_click\"}}</tool_call>.",
+      "Keyboard format: <tool_call>{\"name\":\"desktop_action_key\",\"arguments\":{\"key\":\"space\"}}</tool_call>.",
+      "Text-entry workflow: click the visible input field first, then call desktop_action_type_text with the exact string, then use Enter or a click only if the UI requires submission.",
+      "Continuous play: after every tool result, inspect the latest attached screenshot and immediately output the next single <tool_call> if the goal is not complete.",
+      "Use the provided play memory to learn from the session: avoid repeating moves that did not visibly help, prefer actions that changed the target, and update your next action from the latest screenshot.",
+      "At decision checkpoints, judge whether recent actions succeeded. If strategy should change, call desktop_action_set_goal with the current self-goal, successAssessment, lesson, and nextPlan to enrich play memory.",
+      "Do not narrate progress between play-mode actions. Use normal text only when the goal is complete, you are blocked, or the user needs to intervene.",
+      "Use one desktop_action_mouse, desktop_action_key, desktop_action_type_text, desktop_action_wait, or desktop_action_set_goal per turn, then use the returned screenshot/tool result to decide the next action.",
+      "Only act inside the designated play-mode window. Stop if the user asks, the target is unclear, or the action could affect the wrong app."
+    ]
+  };
+}
+
+function getDesktopToolResultVisualAttachments(toolResult) {
+  if (!toolResult || typeof toolResult !== "object" || Array.isArray(toolResult)) {
+    return [];
+  }
+  return Array.isArray(toolResult.visualAttachments)
+    ? toolResult.visualAttachments.filter((item) => isDataImageUrl(item?.dataUrl))
+    : [];
+}
+
+function isDesktopActionHarnessToolName(toolName) {
+  return ACTION_HARNESS_TOOL_NAMES.has(String(toolName || "").trim());
+}
+
+function isDesktopActionHarnessInteractiveToolName(toolName) {
+  return [
+    "desktop_action_mouse",
+    "desktop_action_key",
+    "desktop_action_type_text",
+    "desktop_action_wait"
+  ].includes(String(toolName || "").trim());
+}
+
+function shouldNudgeDesktopActionHarnessContinue(reply) {
+  const text = String(reply || "").toLowerCase();
+  if (!text.trim()) {
+    return true;
+  }
+  const explicitStopPatterns = [
+    /\bplay mode complete\b/,
+    /\bgoal complete\b/,
+    /\btask complete\b/,
+    /\bstop play mode\b/,
+    /\bblocked\b/,
+    /\bcannot continue\b/,
+    /\bneed(?:s)? (?:user |your )?(?:direction|intervention|input)\b/,
+    /\buser should\b/
+  ];
+  if (explicitStopPatterns.some((pattern) => pattern.test(text))) {
+    return false;
+  }
+  return !(
+    text.includes("complete and no further action") ||
+    text.includes("no safe action available")
+  );
+}
+
+function getActionHarnessLoopBudget() {
+  return normalizeActionHarnessLoopBudget(state.actionHarness?.loopBudget);
+}
+
+function getActionHarnessNudgeInterval() {
+  return normalizeActionHarnessNudgeInterval(state.actionHarness?.nudgeInterval);
+}
+
+function getActionHarnessActionDelayMs() {
+  return normalizeActionHarnessActionDelayMs(state.actionHarness?.actionDelayMs);
+}
+
+function getActionHarnessCaptureMaxImageWidth() {
+  return normalizeActionHarnessCaptureMaxImageWidth(state.actionHarness?.captureMaxImageWidth);
+}
+
+function getActionHarnessCaptureJpegQuality() {
+  return normalizeActionHarnessCaptureJpegQuality(state.actionHarness?.captureJpegQuality);
+}
+
+function shouldRunActionHarnessLoopIteration(iteration, maxIterations) {
+  return Boolean(state.actionHarness?.playMode) && (maxIterations < 0 || iteration < maxIterations);
+}
+
+function shouldInsertActionHarnessDecisionNudge(iteration, nudgeInterval) {
+  return Boolean(state.actionHarness?.playMode) && nudgeInterval > 0 && iteration > 0 && iteration % nudgeInterval === 0;
+}
+
+function buildActionHarnessDecisionNudge(iteration) {
+  return [
+    `Play-mode decision checkpoint after ${iteration} action loop${iteration === 1 ? "" : "s"}.`,
+    "Judge whether the last actions visibly helped, failed, or were inconclusive from the latest screenshot and play memory.",
+    "Output exactly one desktop_action_set_goal tool call now with a concise current goal, successAssessment, lesson, and nextPlan so future actions have better context.",
+    "Then continue play mode on the following turn with the next action."
+  ].join(" ");
+}
+
+async function captureActionHarnessVisualAfterAction(actionLabel, delayMs = getActionHarnessActionDelayMs()) {
+  if (delayMs > 0) {
+    await actionHarness.delay(delayMs);
+  }
+  try {
+    const capture = await captureActionHarnessWindow({ grid: state.actionHarness?.grid });
+    const grid = actionHarness.normalizeGrid(capture.grid || state.actionHarness?.grid);
+    const label = formatActionHarnessTargetLabel(capture);
+    return {
+      content: `Latest play-mode screenshot after ${actionLabel}: ${label}. Grid columns A-${actionHarness.gridColumnLabel(grid.columns - 1)}, rows 1-${grid.rows}. Continue with the next single tool call if the goal is not complete.`,
+      visualAttachments: [
+        {
+          dataUrl: capture.dataUrl,
+          label: "latest play-mode window screenshot with grid overlay"
+        }
+      ]
+    };
+  } catch (error) {
+    const message = String(error?.message || error || "post-action capture failed");
+    appendRuntimeLog(`[desktop action harness] post-action capture failed after ${actionLabel}: ${message}`);
+    return {
+      content: `Automatic screenshot after ${actionLabel} failed: ${message}. Call desktop_action_capture_window before choosing another action.`,
+      visualAttachments: []
+    };
+  }
+}
+
+function normalizeDesktopActionMouseAction(args = {}) {
+  const raw = String(
+    args.action ||
+    args.type ||
+    args.mouseAction ||
+    args.mouse_action ||
+    args.click ||
+    "left_click"
+  ).trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (["move", "mousemove", "mouse_move", "hover"].includes(raw)) {
+    return "move";
+  }
+  if (["left", "click", "leftclick", "left_click", "tap"].includes(raw)) {
+    return "left_click";
+  }
+  if (["double", "doubleclick", "double_click", "dblclick", "dbl_click"].includes(raw)) {
+    return "double_click";
+  }
+  if (["right", "rightclick", "right_click", "context", "context_click"].includes(raw)) {
+    return "right_click";
+  }
+  if (["middle", "middleclick", "middle_click"].includes(raw)) {
+    return "middle_click";
+  }
+  return "left_click";
+}
+
+async function executeDesktopActionHarnessTool(toolName, args = {}) {
+  const normalizedArgs = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (toolName === "desktop_action_stop") {
+    const nextState = stopActionHarness(normalizedArgs.reason || "Play mode stopped by tool call.");
+    return {
+      success: true,
+      message: "Desktop play mode stopped.",
+      state: nextState
+    };
+  }
+  const { targetWindow } = ensureActionHarnessPlayMode();
+
+  if (toolName === "desktop_action_capture_window") {
+    const grid = actionHarness.normalizeGrid({
+      columns: normalizedArgs.columns || state.actionHarness?.grid?.columns,
+      rows: normalizedArgs.rows || state.actionHarness?.grid?.rows
+    });
+    const capture = await captureActionHarnessWindow({ grid });
+    const label = formatActionHarnessTargetLabel(capture);
+    return {
+      success: true,
+      message: `Captured ${label} with grid A-${actionHarness.gridColumnLabel(grid.columns - 1)} by 1-${grid.rows}.`,
+      content: `Use the attached play-mode screenshot to choose the next grid cell. Target window: ${label}. Grid columns A-${actionHarness.gridColumnLabel(grid.columns - 1)}, rows 1-${grid.rows}.`,
+      visualAttachments: [
+        {
+          dataUrl: capture.dataUrl,
+          label: "play-mode window screenshot with grid overlay"
+        }
+      ]
+    };
+  }
+
+  if (toolName === "desktop_action_set_goal") {
+    const goal = clipActionHarnessMemoryText(normalizedArgs.goal || "", 300);
+    const successAssessment = clipActionHarnessMemoryText(normalizedArgs.successAssessment || normalizedArgs.assessment || "", 500);
+    const lesson = clipActionHarnessMemoryText(normalizedArgs.lesson || normalizedArgs.memory || "", 500);
+    const nextPlan = clipActionHarnessMemoryText(normalizedArgs.nextPlan || normalizedArgs.plan || "", 500);
+    if (goal) {
+      actionHarnessRuntime.currentGoal = goal;
+    }
+    appendActionHarnessPlayMemory({
+      type: "self_goal",
+      observation: [successAssessment, lesson].filter(Boolean).join(" "),
+      result: [goal ? `Goal: ${goal}` : "", nextPlan ? `Next plan: ${nextPlan}` : ""].filter(Boolean).join(" ")
+    });
+    setActionHarnessState({
+      playMode: true,
+      status: "ready",
+      lastActionAt: Date.now(),
+      lastAction: "updated play memory",
+      lastError: ""
+    });
+    saveState();
+    broadcastState();
+    const postActionCapture = await captureActionHarnessVisualAfterAction("play-memory update", 0);
+    return {
+      success: true,
+      message: "Updated play-mode self-goal and memory.",
+      content: `Updated play memory.${goal ? ` Current self-goal: ${goal}.` : ""}${successAssessment ? ` Success assessment: ${successAssessment}.` : ""}${lesson ? ` Lesson: ${lesson}.` : ""}${nextPlan ? ` Next plan: ${nextPlan}.` : ""}\n\n${postActionCapture.content}`,
+      visualAttachments: postActionCapture.visualAttachments
+    };
+  }
+
+  if (toolName === "desktop_action_mouse") {
+    const capture = actionHarnessRuntime.lastCapture || await captureActionHarnessWindow({ grid: state.actionHarness?.grid });
+    const point = actionHarness.mouseTargetToScreenPoint(normalizedArgs, capture);
+    const requestedAction = normalizeDesktopActionMouseAction(normalizedArgs);
+    const button =
+      requestedAction === "right_click" ? "right" :
+      requestedAction === "middle_click" ? "middle" :
+      "left";
+    const clicks =
+      requestedAction === "move" ? 0 :
+      requestedAction === "double_click" ? 2 :
+      1;
+    let inputResult = null;
+    try {
+      inputResult = await actionHarness.sendMouseInput({
+        hwnd: targetWindow.hwnd,
+        x: point.x,
+        y: point.y,
+        button,
+        clicks,
+        requireActive: false
+      });
+    } catch (error) {
+      const message = String(error?.message || error || "Mouse action failed.");
+      appendRuntimeLog(`[desktop action harness] mouse failed ${requestedAction} ${point.cell}: ${message}`);
+      setActionHarnessState({
+        playMode: true,
+        status: "error",
+        lastError: message,
+        lastAction: `${requestedAction} ${point.cell} failed`
+      });
+      saveState();
+      broadcastState();
+      throw error;
+    }
+    const cursor = inputResult?.cursor || {};
+    const cursorWarning = String(cursor.warning || inputResult?.warning || "").trim();
+    appendRuntimeLog(`[desktop action harness] mouse ${requestedAction} ${point.cell} requested=(${point.x}, ${point.y}) cursor=(${cursor.x ?? "?"}, ${cursor.y ?? "?"}) focusMatched=${Boolean(inputResult?.focusMatched)} absoluteMoveUsed=${Boolean(cursor.absoluteMoveUsed)} verified=${cursor.verified !== false}`);
+    if (cursorWarning) {
+      appendRuntimeLog(`[desktop action harness] mouse warning ${requestedAction} ${point.cell}: ${cursorWarning}`);
+    }
+    setActionHarnessState({
+      playMode: true,
+      status: "ready",
+      lastActionAt: Date.now(),
+      lastAction: cursorWarning ? `${requestedAction} ${point.cell} (cursor warning)` : `${requestedAction} ${point.cell}`,
+      lastError: ""
+    });
+    saveState();
+    broadcastState();
+    const postActionCapture = await captureActionHarnessVisualAfterAction(`${requestedAction} ${point.cell}`);
+    const warningContent = cursorWarning ? `\n\nWarning: ${cursorWarning}` : "";
+    return {
+      success: true,
+      message: clicks ? `Performed ${requestedAction} at ${point.cell}.` : `Moved mouse to ${point.cell}.`,
+      content: `${requestedAction} at ${point.cell} (${point.x}, ${point.y}) in ${formatActionHarnessTargetLabel(targetWindow)}.${warningContent}\n\nIf the target did not visibly react, re-check that the chosen global grid cell is over the intended UI element; the grid covers the full screenshot, not just the game board.\n\n${postActionCapture.content}`,
+      visualAttachments: postActionCapture.visualAttachments
+    };
+  }
+
+  if (toolName === "desktop_action_key") {
+    const key = String(normalizedArgs.key || "").trim();
+    await actionHarness.sendKeyInput({
+      hwnd: targetWindow.hwnd,
+      key,
+      repeat: normalizedArgs.repeat,
+      holdMs: normalizedArgs.holdMs
+    });
+    setActionHarnessState({
+      playMode: true,
+      status: "ready",
+      lastActionAt: Date.now(),
+      lastAction: `key ${key}`,
+      lastError: ""
+    });
+    saveState();
+    broadcastState();
+    const postActionCapture = await captureActionHarnessVisualAfterAction(`key ${key}`);
+    return {
+      success: true,
+      message: `Pressed ${key}.`,
+      content: `Pressed ${key} in ${formatActionHarnessTargetLabel(targetWindow)}.\n\n${postActionCapture.content}`,
+      visualAttachments: postActionCapture.visualAttachments
+    };
+  }
+
+  if (toolName === "desktop_action_type_text") {
+    const text = String(normalizedArgs.text || "").slice(0, 1000);
+    await actionHarness.typeTextInput({
+      hwnd: targetWindow.hwnd,
+      text
+    });
+    setActionHarnessState({
+      playMode: true,
+      status: "ready",
+      lastActionAt: Date.now(),
+      lastAction: `typed ${text.length} chars`,
+      lastError: ""
+    });
+    saveState();
+    broadcastState();
+    const postActionCapture = await captureActionHarnessVisualAfterAction(`typed ${text.length} characters`);
+    return {
+      success: true,
+      message: `Typed ${text.length} characters.`,
+      content: `Typed ${text.length} characters in ${formatActionHarnessTargetLabel(targetWindow)}.\n\n${postActionCapture.content}`,
+      visualAttachments: postActionCapture.visualAttachments
+    };
+  }
+
+  if (toolName === "desktop_action_wait") {
+    const waitMs = Math.max(50, Math.min(10000, Math.round(Number(normalizedArgs.ms) || 500)));
+    await actionHarness.delay(waitMs);
+    const postActionCapture = await captureActionHarnessVisualAfterAction(`waiting ${waitMs}ms`, 0);
+    return {
+      success: true,
+      message: `Waited ${waitMs}ms.`,
+      content: `Waited ${waitMs}ms.\n\n${postActionCapture.content}`,
+      visualAttachments: postActionCapture.visualAttachments
+    };
+  }
+
+  throw new Error(`Unknown desktop action harness tool: ${toolName}`);
 }
 
 async function fetchDesktopToolingBundle(apiOrigin, options = {}) {
@@ -2922,7 +4314,7 @@ function composeDesktopSystemPrompt(basePrompt) {
 
 function buildDesktopToolSystemPrompt(basePrompt, toolingBundle) {
   const dynamicTools = Array.isArray(toolingBundle?.promptLines) && toolingBundle.promptLines.length
-    ? `\n\nAvailable proxy tools:\n${toolingBundle.promptLines.slice(0, 80).join("\n")}`
+    ? `\n\nAvailable tools:\n${toolingBundle.promptLines.slice(0, 100).join("\n")}`
     : "";
   const toolRules = `You are CATBot, a concise desktop companion with access to proxy-server tools.
 
@@ -2960,9 +4352,26 @@ function buildDesktopChatBody({ messages, model, tools, includeNativeTools = tru
   return body;
 }
 
+function serializeDesktopChatRequestBody(body) {
+  const text = JSON.stringify(body);
+  return {
+    text,
+    bytes: Buffer.byteLength(text, "utf8")
+  };
+}
+
 function shouldRetryDesktopChatWithoutNativeTools(error) {
   const message = String(error?.message || error || "").toLowerCase();
   return (
+    message.includes("channel") ||
+    message.includes("tool_call") ||
+    message.includes("tool call") ||
+    message.includes("tool role") ||
+    message.includes("role \"tool\"") ||
+    message.includes("role 'tool'") ||
+    message.includes("no user query") ||
+    message.includes("jinja") ||
+    message.includes("prompt template") ||
     message.includes("tool_choice") ||
     message.includes("tools") && (
       message.includes("unsupported") ||
@@ -2976,11 +4385,47 @@ function shouldRetryDesktopChatWithoutNativeTools(error) {
   );
 }
 
-async function requestDesktopChatCompletion(proxyUrl, body, headers, signal, apiOrigin) {
+function shouldUseDesktopNativeTools(options = {}) {
+  if (options.actionHarnessPlayMode) {
+    return false;
+  }
+  const model = String(options.model || "").toLowerCase();
+  const endpoint = String(options.endpoint || "").toLowerCase();
+  if (model.includes("qwen") || model.includes("hermes") || endpoint.includes("lmstudio")) {
+    return false;
+  }
+  return true;
+}
+
+function compactDesktopActionHarnessMessagesForRequest(messages = []) {
+  if (!Array.isArray(messages) || messages.length <= DESKTOP_ACTION_HARNESS_CONTEXT_TAIL_MESSAGES + 3) {
+    return messages;
+  }
+  const selected = [];
+  const seen = new Set();
+  const addMessage = (message) => {
+    if (!message || seen.has(message)) {
+      return;
+    }
+    seen.add(message);
+    selected.push(message);
+  };
+  if (messages[0]?.role === "system") {
+    addMessage(messages[0]);
+  }
+  const firstUserMessage = messages.find((message) => message?.role === "user");
+  addMessage(firstUserMessage);
+  for (const message of messages.slice(-DESKTOP_ACTION_HARNESS_CONTEXT_TAIL_MESSAGES)) {
+    addMessage(message);
+  }
+  return selected;
+}
+
+async function requestDesktopChatCompletion(proxyUrl, bodyText, headers, signal, apiOrigin) {
   const response = await net.fetch(proxyUrl, {
     method: "POST",
     headers,
-    body: JSON.stringify(body),
+    body: bodyText,
     signal
   });
   const responseText = await response.text();
@@ -3020,11 +4465,12 @@ function formatDesktopToolResultForModel(toolResult) {
     return toolResult;
   }
   if (toolResult && typeof toolResult === "object") {
+    const { visualAttachments: _visualAttachments, dataUrl: _dataUrl, ...modelSafeResult } = toolResult;
     if (typeof toolResult.content === "string" && toolResult.content.trim()) {
       return `${toolResult.message || "Tool result"}\n\n${toolResult.content}`;
     }
     try {
-      return JSON.stringify(toolResult);
+      return JSON.stringify(modelSafeResult);
     } catch (_) {
       return String(toolResult);
     }
@@ -3037,8 +4483,12 @@ async function executeDesktopToolCall(apiOrigin, toolCall, context = {}, signal 
   if (!toolName) {
     throw new Error("Tool call is missing a function name.");
   }
-  requireDesktopAuthToken(`running proxy tool ${toolName}`);
   const args = getDesktopToolCallArguments(toolCall);
+  if (isDesktopActionHarnessToolName(toolName)) {
+    appendRuntimeLog(`[desktop action harness] executing ${toolName} ${JSON.stringify(args).slice(0, 900)}`);
+    return executeDesktopActionHarnessTool(toolName, args);
+  }
+  requireDesktopAuthToken(`running proxy tool ${toolName}`);
   appendRuntimeLog(`[desktop tool] executing ${toolName} ${JSON.stringify(args).slice(0, 900)}`);
   const response = await net.fetch(`${apiOrigin}/v1/tools/execute`, {
     method: "POST",
@@ -3090,7 +4540,14 @@ async function sendDesktopChatMessage(payload = {}) {
   const history = normalizeDesktopChatHistory(payload.history || state.desktopChatHistory);
   const proxyUrl = `${apiOrigin}/v1/proxy/chat/completions${endpointOverride ? `?endpoint=${encodeURIComponent(endpointOverride)}` : ""}`;
   const controller = new AbortController();
-  const timeoutHandle = setTimeout(() => controller.abort(), 120000);
+  const playModeAtRequestStart = Boolean(state.actionHarness?.playMode);
+  const playModeLoopBudgetAtRequestStart = playModeAtRequestStart ? getActionHarnessLoopBudget() : 0;
+  const chatTimeoutMs = playModeAtRequestStart && playModeLoopBudgetAtRequestStart < 0
+    ? 0
+    : playModeAtRequestStart
+      ? DESKTOP_ACTION_HARNESS_CHAT_TIMEOUT_MS
+      : DESKTOP_CHAT_REQUEST_TIMEOUT_MS;
+  const timeoutHandle = chatTimeoutMs > 0 ? setTimeout(() => controller.abort(), chatTimeoutMs) : null;
   const lowLatency = Boolean(payload.lowLatency);
   let toolingBundle = await fetchDesktopToolingBundle(apiOrigin, {
     signal: controller.signal,
@@ -3103,8 +4560,19 @@ async function sendDesktopChatMessage(payload = {}) {
       forceRefresh: true
     });
   }
-  const tools = Array.isArray(toolingBundle.tools) ? toolingBundle.tools : [];
-  const systemPrompt = buildDesktopToolSystemPrompt(requestedSystemPrompt, toolingBundle);
+  const actionTooling = getDesktopActionHarnessTooling();
+  const tools = [
+    ...actionTooling.tools,
+    ...(Array.isArray(toolingBundle.tools) ? toolingBundle.tools : [])
+  ];
+  const systemPrompt = buildDesktopToolSystemPrompt(requestedSystemPrompt, {
+    ...toolingBundle,
+    tools,
+    promptLines: [
+      ...actionTooling.promptLines,
+      ...(Array.isArray(toolingBundle.promptLines) ? toolingBundle.promptLines : [])
+    ]
+  });
   const messages = [];
   if (systemPrompt) {
     messages.push({ role: "system", content: systemPrompt });
@@ -3133,82 +4601,237 @@ async function sendDesktopChatMessage(payload = {}) {
       },
       { providerApiKey: chatApiKey }
     );
-    let includeNativeTools = tools.length > 0;
+    const allowNativeTools = shouldUseDesktopNativeTools({
+      endpoint,
+      model,
+      actionHarnessPlayMode: Boolean(state.actionHarness?.playMode)
+    });
+    if (tools.length > 0 && !allowNativeTools) {
+      appendRuntimeLog("[desktop tools] using text fallback tool calls for this model/mode to avoid channel-template errors.");
+    }
+    let includeNativeTools = tools.length > 0 && allowNativeTools;
+    const buildRequestMessagesWithCurrentToolMode = () => {
+      const contextualMessagesRaw = state.actionHarness?.playMode
+        ? injectActionHarnessPlayMemoryMessage(compactDesktopActionHarnessMessagesForRequest(messages))
+        : messages;
+      const contextualMessages = state.actionHarness?.playMode
+        ? keepLatestDesktopVisualMessageOnly(contextualMessagesRaw)
+        : contextualMessagesRaw;
+      return includeNativeTools
+        ? contextualMessages
+        : sanitizeDesktopMessagesForTextFallback(contextualMessages, { endpoint, model });
+    };
     const requestChatWithCurrentToolMode = async () => {
+      const requestMessages = buildRequestMessagesWithCurrentToolMode();
+      const requestBody = buildDesktopChatBody({ messages: requestMessages, model, tools, includeNativeTools });
+      const requestStartedAt = Date.now();
+      const serializeStartedAt = Date.now();
+      const serializedRequestBody = serializeDesktopChatRequestBody(requestBody);
+      const serializeMs = Date.now() - serializeStartedAt;
+      if (state.actionHarness?.playMode) {
+        appendRuntimeLog(`[desktop chat] play request start mode=${includeNativeTools ? "native" : "text"} messages=${requestMessages.length} images=${countDesktopImagePartsInMessages(requestMessages)} bytes=${serializedRequestBody.bytes} serializeMs=${serializeMs}`);
+      }
       try {
-        return await requestDesktopChatCompletion(
+        const result = await requestDesktopChatCompletion(
           proxyUrl,
-          buildDesktopChatBody({ messages, model, tools, includeNativeTools }),
+          serializedRequestBody.text,
           requestHeaders,
           controller.signal,
           apiOrigin
         );
+        if (state.actionHarness?.playMode) {
+          appendRuntimeLog(`[desktop chat] play request completed in ${Date.now() - requestStartedAt}ms`);
+        }
+        return result;
       } catch (error) {
         if (!includeNativeTools || !shouldRetryDesktopChatWithoutNativeTools(error)) {
           throw error;
         }
         includeNativeTools = false;
         appendRuntimeLog(`[desktop tools] endpoint rejected native tool schema; retrying with text fallback: ${String(error?.message || error)}`);
-        return requestDesktopChatCompletion(
+        const fallbackMessages = buildRequestMessagesWithCurrentToolMode();
+        const fallbackBody = buildDesktopChatBody({ messages: fallbackMessages, model, tools, includeNativeTools });
+        const fallbackStartedAt = Date.now();
+        const fallbackSerializeStartedAt = Date.now();
+        const serializedFallbackBody = serializeDesktopChatRequestBody(fallbackBody);
+        const fallbackSerializeMs = Date.now() - fallbackSerializeStartedAt;
+        if (state.actionHarness?.playMode) {
+          appendRuntimeLog(`[desktop chat] play fallback request start messages=${fallbackMessages.length} images=${countDesktopImagePartsInMessages(fallbackMessages)} bytes=${serializedFallbackBody.bytes} serializeMs=${fallbackSerializeMs}`);
+        }
+        const fallbackResult = await requestDesktopChatCompletion(
           proxyUrl,
-          buildDesktopChatBody({ messages, model, tools, includeNativeTools }),
+          serializedFallbackBody.text,
           requestHeaders,
           controller.signal,
           apiOrigin
         );
+        if (state.actionHarness?.playMode) {
+          appendRuntimeLog(`[desktop chat] play fallback request completed in ${Date.now() - fallbackStartedAt}ms`);
+        }
+        return fallbackResult;
       }
     };
     let data = await requestChatWithCurrentToolMode();
     let assistantMessage = getDesktopChatResponseMessage(data);
     let reply = getVisibleDesktopAssistantText(assistantMessage);
     let toolIterations = 0;
+    const maxToolIterations = state.actionHarness?.playMode
+      ? getActionHarnessLoopBudget()
+      : DESKTOP_TOOL_LOOP_MAX_ITERATIONS;
+    const actionHarnessNudgeInterval = state.actionHarness?.playMode ? getActionHarnessNudgeInterval() : 0;
     let lastToolResultContent = "";
+    let lastActionHarnessVisualAttachments = [];
+    let actionHarnessContinueNudges = 0;
+    let actionHarnessCompletedActionLoops = 0;
+    const actionHarnessContinueNudgeLimit = maxToolIterations < 0
+      ? Number.POSITIVE_INFINITY
+      : DESKTOP_ACTION_HARNESS_CONTINUE_NUDGE_LIMIT;
 
-    while (toolIterations < DESKTOP_TOOL_LOOP_MAX_ITERATIONS) {
-      const { calls, native } = collectDesktopToolCalls(assistantMessage);
+    while (state.actionHarness?.playMode ? shouldRunActionHarnessLoopIteration(toolIterations, maxToolIterations) : toolIterations < maxToolIterations) {
+      const { calls } = collectDesktopToolCalls(assistantMessage);
+      const assistantObservation = getVisibleDesktopAssistantText(assistantMessage);
       if (!calls.length) {
+        if (state.actionHarness?.playMode && assistantObservation) {
+          appendActionHarnessPlayMemory({
+            type: "model_note",
+            observation: assistantObservation
+          });
+        }
+        if (
+          state.actionHarness?.playMode &&
+          actionHarnessContinueNudges < actionHarnessContinueNudgeLimit &&
+          shouldNudgeDesktopActionHarnessContinue(reply)
+        ) {
+          actionHarnessContinueNudges += 1;
+          const nudgeLimitLabel = Number.isFinite(actionHarnessContinueNudgeLimit) ? String(actionHarnessContinueNudgeLimit) : "infinite";
+          appendRuntimeLog(`[desktop action harness] nudging continuous play after non-tool reply (${actionHarnessContinueNudges}/${nudgeLimitLabel})`);
+          let nudgeVisualAttachments = lastActionHarnessVisualAttachments;
+          if (!nudgeVisualAttachments.length) {
+            const nudgeCapture = await captureActionHarnessVisualAfterAction("non-tool response", 0);
+            nudgeVisualAttachments = nudgeCapture.visualAttachments;
+            if (nudgeCapture.content) {
+              appendActionHarnessPlayMemory({
+                type: "capture",
+                result: nudgeCapture.content
+              });
+            }
+          }
+          messages.push(buildDesktopUserMessage(
+            "Continue desktop play mode. Inspect the latest attached screenshot/tool result and the play memory. If the goal is not complete and you are not blocked, output exactly one next <tool_call> and no prose. If complete or blocked, answer briefly with the reason.",
+            nudgeVisualAttachments,
+            { maxChars: 1300 }
+          ));
+          data = await requestChatWithCurrentToolMode();
+          assistantMessage = getDesktopChatResponseMessage(data);
+          reply = getVisibleDesktopAssistantText(assistantMessage);
+          continue;
+        }
         break;
       }
 
-      messages.push(buildDesktopAssistantHistoryMessage(assistantMessage));
+      messages.push(buildDesktopAssistantHistoryMessage(assistantMessage, {
+        toolCalls: calls
+      }));
+      actionHarnessContinueNudges = 0;
+      let actionHarnessToolAlreadyRan = false;
+      let actionHarnessActionToolRanThisStep = false;
+      const toolResponseParts = [];
+      const toolVisualAttachments = [];
       for (const toolCall of calls) {
         const toolName = getDesktopToolCallName(toolCall);
+        let toolArgsForMemory = {};
+        try {
+          toolArgsForMemory = getDesktopToolCallArguments(toolCall);
+        } catch (_) {
+          toolArgsForMemory = {};
+        }
         state.expression = "think";
         state.transientExpression = true;
         saveState();
         broadcastState();
-        const toolResult = await executeDesktopToolCall(
-          apiOrigin,
-          toolCall,
-          {
-            conversation_id: "desktop-avatar",
-            user_id: desktopAuth.username || "desktop-avatar",
-            metadata: { channel: "electron_desktop_avatar" }
-          },
-          controller.signal
-        );
+        const isActionHarnessTool = isDesktopActionHarnessToolName(toolName);
+        const toolResult = isActionHarnessTool && actionHarnessToolAlreadyRan
+          ? {
+              success: false,
+              message: "Skipped extra desktop action.",
+              content: "Only one desktop action harness tool is allowed per reasoning step. Inspect the latest result and call the next action in a later step."
+            }
+          : await executeDesktopToolCall(
+              apiOrigin,
+              toolCall,
+              {
+                conversation_id: "desktop-avatar",
+                user_id: desktopAuth.username || "desktop-avatar",
+                metadata: { channel: "electron_desktop_avatar" }
+              },
+              controller.signal
+            );
+        if (isActionHarnessTool) {
+          actionHarnessToolAlreadyRan = true;
+        }
+        if (isDesktopActionHarnessInteractiveToolName(toolName)) {
+          actionHarnessActionToolRanThisStep = true;
+        }
         const toolResultContent = formatDesktopToolResultForModel(toolResult);
         lastToolResultContent = toolResultContent;
-        if (native) {
-          messages.push({
-            role: "tool",
-            content: toolResultContent,
-            tool_call_id: toolCall.id || toolName
-          });
-        } else {
-          messages.push({
-            role: "user",
-            content: `Tool result from ${toolName}:\n<tool_response>\n${toolResultContent}\n</tool_response>`
+        if (isActionHarnessTool) {
+          appendActionHarnessPlayMemory({
+            type: "action",
+            toolName,
+            args: toolArgsForMemory,
+            observation: assistantObservation,
+            result: toolResultContent
           });
         }
+        toolResponseParts.push(`Tool result from ${toolName}:\n<tool_response>\n${toolResultContent}\n</tool_response>`);
+        const visualAttachments = getDesktopToolResultVisualAttachments(toolResult);
+        if (visualAttachments.length) {
+          toolVisualAttachments.push(...visualAttachments);
+        }
+      }
+      if (toolVisualAttachments.length) {
+        lastActionHarnessVisualAttachments = toolVisualAttachments;
       }
 
+      if (state.actionHarness?.playMode && actionHarnessActionToolRanThisStep) {
+        actionHarnessCompletedActionLoops += 1;
+      }
+      const nextToolIteration = toolIterations + 1;
+      const shouldInsertDecisionNudge = actionHarnessActionToolRanThisStep &&
+        shouldInsertActionHarnessDecisionNudge(actionHarnessCompletedActionLoops, actionHarnessNudgeInterval);
+
+      if (toolResponseParts.length) {
+        const visualInstruction = toolVisualAttachments.length
+          ? "\n\nInspect the attached visual result before choosing the next play-mode action."
+          : "";
+        const decisionInstruction = shouldInsertDecisionNudge
+          ? `\n\n${buildActionHarnessDecisionNudge(actionHarnessCompletedActionLoops)}`
+          : "";
+        messages.push(buildDesktopUserMessage(
+          `${toolResponseParts.join("\n\n")}${visualInstruction}${decisionInstruction}`,
+          toolVisualAttachments,
+          { maxChars: DESKTOP_TOOL_RESULT_MESSAGE_CHAR_LIMIT }
+        ));
+      }
+
+      if (playModeAtRequestStart && !state.actionHarness?.playMode) {
+        break;
+      }
+      if (state.actionHarness?.playMode && maxToolIterations >= 0 && nextToolIteration >= maxToolIterations) {
+        appendRuntimeLog(`[desktop action harness] loop budget reached (${nextToolIteration}/${maxToolIterations}).`);
+        break;
+      }
       data = await requestChatWithCurrentToolMode();
       assistantMessage = getDesktopChatResponseMessage(data);
       reply = getVisibleDesktopAssistantText(assistantMessage);
-      toolIterations += 1;
+      toolIterations = nextToolIteration;
     }
 
+    if (!reply) {
+      if (assistantMessageLooksLikeOnlyToolCall(assistantMessage)) {
+        reply = "Desktop action completed.";
+      }
+    }
     if (!reply) {
       reply = coerceAssistantTextFromChatResponse(data);
     }
@@ -3226,7 +4849,8 @@ async function sendDesktopChatMessage(payload = {}) {
       { role: "assistant", content: reply }
     ]);
 
-    const shouldSpeak = payload.speakReply == null ? state.speakChatReplies : Boolean(payload.speakReply);
+    const suppressPlayModeToolSpeech = playModeAtRequestStart && assistantMessageLooksLikeOnlyToolCall(assistantMessage);
+    const shouldSpeak = !suppressPlayModeToolSpeech && (payload.speakReply == null ? state.speakChatReplies : Boolean(payload.speakReply));
     state.speakChatReplies = shouldSpeak;
     state.expression = shouldSpeak ? "neutral" : inferDesktopAvatarExpression(reply);
     state.transientExpression = !shouldSpeak;
@@ -3246,6 +4870,7 @@ async function sendDesktopChatMessage(payload = {}) {
       state: getSafeState()
     };
   } catch (error) {
+    appendRuntimeLog(`[desktop chat] request failed: ${String(error?.message || error).slice(0, 1200)}`);
     state.expression = "sad";
     state.transientExpression = true;
     saveState();
@@ -3256,7 +4881,9 @@ async function sendDesktopChatMessage(payload = {}) {
     }
     throw error;
   } finally {
-    clearTimeout(timeoutHandle);
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
   }
 }
 
@@ -3420,6 +5047,10 @@ function updateTrayMenu() {
       click: () => startVoiceCaptureFromShortcut()
     },
     {
+      label: state.actionHarness?.playMode ? "Stop Desktop Play Mode (Ctrl+Shift+P)" : "Start Desktop Play Mode (Ctrl+Shift+P)",
+      click: () => toggleActionHarness({ armDelayMs: DESKTOP_ACTION_HARNESS_ARM_COUNTDOWN_MS }).catch((error) => appendRuntimeLog(`[action harness] ${String(error?.message || error)}`))
+    },
+    {
       label: "Open Web Client In Browser",
       enabled: Boolean(state.webClientUrl),
       click: () => shell.openExternal(state.webClientUrl)
@@ -3474,7 +5105,12 @@ function registerShortcuts() {
     "CommandOrControl+Shift+A": () => updateState({ visible: !state.visible }),
     "CommandOrControl+Shift+X": () => toggleClickThrough(),
     "CommandOrControl+Alt+Space": () => startVoiceCaptureFromShortcut(),
-    "CommandOrControl+Shift+Space": () => toggleQuickHud()
+    "CommandOrControl+Shift+Space": () => toggleQuickHud(),
+    "CommandOrControl+Shift+P": () => {
+      toggleActionHarness({ armDelayMs: DESKTOP_ACTION_HARNESS_ARM_COUNTDOWN_MS }).catch((error) => {
+        appendRuntimeLog(`[action harness shortcut] ${String(error?.message || error)}`);
+      });
+    }
   };
 
   for (const [accelerator, handler] of Object.entries(shortcuts)) {
@@ -3672,6 +5308,10 @@ ipcMain.handle("desktop:prewarm-chat", (_event, payload) => prewarmDesktopChat(p
 ipcMain.handle("desktop:send-chat-message", (_event, payload) => sendDesktopChatMessage(payload));
 ipcMain.handle("desktop:clear-chat-history", () => clearDesktopChatHistory());
 ipcMain.handle("desktop:capture-screen-snapshot", () => capturePrimaryScreenSnapshot());
+ipcMain.handle("desktop:start-action-harness", (_event, payload) => startActionHarness(payload));
+ipcMain.handle("desktop:stop-action-harness", (_event, reason) => stopActionHarness(reason));
+ipcMain.handle("desktop:toggle-action-harness", (_event, payload) => toggleActionHarness(payload));
+ipcMain.handle("desktop:capture-action-harness", (_event, payload) => captureActionHarnessWindow(payload));
 ipcMain.handle("desktop:transcribe-audio", (_event, payload) => transcribeDesktopAudio(payload));
 ipcMain.handle("desktop:resolve-asset-url", (_event, relativePath) => toAssetUrl(relativePath));
 ipcMain.handle("desktop:synthesize-preview-speech", async (_event, payload = {}) => {

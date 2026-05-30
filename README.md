@@ -909,7 +909,13 @@ Install all Python dependencies with: `pip install -r requirements.txt`
 Run tests from project root:
 
 ```bash
-# Run all tests
+# Full local regression run for Codex and maintainers
+python scripts/run_full_regression.py
+
+# List available regression suites
+python scripts/run_full_regression.py --list
+
+# Run all Python tests directly
 python -m pytest tests/ -v
 
 # Test file operations

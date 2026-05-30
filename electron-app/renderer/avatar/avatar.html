@@ -27,6 +27,13 @@
     <span class="voice-capture-dot" aria-hidden="true"></span>
     <span id="voice-capture-status-text">Listening...</span>
   </div>
+  <section class="action-arming-overlay" id="action-arming-overlay" aria-live="polite" aria-hidden="true">
+    <div class="action-arming-card">
+      <span class="action-arming-kicker">Desktop Play Mode</span>
+      <strong id="action-arming-countdown">5</strong>
+      <p id="action-arming-text">Select the required active window now. CATBot will bind to the foreground window when the countdown ends.</p>
+    </div>
+  </section>
   <section class="auth-gate" id="auth-gate" aria-label="Sign in required" role="dialog" aria-modal="true" aria-hidden="true">
     <div class="auth-gate-card">
       <p class="auth-gate-kicker">CATBot Desktop</p>
@@ -49,6 +56,9 @@
       </button>
       <button type="button" data-quick-action="screen" title="Toggle screen context" aria-label="Toggle screen context">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H4V5Zm2 2v6h12V7H6Z"/><path d="M10 17h4l1 2h3v2H6v-2h3l1-2Z"/></svg>
+      </button>
+      <button type="button" data-quick-action="play" title="Desktop play mode" aria-label="Desktop play mode">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5Z"/><path d="M4 4h2v16H4V4Z"/></svg>
       </button>
       <button type="button" data-quick-action="webcam" title="Toggle webcam context" aria-label="Toggle webcam context">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10v10H4V7Zm2 2v6h6V9H6Z"/><path d="m15 10 5-3v10l-5-3v-4Z"/><path d="M8 5h4l1 2H7l1-2Z"/></svg>
@@ -87,6 +97,7 @@
     <div class="sheet-grip" aria-hidden="true"></div>
     <div class="sheet-tabs" role="tablist" aria-label="Avatar control sections">
       <button type="button" data-hud-panel-button="chat">Chat</button>
+      <button type="button" data-hud-panel-button="play">Play</button>
       <button type="button" data-hud-panel-button="auth">Auth</button>
       <button type="button" data-hud-panel-button="models">Model</button>
       <button type="button" data-hud-panel-button="character">Character</button>
@@ -102,6 +113,23 @@
       </div>
       <div id="hud-chat-log" class="hud-chat-log" aria-live="polite"></div>
       <p class="sheet-hint">Use the prompt bar below. Replies can drive expression, speech bubble, and lip sync.</p>
+    </div>
+
+    <div class="sheet-panel" data-hud-panel="play">
+      <div class="sheet-title">
+        <span>Action Harness</span>
+        <strong id="hud-action-chip">Play Off</strong>
+      </div>
+      <p id="hud-action-status" class="sheet-hint">Start play mode, then focus the app or game window to designate it as the target.</p>
+      <div class="sheet-actions">
+        <button id="hud-action-start-btn" type="button">Start Play</button>
+        <button id="hud-action-stop-btn" type="button">Stop</button>
+        <button id="hud-action-capture-btn" type="button">Capture Grid</button>
+      </div>
+      <div class="hud-action-preview-wrap">
+        <img id="hud-action-preview" class="hud-action-preview" alt="Play-mode grid preview">
+      </div>
+      <p class="sheet-hint">When play mode is on, CATBot gets desktop-only tools for grid capture, mouse clicks, and discrete keys. Actions are constrained to the designated target window.</p>
     </div>
 
     <div class="sheet-panel" data-hud-panel="auth">
@@ -208,6 +236,19 @@
         <button id="hud-apply-window-size-btn" type="button">Apply Size</button>
         <button id="hud-reset-window-size-btn" type="button">Reset Size</button>
       </div>
+      <div class="sheet-title">
+        <span>Play Mode</span>
+      </div>
+      <div class="sheet-field-pair">
+        <label>Loop budget <input id="hud-play-loop-budget" type="number" min="-1" max="1000" step="1" inputmode="numeric"></label>
+        <label>Nudge interval <input id="hud-play-nudge-interval" type="number" min="0" max="50" step="1" inputmode="numeric"></label>
+      </div>
+      <label>Action delay ms <input id="hud-play-action-delay" type="number" min="0" max="3000" step="50" inputmode="numeric"></label>
+      <div class="sheet-field-pair">
+        <label>Capture width <input id="hud-play-capture-width" type="number" min="480" max="1600" step="40" inputmode="numeric"></label>
+        <label>JPEG quality <input id="hud-play-capture-quality" type="number" min="45" max="90" step="1" inputmode="numeric"></label>
+      </div>
+      <p class="sheet-hint">Set loop budget to -1 for indefinite play. Nudge interval inserts a success/strategy checkpoint every N completed actions; 0 disables interval nudges. Action delay is the wait before the next screenshot after an action. Lower capture width or JPEG quality improves play-loop speed; raise them for small UI accuracy.</p>
       <div class="sheet-actions">
         <button id="hud-save-settings-btn" type="button">Save</button>
         <button id="hud-toggle-speak-btn" type="button">Speak Replies: On</button>

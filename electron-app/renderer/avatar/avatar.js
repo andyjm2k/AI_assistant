@@ -17,6 +17,9 @@ const renderFallbackStatus = document.getElementById("render-fallback-status");
 const speechBubble = document.getElementById("speech-bubble");
 const voiceCaptureStatus = document.getElementById("voice-capture-status");
 const voiceCaptureStatusText = document.getElementById("voice-capture-status-text");
+const actionArmingOverlay = document.getElementById("action-arming-overlay");
+const actionArmingCountdown = document.getElementById("action-arming-countdown");
+const actionArmingText = document.getElementById("action-arming-text");
 const authGate = document.getElementById("auth-gate");
 const authGateProxyUrl = document.getElementById("auth-gate-proxy-url");
 const authGateUsername = document.getElementById("auth-gate-username");
@@ -35,6 +38,12 @@ const hudPanelButtons = Array.from(document.querySelectorAll("[data-hud-panel-bu
 const hudPanels = Array.from(document.querySelectorAll("[data-hud-panel]"));
 const hudChatLog = document.getElementById("hud-chat-log");
 const hudClearChatBtn = document.getElementById("hud-clear-chat-btn");
+const hudActionChip = document.getElementById("hud-action-chip");
+const hudActionStatus = document.getElementById("hud-action-status");
+const hudActionStartBtn = document.getElementById("hud-action-start-btn");
+const hudActionStopBtn = document.getElementById("hud-action-stop-btn");
+const hudActionCaptureBtn = document.getElementById("hud-action-capture-btn");
+const hudActionPreview = document.getElementById("hud-action-preview");
 const hudAuthChip = document.getElementById("hud-auth-chip");
 const hudAuthUsername = document.getElementById("hud-auth-username");
 const hudAuthPassword = document.getElementById("hud-auth-password");
@@ -78,6 +87,11 @@ const hudTtsModel = document.getElementById("hud-tts-model");
 const hudTtsVoice = document.getElementById("hud-tts-voice");
 const hudWindowWidth = document.getElementById("hud-window-width");
 const hudWindowHeight = document.getElementById("hud-window-height");
+const hudPlayLoopBudget = document.getElementById("hud-play-loop-budget");
+const hudPlayNudgeInterval = document.getElementById("hud-play-nudge-interval");
+const hudPlayActionDelay = document.getElementById("hud-play-action-delay");
+const hudPlayCaptureWidth = document.getElementById("hud-play-capture-width");
+const hudPlayCaptureQuality = document.getElementById("hud-play-capture-quality");
 const hudApplyWindowSizeBtn = document.getElementById("hud-apply-window-size-btn");
 const hudResetWindowSizeBtn = document.getElementById("hud-reset-window-size-btn");
 const hudSaveSettingsBtn = document.getElementById("hud-save-settings-btn");
@@ -99,6 +113,8 @@ const hudPreviewSpeechBtn = document.getElementById("hud-preview-speech-btn");
 const hudClearSpeechBtn = document.getElementById("hud-clear-speech-btn");
 const hudOpenBrowserBtn = document.getElementById("hud-open-browser-btn");
 const hudStatusOutput = document.getElementById("hud-status-output");
+
+const ACTION_HARNESS_ARM_COUNTDOWN_MS = 5000;
 
 let currentState = await window.catbotDesktop.getState();
 let currentAuthStatus = await window.catbotDesktop.getAuthStatus();
@@ -135,28 +151,24 @@ let speechPreviewInProgress = false;
 let speechPreviewPcmStreamActive = false;
 let speechPreviewPcmActiveSources = 0;
 let speechPreviewPcmNextPlayTime = 0;
+let speechPreviewLastPcmSchedule = null;
 let speechPreviewPcmCleanupFns = [];
 let speechPreviewStreamCancel = null;
 let speechGeneration = 0;
 let speechExpressionResetTimeout = 0;
 let lookTarget = null;
 let quickHudWasVisible = Boolean(currentState.quickHudVisible);
+let actionArmingCountdownTimer = 0;
 let pendingScreenSnapshot = null;
 let screenContextModeEnabled = Boolean(currentState.screenContextMode);
 let webcamStream = null;
 let webcamStartPromise = null;
 let micRecorder = null;
+let micStartPromise = null;
+let micStopRequestedDuringStart = false;
 let micStream = null;
 let micChunks = [];
-let micStopTimer = 0;
 let micAutoSendOnStop = false;
-let micAudioContext = null;
-let micAnalyserNode = null;
-let micSourceNode = null;
-let micAnalysisRafId = 0;
-let micRecordingStartedAt = 0;
-let micSpeechStarted = false;
-let micLastVoiceAt = 0;
 let voiceCaptureClearTimer = 0;
 let autoCompanionTimer = 0;
 let autoCompanionRunning = false;
@@ -200,11 +212,6 @@ const TTS_STREAMING_UTTERANCE_CHUNK_MAX_CHARS = 360;
 const TTS_UTTERANCE_FIRST_CHUNK_WORDS = 10;
 const TTS_UTTERANCE_CHUNK_WORDS = 18;
 const TTS_UTTERANCE_MIN_CHUNK_WORDS = 5;
-const VOICE_CAPTURE_MAX_MS = 10000;
-const VOICE_CAPTURE_MIN_MS = 650;
-const VOICE_CAPTURE_START_GRACE_MS = 2600;
-const VOICE_CAPTURE_SILENCE_MS = 850;
-const VOICE_CAPTURE_RMS_THRESHOLD = 0.028;
 const AUTO_COMPANION_MIN_DELAY_MS = 90000;
 const AUTO_COMPANION_MAX_DELAY_MS = 240000;
 const AUTO_COMPANION_USER_IDLE_GRACE_MS = 45000;
@@ -538,35 +545,66 @@ function allocateSpeechSentenceDurations(sentences, totalDurationMs) {
   });
 }
 
-function scheduleSpeechBubbleSentences(text, totalDurationMs, previewToken) {
-  clearSpeechBubbleSequence();
-  clearSpeechBubbleHideTimer();
-
+function queueSpeechBubbleSentences(text, totalDurationMs, previewToken, options = {}) {
   const sentences = splitSpeechIntoSentences(text);
   if (!sentences.length) {
-    hideSpeechBubble({ immediate: true });
-    return;
+    return false;
   }
 
   const durations = allocateSpeechSentenceDurations(sentences, totalDurationMs);
+  const startDelayMs = Math.max(0, Number(options.startDelayMs) || 0);
+  const elapsedOffsetMs = Math.max(0, Number(options.elapsedOffsetMs) || 0);
   let elapsedMs = 0;
   sentences.forEach((sentence, index) => {
     const sentenceDurationMs = durations[index] || 900;
+    const sentenceStartMs = elapsedMs;
+    const sentenceEndMs = sentenceStartMs + sentenceDurationMs;
+    elapsedMs = sentenceEndMs;
+    if (sentenceEndMs <= elapsedOffsetMs) {
+      return;
+    }
+    const visibleStartMs = Math.max(sentenceStartMs, elapsedOffsetMs);
+    const remainingSentenceMs = Math.max(0, sentenceEndMs - visibleStartMs);
+    const showDelayMs = Math.max(0, startDelayMs + sentenceStartMs - elapsedOffsetMs);
     const showTimer = window.setTimeout(() => {
       if (previewToken !== speechGeneration) {
         return;
       }
       showSpeechBubble(sentence);
-      const visibleDurationMs = Math.max(280, sentenceDurationMs - SPEECH_BUBBLE_FADE_MS - SPEECH_SENTENCE_GAP_MS);
+      const visibleDurationMs = Math.max(280, remainingSentenceMs - SPEECH_BUBBLE_FADE_MS - SPEECH_SENTENCE_GAP_MS);
       const hideTimer = window.setTimeout(() => {
-        if (previewToken === speechGeneration) {
+        if (previewToken === speechGeneration && speechBubble?.textContent === sentence) {
           hideSpeechBubble({ clearSequence: false });
         }
       }, visibleDurationMs);
       bubbleSequenceTimeouts.push(hideTimer);
-    }, elapsedMs);
+    }, showDelayMs);
     bubbleSequenceTimeouts.push(showTimer);
-    elapsedMs += sentenceDurationMs;
+  });
+  return true;
+}
+
+function scheduleSpeechBubbleSentences(text, totalDurationMs, previewToken) {
+  clearSpeechBubbleSequence();
+  clearSpeechBubbleHideTimer();
+
+  if (!queueSpeechBubbleSentences(text, totalDurationMs, previewToken)) {
+    hideSpeechBubble({ immediate: true });
+  }
+}
+
+function queueSpeechBubbleSentencesForAudioWindow(text, audioStartTime, audioEndTime, previewToken, fallbackDurationMs = 0) {
+  const startTime = Number(audioStartTime);
+  const endTime = Number(audioEndTime);
+  if (!audioContext || !Number.isFinite(startTime) || !Number.isFinite(endTime) || endTime <= startTime) {
+    return queueSpeechBubbleSentences(text, fallbackDurationMs, previewToken);
+  }
+
+  const currentTime = audioContext.currentTime;
+  const durationMs = Math.max(450, Math.round((endTime - startTime) * 1000));
+  return queueSpeechBubbleSentences(text, durationMs, previewToken, {
+    startDelayMs: Math.max(0, (startTime - currentTime) * 1000),
+    elapsedOffsetMs: Math.max(0, (currentTime - startTime) * 1000)
   });
 }
 
@@ -935,7 +973,7 @@ function canRunAutoCompanionAction() {
   if (!currentState.visible || currentState.moveMode || currentState.quickHudVisible || activeHudPanel) {
     return false;
   }
-  if (micRecorder?.state === "recording" || quickChatSend?.hasAttribute("aria-busy")) {
+  if (isMicrophoneCaptureActive() || quickChatSend?.hasAttribute("aria-busy")) {
     return false;
   }
   if (analyserSpeechActive || Date.now() < speechActiveUntil + AUTO_COMPANION_SPEECH_COOLDOWN_MS) {
@@ -1190,10 +1228,11 @@ function setHudPanel(panelName) {
         (action === "models" && activeHudPanel === "models") ||
         (action === "character" && activeHudPanel === "character") ||
         (action === "controls" && activeHudPanel === "settings") ||
+        (action === "play" && (activeHudPanel === "play" || currentState.actionHarness?.playMode)) ||
         (action === "screen" && screenContextModeEnabled) ||
         (action === "move" && currentState.moveMode) ||
         (action === "webcam" && currentState.webcamMode) ||
-        (action === "microphone" && micRecorder?.state === "recording")
+        (action === "microphone" && isMicrophoneCaptureActive())
     );
   }
   if (activeHudPanel === "chat") {
@@ -1205,6 +1244,8 @@ function setHudPanel(panelName) {
     void refreshHudCompanions({ silent: true });
   } else if (activeHudPanel === "status") {
     requestAnimationFrame(() => hudSpeechText?.focus());
+  } else if (activeHudPanel === "play") {
+    requestAnimationFrame(() => hudActionStartBtn?.focus());
   } else if (activeHudPanel === "settings") {
     void populateHudTtsVoiceOptions(hudTtsVoice?.value || currentState.ttsVoice);
   }
@@ -1239,6 +1280,89 @@ function renderHudChat(history = []) {
     hudChatLog.appendChild(item);
   }
   hudChatLog.scrollTop = hudChatLog.scrollHeight;
+}
+
+function getActionHarnessTargetLabel(actionHarness = currentState.actionHarness) {
+  const target = actionHarness?.targetWindow;
+  if (!target) {
+    return "No target window";
+  }
+  const title = String(target.title || "").trim() || `Window ${target.hwnd || ""}`.trim();
+  const rect = target.rect || {};
+  const width = Math.round(Number(rect.width) || 0);
+  const height = Math.round(Number(rect.height) || 0);
+  return width && height ? `${title} (${width}x${height})` : title;
+}
+
+function getActionHarnessArmingSeconds(actionHarness = currentState.actionHarness) {
+  const armEndsAt = Number(actionHarness?.armEndsAt) || 0;
+  if (!armEndsAt) {
+    return 5;
+  }
+  return Math.max(0, Math.ceil((armEndsAt - Date.now()) / 1000));
+}
+
+function syncActionHarnessArmingOverlay(state = currentState) {
+  const harness = state?.actionHarness || {};
+  const isArming = String(harness.status || "") === "arming";
+  document.body.classList.toggle("action-harness-arming", isArming);
+  if (actionArmingOverlay) {
+    actionArmingOverlay.setAttribute("aria-hidden", isArming ? "false" : "true");
+  }
+  if (actionArmingCountdown) {
+    actionArmingCountdown.textContent = String(getActionHarnessArmingSeconds(harness));
+  }
+  if (actionArmingText) {
+    actionArmingText.textContent = "Select the required active window now. Click or Alt-Tab to the target app before the countdown ends.";
+  }
+  if (actionArmingCountdownTimer) {
+    window.clearInterval(actionArmingCountdownTimer);
+    actionArmingCountdownTimer = 0;
+  }
+  if (isArming) {
+    actionArmingCountdownTimer = window.setInterval(() => {
+      const latestHarness = currentState.actionHarness || {};
+      if (String(latestHarness.status || "") !== "arming") {
+        syncActionHarnessArmingOverlay(currentState);
+        return;
+      }
+      if (actionArmingCountdown) {
+        actionArmingCountdown.textContent = String(getActionHarnessArmingSeconds(latestHarness));
+      }
+    }, 200);
+  }
+}
+
+function renderActionHarnessState(state = currentState) {
+  const harness = state?.actionHarness || {};
+  const playMode = Boolean(harness.playMode);
+  const status = String(harness.status || (playMode ? "ready" : "idle"));
+  const targetLabel = getActionHarnessTargetLabel(harness);
+  const grid = harness.grid || {};
+  const gridText = `${grid.columns || 12}x${grid.rows || 9}`;
+  const armingSeconds = getActionHarnessArmingSeconds(harness);
+  if (hudActionChip) {
+    hudActionChip.textContent = playMode ? "Play On" : status === "arming" ? "Arming" : "Play Off";
+  }
+  if (hudActionStatus) {
+    const detail = playMode
+      ? `Target: ${targetLabel}. Grid: ${gridText}. Last action: ${harness.lastAction || "none"}.`
+      : status === "arming"
+        ? `Select the required active window now. Binding in ${armingSeconds}s.`
+        : harness.lastError || "Start play mode, then focus the app or game window to designate it as the target.";
+    hudActionStatus.textContent = detail;
+    hudActionStatus.classList.toggle("is-error", status === "error");
+  }
+  if (hudActionStartBtn) {
+    hudActionStartBtn.textContent = playMode || status === "arming" ? "Restart Play" : "Start Play";
+    hudActionStartBtn.disabled = status === "arming";
+  }
+  if (hudActionStopBtn) {
+    hudActionStopBtn.disabled = !playMode && status !== "arming";
+  }
+  if (hudActionCaptureBtn) {
+    hudActionCaptureBtn.disabled = !playMode;
+  }
 }
 
 function renderAuthStatus(status = currentAuthStatus) {
@@ -1599,6 +1723,7 @@ async function setHudDefaultCompanion(companionId) {
 
 function renderHudState(state = currentState) {
   renderHudChat(state.desktopChatHistory);
+  renderActionHarnessState(state);
   if (hudSoulPrompt) {
     hudSoulPrompt.value = String(state.soulPrompt || "");
   }
@@ -1683,6 +1808,36 @@ function renderHudState(state = currentState) {
   if (hudWindowHeight) {
     hudWindowHeight.value = String(windowHeight);
   }
+  if (hudPlayLoopBudget) {
+    const loopBudget = Number.isFinite(Number(state.actionHarness?.loopBudget))
+      ? Math.round(Number(state.actionHarness.loopBudget))
+      : 80;
+    hudPlayLoopBudget.value = String(loopBudget);
+  }
+  if (hudPlayNudgeInterval) {
+    const nudgeInterval = Number.isFinite(Number(state.actionHarness?.nudgeInterval))
+      ? Math.round(Number(state.actionHarness.nudgeInterval))
+      : 5;
+    hudPlayNudgeInterval.value = String(nudgeInterval);
+  }
+  if (hudPlayActionDelay) {
+    const actionDelayMs = Number.isFinite(Number(state.actionHarness?.actionDelayMs))
+      ? Math.round(Number(state.actionHarness.actionDelayMs))
+      : 250;
+    hudPlayActionDelay.value = String(actionDelayMs);
+  }
+  if (hudPlayCaptureWidth) {
+    const captureWidth = Number.isFinite(Number(state.actionHarness?.captureMaxImageWidth))
+      ? Math.round(Number(state.actionHarness.captureMaxImageWidth))
+      : 800;
+    hudPlayCaptureWidth.value = String(captureWidth);
+  }
+  if (hudPlayCaptureQuality) {
+    const captureQuality = Number.isFinite(Number(state.actionHarness?.captureJpegQuality))
+      ? Math.round(Number(state.actionHarness.captureJpegQuality))
+      : 62;
+    hudPlayCaptureQuality.value = String(captureQuality);
+  }
   if (hudToggleSpeakBtn) {
     hudToggleSpeakBtn.textContent = `Speak Replies: ${state.speakChatReplies === false ? "Off" : "On"}`;
   }
@@ -1746,6 +1901,17 @@ function renderHudState(state = currentState) {
         defaultCompanionId: state.defaultCompanionId || "",
         speakChatReplies: state.speakChatReplies !== false,
         screenContextMode: Boolean(state.screenContextMode),
+        actionHarness: {
+          playMode: Boolean(state.actionHarness?.playMode),
+          status: state.actionHarness?.status || "idle",
+          target: getActionHarnessTargetLabel(state.actionHarness),
+          grid: state.actionHarness?.grid || {},
+          loopBudget: state.actionHarness?.loopBudget,
+          nudgeInterval: state.actionHarness?.nudgeInterval,
+          actionDelayMs: state.actionHarness?.actionDelayMs,
+          captureMaxImageWidth: state.actionHarness?.captureMaxImageWidth,
+          captureJpegQuality: state.actionHarness?.captureJpegQuality
+        },
         ttsEndpoint: state.ttsEndpoint || "(not set)"
       },
       null,
@@ -1807,6 +1973,11 @@ function getHudWindowBoundsPatch(widthValue = hudWindowWidth?.value, heightValue
 }
 
 function getHudSettingsPatch() {
+  const loopBudget = Math.round(Number(hudPlayLoopBudget?.value));
+  const nudgeInterval = Math.round(Number(hudPlayNudgeInterval?.value));
+  const actionDelayMs = Math.round(Number(hudPlayActionDelay?.value));
+  const captureMaxImageWidth = Math.round(Number(hudPlayCaptureWidth?.value));
+  const captureJpegQuality = Math.round(Number(hudPlayCaptureQuality?.value));
   const patch = {
     webClientUrl: hudWebUrl?.value.trim() || "",
     proxyBaseUrl: hudProxyUrl?.value.trim() || currentState.proxyBaseUrl,
@@ -1815,6 +1986,13 @@ function getHudSettingsPatch() {
     ttsEndpoint: hudTtsEndpoint?.value.trim() || "",
     ttsModel: hudTtsModel?.value.trim() || "tts-1",
     ttsVoice: hudTtsVoice?.value.trim() || "alloy",
+    actionHarness: {
+      loopBudget: Number.isFinite(loopBudget) ? loopBudget : currentState.actionHarness?.loopBudget,
+      nudgeInterval: Number.isFinite(nudgeInterval) ? nudgeInterval : currentState.actionHarness?.nudgeInterval,
+      actionDelayMs: Number.isFinite(actionDelayMs) ? actionDelayMs : currentState.actionHarness?.actionDelayMs,
+      captureMaxImageWidth: Number.isFinite(captureMaxImageWidth) ? captureMaxImageWidth : currentState.actionHarness?.captureMaxImageWidth,
+      captureJpegQuality: Number.isFinite(captureJpegQuality) ? captureJpegQuality : currentState.actionHarness?.captureJpegQuality
+    },
     ...getHudWindowBoundsPatch()
   };
   const typedProviderKey = hudChatApiKey?.value.trim() || "";
@@ -1835,13 +2013,14 @@ function updateQuickHudVisualState() {
   if (!quickHud) {
     return;
   }
-  const isRecording = Boolean(micRecorder && micRecorder.state === "recording");
+  const isRecording = isMicrophoneCaptureActive();
   for (const button of quickHud.querySelectorAll("[data-quick-action]")) {
     const action = button.dataset.quickAction;
     const isActive =
       (action === "microphone" && isRecording) ||
       (action === "webcam" && Boolean(currentState.webcamMode)) ||
-      (action === "screen" && screenContextModeEnabled);
+      (action === "screen" && screenContextModeEnabled) ||
+      (action === "play" && Boolean(currentState.actionHarness?.playMode));
     button.classList.toggle("is-active", isActive);
     button.classList.toggle("is-warming", action === "webcam" && Boolean(webcamStartPromise));
     button.classList.toggle("has-attachment", action === "screen" && Boolean(pendingScreenSnapshot));
@@ -1866,9 +2045,10 @@ function syncQuickHudControls(state = currentState) {
     const isActive =
       (action === "click-through" && !state.clickThrough) ||
       (action === "move" && state.moveMode) ||
-      (action === "microphone" && micRecorder?.state === "recording") ||
+      (action === "microphone" && isMicrophoneCaptureActive()) ||
       (action === "webcam" && state.webcamMode) ||
       (action === "screen" && screenContextModeEnabled) ||
+      (action === "play" && (state.actionHarness?.playMode || state.actionHarness?.status === "arming" || activeHudPanel === "play")) ||
       (action === "speak" && state.speakChatReplies !== false) ||
       (action === "focus-chat" && activeHudPanel === "chat") ||
       (action === "models" && activeHudPanel === "models") ||
@@ -1895,7 +2075,9 @@ async function sendQuickChatMessage(options = {}) {
   }
   const messageOverride = typeof options.message === "string" ? options.message.trim() : "";
   const isVoiceFlow = options.source === "voice";
-  const defaultVisualPrompt = pendingScreenSnapshot || screenContextModeEnabled
+  const defaultVisualPrompt = currentState.actionHarness?.playMode
+    ? "Inspect the play-mode window and decide the next safe action."
+    : pendingScreenSnapshot || screenContextModeEnabled
     ? "What can you see on my screen?"
     : currentState.webcamMode
       ? "What can you see from my webcam?"
@@ -1941,7 +2123,26 @@ async function sendQuickChatMessage(options = {}) {
     }
   }
   const screenImageDataUrl = options.screenImageDataUrl || screenSnapshot?.dataUrl || pendingScreenSnapshotForPrompt?.dataUrl || "";
-  const messageForModel = screenContextIssueNote ? `${text}\n\n[${screenContextIssueNote}]` : text;
+  let actionHarnessSnapshot = null;
+  let actionHarnessIssueNote = "";
+  if (currentState.actionHarness?.playMode && !options.actionHarnessImageDataUrl) {
+    try {
+      setQuickHudStatus("Capturing play window grid...");
+      if (isVoiceFlow) {
+        setVoiceCaptureStatus("Capturing play window...", "sending");
+      }
+      actionHarnessSnapshot = await window.catbotDesktop.captureActionHarness();
+      currentState = await window.catbotDesktop.getState();
+      renderHudState(currentState);
+    } catch (error) {
+      const message = formatQuickStatus(error?.message || error || "Play window capture failed.");
+      actionHarnessIssueNote = `Desktop play mode is on, but the play-window grid could not be attached because capture failed: ${message}. Ask for direction or use non-visual actions only if safe.`;
+      setQuickHudStatus(`${message} Sending without play-window grid.`);
+    }
+  }
+  const actionHarnessImageDataUrl = options.actionHarnessImageDataUrl || actionHarnessSnapshot?.dataUrl || "";
+  const promptNotes = [screenContextIssueNote, actionHarnessIssueNote].filter(Boolean);
+  const messageForModel = promptNotes.length ? `${text}\n\n[${promptNotes.join(" ")}]` : text;
   const usedPendingScreenSnapshot = Boolean(pendingScreenSnapshotForPrompt);
   try {
     const hiddenState = await window.catbotDesktop.setQuickHudVisible(false);
@@ -1962,6 +2163,7 @@ async function sendQuickChatMessage(options = {}) {
       lowLatency: Boolean(options.lowLatency),
       screenImageDataUrl,
       webcamImageDataUrl: webcamSnapshot?.dataUrl || "",
+      actionHarnessImageDataUrl,
       historyUserText: options.historyUserText || text
     });
     if (quickChatInput && options.clearInput !== false) {
@@ -2023,36 +2225,89 @@ async function attachScreenSnapshot() {
   quickChatInput?.focus();
 }
 
+function showActionHarnessPreview(capture) {
+  if (!hudActionPreview) {
+    return;
+  }
+  const dataUrl = String(capture?.dataUrl || "");
+  hudActionPreview.src = dataUrl;
+  hudActionPreview.parentElement?.classList.toggle("is-visible", Boolean(dataUrl));
+}
+
+async function startActionHarnessFromHud(options = {}) {
+  const quickStart = Boolean(options.quickStart);
+  setHudPanel("play");
+  setQuickHudStatus("Focus the target window now...");
+  showActionHarnessPreview(null);
+  try {
+    if (quickStart) {
+      await window.catbotDesktop.setQuickHudVisible(false);
+    }
+    const result = await window.catbotDesktop.startActionHarness({
+      armDelayMs: ACTION_HARNESS_ARM_COUNTDOWN_MS
+    });
+    if (result?.state) {
+      currentState = result.state;
+      applyStateToScene(currentState);
+      renderHudState(currentState);
+    }
+    showActionHarnessPreview(result?.capture);
+    const captureError = String(result?.captureError || "").trim();
+    setQuickHudStatus(captureError
+      ? `Play mode on: ${getActionHarnessTargetLabel(currentState.actionHarness)}. Initial grid capture failed; use Capture Grid to retry.`
+      : `Play mode on: ${getActionHarnessTargetLabel(currentState.actionHarness)}.`);
+  } catch (error) {
+    const message = formatQuickStatus(error?.message || error || "Could not start play mode.");
+    try {
+      currentState = await window.catbotDesktop.setQuickHudVisible(true);
+      setHudPanel("play");
+    } catch (_) {
+      // Keep the original action-harness error visible if the HUD restore fails.
+    }
+    setQuickHudStatus(message);
+    currentState = await window.catbotDesktop.getState();
+    renderHudState(currentState);
+  }
+}
+
+async function stopActionHarnessFromHud(reason = "Play mode stopped from HUD.") {
+  try {
+    currentState = await window.catbotDesktop.stopActionHarness(reason);
+    renderHudState(currentState);
+    updateQuickHudVisualState();
+    setQuickHudStatus("Play mode stopped.");
+  } catch (error) {
+    setQuickHudStatus(formatQuickStatus(error?.message || error || "Could not stop play mode."));
+  }
+}
+
+async function captureActionHarnessFromHud(options = {}) {
+  if (!currentState.actionHarness?.playMode) {
+    setQuickHudStatus("Start play mode before capturing a grid.");
+    return null;
+  }
+  try {
+    if (!options.silent) {
+      setQuickHudStatus("Capturing play window grid...");
+    }
+    const capture = await window.catbotDesktop.captureActionHarness();
+    currentState = await window.catbotDesktop.getState();
+    renderHudState(currentState);
+    showActionHarnessPreview(capture);
+    if (!options.silent) {
+      setQuickHudStatus(`Captured ${getActionHarnessTargetLabel(currentState.actionHarness)}.`);
+    }
+    return capture;
+  } catch (error) {
+    const message = formatQuickStatus(error?.message || error || "Play window capture failed.");
+    if (!options.silent) {
+      setQuickHudStatus(message);
+    }
+    return null;
+  }
+}
+
 function cleanupMicStream() {
-  if (micStopTimer) {
-    clearTimeout(micStopTimer);
-    micStopTimer = 0;
-  }
-  if (micAnalysisRafId) {
-    cancelAnimationFrame(micAnalysisRafId);
-    micAnalysisRafId = 0;
-  }
-  try {
-    micSourceNode?.disconnect();
-  } catch (_) {
-    // ignore source cleanup failures
-  }
-  try {
-    micAnalyserNode?.disconnect();
-  } catch (_) {
-    // ignore analyser cleanup failures
-  }
-  try {
-    micAudioContext?.close?.();
-  } catch (_) {
-    // ignore audio context cleanup failures
-  }
-  micAudioContext = null;
-  micAnalyserNode = null;
-  micSourceNode = null;
-  micRecordingStartedAt = 0;
-  micSpeechStarted = false;
-  micLastVoiceAt = 0;
   try {
     micStream?.getTracks?.().forEach((track) => track.stop());
   } catch (_) {
@@ -2071,62 +2326,6 @@ async function prewarmVoiceChat() {
   }
 }
 
-async function startMicSilenceDetection(stream) {
-  try {
-    micAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-    if (micAudioContext.state === "suspended") {
-      await micAudioContext.resume();
-    }
-    micSourceNode = micAudioContext.createMediaStreamSource(stream);
-    micAnalyserNode = micAudioContext.createAnalyser();
-    micAnalyserNode.fftSize = 1024;
-    micAnalyserNode.smoothingTimeConstant = 0.25;
-    micSourceNode.connect(micAnalyserNode);
-  } catch (error) {
-    console.warn("Could not start microphone silence detection:", error);
-    return;
-  }
-
-  const buffer = new Uint8Array(micAnalyserNode.fftSize);
-  micRecordingStartedAt = performance.now();
-  micSpeechStarted = false;
-  micLastVoiceAt = micRecordingStartedAt;
-
-  const step = () => {
-    if (!micRecorder || micRecorder.state !== "recording" || !micAnalyserNode) {
-      micAnalysisRafId = 0;
-      return;
-    }
-
-    micAnalyserNode.getByteTimeDomainData(buffer);
-    let sum = 0;
-    for (let index = 0; index < buffer.length; index += 1) {
-      const normalizedSample = (buffer[index] - 128) / 128;
-      sum += normalizedSample * normalizedSample;
-    }
-    const rms = Math.sqrt(sum / buffer.length);
-    const now = performance.now();
-    const elapsedMs = now - micRecordingStartedAt;
-
-    if (rms >= VOICE_CAPTURE_RMS_THRESHOLD) {
-      micSpeechStarted = true;
-      micLastVoiceAt = now;
-    }
-
-    const passedMinimum = elapsedMs >= VOICE_CAPTURE_MIN_MS;
-    const speechEnded = micSpeechStarted && now - micLastVoiceAt >= VOICE_CAPTURE_SILENCE_MS;
-    const noSpeechTimeout = !micSpeechStarted && elapsedMs >= VOICE_CAPTURE_START_GRACE_MS;
-    if (passedMinimum && (speechEnded || noSpeechTimeout)) {
-      stopMicrophoneRecording();
-      return;
-    }
-
-    micAnalysisRafId = requestAnimationFrame(step);
-  };
-
-  micAnalysisRafId = requestAnimationFrame(step);
-}
-
 async function transcribeMicBlob(blob) {
   if (!blob || blob.size <= 0) {
     throw new Error("No microphone audio was captured.");
@@ -2143,7 +2342,28 @@ async function transcribeMicBlob(blob) {
   return text;
 }
 
+function isMicrophoneCaptureActive() {
+  return Boolean(micStartPromise || micRecorder?.state === "recording");
+}
+
+function cutOffSpeechForMicrophoneCapture() {
+  if (!speechPreviewInProgress && !analyserSpeechActive && !speechPreviewAudio && Date.now() >= speechActiveUntil) {
+    return;
+  }
+  speechGeneration += 1;
+  stopSpeechPreview();
+}
+
 function stopMicrophoneRecording() {
+  if (micStartPromise && (!micRecorder || micRecorder.state !== "recording")) {
+    micStopRequestedDuringStart = true;
+    setQuickHudStatus("Stopping microphone...");
+    if (micAutoSendOnStop) {
+      setVoiceCaptureStatus("Stopping...", "transcribing");
+    }
+    updateQuickHudVisualState();
+    return;
+  }
   if (!micRecorder || micRecorder.state !== "recording") {
     return;
   }
@@ -2160,6 +2380,9 @@ function stopMicrophoneRecording() {
 }
 
 async function startMicrophoneRecording(options = {}) {
+  if (micStartPromise || micRecorder?.state === "recording") {
+    return micStartPromise;
+  }
   if (isAuthRequired()) {
     syncAuthGate(currentAuthStatus, { message: "Sign in before using voice chat." });
     return;
@@ -2172,13 +2395,15 @@ async function startMicrophoneRecording(options = {}) {
   }
 
   micAutoSendOnStop = Boolean(options.autoSend);
-  setQuickHudStatus("Listening...");
+  micStopRequestedDuringStart = false;
+  cutOffSpeechForMicrophoneCapture();
+  setQuickHudStatus("Listening. Trigger voice chat again to stop.");
   if (micAutoSendOnStop) {
-    setVoiceCaptureStatus("Listening...", "recording");
+    setVoiceCaptureStatus("Listening. Trigger again to stop.", "recording");
     void prewarmVoiceChat();
   }
   micChunks = [];
-  try {
+  micStartPromise = (async () => {
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -2187,7 +2412,6 @@ async function startMicrophoneRecording(options = {}) {
         channelCount: 1
       }
     });
-    void startMicSilenceDetection(micStream);
     const supportedMimeTypes = [
       "audio/webm;codecs=opus",
       "audio/webm",
@@ -2235,8 +2459,13 @@ async function startMicrophoneRecording(options = {}) {
       }
     });
     micRecorder.start(250);
-    micStopTimer = window.setTimeout(stopMicrophoneRecording, VOICE_CAPTURE_MAX_MS);
     updateQuickHudVisualState();
+    if (micStopRequestedDuringStart) {
+      stopMicrophoneRecording();
+    }
+  })();
+  try {
+    await micStartPromise;
   } catch (error) {
     micRecorder = null;
     micAutoSendOnStop = false;
@@ -2246,11 +2475,14 @@ async function startMicrophoneRecording(options = {}) {
     setQuickHudStatus(formatQuickStatus(message));
     setVoiceCaptureStatus(formatQuickStatus(message), "error");
     clearVoiceCaptureStatus(5000);
+  } finally {
+    micStartPromise = null;
+    updateQuickHudVisualState();
   }
 }
 
 async function toggleMicrophoneRecording(options = {}) {
-  if (micRecorder?.state === "recording") {
+  if (isMicrophoneCaptureActive()) {
     stopMicrophoneRecording();
     return;
   }
@@ -2300,6 +2532,12 @@ function setupQuickHud() {
       await toggleMicrophoneRecording({ autoSend: true });
     } else if (action === "screen") {
       await attachScreenSnapshot();
+    } else if (action === "play") {
+      if (currentState.actionHarness?.playMode || currentState.actionHarness?.status === "arming") {
+        await stopActionHarnessFromHud("Play mode stopped from quick action.");
+      } else {
+        await startActionHarnessFromHud({ quickStart: true });
+      }
     } else if (action === "webcam") {
       await toggleWebcamMode();
     } else if (action === "models") {
@@ -2343,6 +2581,10 @@ function setupQuickHud() {
     currentState = await window.catbotDesktop.clearChatHistory();
     renderHudState(currentState);
   });
+
+  hudActionStartBtn?.addEventListener("click", () => startActionHarnessFromHud({ quickStart: true }));
+  hudActionStopBtn?.addEventListener("click", () => stopActionHarnessFromHud());
+  hudActionCaptureBtn?.addEventListener("click", () => captureActionHarnessFromHud());
 
   hudAuthLoginBtn?.addEventListener("click", () => runHudAuth("login"));
   hudAuthSignupBtn?.addEventListener("click", () => runHudAuth("signup"));
@@ -4738,6 +4980,7 @@ async function loadLive2dModel(modelPath) {
 function applyStateToScene(state) {
   document.body.classList.toggle("move-mode", Boolean(state.moveMode));
   syncQuickHudControls(state);
+  syncActionHarnessArmingOverlay(state);
   const modelScale = Math.max(0.25, Math.min(2.5, Number(state.scale) || 1));
   syncAvatarOverlayPosition(state);
 
@@ -4935,6 +5178,7 @@ function logSpeechPreviewPcm(level, label, payload) {
 }
 
 function playPcmSpeechPreviewBytes(bytes, sampleRate, channels, previewToken, pcmFormat = {}) {
+  speechPreviewLastPcmSchedule = null;
   if (previewToken !== speechGeneration || !speechPreviewAnalyserNode || !audioContext) {
     return 0;
   }
@@ -5015,6 +5259,15 @@ function playPcmSpeechPreviewBytes(bytes, sampleRate, channels, previewToken, pc
   }
   const startAt = speechPreviewPcmNextPlayTime;
   speechPreviewPcmNextPlayTime = startAt + audioBuffer.duration;
+  speechPreviewLastPcmSchedule = {
+    startTime: startAt,
+    endTime: speechPreviewPcmNextPlayTime,
+    duration: audioBuffer.duration,
+    bytes: alignedLength,
+    sampleRate: safeSampleRate,
+    channels: safeChannels,
+    encoding: format.encoding
+  };
   logSpeechPreviewPcm("debug", "scheduled chunk", {
     bytes: alignedLength,
     encoding: format.encoding,
@@ -5342,14 +5595,45 @@ async function streamSpeechPreviewChunkToPcmQueue(chunkText, fallbackDurationMs,
   let pcmFormat = normalizeSpeechPreviewPcmFormat({ encoding: "s16le", bitsPerSample: 16 });
   let carry = new Uint8Array(0);
   let streamedBytes = 0;
+  let chunkAudioStartTime = 0;
+  let chunkAudioEndTime = 0;
+  let chunkBubbleQueued = false;
   const frameBytes = () => getSpeechPreviewPcmFrameBytes(pcmFormat, channels);
+  const rememberLastPcmSchedule = () => {
+    const schedule = speechPreviewLastPcmSchedule;
+    const startTime = Number(schedule?.startTime);
+    const endTime = Number(schedule?.endTime);
+    if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || endTime <= startTime) {
+      return;
+    }
+    chunkAudioStartTime = chunkAudioStartTime
+      ? Math.min(chunkAudioStartTime, startTime)
+      : startTime;
+    chunkAudioEndTime = Math.max(chunkAudioEndTime, endTime);
+  };
+  const scheduleChunkSpeechBubbleFromPcmTiming = () => {
+    if (chunkBubbleQueued || previewToken !== speechGeneration) {
+      return;
+    }
+    chunkBubbleQueued = queueSpeechBubbleSentencesForAudioWindow(
+      chunkText,
+      chunkAudioStartTime,
+      chunkAudioEndTime,
+      previewToken,
+      fallbackDurationMs
+    );
+  };
   const flushCarry = () => {
     if (carry.byteLength <= 0 || previewToken !== speechGeneration) {
       return;
     }
     const padded = new Uint8Array(carry.byteLength + (frameBytes() - (carry.byteLength % frameBytes())) % frameBytes());
     padded.set(carry);
-    streamedBytes += playPcmSpeechPreviewBytes(padded, sampleRate, channels, previewToken, pcmFormat);
+    const playedLength = playPcmSpeechPreviewBytes(padded, sampleRate, channels, previewToken, pcmFormat);
+    streamedBytes += playedLength;
+    if (playedLength > 0) {
+      rememberLastPcmSchedule();
+    }
     carry = new Uint8Array(0);
   };
   const flushPcmBytes = (value) => {
@@ -5371,6 +5655,9 @@ async function streamSpeechPreviewChunkToPcmQueue(chunkText, fallbackDurationMs,
     if (alignedLength > 0) {
       const playedLength = playPcmSpeechPreviewBytes(joined.subarray(0, alignedLength), sampleRate, channels, previewToken, pcmFormat);
       streamedBytes += playedLength;
+      if (playedLength > 0) {
+        rememberLastPcmSchedule();
+      }
     }
     carry = joined.slice(alignedLength);
   };
@@ -5393,7 +5680,6 @@ async function streamSpeechPreviewChunkToPcmQueue(chunkText, fallbackDurationMs,
         bytesPerSample: data?.bytesPerSample
       });
       forceNeutralVrmFaceForSpeech(state);
-      scheduleSpeechBubbleSentences(chunkText, fallbackDurationMs, previewToken);
       setStatus(statusText);
     },
     onChunk: flushPcmBytes,
@@ -5415,6 +5701,9 @@ async function streamSpeechPreviewChunkToPcmQueue(chunkText, fallbackDurationMs,
       return result;
     }
     if (result?.streamed) {
+      if (streamedBytes > 0) {
+        scheduleChunkSpeechBubbleFromPcmTiming();
+      }
       return { streamed: true, completed: streamedBytes > 0, streamedBytes };
     }
     if (result?.audioBuffer) {

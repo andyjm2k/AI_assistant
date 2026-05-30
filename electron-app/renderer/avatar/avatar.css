@@ -187,6 +187,63 @@ body.voice-capture-active .voice-capture-status {
   animation: none;
 }
 
+.action-arming-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 24;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  box-sizing: border-box;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(8px) scale(0.98);
+  transition: opacity 160ms ease, transform 160ms ease;
+  -webkit-app-region: no-drag;
+}
+
+body.action-harness-arming .action-arming-overlay {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.action-arming-card {
+  display: grid;
+  gap: 8px;
+  width: min(360px, calc(100vw - 36px));
+  padding: 16px 18px;
+  box-sizing: border-box;
+  border: 1px solid rgba(248, 252, 255, 0.18);
+  border-radius: 16px;
+  background: rgba(7, 8, 14, 0.9);
+  color: #f8fcff;
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.42);
+  text-align: center;
+  backdrop-filter: blur(16px);
+}
+
+.action-arming-kicker {
+  color: rgba(82, 214, 139, 0.94);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+#action-arming-countdown {
+  color: #fff;
+  font-size: 54px;
+  line-height: 0.95;
+  font-weight: 900;
+}
+
+#action-arming-text {
+  margin: 0;
+  color: rgba(248, 252, 255, 0.78);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
 @keyframes voiceCapturePulse {
   0% {
     box-shadow: 0 0 0 0 currentColor;
@@ -363,7 +420,7 @@ body.quick-hud-visible .quick-hud {
 
 .quick-action-bar {
   display: grid;
-  grid-template-columns: repeat(10, minmax(0, 1fr));
+  grid-template-columns: repeat(11, minmax(0, 1fr));
   gap: 6px;
   width: min(456px, 100%);
   padding: 7px;
@@ -529,7 +586,7 @@ body.hud-sheet-visible .hud-sheet {
 
 .sheet-tabs {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   gap: 6px;
   margin-bottom: 10px;
 }
@@ -677,6 +734,10 @@ body.hud-sheet-visible .hud-sheet {
   line-height: 1.35;
 }
 
+.sheet-hint.is-error {
+  color: #ff9daa;
+}
+
 .hud-chat-log {
   display: grid;
   gap: 7px;
@@ -700,6 +761,26 @@ body.hud-sheet-visible .hud-sheet {
   font: 10px/1.45 "Cascadia Mono", "Consolas", monospace;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.hud-action-preview-wrap {
+  display: none;
+  overflow: hidden;
+  border: 1px solid rgba(248, 252, 255, 0.1);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.hud-action-preview-wrap.is-visible {
+  display: block;
+}
+
+.hud-action-preview {
+  display: block;
+  width: 100%;
+  max-height: 170px;
+  object-fit: contain;
+  background: rgba(0, 0, 0, 0.18);
 }
 
 .hud-chat-message,
