@@ -96,6 +96,8 @@ class MemoryManager:
         )
         self._operational_state_pattern = re.compile(
             r"\b(todo|to-?do|task list|my tasks?|due tasks?|overdue tasks?|task execution|"
+            r"task outcome memory|experience hints from similar tasks|repeat for similar tasks|"
+            r"avoid for similar tasks|"
             r"execution status|status update|awaiting confirmation|paused awaiting feedback|"
             r"pending tasks?|completed tasks?|cancelled tasks?|task id|current state|"
             r"list state|working:|done:|failed:)\b",
@@ -151,6 +153,10 @@ class MemoryManager:
         Returns:
             Memory ID of the stored memory
         """
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Memory text is required")
+
         # Generate embedding for the text
         embedding = await self.embeddings_client.get_embedding(text)
         
@@ -188,7 +194,15 @@ class MemoryManager:
         # Check for None explicitly to allow 0 and 0.0 as valid values
         if limit is None:
             limit = self.search_limit
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = self.search_limit
         if similarity_threshold is None:
+            similarity_threshold = self.similarity_threshold
+        try:
+            similarity_threshold = float(similarity_threshold)
+        except (TypeError, ValueError):
             similarity_threshold = self.similarity_threshold
         
         # Generate embedding for query
@@ -467,6 +481,27 @@ class MemoryManager:
             return normalized
         return normalized[: max_chars - 3].rstrip() + "..."
 
+    def _merge_extra_metadata(
+        self,
+        base: Dict[str, Any],
+        extra: Optional[Dict[str, Any]],
+        protected_keys: Optional[set[str]] = None,
+    ) -> Dict[str, Any]:
+        """Merge caller metadata without allowing it to replace internal learning fields."""
+        merged = dict(base)
+        if not extra:
+            return merged
+        protected = set(protected_keys or set(base.keys()))
+        ignored: List[str] = []
+        for key, value in extra.items():
+            if key in protected:
+                ignored.append(str(key))
+                continue
+            merged[key] = value
+        if ignored:
+            merged["ignored_metadata_keys"] = sorted(set(ignored))
+        return merged
+
     def _normalize_task_outcome(self, status: Optional[str], message: Optional[str]) -> str:
         """Map raw execution status to normalized outcome buckets."""
         raw_status = (status or "").strip().lower()
@@ -650,8 +685,7 @@ class MemoryManager:
             "learning_points": learning_points,
             "event_timestamp": now,
         }
-        if metadata:
-            experience_metadata.update(metadata)
+        experience_metadata = self._merge_extra_metadata(experience_metadata, metadata)
 
         try:
             memory_ids.append(
@@ -673,9 +707,12 @@ class MemoryManager:
                     "task_description": task_text,
                     "status": status,
                     "outcome": outcome,
+                    "tool_names": normalized_tools,
+                    "learning_point": point,
                     "learning_rank": idx,
                     "event_timestamp": now,
                 }
+                learning_metadata = self._merge_extra_metadata(learning_metadata, metadata)
                 memory_ids.append(
                     await self.store_memory(
                         text=learning_text,
@@ -762,14 +799,50 @@ class MemoryManager:
             return ""
 
         lines = ["Experience hints from similar tasks:"]
-        for mem in successes[:2]:
-            text = self._sanitize_learning_text(mem.get("text", ""), max_chars=220)
+        seen_lines = set()
+        for mem in successes:
+            text = self._format_learning_memory_for_guidance(mem)
             if text:
-                lines.append(f"- Repeat: {text}")
-        for mem in failures[:2]:
-            text = self._sanitize_learning_text(mem.get("text", ""), max_chars=220)
+                key = f"repeat:{text.lower()}"
+                if key not in seen_lines:
+                    seen_lines.add(key)
+                    lines.append(f"- Repeat: {text}")
+            if len([line for line in lines if line.startswith("- Repeat:")]) >= 2:
+                break
+        for mem in failures:
+            text = self._format_learning_memory_for_guidance(mem)
             if text:
-                lines.append(f"- Avoid: {text}")
+                key = f"avoid:{text.lower()}"
+                if key not in seen_lines:
+                    seen_lines.add(key)
+                    lines.append(f"- Avoid: {text}")
+            if len([line for line in lines if line.startswith("- Avoid:")]) >= 2:
+                break
 
         return "\n".join(lines)
+
+    def _format_learning_memory_for_guidance(self, memory: Dict[str, Any]) -> str:
+        """Prefer distilled learning points over raw task-outcome prose."""
+        point = self._sanitize_learning_text(memory.get("learning_point"), max_chars=220)
+        if point:
+            return point
+
+        points = memory.get("learning_points")
+        if isinstance(points, list):
+            for item in points:
+                text = self._sanitize_learning_text(str(item), max_chars=220)
+                if text:
+                    return text
+
+        text = self._sanitize_learning_text(memory.get("text", ""), max_chars=220)
+        prefixes = (
+            "Repeat for similar tasks:",
+            "Avoid for similar tasks:",
+            "Note for similar tasks:",
+            "Task outcome memory.",
+        )
+        for prefix in prefixes:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+        return text
 

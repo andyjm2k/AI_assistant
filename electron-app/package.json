@@ -35,7 +35,6 @@
       "renderer/**/*",
       "assets/**/*",
       "config/**/*",
-      ".env",
       "package.json"
     ],
     "extraResources": [

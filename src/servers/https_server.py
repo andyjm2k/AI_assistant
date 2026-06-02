@@ -40,6 +40,19 @@ HOST = '0.0.0.0'  # Allow network access
 # Default certificate files (will be auto-detected if mkcert certificates exist)
 CERT_FILE = f"{_CERT_HOSTNAME}+2.pem"
 KEY_FILE = f"{_CERT_HOSTNAME}+2-key.pem"
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://cubism.live2d.com https://esm.sh; "
+    "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+    "img-src 'self' data: blob: http: https:; "
+    "font-src 'self' data: https://cdnjs.cloudflare.com; "
+    "connect-src 'self' data: blob: http: https: ws: wss:; "
+    "media-src 'self' data: blob: http: https:; "
+    "worker-src 'self' blob:; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'none'"
+)
 
 
 def _configure_console_output() -> None:
@@ -61,6 +74,7 @@ class MyHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Content-Security-Policy', CONTENT_SECURITY_POLICY)
         super().end_headers()
 
 def get_local_ip():

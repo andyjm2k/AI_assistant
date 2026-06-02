@@ -86,6 +86,80 @@ class TestVectorStore:
         
         assert "dimension mismatch" in str(exc_info.value).lower()
 
+    def test_add_embedding_metadata_cannot_override_reserved_fields(self, vector_store):
+        """Caller metadata must not corrupt memory identity, text, or embedding index."""
+        memory_id = vector_store.add_embedding(
+            embedding=[1.0, 0.0, 0.0],
+            text="Original memory text",
+            category="preference",
+            source="explicit",
+            metadata={
+                "id": "mem_bad",
+                "text": "Corrupted text",
+                "category": "task_learning",
+                "source": "task_execution",
+                "embedding_index": 999,
+                "timestamp": "not-a-real-timestamp",
+                "memory_type": "profile_fact",
+            },
+        )
+
+        memory = vector_store.get_memory(memory_id)
+        assert memory["id"] == memory_id
+        assert memory["text"] == "Original memory text"
+        assert memory["category"] == "preference"
+        assert memory["source"] == "explicit"
+        assert memory["embedding_index"] == 0
+        assert memory["memory_type"] == "profile_fact"
+        assert "embedding_index" in memory["ignored_metadata_keys"]
+
+        results = vector_store.search([1.0, 0.0, 0.0], limit=1, similarity_threshold=0.0)
+        assert results[0]["id"] == memory_id
+
+    def test_search_and_list_limit_zero_return_empty(self, vector_store):
+        """A zero result limit should mean zero results, not one or all."""
+        vector_store.add_embedding(embedding=[1.0, 0.0], text="Memory 1")
+        assert vector_store.search([1.0, 0.0], limit=0, similarity_threshold=0.0) == []
+        assert vector_store.list_memories(limit=0) == []
+        assert len(vector_store.search([1.0, 0.0], limit="1", similarity_threshold="0.0")) == 1
+        assert len(vector_store.list_memories(limit="1")) == 1
+
+    def test_get_memory_returns_copy(self, vector_store):
+        """External callers should not mutate in-memory metadata through get_memory."""
+        memory_id = vector_store.add_embedding(embedding=[1.0, 0.0], text="Immutable from caller")
+
+        memory = vector_store.get_memory(memory_id)
+        memory["text"] = "Mutated externally"
+
+        assert vector_store.get_memory(memory_id)["text"] == "Immutable from caller"
+
+    def test_load_repairs_duplicate_embedding_indices(self, temp_dir):
+        """Reload should repair unusable duplicate metadata indices instead of losing searchability."""
+        store = VectorStore(storage_path=temp_dir)
+        first_id = store.add_embedding(embedding=[1.0, 0.0], text="First memory")
+        second_id = store.add_embedding(embedding=[0.0, 1.0], text="Second memory")
+
+        metadata = json.loads(Path(temp_dir, "metadata.json").read_text(encoding="utf-8"))
+        metadata["memories"][1]["embedding_index"] = metadata["memories"][0]["embedding_index"]
+        Path(temp_dir, "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        repaired = VectorStore(storage_path=temp_dir)
+        assert repaired.get_memory(first_id)["embedding_index"] == 0
+        assert repaired.get_memory(second_id)["embedding_index"] == 1
+
+    def test_load_skips_metadata_records_without_ids(self, temp_dir):
+        """A malformed metadata row should not make every valid memory unavailable."""
+        store = VectorStore(storage_path=temp_dir)
+        memory_id = store.add_embedding(embedding=[1.0, 0.0], text="Valid memory")
+
+        metadata_path = Path(temp_dir, "metadata.json")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["memories"].append({"text": "Missing id", "embedding_index": 99})
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        reloaded = VectorStore(storage_path=temp_dir)
+        assert reloaded.get_memory(memory_id)["text"] == "Valid memory"
+
     def test_search_similar(self, vector_store):
         """Test similarity search."""
         # Add some embeddings

@@ -255,6 +255,8 @@ class TestMemoryManager:
         """Operational todo/task/status snapshots should be detected as non-durable memory text."""
         assert memory_manager.is_operational_memory_text("Todo list: 1. Pay rent 2. Submit report") is True
         assert memory_manager.is_operational_memory_text("Task execution status: awaiting confirmation") is True
+        assert memory_manager.is_operational_memory_text("Task outcome memory. Task: deploy app.") is True
+        assert memory_manager.is_operational_memory_text("Repeat for similar tasks: use write_file.") is True
         assert memory_manager.is_operational_memory_text("User prefers dark mode for coding.") is False
 
     def test_filter_memories_for_conversation_context_excludes_task_and_state(self, memory_manager):
@@ -262,6 +264,7 @@ class TestMemoryManager:
         memories = [
             {"text": "User prefers dark mode.", "category": "preference", "source": "conversation", "similarity": 0.92},
             {"text": "Task outcome memory. Task: deploy app.", "category": "task_experience", "source": "task_execution", "similarity": 0.90},
+            {"text": "Task outcome memory. Task: deploy app.", "category": "general", "source": "unknown", "similarity": 0.88},
             {"text": "Todo list: 1. buy milk", "category": "general", "source": "telegram", "similarity": 0.89},
         ]
         out = memory_manager.filter_memories_for_conversation_context(memories)
@@ -302,6 +305,44 @@ class TestMemoryManager:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     @pytest.mark.asyncio
+    async def test_record_task_outcome_protects_learning_metadata_fields(
+        self,
+        mock_embeddings_client,
+        mock_vector_store,
+    ):
+        """Caller metadata should not rewrite task-learning classification fields."""
+        tmp_dir = Path("memory_data") / f"test_task_learning_meta_{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            manager = MemoryManager(
+                storage_path=str(tmp_dir),
+                embeddings_client=mock_embeddings_client,
+                vector_store=mock_vector_store,
+            )
+            await manager.record_task_outcome(
+                task_description="Generate and save a research brief",
+                status="awaiting_confirmation",
+                summary="Used web search and wrote the brief to a file.",
+                tool_names=["web_search", "filesystem.write_text"],
+                metadata={
+                    "memory_type": "preference",
+                    "outcome": "failure",
+                    "event_timestamp": "bad",
+                    "user_key": "user-1",
+                },
+            )
+
+            first_call = mock_vector_store.add_embedding.call_args_list[0]
+            metadata = first_call.kwargs["metadata"]
+            assert metadata["memory_type"] == "task_experience"
+            assert metadata["outcome"] == "success"
+            assert metadata["user_key"] == "user-1"
+            assert "memory_type" in metadata["ignored_metadata_keys"]
+            assert "outcome" in metadata["ignored_metadata_keys"]
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @pytest.mark.asyncio
     async def test_build_task_execution_guidance_uses_task_learning_memories(self, memory_manager):
         """Guidance builder should include repeat/avoid hints from matching task memories."""
         memory_manager.search_memories = AsyncMock(
@@ -328,4 +369,30 @@ class TestMemoryManager:
         guidance = await memory_manager.build_task_execution_guidance("Generate a report and save it")
         assert "Repeat:" in guidance
         assert "Avoid:" in guidance
+
+    @pytest.mark.asyncio
+    async def test_build_task_execution_guidance_prefers_distilled_learning_points(self, memory_manager):
+        """Guidance should surface compact learning points instead of raw task memory wrappers."""
+        memory_manager.search_memories = AsyncMock(
+            return_value=[
+                {
+                    "text": "Task outcome memory. Task: publish notes. Outcome: success.",
+                    "category": "task_experience",
+                    "outcome": "success",
+                    "learning_points": ["Successful pattern: use filesystem.write_text for final artifacts."],
+                    "similarity": 0.91,
+                },
+                {
+                    "text": "Repeat for similar tasks: Successful pattern: use filesystem.write_text for final artifacts. (task: publish notes)",
+                    "category": "task_learning",
+                    "outcome": "success",
+                    "learning_point": "Successful pattern: use filesystem.write_text for final artifacts.",
+                    "similarity": 0.89,
+                },
+            ]
+        )
+
+        guidance = await memory_manager.build_task_execution_guidance("Publish notes")
+        assert guidance.count("Successful pattern: use filesystem.write_text") == 1
+        assert "Task outcome memory" not in guidance
 

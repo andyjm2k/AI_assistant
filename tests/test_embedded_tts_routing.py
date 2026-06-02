@@ -91,3 +91,15 @@ def test_proxy_tts_voices_forwards_model_query_to_upstream():
     assert response.status_code == 200, response.text
     assert requested_urls
     assert requested_urls[0].endswith("/voices?model=pocket-tts-realtime")
+
+
+def test_proxy_tts_speech_rejects_remote_endpoint_without_catbot_auth():
+    response = _client().post(
+        "/v1/proxy/tts/speech",
+        params={"endpoint": "https://evil.example"},
+        headers={"Authorization": "Bearer SECRET_TOKEN"},
+        json={"model": "tts-1", "voice": "alloy", "input": "hello"},
+    )
+
+    assert response.status_code == 401
+    assert "CATBot authentication is required" in response.json()["detail"]

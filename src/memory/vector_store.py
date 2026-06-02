@@ -4,10 +4,9 @@ Uses numpy for efficient vector operations and cosine similarity search.
 """
 
 import json
-import os
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from typing import Any, List, Dict, Optional
+from datetime import datetime, timezone
 import uuid
 import numpy as np
 
@@ -17,6 +16,16 @@ class VectorStore:
     Local file-based vector store for embeddings.
     Stores embeddings as numpy arrays and metadata as JSON.
     """
+
+    _RESERVED_METADATA_KEYS = {
+        "id",
+        "text",
+        "category",
+        "timestamp",
+        "source",
+        "embedding_index",
+        "similarity",
+    }
 
     def __init__(self, storage_path: str = "./memory_data"):
         """
@@ -43,6 +52,11 @@ class VectorStore:
         # Load existing data if available
         self._load()
 
+    @staticmethod
+    def _utc_timestamp() -> str:
+        """Return an ISO-8601 UTC timestamp with a Z suffix."""
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     def _load(self) -> None:
         """Load embeddings and metadata from disk."""
         # Load embeddings if file exists
@@ -58,16 +72,28 @@ class VectorStore:
             try:
                 with open(self.metadata_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    self.metadata = {item["id"]: item for item in data.get("memories", [])}
+                    loaded_metadata: Dict[str, Dict[str, Any]] = {}
+                    for item in data.get("memories", []):
+                        if not isinstance(item, dict):
+                            continue
+                        memory_id = str(item.get("id") or "").strip()
+                        if not memory_id:
+                            continue
+                        loaded_metadata[memory_id] = item
+                    self.metadata = loaded_metadata
             except Exception as e:
                 print(f"Warning: Failed to load metadata: {e}")
                 self.metadata = {}
         
         # Validate consistency between embeddings and metadata
-        self._validate_consistency()
+        if self._validate_consistency():
+            self._save(validate=False)
 
-    def _save(self) -> None:
+    def _save(self, validate: bool = True) -> None:
         """Save embeddings and metadata to disk."""
+        if validate:
+            self._validate_consistency()
+
         # Save embeddings array. When empty, remove stale on-disk vectors.
         if len(self.embeddings) > 0:
             np.save(str(self.embeddings_file), self.embeddings)
@@ -86,29 +112,105 @@ class VectorStore:
         config = {
             "embedding_dim": int(self.embeddings.shape[1]) if len(self.embeddings) > 0 else 0,
             "num_memories": len(self.metadata),
-            "last_updated": datetime.utcnow().isoformat() + "Z",
+            "last_updated": self._utc_timestamp(),
         }
         with open(self.config_file, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
 
-    def _validate_consistency(self) -> None:
-        """Validate that embeddings and metadata are consistent."""
-        # Check if number of embeddings matches number of metadata entries
+    def _validate_consistency(self) -> bool:
+        """Validate that embeddings and metadata are consistent.
+
+        Returns True when in-memory data was repaired.
+        """
+        changed = False
+
+        if not isinstance(self.embeddings, np.ndarray):
+            self.embeddings = np.array([])
+            changed = True
+
+        if self.embeddings.size == 0:
+            if len(self.embeddings) != 0:
+                self.embeddings = np.array([])
+                changed = True
+        elif self.embeddings.ndim == 1:
+            if len(self.metadata) <= 1:
+                self.embeddings = self.embeddings.reshape(1, -1)
+                changed = True
+            else:
+                print("Warning: Invalid one-dimensional embeddings with multiple metadata records")
+                self.embeddings = np.array([])
+                changed = True
+        elif self.embeddings.ndim != 2:
+            print(f"Warning: Invalid embeddings shape {self.embeddings.shape}; clearing memory vectors")
+            self.embeddings = np.array([])
+            changed = True
+
         num_embeddings = len(self.embeddings) if len(self.embeddings) > 0 else 0
-        num_metadata = len(self.metadata)
-        
-        # If mismatch, keep the smaller set and warn
-        if num_embeddings != num_metadata:
-            print(f"Warning: Embeddings ({num_embeddings}) and metadata ({num_metadata}) count mismatch")
-            
-            # If we have more embeddings than metadata, truncate embeddings
-            if num_embeddings > num_metadata:
-                self.embeddings = self.embeddings[:num_metadata]
-            # If we have more metadata than embeddings, remove extra metadata
-            elif num_metadata > num_embeddings:
-                # Keep only first num_embeddings metadata entries
-                metadata_items = list(self.metadata.items())[:num_embeddings]
-                self.metadata = dict(metadata_items)
+        if not self.metadata:
+            if num_embeddings:
+                print(f"Warning: Dropping {num_embeddings} embeddings without metadata")
+                self.embeddings = np.array([])
+                changed = True
+            return changed
+
+        if num_embeddings == 0:
+            print(f"Warning: Dropping {len(self.metadata)} metadata records without embeddings")
+            self.metadata = {}
+            return True
+
+        repaired_items = []
+        used_indices = set()
+        next_fallback_index = 0
+        for memory_id, memory_data in list(self.metadata.items()):
+            if not isinstance(memory_data, dict):
+                changed = True
+                continue
+
+            idx = memory_data.get("embedding_index")
+            idx_is_valid = isinstance(idx, int) and 0 <= idx < num_embeddings and idx not in used_indices
+            if not idx_is_valid:
+                while next_fallback_index < num_embeddings and next_fallback_index in used_indices:
+                    next_fallback_index += 1
+                if next_fallback_index >= num_embeddings:
+                    changed = True
+                    continue
+                idx = next_fallback_index
+                changed = True
+
+            used_indices.add(idx)
+            repaired_items.append((idx, memory_id, dict(memory_data)))
+
+        if len(repaired_items) != len(self.metadata) or len(repaired_items) != num_embeddings:
+            print(
+                f"Warning: Repaired vector-store consistency "
+                f"(embeddings={num_embeddings}, metadata={len(self.metadata)}, usable={len(repaired_items)})"
+            )
+            changed = True
+
+        repaired_items.sort(key=lambda item: item[0])
+        selected_indices = [idx for idx, _, _ in repaired_items]
+        if selected_indices:
+            if selected_indices != list(range(len(selected_indices))):
+                changed = True
+            self.embeddings = self.embeddings[selected_indices]
+        else:
+            self.embeddings = np.array([])
+
+        repaired_metadata: Dict[str, Dict[str, Any]] = {}
+        for new_index, (_, memory_id, memory_data) in enumerate(repaired_items):
+            if memory_data.get("id") != memory_id:
+                memory_data["id"] = memory_id
+                changed = True
+            if memory_data.get("embedding_index") != new_index:
+                memory_data["embedding_index"] = new_index
+                changed = True
+            repaired_metadata[memory_id] = memory_data
+
+        if repaired_metadata != self.metadata:
+            self.metadata = repaired_metadata
+            changed = True
+
+        return changed
 
     def add_embedding(
         self,
@@ -166,14 +268,21 @@ class VectorStore:
             "id": memory_id,
             "text": text,
             "category": category or "general",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": self._utc_timestamp(),
             "source": source or "unknown",
             "embedding_index": embedding_index,
         }
         
-        # Add any additional metadata
+        # Add any additional metadata without allowing callers to corrupt index keys.
         if metadata:
-            memory_metadata.update(metadata)
+            ignored_keys = []
+            for key, value in metadata.items():
+                if key in self._RESERVED_METADATA_KEYS:
+                    ignored_keys.append(str(key))
+                    continue
+                memory_metadata[key] = value
+            if ignored_keys:
+                memory_metadata["ignored_metadata_keys"] = sorted(set(ignored_keys))
         
         # Store metadata
         self.metadata[memory_id] = memory_metadata
@@ -202,6 +311,21 @@ class VectorStore:
         Returns:
             List of memory dictionaries with similarity scores, sorted by relevance
         """
+        if limit is None:
+            limit = 5
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 5
+        if limit <= 0:
+            return []
+        if similarity_threshold is None:
+            similarity_threshold = 0.0
+        try:
+            similarity_threshold = float(similarity_threshold)
+        except (TypeError, ValueError):
+            similarity_threshold = 0.0
+
         # If no embeddings stored, return empty list
         if len(self.embeddings) == 0:
             return []
@@ -275,7 +399,8 @@ class VectorStore:
         Returns:
             Memory metadata dict or None if not found
         """
-        return self.metadata.get(memory_id)
+        memory = self.metadata.get(memory_id)
+        return memory.copy() if memory else None
 
     def get_memories_by_category(self, category: str) -> List[Dict]:
         """
@@ -352,7 +477,14 @@ class VectorStore:
         memories.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
         
         # Apply limit if specified
-        if limit:
+        if limit is not None:
+            try:
+                limit = int(limit)
+            except (TypeError, ValueError):
+                limit = None
+        if limit is not None:
+            if limit <= 0:
+                return []
             memories = memories[:limit]
         
         return [memory.copy() for memory in memories]

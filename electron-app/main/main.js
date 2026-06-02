@@ -14,6 +14,7 @@ const {
   net,
   screen,
   session,
+  safeStorage,
   desktopCapturer
 } = require("electron");
 
@@ -240,6 +241,29 @@ function appendRuntimeLog(message) {
 
 function normalizeUrlString(value) {
   return String(value || "").trim().replace(/\/+$/, "");
+}
+
+function isSafeExternalUrl(value) {
+  const normalized = normalizeUrlString(value);
+  if (!normalized) {
+    return false;
+  }
+  try {
+    const parsed = new URL(normalized);
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch (_) {
+    return false;
+  }
+}
+
+function openSafeExternalUrl(value) {
+  const normalized = normalizeUrlString(value);
+  if (!isSafeExternalUrl(normalized)) {
+    appendRuntimeLog(`[security] blocked external URL: ${normalized || "(empty)"}`);
+    return false;
+  }
+  shell.openExternal(normalized).catch((error) => appendRuntimeLog(`[security] openExternal failed: ${String(error?.message || error)}`));
+  return true;
 }
 
 function normalizeEndpointString(value) {
@@ -1823,6 +1847,7 @@ const DEFAULT_STATE = (() => {
 
 let state = deepMerge(DEFAULT_STATE, loadJsonFile(USER_STATE_FILE, {}));
 let desktopAuth = loadDesktopAuth();
+saveDesktopAuth();
 const migratedProviderApiKey = String(state.chatApiKey || "").trim() || getBootstrapProviderApiKey();
 if (migratedProviderApiKey && !desktopAuth.chatApiKey) {
   desktopAuth.chatApiKey = migratedProviderApiKey;
@@ -1866,6 +1891,10 @@ state.speechBubbleText = "";
 state.speechTriggerId = 0;
 state.speechDurationMs = 2600;
 state.webClientUrl = normalizeUrlString(state.webClientUrl);
+if (state.webClientUrl && !isSafeExternalUrl(state.webClientUrl)) {
+  appendRuntimeLog(`[security] discarded unsafe web client URL: ${state.webClientUrl}`);
+  state.webClientUrl = "";
+}
 state.proxyBaseUrl = normalizeUrlString(state.proxyBaseUrl || DEFAULT_STATE.proxyBaseUrl || DEFAULT_PROXY_BASE_URL);
 
 function saveState() {
@@ -1891,22 +1920,70 @@ function saveState() {
   });
 }
 
+function canEncryptDesktopSecret() {
+  try {
+    return Boolean(safeStorage?.isEncryptionAvailable?.());
+  } catch (_) {
+    return false;
+  }
+}
+
+function protectDesktopSecret(value) {
+  const text = String(value || "");
+  if (!text) {
+    return null;
+  }
+  if (!canEncryptDesktopSecret()) {
+    if (String(process.env.ELECTRON_ALLOW_PLAINTEXT_AUTH_STORAGE || "").toLowerCase() === "true") {
+      return { encoding: "plain", value: text };
+    }
+    appendRuntimeLog("[security] Electron safeStorage is unavailable; secret was not persisted.");
+    return null;
+  }
+  return {
+    encoding: "safeStorage",
+    value: safeStorage.encryptString(text).toString("base64")
+  };
+}
+
+function unprotectDesktopSecret(value) {
+  if (!value) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (value.encoding === "plain") {
+    return String(value.value || "").trim();
+  }
+  if (value.encoding === "safeStorage" && value.value && canEncryptDesktopSecret()) {
+    try {
+      return safeStorage.decryptString(Buffer.from(String(value.value), "base64")).trim();
+    } catch (error) {
+      appendRuntimeLog(`[security] failed to decrypt desktop secret: ${String(error?.message || error)}`);
+      return "";
+    }
+  }
+  return "";
+}
+
 function loadDesktopAuth() {
   const saved = loadJsonFile(USER_AUTH_FILE, {});
-  const accessToken = String(saved.accessToken || "").trim();
+  const accessToken = unprotectDesktopSecret(saved.accessTokenSecret || saved.accessToken);
   const tokenUsable = isDesktopJwtTokenUsable(accessToken);
   return {
     accessToken: tokenUsable ? accessToken : "",
     username: tokenUsable ? String(saved.username || "").trim() : "",
-    chatApiKey: String(saved.chatApiKey || "").trim()
+    chatApiKey: unprotectDesktopSecret(saved.chatApiKeySecret || saved.chatApiKey)
   };
 }
 
 function saveDesktopAuth() {
   saveJsonFile(USER_AUTH_FILE, {
-    accessToken: desktopAuth.accessToken || "",
+    version: 2,
+    accessTokenSecret: protectDesktopSecret(desktopAuth.accessToken),
     username: desktopAuth.username || "",
-    chatApiKey: desktopAuth.chatApiKey || ""
+    chatApiKeySecret: protectDesktopSecret(desktopAuth.chatApiKey)
   });
 }
 
@@ -2208,6 +2285,10 @@ function applyCompanionSettingsToDesktopState(settings = {}) {
   state.chatSystemPrompt = String(state.chatSystemPrompt || DEFAULT_STATE.chatSystemPrompt || "").trim();
   state.proxyBaseUrl = normalizeUrlString(state.proxyBaseUrl || DEFAULT_STATE.proxyBaseUrl || DEFAULT_PROXY_BASE_URL);
   state.webClientUrl = normalizeUrlString(state.webClientUrl);
+  if (state.webClientUrl && !isSafeExternalUrl(state.webClientUrl)) {
+    appendRuntimeLog(`[security] discarded unsafe web client URL: ${state.webClientUrl}`);
+    state.webClientUrl = "";
+  }
   state.ttsEndpoint = normalizeUrlString(state.ttsEndpoint);
   state.ttsModel = String(state.ttsModel || "tts-1").trim() || "tts-1";
   state.ttsVoice = String(state.ttsVoice || "alloy").trim() || "alloy";
@@ -2936,6 +3017,45 @@ function createControlWindow() {
   });
 }
 
+function isAllowedWebClientNavigation(targetUrl) {
+  const normalizedTarget = normalizeUrlString(targetUrl);
+  if (!normalizedTarget) {
+    return false;
+  }
+  if (normalizedTarget.startsWith("data:text/html,")) {
+    return !state.webClientUrl;
+  }
+  const configuredUrl = normalizeUrlString(state.webClientUrl);
+  if (!configuredUrl) {
+    return false;
+  }
+  try {
+    const target = new URL(normalizedTarget);
+    const configured = new URL(configuredUrl);
+    return target.origin === configured.origin;
+  } catch {
+    return false;
+  }
+}
+
+function installWebClientNavigationGuards(windowInstance) {
+  windowInstance.webContents.setWindowOpenHandler(({ url }) => {
+    if (url) {
+      openSafeExternalUrl(url);
+    }
+    return { action: "deny" };
+  });
+  windowInstance.webContents.on("will-navigate", (event, url) => {
+    if (isAllowedWebClientNavigation(url)) {
+      return;
+    }
+    event.preventDefault();
+    if (url) {
+      openSafeExternalUrl(url);
+    }
+  });
+}
+
 function createWebClientWindow() {
   webClientWindow = new BrowserWindow({
     ...constrainWindowBounds("webClientBounds", state.webClientBounds),
@@ -2947,11 +3067,12 @@ function createWebClientWindow() {
     title: "CATBot Web Client",
     icon: getLogoPath(),
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true
     }
   });
+  installWebClientNavigationGuards(webClientWindow);
 
   if (state.webClientUrl) {
     webClientWindow.loadURL(state.webClientUrl);
@@ -3165,6 +3286,11 @@ function updateState(partialState = {}) {
   state.quickHudVisible = Boolean(state.quickHudVisible);
   if (!state.visible) {
     state.quickHudVisible = false;
+  }
+  state.webClientUrl = normalizeUrlString(state.webClientUrl);
+  if (state.webClientUrl && !isSafeExternalUrl(state.webClientUrl)) {
+    appendRuntimeLog(`[security] discarded unsafe web client URL: ${state.webClientUrl}`);
+    state.webClientUrl = "";
   }
 
   if (webClientWindow && !webClientWindow.isDestroyed()) {
@@ -4519,7 +4645,7 @@ async function sendDesktopChatMessage(payload = {}) {
   }
 
   const requestedWebClientUrl = normalizeUrlString(payload.webClientUrl || state.webClientUrl);
-  if (requestedWebClientUrl) {
+  if (requestedWebClientUrl && isSafeExternalUrl(requestedWebClientUrl)) {
     state.webClientUrl = requestedWebClientUrl;
   }
   const requestedProxyBaseUrl = normalizeUrlString(payload.proxyBaseUrl || state.proxyBaseUrl || DEFAULT_STATE.proxyBaseUrl || DEFAULT_PROXY_BASE_URL);
@@ -5053,7 +5179,7 @@ function updateTrayMenu() {
     {
       label: "Open Web Client In Browser",
       enabled: Boolean(state.webClientUrl),
-      click: () => shell.openExternal(state.webClientUrl)
+      click: () => openSafeExternalUrl(state.webClientUrl)
     },
     {
       type: "separator"
@@ -5301,8 +5427,7 @@ ipcMain.handle("desktop:launch-external-web-client", () => {
   if (!state.webClientUrl) {
     return false;
   }
-  shell.openExternal(state.webClientUrl);
-  return true;
+  return openSafeExternalUrl(state.webClientUrl);
 });
 ipcMain.handle("desktop:prewarm-chat", (_event, payload) => prewarmDesktopChat(payload));
 ipcMain.handle("desktop:send-chat-message", (_event, payload) => sendDesktopChatMessage(payload));

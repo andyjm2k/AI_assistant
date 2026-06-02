@@ -16,3 +16,11 @@ def test_default_auth_token_lifetime_is_23_hours():
     payload = json.loads(_base64url_decode(token.split(".")[1]).decode("utf-8"))
 
     assert payload["exp"] - payload["iat"] == 23 * 60 * 60
+
+
+def test_jwt_secret_never_uses_static_placeholder():
+    from src.servers import proxy_server as ps
+
+    assert ps._is_insecure_jwt_secret("change-this-secret-in-production") is True
+    assert ps.JWT_SECRET != "change-this-secret-in-production"
+    assert len(ps.JWT_SECRET) >= 32

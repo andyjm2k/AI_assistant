@@ -19,6 +19,7 @@ import base64
 import binascii
 import hmac
 import hashlib
+import ipaddress
 import secrets
 import glob
 import socket
@@ -470,6 +471,7 @@ class FileResponse(BaseModel):
 class AuthSignupRequest(BaseModel):
     username: str
     password: str
+    invite_code: Optional[str] = Field(default=None, validation_alias=AliasChoices("invite_code", "inviteCode"))
 
 
 class AuthLoginRequest(BaseModel):
@@ -778,6 +780,8 @@ MEMORY_CONTEXT_BLOCKED_CATEGORIES = {"task_experience", "task_learning"}
 MEMORY_CONTEXT_BLOCKED_SOURCES = {"task_execution", "task_scheduler", "status_system"}
 MEMORY_CONTEXT_OPERATIONAL_PATTERN = re.compile(
     r"\b(todo|to-?do|task list|my tasks?|due tasks?|overdue tasks?|task execution|"
+    r"task outcome memory|experience hints from similar tasks|repeat for similar tasks|"
+    r"avoid for similar tasks|"
     r"execution status|status update|awaiting confirmation|paused awaiting feedback|"
     r"pending tasks?|completed tasks?|cancelled tasks?|task id|current state|"
     r"list state|working:|done:|failed:)\b",
@@ -2120,6 +2124,40 @@ def _is_trusted_openai_proxy_endpoint(endpoint: str) -> bool:
     return bool(canonical and canonical in _get_trusted_openai_proxy_bases())
 
 
+def _bearer_token_from_authorization_header(auth_header: Optional[str]) -> str:
+    raw = str(auth_header or "").strip()
+    if not raw.lower().startswith("bearer "):
+        return ""
+    return raw[7:].strip()
+
+
+def _looks_like_jwt(token: Optional[str]) -> bool:
+    raw = str(token or "").strip()
+    return bool(raw and len(raw.split(".")) == 3)
+
+
+def _headers_have_valid_catbot_auth(
+    authorization: Optional[str] = None,
+    x_auth_token: Optional[str] = None,
+) -> bool:
+    jwt_authorization = authorization if _looks_like_jwt(_bearer_token_from_authorization_header(authorization)) else None
+    jwt_x_auth_token = x_auth_token if _looks_like_jwt(x_auth_token) else None
+    if not jwt_authorization and not jwt_x_auth_token:
+        return False
+    try:
+        get_current_user_from_headers(jwt_authorization, jwt_x_auth_token)
+        return True
+    except Exception:
+        return False
+
+
+def _request_has_valid_catbot_auth(request: Request) -> bool:
+    return _headers_have_valid_catbot_auth(
+        request.headers.get("Authorization"),
+        request.headers.get("X-Auth-Token"),
+    )
+
+
 def _resolve_openai_proxy_request(
     requested_endpoint: Optional[str],
     *,
@@ -2151,13 +2189,10 @@ def _resolve_openai_proxy_request(
             detail="Configured proxy endpoint is not trusted. Set OPENAI_API_BASE or OPENAI_PROXY_TRUSTED_BASE_URLS correctly.",
         )
 
-    proxy_user_authenticated = False
-    if request_proxy_auth_token:
-        try:
-            get_current_user_from_headers(None, request_proxy_auth_token)
-            proxy_user_authenticated = True
-        except HTTPException:
-            proxy_user_authenticated = False
+    proxy_user_authenticated = _headers_have_valid_catbot_auth(None, request_proxy_auth_token)
+    if auth_header and _headers_have_valid_catbot_auth(auth_header, None):
+        proxy_user_authenticated = True
+        auth_header = ""
 
     if not auth_header:
         if not trusted_endpoint:
@@ -2173,10 +2208,36 @@ def _resolve_openai_proxy_request(
             return resolved_endpoint, trusted_endpoint, "", False
         primary_api_key = _first_non_empty_env(preferred_api_key_env_names(resolved_endpoint, model_name))
         if primary_api_key:
+            if not proxy_user_authenticated:
+                raise HTTPException(
+                    status_code=401,
+                    detail="CATBot authentication is required to use server proxy credentials.",
+                )
             auth_header = f"Bearer {primary_api_key}"
             using_server_credentials = True
 
     return resolved_endpoint, trusted_endpoint, auth_header, using_server_credentials
+
+
+def _resolve_authenticated_server_proxy_credentials(
+    endpoint: str,
+    *,
+    default_endpoint: str,
+    endpoint_kind: str,
+    request_proxy_auth_token: Optional[str],
+    model_name: Optional[str] = None,
+) -> Tuple[str, str, bool]:
+    resolved_endpoint, trusted_endpoint, auth_header, using_server_credentials = _resolve_openai_proxy_request(
+        endpoint,
+        default_endpoint=default_endpoint,
+        endpoint_kind=endpoint_kind,
+        request_auth_header="",
+        request_proxy_auth_token=request_proxy_auth_token,
+        model_name=model_name,
+    )
+    if trusted_endpoint and auth_header and using_server_credentials:
+        return resolved_endpoint, auth_header, True
+    return resolved_endpoint, "", False
 
 
 def _estimate_total_tokens(messages: List[Dict[str, Any]], max_tokens: int) -> int:
@@ -2617,10 +2678,43 @@ CODEX_AUTOGEN_WORKSPACES_DIRNAME = "autogen"
 # Auth configuration
 AUTH_USERS_FILE = _PROJECT_ROOT / "config" / "auth_users.json"
 ENV_FILE = _PROJECT_ROOT / ".env"
-JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-in-production")
+_INSECURE_JWT_SECRET_VALUES = {
+    "",
+    "change-this-secret-in-production",
+    "changeme",
+    "secret",
+    "password",
+}
+JWT_SECRET_IS_EPHEMERAL = False
+
+
+def _is_insecure_jwt_secret(secret_value: Optional[str]) -> bool:
+    normalized = str(secret_value or "").strip()
+    return len(normalized) < 32 or normalized.lower() in _INSECURE_JWT_SECRET_VALUES
+
+
+def _load_jwt_secret() -> str:
+    global JWT_SECRET_IS_EPHEMERAL
+    configured = str(os.getenv("JWT_SECRET", "") or "").strip()
+    if not _is_insecure_jwt_secret(configured):
+        JWT_SECRET_IS_EPHEMERAL = False
+        return configured
+    JWT_SECRET_IS_EPHEMERAL = True
+    print(
+        "[WARN] JWT_SECRET is missing or insecure; using a process-local random JWT secret. "
+        "Set a strong JWT_SECRET to keep sessions valid across restarts.",
+        flush=True,
+    )
+    return secrets.token_urlsafe(48)
+
+
+JWT_SECRET = _load_jwt_secret()
 JWT_ALGORITHM = "HS256"
 DEFAULT_JWT_EXPIRATION_SECONDS = 23 * 60 * 60
 JWT_EXPIRATION_SECONDS = int(os.getenv("JWT_EXPIRATION_SECONDS", str(DEFAULT_JWT_EXPIRATION_SECONDS)))
+AUTH_ALLOW_PUBLIC_SIGNUP = _env_bool("AUTH_ALLOW_PUBLIC_SIGNUP", default=False)
+AUTH_BOOTSTRAP_FIRST_USER = _env_bool("AUTH_BOOTSTRAP_FIRST_USER", default=True)
+AUTH_SIGNUP_INVITE_CODE = (os.getenv("AUTH_SIGNUP_INVITE_CODE") or "").strip()
 SPOTIFY_ACCOUNTS_BASE = "https://accounts.spotify.com"
 SPOTIFY_AUTH_BASE = "https://accounts.spotify.com/api"
 SPOTIFY_OAUTH_TIMEOUT_SECONDS = 20.0
@@ -2679,6 +2773,17 @@ def load_users_db() -> None:
     except Exception as e:
         print(f"âš ï¸ Failed to load users database: {e}")
         users_db = {}
+
+
+def _signup_allowed(request: AuthSignupRequest) -> bool:
+    if AUTH_ALLOW_PUBLIC_SIGNUP:
+        return True
+    invite_code = str(request.invite_code or "").strip()
+    if AUTH_SIGNUP_INVITE_CODE and hmac.compare_digest(invite_code, AUTH_SIGNUP_INVITE_CODE):
+        return True
+    if AUTH_BOOTSTRAP_FIRST_USER and not users_db:
+        return True
+    return False
 
 
 def create_jwt(payload: Dict[str, Any], expires_in: int = JWT_EXPIRATION_SECONDS) -> str:
@@ -2948,12 +3053,51 @@ def _telegram_secret_matches(request: Request) -> bool:
     return False
 
 
-def _validate_telegram_secret(request: Request) -> None:
-    """If TELEGRAM_SECRET is set, require X-Telegram-Secret or Authorization Bearer to match; else raise 401."""
-    if not TELEGRAM_SECRET:
+def _is_loopback_request(request: Request) -> bool:
+    client_host = ""
+    try:
+        client_host = str(getattr(request.client, "host", "") or "").strip().lower()
+    except Exception:
+        client_host = ""
+    if client_host in {"localhost", "testclient"}:
+        return True
+    if not client_host:
+        return False
+    try:
+        return ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        return False
+
+
+def _request_has_internal_or_local_access(request: Request) -> bool:
+    return (
+        _request_has_valid_catbot_auth(request)
+        or _autogen_team_secret_matches(request)
+        or _telegram_secret_matches(request)
+        or _is_loopback_request(request)
+    )
+
+
+def _require_internal_or_local_access(request: Request, capability: str) -> None:
+    if _request_has_internal_or_local_access(request):
         return
-    if not _telegram_secret_matches(request):
-        raise HTTPException(status_code=401, detail="Telegram secret required or invalid")
+    raise HTTPException(status_code=401, detail=f"Authentication is required to access {capability}.")
+
+
+def _validate_telegram_secret(request: Request) -> None:
+    """Require Telegram shared secret, valid CATBot auth, or loopback-only access when no secret is configured."""
+    if _telegram_secret_matches(request):
+        return
+    if _request_has_valid_catbot_auth(request):
+        return
+    if not TELEGRAM_SECRET and _is_loopback_request(request):
+        return
+    if not TELEGRAM_SECRET:
+        raise HTTPException(
+            status_code=401,
+            detail="Telegram secret is not configured. Set TELEGRAM_SECRET or authenticate with CATBot.",
+        )
+    raise HTTPException(status_code=401, detail="Telegram secret required or invalid")
 
 
 def _autogen_team_secret_matches(request: Request) -> bool:
@@ -5147,6 +5291,71 @@ async def shutdown_event():
         await _stop_code_executors(autogen_team)
         autogen_team = None
 
+_SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "x-auth-token",
+    "x-telegram-secret",
+    "x-agent-secret",
+    "cookie",
+    "set-cookie",
+}
+
+
+def _redact_headers_for_log(headers: Any) -> Dict[str, str]:
+    redacted: Dict[str, str] = {}
+    try:
+        iterator = headers.items()
+    except Exception:
+        return redacted
+    for key, value in iterator:
+        key_text = str(key)
+        redacted[key_text] = "[redacted]" if key_text.lower() in _SENSITIVE_HEADER_NAMES else str(value)
+    return redacted
+
+
+def _split_config_list(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [part.strip() for part in re.split(r"[\r\n,]+", value) if part.strip()]
+
+
+CATBOT_CORS_ALLOW_ALL = _env_bool("CATBOT_CORS_ALLOW_ALL", default=False)
+CATBOT_CORS_ALLOWED_ORIGINS = _split_config_list(
+    os.getenv("CATBOT_CORS_ALLOWED_ORIGINS") or os.getenv("CORS_ALLOWED_ORIGINS")
+)
+_DEFAULT_LOCAL_CORS_ORIGINS = ["null"]
+_LOCAL_CORS_ORIGIN_REGEX = (
+    r"^https?://("
+    r"localhost|127\.0\.0\.1|\[::1\]|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}|"
+    r"[^/:]+\.local"
+    r")(:\d{1,5})?$"
+)
+
+
+def _is_allowed_cors_origin(origin: Optional[str]) -> bool:
+    if not origin:
+        return True
+    if CATBOT_CORS_ALLOW_ALL:
+        return True
+    origin_text = str(origin).strip()
+    if origin_text in set(CATBOT_CORS_ALLOWED_ORIGINS + _DEFAULT_LOCAL_CORS_ORIGINS):
+        return True
+    return re.match(_LOCAL_CORS_ORIGIN_REGEX, origin_text, flags=re.IGNORECASE) is not None
+
+
+def _cors_allow_origins() -> List[str]:
+    if CATBOT_CORS_ALLOW_ALL:
+        return ["*"]
+    return list(dict.fromkeys(_DEFAULT_LOCAL_CORS_ORIGINS + CATBOT_CORS_ALLOWED_ORIGINS))
+
+
+def _cors_allow_origin_regex() -> Optional[str]:
+    return None if CATBOT_CORS_ALLOW_ALL else _LOCAL_CORS_ORIGIN_REGEX
+
+
 # Request logging middleware to debug CORS issues
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Middleware to log all incoming requests for debugging."""
@@ -5163,7 +5372,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             print(f"   Origin: {origin}", flush=True)
             sys.stdout.flush()
             if hasattr(request, 'headers'):
-                print(f"   Headers: {dict(request.headers)}", flush=True)
+                print(f"   Headers: {_redact_headers_for_log(request.headers)}", flush=True)
                 sys.stdout.flush()
         except Exception as log_error:
             # If logging fails, continue anyway - don't break the request
@@ -5211,11 +5420,12 @@ app.add_middleware(RequestLoggingMiddleware)
 # Note: Using allow_credentials=False allows more flexible origin matching
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development (be more permissive to debug)
+    allow_origins=_cors_allow_origins(),
+    allow_origin_regex=_cors_allow_origin_regex(),
     allow_credentials=False,  # Set to False to allow more flexible CORS handling
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*", "Authorization", "X-Auth-Token", "Content-Type", "Accept"],  # Explicitly allow Authorization header
-    expose_headers=["*"],
+    expose_headers=["Content-Type"],
 )
 
 
@@ -5292,7 +5502,7 @@ async def require_auth_for_v1_routes(request: Request, call_next):
                 print(f"   Available headers: {list(request.headers.keys())}")
             elif auth_header:
                 # Log token preview for debugging (first 50 chars)
-                token_preview = auth_header[:50] + "..." if len(auth_header) > 50 else auth_header
+                token_preview = "[redacted]"
                 print(f"🔒 Auth check for {path}: Found auth header (length: {len(auth_header)}, preview: {token_preview})")
             
             get_current_user_from_headers(
@@ -5301,10 +5511,7 @@ async def require_auth_for_v1_routes(request: Request, call_next):
             )
         except HTTPException as exc:
             print(f"🔒 Auth check failed for {path}: {exc.detail}")
-            # Log the actual header value for debugging (truncated)
-            auth_debug = request.headers.get("authorization") or request.headers.get("Authorization") or "None"
-            if auth_debug != "None":
-                print(f"   Auth header value (first 100 chars): {auth_debug[:100]}")
+            print("   Auth header value: [redacted]")
             # Include CORS headers in error response
             cors_headers = build_cors_headers(request)
             return JSONResponse(
@@ -5318,23 +5525,18 @@ async def require_auth_for_v1_routes(request: Request, call_next):
 def build_cors_headers(request: Request) -> Dict[str, str]:
     """Build CORS headers for the request origin. Supports both localhost and remote access."""
     try:
-        # Safely get origin from request headers, with fallback
-        if hasattr(request, 'headers'):
-            origin = request.headers.get("origin")
-            # If no origin header (e.g., same-origin request), allow all origins for network access
-            if not origin:
-                origin = "*"
-        else:
-            origin = "*"
+        origin = request.headers.get("origin") if hasattr(request, "headers") else None
     except Exception:
-        # If we can't access headers, allow all origins for network access
-        origin = "*"
-    
-    return {
-        "Access-Control-Allow-Origin": origin,
+        origin = None
+
+    headers = {
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
         "Access-Control-Allow-Headers": "*",
     }
+    if origin and _is_allowed_cors_origin(origin):
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Vary"] = "Origin"
+    return headers
 
 # Global exception handler to ensure CORS headers are always included
 @app.exception_handler(HTTPException)
@@ -5347,7 +5549,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         print(f"âš ï¸ Error building CORS headers in HTTPException handler: {header_error}")
         # Use minimal safe headers if build_cors_headers fails
         cors_headers = {
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",
         }
@@ -5368,7 +5569,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         print(f"âš ï¸ Error building CORS headers in ValidationException handler: {header_error}")
         # Use minimal safe headers if build_cors_headers fails
         cors_headers = {
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",
         }
@@ -5401,7 +5601,6 @@ async def general_exception_handler(request: Request, exc: Exception):
         sys.stdout.flush()
         # Use minimal safe headers if build_cors_headers fails
         cors_headers = {
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",
         }
@@ -5995,7 +6194,8 @@ def _render_page_selenium_sync(
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1366,768")
-    options.add_argument("--no-sandbox")
+    if _env_bool("SELENIUM_ALLOW_NO_SANDBOX", default=False):
+        options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
 
     selector = (wait_for_selector or "").strip() or None
@@ -6112,6 +6312,92 @@ def _normalize_url(raw_url: str) -> str:
     return url
 
 
+PROXY_OUTBOUND_ALLOW_PRIVATE = _env_bool("CATBOT_OUTBOUND_ALLOW_PRIVATE", default=False)
+PROXY_FETCH_ALLOW_JS_RENDER = _env_bool("PROXY_FETCH_ALLOW_JS_RENDER", default=False)
+try:
+    PROXY_FETCH_MAX_REDIRECTS = max(0, min(10, int(os.getenv("PROXY_FETCH_MAX_REDIRECTS", "5"))))
+except ValueError:
+    PROXY_FETCH_MAX_REDIRECTS = 5
+try:
+    PROXY_FETCH_MAX_RESPONSE_BYTES = max(64 * 1024, int(os.getenv("PROXY_FETCH_MAX_RESPONSE_BYTES", str(5 * 1024 * 1024))))
+except ValueError:
+    PROXY_FETCH_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+
+
+def _is_forbidden_outbound_ip(ip_text: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return True
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _hostname_resolves_to_forbidden_address(hostname: str, port: Optional[int]) -> bool:
+    try:
+        infos = socket.getaddrinfo(hostname, port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise HTTPException(status_code=502, detail=f"Could not resolve outbound hostname: {hostname}") from exc
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        if _is_forbidden_outbound_ip(str(sockaddr[0])):
+            return True
+    return False
+
+
+def _validate_outbound_url(raw_url: str, *, allow_private: bool = False) -> str:
+    normalized = _normalize_url(raw_url)
+    parsed = urlparse(normalized)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Outbound URL must use http or https.")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="Outbound URL must not include embedded credentials.")
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="Outbound URL must include a hostname.")
+    if not (allow_private or PROXY_OUTBOUND_ALLOW_PRIVATE):
+        if host.lower() in {"localhost"}:
+            raise HTTPException(status_code=400, detail="Outbound URL points to a local address.")
+        if _hostname_resolves_to_forbidden_address(host, parsed.port):
+            raise HTTPException(status_code=400, detail="Outbound URL resolves to a private or local address.")
+    return normalized
+
+
+async def _get_with_outbound_policy(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: Dict[str, str],
+    allow_private: bool = False,
+    max_redirects: int = PROXY_FETCH_MAX_REDIRECTS,
+) -> httpx.Response:
+    current_url = _validate_outbound_url(url, allow_private=allow_private)
+    for _ in range(max_redirects + 1):
+        response = await client.get(current_url, headers=headers, follow_redirects=False)
+        if 300 <= response.status_code < 400 and response.headers.get("location"):
+            current_url = _validate_outbound_url(
+                urljoin(current_url, response.headers["location"]),
+                allow_private=allow_private,
+            )
+            continue
+        declared_size = response.headers.get("content-length")
+        if declared_size and declared_size.isdigit() and int(declared_size) > PROXY_FETCH_MAX_RESPONSE_BYTES:
+            raise HTTPException(status_code=413, detail="Upstream response is too large.")
+        if len(response.content or b"") > PROXY_FETCH_MAX_RESPONSE_BYTES:
+            raise HTTPException(status_code=413, detail="Upstream response is too large.")
+        return response
+    raise HTTPException(status_code=400, detail="Too many outbound redirects.")
+
+
 def _is_same_domain(base_url: str, candidate_url: str) -> bool:
     try:
         base_host = (urlparse(base_url).hostname or "").lower()
@@ -6210,7 +6496,7 @@ async def _fetch_and_extract_content(
     wait_for_selector: Optional[str] = None,
     js_wait_ms: int = 2200,
 ) -> Dict[str, Any]:
-    normalized_start = _normalize_url(url)
+    normalized_start = _validate_outbound_url(url)
     max_pages = max(1, min(int(max_pages or 1), 10))
     max_depth = max(0, min(int(max_depth or 0), 2))
 
@@ -6229,9 +6515,10 @@ async def _fetch_and_extract_content(
     rendered_engine_used: Optional[str] = None
 
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
             while queue and len(pages) < max_pages:
                 current_url, depth = queue.popleft()
+                current_url = _validate_outbound_url(current_url)
                 if current_url in visited:
                     continue
                 visited.add(current_url)
@@ -6239,6 +6526,11 @@ async def _fetch_and_extract_content(
                 try:
                     should_render_this_page = bool(render_js) and depth == 0
                     if should_render_this_page:
+                        if not PROXY_FETCH_ALLOW_JS_RENDER:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="JavaScript rendering is disabled. Set PROXY_FETCH_ALLOW_JS_RENDER=true to enable it.",
+                            )
                         rendered = await _render_page_dynamic(
                             url=current_url,
                             headers=headers,
@@ -6248,11 +6540,11 @@ async def _fetch_and_extract_content(
                             js_wait_ms=js_wait_ms,
                         )
                         raw_html = rendered.get("raw_html") or ""
-                        final_url = rendered.get("final_url") or current_url
+                        final_url = _validate_outbound_url(rendered.get("final_url") or current_url)
                         content_type = "text/html"
                         rendered_engine_used = rendered.get("render_engine") or rendered_engine_used
                     else:
-                        response = await client.get(current_url, headers=headers)
+                        response = await _get_with_outbound_policy(client, current_url, headers=headers)
                         response.raise_for_status()
                         raw_html = response.text
                         final_url = str(response.url)
@@ -7841,6 +8133,7 @@ def _log_tool_invocation(source: str, tool_name: str, parameters: Optional[Dict[
 @app.post("/v1/tools/log")
 async def log_tool_invocation(request: Request):
     """Record a tool invocation from clients that execute tool routing locally (e.g. HTML UI)."""
+    _require_internal_or_local_access(request, "tool invocation logging")
     body: Dict[str, Any] = {}
     try:
         parsed = await request.json()
@@ -8152,6 +8445,11 @@ async def auth_signup(request: AuthSignupRequest):
     username = request.username.strip().lower()
     password = request.password
 
+    if not _signup_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Public signup is disabled. Ask an administrator for an invite code.",
+        )
     if len(username) < 3:
         raise HTTPException(status_code=400, detail="username must be at least 3 characters")
     if len(password) < 8:
@@ -8560,6 +8858,9 @@ async def _record_task_execution_learning(
 
     summary = str(message or "").strip()
     error_hint = str(diagnostics.get("last_error") or "").strip()
+    tool_error_messages = diagnostics.get("tool_error_messages") or []
+    if not error_hint and tool_error_messages:
+        error_hint = "; ".join(str(item) for item in tool_error_messages[:3] if item)
     if not error_hint and str(status or "").lower() in {"failed", "failure", "error"}:
         error_hint = summary
 
@@ -8573,7 +8874,7 @@ async def _record_task_execution_learning(
         "tool_usage_counts": tool_usage if isinstance(tool_usage, dict) else {},
         "tool_success_count": diagnostics.get("tool_success_count"),
         "tool_failure_count": diagnostics.get("tool_failure_count"),
-        "tool_error_messages": diagnostics.get("tool_error_messages") or [],
+        "tool_error_messages": tool_error_messages if isinstance(tool_error_messages, list) else [],
     }
     try:
         await memory_manager.record_task_outcome(
@@ -10271,8 +10572,9 @@ async def telegram_clear_conversation(request: Request, conversation_id: str):
 # ============================================================================
 
 @app.post("/v1/status/start")
-async def status_start(request: StatusStartRequest):
+async def status_start(request: StatusStartRequest, raw_request: Request):
     """Start a status session for progress updates."""
+    _require_internal_or_local_access(raw_request, "status updates")
     state = (request.state or "On it. I'm working on that now.").strip()
     await _start_status_session(
         conversation_id=request.conversation_id,
@@ -10285,8 +10587,9 @@ async def status_start(request: StatusStartRequest):
 
 
 @app.post("/v1/status/update")
-async def status_update(request: StatusUpdateRequest):
+async def status_update(request: StatusUpdateRequest, raw_request: Request):
     """Update the current status state for a session."""
+    _require_internal_or_local_access(raw_request, "status updates")
     event = await _update_status_session(
         conversation_id=request.conversation_id,
         request_id=request.request_id,
@@ -10297,8 +10600,9 @@ async def status_update(request: StatusUpdateRequest):
 
 
 @app.post("/v1/status/finish")
-async def status_finish(request: StatusFinishRequest):
+async def status_finish(request: StatusFinishRequest, raw_request: Request):
     """Finish a status session and stop heartbeat updates."""
+    _require_internal_or_local_access(raw_request, "status updates")
     event = await _finish_status_session(
         conversation_id=request.conversation_id,
         request_id=request.request_id,
@@ -10309,8 +10613,9 @@ async def status_finish(request: StatusFinishRequest):
 
 
 @app.get("/v1/status/latest")
-async def status_latest(conversation_id: str, request_id: Optional[str] = None):
+async def status_latest(raw_request: Request, conversation_id: str, request_id: Optional[str] = None):
     """Get the latest status event for a conversation (optionally by request_id)."""
+    _require_internal_or_local_access(raw_request, "status updates")
     event = _get_latest_status_event(conversation_id, request_id=request_id)
     if not event:
         return {"found": False}
@@ -10320,8 +10625,9 @@ async def status_latest(conversation_id: str, request_id: Optional[str] = None):
 
 
 @app.get("/v1/status/events")
-async def status_events(conversation_id: str, request_id: str, since_seq: int = 0):
+async def status_events(raw_request: Request, conversation_id: str, request_id: str, since_seq: int = 0):
     """Get status events since a sequence number for a given request."""
+    _require_internal_or_local_access(raw_request, "status updates")
     events = _get_status_events_since(conversation_id, request_id, since_seq)
     latest = status_latest_index.get((conversation_id, request_id))
     latest_seq = latest.get("seq") if latest else since_seq
@@ -11621,8 +11927,9 @@ def _load_monitor_dashboard_html(*, detail_mode: bool) -> str:
 
 
 @app.get("/monitor")
-async def monitor_dashboard():
+async def monitor_dashboard(request: Request):
     """Serve the monitoring dashboard HTML."""
+    _require_internal_or_local_access(request, "monitoring")
     html = _load_monitor_dashboard_html(detail_mode=False)
     if not html:
         return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
@@ -11630,8 +11937,9 @@ async def monitor_dashboard():
 
 
 @app.get("/monitor/detail")
-async def monitor_dashboard_detail():
+async def monitor_dashboard_detail(request: Request):
     """Serve the monitoring detail HTML shell."""
+    _require_internal_or_local_access(request, "monitoring")
     html = _load_monitor_dashboard_html(detail_mode=True)
     if not html:
         return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
@@ -11639,8 +11947,9 @@ async def monitor_dashboard_detail():
 
 
 @app.get("/monitor/summary")
-async def monitor_summary():
+async def monitor_summary(request: Request):
     """Return high-level system status summary."""
+    _require_internal_or_local_access(request, "monitoring")
     uptime_seconds = max(0.0, time.time() - PROXY_START_TIME)
     openai_key_present = bool(
         os.getenv("OPENAI_API_KEY")
@@ -11665,15 +11974,17 @@ async def monitor_summary():
 
 
 @app.get("/monitor/status")
-async def monitor_status(limit: int = 50):
+async def monitor_status(request: Request, limit: int = 50):
     """Return recent status events for dashboard display."""
+    _require_internal_or_local_access(request, "monitoring")
     limit = max(1, min(200, limit))
     return {"events": _get_recent_status_events(limit)}
 
 
 @app.get("/monitor/logs")
-async def monitor_logs(limit: int = 200):
+async def monitor_logs(request: Request, limit: int = 200):
     """Return the last N lines from the proxy log file if configured."""
+    _require_internal_or_local_access(request, "monitoring")
     limit = max(1, min(1000, limit))
     log_path = PROXY_LOG_FILE
     if not log_path or not log_path.exists():
@@ -11684,8 +11995,9 @@ async def monitor_logs(limit: int = 200):
 
 
 @app.get("/monitor/workflows")
-async def monitor_workflows():
+async def monitor_workflows(request: Request):
     """Return recent AutoGen, Browser-use, Philosopher, and task execution activity."""
+    _require_internal_or_local_access(request, "monitoring")
     browser_health = dict(monitor_browser_health_snapshot)
     if _monitor_browser_health_is_stale(browser_health):
         try:
@@ -11706,8 +12018,9 @@ async def monitor_workflows():
 
 
 @app.get("/monitor/workflows/log/{run_id}")
-async def monitor_workflow_log(run_id: str):
+async def monitor_workflow_log(run_id: str, request: Request):
     """Return the full scratch log for a recent workflow run when available."""
+    _require_internal_or_local_access(request, "monitoring")
     run = _find_monitor_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -11723,8 +12036,9 @@ async def monitor_workflow_log(run_id: str):
 
 
 @app.get("/monitor/logs/browser-use")
-async def monitor_browser_use_logs(limit: int = 200):
+async def monitor_browser_use_logs(request: Request, limit: int = 200):
     """Return the last N lines from the browser-use log file when configured."""
+    _require_internal_or_local_access(request, "monitoring")
     limit = max(1, min(1000, limit))
     log_path = Path(BROWSER_USE_LOG_FILE) if BROWSER_USE_LOG_FILE else None
     if not log_path or not log_path.exists():
@@ -11777,13 +12091,14 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
         if not endpoint:
             endpoint = request.query_params.get('endpoint', '')
 
-        endpoint, _trusted_endpoint, auth_header, _using_server_credentials = _resolve_openai_proxy_request(
+        endpoint, trusted_endpoint, auth_header, using_server_credentials = _resolve_openai_proxy_request(
             endpoint,
             default_endpoint=os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/models'),
             endpoint_kind="models",
             request_auth_header=request.headers.get('Authorization', ''),
             request_proxy_auth_token=request.headers.get('X-Auth-Token', ''),
         )
+        endpoint = _validate_outbound_url(endpoint, allow_private=trusted_endpoint)
         minimax_compatible = is_minimax_chat_request(endpoint, None)
 
         headers = {}
@@ -11806,6 +12121,41 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
         print(f"Models list response status: {response.status_code}")
 
         if response.status_code != 200:
+            if response.status_code in {401, 403} and trusted_endpoint and not using_server_credentials:
+                retry_endpoint, server_auth_header, retry_with_server_credentials = _resolve_authenticated_server_proxy_credentials(
+                    endpoint,
+                    default_endpoint=os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/models'),
+                    endpoint_kind="models",
+                    request_proxy_auth_token=request.headers.get('X-Auth-Token', ''),
+                )
+                if retry_with_server_credentials:
+                    retry_endpoint = _validate_outbound_url(retry_endpoint, allow_private=True)
+                    retry_headers = dict(headers)
+                    retry_headers["Authorization"] = server_auth_header
+                    print("Models list caller authorization was rejected; retrying with authenticated server credentials")
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        response = await client.get(retry_endpoint, headers=retry_headers)
+                    endpoint = retry_endpoint
+                    headers = retry_headers
+                    using_server_credentials = True
+                    print(f"Models list retry response status: {response.status_code}")
+
+            if response.status_code == 200:
+                try:
+                    response_data = response.json()
+                    model_ids = _extract_openai_compatible_model_ids(response_data)
+                    if minimax_compatible and not model_ids:
+                        return JSONResponse(content=_build_minimax_models_fallback_payload(), status_code=200)
+                    return JSONResponse(content=response_data, status_code=200)
+                except Exception as json_error:
+                    print(f"Failed to parse JSON response after auth retry: {json_error}")
+                    if minimax_compatible:
+                        return JSONResponse(content=_build_minimax_models_fallback_payload(), status_code=200)
+                    return JSONResponse(
+                        content={"error": "Invalid JSON response from LLM service"},
+                        status_code=500,
+                    )
+
             print(f"LLM service returned error: {response.status_code}")
             print(f"   Response text: {response.text[:500]}")
             if minimax_compatible:
@@ -12246,7 +12596,7 @@ async def proxy_chat_completions(request: Request):
             if default_openai_model:
                 body_clean["model"] = default_openai_model
 
-        endpoint, _trusted_endpoint, auth_header, using_server_credentials = _resolve_openai_proxy_request(
+        endpoint, trusted_endpoint, auth_header, using_server_credentials = _resolve_openai_proxy_request(
             endpoint,
             default_endpoint=os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/chat/completions'),
             endpoint_kind="chat",
@@ -12254,6 +12604,7 @@ async def proxy_chat_completions(request: Request):
             request_proxy_auth_token=request.headers.get('X-Auth-Token', ''),
             model_name=body_clean.get("model"),
         )
+        endpoint = _validate_outbound_url(endpoint, allow_private=trusted_endpoint)
         allow_server_side_fallbacks = using_server_credentials
 
         # Build headers for the forwarded request
@@ -12326,6 +12677,37 @@ async def proxy_chat_completions(request: Request):
 
         # Check if the response is successful
         if response.status_code != 200:
+            if response.status_code in {401, 403} and trusted_endpoint and not using_server_credentials:
+                retry_endpoint, server_auth_header, retry_with_server_credentials = _resolve_authenticated_server_proxy_credentials(
+                    endpoint,
+                    default_endpoint=os.getenv('OPENAI_API_BASE', 'http://localhost:1234/v1/chat/completions'),
+                    endpoint_kind="chat",
+                    request_proxy_auth_token=request.headers.get('X-Auth-Token', ''),
+                    model_name=body_clean.get("model"),
+                )
+                if retry_with_server_credentials:
+                    retry_endpoint = _validate_outbound_url(retry_endpoint, allow_private=True)
+                    retry_headers = dict(headers)
+                    retry_headers["Authorization"] = server_auth_header
+                    print("Chat caller authorization was rejected; retrying with authenticated server credentials")
+                    response = await _call_chat_completion(retry_endpoint, retry_headers, body_clean, timeout_seconds=120.0)
+                    endpoint = retry_endpoint
+                    headers = retry_headers
+                    using_server_credentials = True
+                    allow_server_side_fallbacks = True
+                    print(f"Chat completions auth retry response status: {response.status_code}")
+
+            if response.status_code == 200:
+                try:
+                    response_data = response.json()
+                    return JSONResponse(content=response_data, status_code=200)
+                except Exception as json_error:
+                    print(f"Failed to parse JSON response after auth retry: {json_error}")
+                    return JSONResponse(
+                        content={"error": "Invalid JSON response from LLM service"},
+                        status_code=500
+                    )
+
             print(f"LLM service returned error: {response.status_code}")
             print(f"   Response text: {response.text[:500]}")
             error_text = response.text or ""
@@ -12435,15 +12817,15 @@ async def proxy_chat_completions(request: Request):
 @app.options("/v1/audio/transcriptions")
 async def proxy_whisper_options(request: Request):
     """Handle CORS preflight requests for Whisper endpoint."""
+    headers = build_cors_headers(request)
+    headers.update({
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Max-Age": "3600",
+    })
     return JSONResponse(
         content={},
         status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Max-Age": "3600",
-        }
+        headers=headers,
     )
 
 # Whisper proxy endpoint to handle CORS; compatible with OpenAI whisper-1 (passes key when needed)
@@ -12451,11 +12833,15 @@ async def proxy_whisper_options(request: Request):
 async def proxy_whisper(request: Request):
     """Proxy Whisper transcription requests to handle CORS. Client Authorization is for proxy auth only; upstream uses WHISPER_API_KEY."""
     try:
+        _require_internal_or_local_access(request, "audio transcription")
         # Get the form data from the request
         form_data = await request.form()
         
         # Get the Whisper endpoint (defaulting to localhost:8001)
-        whisper_endpoint = os.getenv('WHISPER_ENDPOINT', 'http://localhost:8001/v1/audio/transcriptions')
+        whisper_endpoint = _validate_outbound_url(
+            os.getenv('WHISPER_ENDPOINT', 'http://localhost:8001/v1/audio/transcriptions'),
+            allow_private=True,
+        )
         
         print(f"ðŸ“ Proxying Whisper request to: {whisper_endpoint}")
         
@@ -13666,37 +14052,108 @@ def _log_tts_rtf(label: str, **payload: Any) -> None:
         print(f"[tts rtf] {label} {payload}", flush=True)
 
 
+def _redact_sensitive_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    redacted: Dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        if key.lower() in {"authorization", "x-auth-token", "x-telegram-secret", "x-agent-secret"}:
+            redacted[key] = "[redacted]"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _normalize_tts_proxy_base_url(endpoint: str) -> str:
+    raw = str(endpoint or "").strip().rstrip("/")
+    if not raw:
+        raise HTTPException(status_code=400, detail="Endpoint parameter is required")
+    if "://" not in raw:
+        raw = f"http://{raw}"
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="TTS endpoint must use http or https.")
+    if not parsed.netloc:
+        raise HTTPException(status_code=400, detail="TTS endpoint must include a hostname.")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="TTS endpoint URLs must not include embedded credentials.")
+    return urlunparse((scheme, parsed.netloc, "", "", "", "")).rstrip("/")
+
+
+def _canonical_tts_proxy_base(endpoint: str) -> Optional[str]:
+    try:
+        return _normalize_tts_proxy_base_url(endpoint).lower()
+    except HTTPException:
+        return None
+
+
+def _get_trusted_tts_proxy_bases() -> Set[str]:
+    candidates: List[str] = []
+    for env_name in ("TTS_ENDPOINT", "TELEGRAM_TTS_ENDPOINT"):
+        value = os.getenv(env_name, "")
+        if value and value.strip():
+            candidates.append(value.strip())
+    extra_trusted = os.getenv("TTS_PROXY_TRUSTED_BASE_URLS", "")
+    if extra_trusted.strip():
+        candidates.extend(part for part in re.split(r"[\r\n,]+", extra_trusted) if part.strip())
+    trusted: Set[str] = set()
+    for candidate in candidates:
+        canonical = _canonical_tts_proxy_base(candidate)
+        if canonical:
+            trusted.add(canonical)
+    return trusted
+
+
+def _is_loopback_tts_base_url(base_url: str) -> bool:
+    try:
+        parsed = urlparse(base_url)
+        host = (parsed.hostname or "").strip().lower()
+    except Exception:
+        host = ""
+    if host in {"localhost"}:
+        return True
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_trusted_tts_proxy_base(base_url: str) -> bool:
+    canonical = _canonical_tts_proxy_base(base_url)
+    return bool(canonical and (canonical in _get_trusted_tts_proxy_bases() or _is_loopback_tts_base_url(canonical)))
+
+
+def _require_tts_proxy_access(request: Request, base_url: str) -> None:
+    if _is_trusted_tts_proxy_base(base_url) or _request_has_valid_catbot_auth(request):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="CATBot authentication is required to proxy TTS requests to this endpoint.",
+    )
+
+
+def _enforce_tts_outbound_policy(base_url: str) -> None:
+    _validate_outbound_url(base_url, allow_private=_is_trusted_tts_proxy_base(base_url))
+
+
+def _resolve_tts_provider_authorization(request: Request) -> str:
+    auth_header = _normalize_openai_proxy_auth_header(request.headers.get("Authorization"))
+    if auth_header and _headers_have_valid_catbot_auth(auth_header, None):
+        return ""
+    return auth_header
+
+
 @app.get("/v1/proxy/tts/voices")
-async def proxy_tts_voices(endpoint: str, model: Optional[str] = None):
+async def proxy_tts_voices(request: Request, endpoint: str, model: Optional[str] = None):
     """Proxy TTS voices requests to handle CORS. Tries /voices first, then /v1/audio/voices."""
     if not endpoint:
         raise HTTPException(status_code=400, detail="Endpoint parameter is required")
     
     try:
-        # Normalize the endpoint URL (remove trailing slash)
-        base_endpoint = endpoint.rstrip('/')
-        
-        # Extract base URL (origin: protocol + host + port) to avoid path duplication
-        try:
-            # Parse the endpoint URL to extract the origin (protocol + host + port)
-            if not base_endpoint.startswith('http://') and not base_endpoint.startswith('https://'):
-                # If no protocol, assume http://
-                base_endpoint = f"http://{base_endpoint}"
-            
-            parsed_url = urlparse(base_endpoint)
-            # Reconstruct base URL with scheme, hostname, and port (if present)
-            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        except Exception as e:
-            # Fallback to simple string replacement if URL parsing fails
-            # Extract origin manually using regex
-            match = re.match(r'^(https?://[^/]+)', base_endpoint)
-            if match:
-                base_url = match.group(1)
-            else:
-                # Last resort: remove /v1 and any path
-                base_url = base_endpoint.split('/')[0] if '/' in base_endpoint else base_endpoint
-                if not base_url.startswith('http'):
-                    base_url = f"http://{base_url}"
+        base_url = _normalize_tts_proxy_base_url(endpoint)
+        _require_tts_proxy_access(request, base_url)
+        _enforce_tts_outbound_policy(base_url)
         
         skip_tls_verify = _should_skip_tts_tls_verify(base_url)
         if skip_tls_verify:
@@ -13843,30 +14300,9 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
             tts_endpoint = os.getenv('TTS_ENDPOINT', 'http://localhost:4123/v1')
             endpoint = tts_endpoint.rstrip('/')
         
-        # Normalize the endpoint URL (remove trailing slash)
-        base_endpoint = endpoint.rstrip('/')
-        
-        # Extract base URL (origin: protocol + host + port) to avoid path duplication
-        try:
-            # Parse the endpoint URL to extract the origin (protocol + host + port)
-            if not base_endpoint.startswith('http://') and not base_endpoint.startswith('https://'):
-                # If no protocol, assume http://
-                base_endpoint = f"http://{base_endpoint}"
-            
-            parsed_url = urlparse(base_endpoint)
-            # Reconstruct base URL with scheme, hostname, and port (if present)
-            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        except Exception as e:
-            # Fallback to simple string replacement if URL parsing fails
-            # Extract origin manually using regex
-            match = re.match(r'^(https?://[^/]+)', base_endpoint)
-            if match:
-                base_url = match.group(1)
-            else:
-                # Last resort: remove /v1 and any path
-                base_url = base_endpoint.split('/')[0] if '/' in base_endpoint else base_endpoint
-                if not base_url.startswith('http'):
-                    base_url = f"http://{base_url}"
+        base_url = _normalize_tts_proxy_base_url(endpoint)
+        _require_tts_proxy_access(request, base_url)
+        _enforce_tts_outbound_policy(base_url)
         
         # Construct the speech endpoint URL
         speech_url = f"{base_url}/v1/audio/speech"
@@ -13891,8 +14327,8 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
         if accept_header:
             forward_headers['Accept'] = accept_header
         
-        # Forward Authorization header if present
-        auth_header = request.headers.get('Authorization')
+        # Forward provider Authorization only. CATBot JWTs are proxy auth and must never be sent upstream.
+        auth_header = _resolve_tts_provider_authorization(request)
         if auth_header:
             forward_headers['Authorization'] = auth_header
 
@@ -13957,7 +14393,7 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
 
         print(f"✅ TTS speech response status: {upstream_response.status_code}")
         print(f"📤 TTS request body: {json.dumps(request_body, indent=2)[:500]}")
-        print(f"📤 TTS request headers: {forward_headers}")
+        print(f"📤 TTS request headers: {_redact_sensitive_headers(forward_headers)}")
         upstream_content_type = upstream_response.headers.get("content-type", "audio/mpeg")
         # Normalize non-standard MP3 MIME type for better iOS Safari compatibility.
         if isinstance(upstream_content_type, str) and upstream_content_type.lower().startswith("audio/mp3"):
@@ -14017,6 +14453,8 @@ async def proxy_tts_speech(request: Request, endpoint: Optional[str] = None):
             headers=_copy_tts_audio_headers(upstream_response, upstream_content_type),
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"âŒ TTS speech proxy error: {e}")
         import traceback
@@ -15462,6 +15900,14 @@ async def model_avatar_scan(
 # GOOGLE DRIVE UPLOAD ENDPOINT
 # ============================================================================
 
+def _close_google_media_upload(media: Any) -> None:
+    file_obj = getattr(media, "_fd", None)
+    close = getattr(file_obj, "close", None)
+    if callable(close):
+        with suppress(Exception):
+            close()
+
+
 # Internal drive upload for Telegram tool runner (no auth; same path/credential checks)
 async def _upload_drive_internal(file_path: str, file_name: Optional[str] = None) -> Dict[str, Any]:
     """Upload a file from scratch dir to Google Drive. Returns dict with success, message, fileId, etc. Used by Telegram tools only."""
@@ -15512,11 +15958,14 @@ async def _upload_drive_internal(file_path: str, file_name: Optional[str] = None
         upload_file_name = file_name if file_name else file_path_obj.name
         file_metadata = {'name': upload_file_name, 'parents': [folder_id]}
         media = MediaFileUpload(str(file_path_obj), resumable=True)
-        file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, name, webViewLink'
-        ).execute()
+        try:
+            file = drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id, name, webViewLink'
+            ).execute()
+        finally:
+            _close_google_media_upload(media)
         return {
             'success': True,
             'fileId': file.get('id'),
@@ -15624,11 +16073,14 @@ async def upload_to_drive(request: Request, current_user: Dict[str, Any] = Depen
         )
         
         # Perform the upload
-        file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, name, webViewLink'
-        ).execute()
+        try:
+            file = drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id, name, webViewLink'
+            ).execute()
+        finally:
+            _close_google_media_upload(media)
         
         # Audit log: user, filename, folder_id, success, file_id
         user_sub = current_user.get("sub") or "unknown"

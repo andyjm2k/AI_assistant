@@ -11,6 +11,12 @@ from fastapi.testclient import TestClient
 from src.servers import proxy_server
 
 
+def _proxy_auth_headers(username="proxy-chat-user"):
+    proxy_server.users_db.setdefault(username, {"created_at": "2026-01-01T00:00:00Z"})
+    token = proxy_server.create_jwt({"sub": username})
+    return {"X-Auth-Token": token}
+
+
 def test_normalize_chat_endpoint_appends_path():
     base = "http://localhost:1234/v1"
     assert proxy_server._normalize_chat_endpoint(base) == "http://localhost:1234/v1/chat/completions"
@@ -106,7 +112,7 @@ async def test_execute_tool_for_philosopher_respects_explicit_server_id(monkeypa
     assert request.parameters == {"x": 1}
 
 
-def test_proxy_chat_completions_uses_server_key_for_trusted_default(monkeypatch):
+def test_proxy_chat_completions_uses_server_key_for_authenticated_trusted_default(monkeypatch):
     monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "server-key")
 
@@ -120,6 +126,7 @@ def test_proxy_chat_completions_uses_server_key_for_trusted_default(monkeypatch)
     with TestClient(proxy_server.app) as client:
         response = client.post(
             "/v1/proxy/chat/completions",
+            headers=_proxy_auth_headers(),
             json={"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
         )
 
@@ -127,7 +134,21 @@ def test_proxy_chat_completions_uses_server_key_for_trusted_default(monkeypatch)
     assert response.json()["id"] == "chatcmpl-test"
 
 
-def test_proxy_chat_completions_blank_bearer_uses_server_key_for_trusted_default(monkeypatch):
+def test_proxy_chat_completions_rejects_anonymous_server_key_for_trusted_default(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "server-key")
+
+    with TestClient(proxy_server.app) as client:
+        response = client.post(
+            "/v1/proxy/chat/completions",
+            json={"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 401
+    assert "CATBot authentication is required" in response.json()["detail"]
+
+
+def test_proxy_chat_completions_blank_bearer_uses_server_key_for_authenticated_trusted_default(monkeypatch):
     monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "server-key")
 
@@ -141,12 +162,38 @@ def test_proxy_chat_completions_blank_bearer_uses_server_key_for_trusted_default
     with TestClient(proxy_server.app) as client:
         response = client.post(
             "/v1/proxy/chat/completions",
-            headers={"Authorization": "Bearer"},
+            headers={**_proxy_auth_headers(), "Authorization": "Bearer"},
             json={"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
         )
 
     assert response.status_code == 200
     assert response.json()["id"] == "chatcmpl-test"
+
+
+def test_proxy_chat_completions_retries_server_key_when_authenticated_caller_key_is_rejected(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "server-key")
+    calls = []
+
+    async def fake_call(endpoint, headers, payload, timeout_seconds):
+        calls.append(dict(headers))
+        if headers.get("Authorization") == "Bearer bad-browser-key":
+            return httpx.Response(401, json={"error": "bad key"}, headers={"content-type": "application/json"})
+        assert headers["Authorization"] == "Bearer server-key"
+        return httpx.Response(200, json={"id": "chatcmpl-test", "choices": []})
+
+    monkeypatch.setattr(proxy_server, "_call_chat_completion", fake_call)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.post(
+            "/v1/proxy/chat/completions?endpoint=https://trusted.example/v1",
+            headers={**_proxy_auth_headers(), "Authorization": "Bearer bad-browser-key"},
+            json={"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "chatcmpl-test"
+    assert [call["Authorization"] for call in calls] == ["Bearer bad-browser-key", "Bearer server-key"]
 
 
 def test_proxy_chat_completions_rejects_untrusted_override_without_auth(monkeypatch):
@@ -160,7 +207,7 @@ def test_proxy_chat_completions_rejects_untrusted_override_without_auth(monkeypa
         )
 
     assert response.status_code == 400
-    assert "Endpoint override requires an Authorization header" in response.json()["detail"]
+    assert "Endpoint override requires" in response.json()["detail"]
 
 
 def test_proxy_chat_completions_untrusted_override_uses_caller_auth_without_fallback(monkeypatch):
@@ -179,18 +226,18 @@ def test_proxy_chat_completions_untrusted_override_uses_caller_auth_without_fall
 
     with TestClient(proxy_server.app) as client:
         response = client.post(
-            "/v1/proxy/chat/completions?endpoint=https://caller.example/v1",
+            "/v1/proxy/chat/completions?endpoint=https://example.com/v1",
             headers={"Authorization": "Bearer caller-key"},
             json={"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]},
         )
 
     assert response.status_code == 503
-    assert captured["endpoint"] == "https://caller.example/v1/chat/completions"
+    assert captured["endpoint"] == "https://example.com/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer caller-key"
     assert fallback_mock.await_count == 0
 
 
-def test_proxy_models_uses_server_key_for_trusted_default(monkeypatch):
+def test_proxy_models_uses_server_key_for_authenticated_trusted_default(monkeypatch):
     monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "server-key")
     captured = {}
@@ -214,16 +261,27 @@ def test_proxy_models_uses_server_key_for_trusted_default(monkeypatch):
             return httpx.Response(200, json={"data": []}, headers={"content-type": "application/json"})
 
     monkeypatch.setattr(proxy_server.httpx, "AsyncClient", FakeAsyncClient)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.get("/v1/proxy/models", headers=_proxy_auth_headers())
+
+    assert response.status_code == 200
+    assert captured["endpoint"] == "https://trusted.example/v1/models"
+    assert captured["headers"]["Authorization"] == "Bearer server-key"
+
+
+def test_proxy_models_rejects_anonymous_server_key_for_trusted_default(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "server-key")
 
     with TestClient(proxy_server.app) as client:
         response = client.get("/v1/proxy/models")
 
-    assert response.status_code == 200
-    assert captured["endpoint"] == "https://trusted.example/v1/models"
-    assert captured["headers"]["Authorization"] == "Bearer server-key"
+    assert response.status_code == 401
+    assert "CATBot authentication is required" in response.json()["detail"]
 
 
-def test_proxy_models_blank_bearer_uses_server_key_for_trusted_default(monkeypatch):
+def test_proxy_models_blank_bearer_uses_server_key_for_authenticated_trusted_default(monkeypatch):
     monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "server-key")
     captured = {}
@@ -249,11 +307,48 @@ def test_proxy_models_blank_bearer_uses_server_key_for_trusted_default(monkeypat
     monkeypatch.setattr(proxy_server.httpx, "AsyncClient", FakeAsyncClient)
 
     with TestClient(proxy_server.app) as client:
-        response = client.get("/v1/proxy/models", headers={"Authorization": "Bearer"})
+        response = client.get("/v1/proxy/models", headers={**_proxy_auth_headers(), "Authorization": "Bearer"})
 
     assert response.status_code == 200
     assert captured["endpoint"] == "https://trusted.example/v1/models"
     assert captured["headers"]["Authorization"] == "Bearer server-key"
+
+
+def test_proxy_models_retries_server_key_when_authenticated_caller_key_is_rejected(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "server-key")
+    seen_authorization = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            self.is_closed = True
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            self.is_closed = True
+
+        async def get(self, endpoint, headers=None):
+            seen_authorization.append((headers or {}).get("Authorization"))
+            if (headers or {}).get("Authorization") == "Bearer bad-browser-key":
+                return httpx.Response(401, json={"error": "bad key"}, headers={"content-type": "application/json"})
+            assert (headers or {}).get("Authorization") == "Bearer server-key"
+            return httpx.Response(200, json={"data": []}, headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(proxy_server.httpx, "AsyncClient", FakeAsyncClient)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.get(
+            "/v1/proxy/models?endpoint=https://trusted.example/v1",
+            headers={**_proxy_auth_headers(), "Authorization": "Bearer bad-browser-key"},
+        )
+
+    assert response.status_code == 200
+    assert seen_authorization == ["Bearer bad-browser-key", "Bearer server-key"]
 
 
 def test_proxy_models_returns_minimax_fallback_when_upstream_models_endpoint_fails(monkeypatch):
@@ -279,7 +374,7 @@ def test_proxy_models_returns_minimax_fallback_when_upstream_models_endpoint_fai
     monkeypatch.setattr(proxy_server.httpx, "AsyncClient", FakeAsyncClient)
 
     with TestClient(proxy_server.app) as client:
-        response = client.get("/v1/proxy/models")
+        response = client.get("/v1/proxy/models", headers=_proxy_auth_headers("minimax-model-user"))
 
     assert response.status_code == 200
     payload = response.json()
@@ -297,4 +392,4 @@ def test_proxy_models_rejects_untrusted_override_without_auth(monkeypatch):
         response = client.get("/v1/proxy/models?endpoint=https://evil.example/v1")
 
     assert response.status_code == 400
-    assert "Endpoint override requires an Authorization header" in response.json()["detail"]
+    assert "Endpoint override requires" in response.json()["detail"]

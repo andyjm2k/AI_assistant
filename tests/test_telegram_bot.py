@@ -85,6 +85,14 @@ class TestIsAuthorized:
         ):
             assert telegram_bot.is_authorized(123) is False
 
+    def test_allow_all_does_not_make_user_admin(self):
+        with patch.object(telegram_bot, "ALLOW_ALL_USERS", True), patch.object(
+            telegram_bot, "ADMIN_IDS", {123}
+        ):
+            assert telegram_bot.is_authorized(999) is True
+            assert telegram_bot.is_admin_user(999) is False
+            assert telegram_bot.is_admin_user(123) is True
+
 
 class TestBuildChatUrl:
     """Tests for build_chat_url."""
@@ -242,6 +250,77 @@ class TestHandleAttachment:
         assert mock_reply.await_args.kwargs["attachments"][0]["filename"] == "brief.txt"
         assert mock_reply.await_args.kwargs["attachments"][0]["mime_type"] == "text/plain"
         assert mock_reply.await_args.kwargs["attachments"][0]["content_base64"] == "aGVsbG8="
+
+    @pytest.mark.asyncio
+    async def test_document_attachment_rejects_known_oversize_before_download(self):
+        update = MagicMock()
+        update.message.caption = "Please summarize this"
+        update.message.photo = []
+        update.message.chat.send_action = AsyncMock()
+        update.message.reply_text = AsyncMock()
+        update.message.document = MagicMock(
+            file_id="file-oversize",
+            file_name="large.txt",
+            file_unique_id="unique-large",
+            mime_type="text/plain",
+            file_size=11,
+        )
+        context = MagicMock()
+        context.bot.get_file = AsyncMock()
+
+        with patch("src.integrations.telegram_bot._authorize_or_reject", AsyncMock(return_value=123)), patch.object(
+            telegram_bot,
+            "MAX_ATTACHMENT_BYTES",
+            10,
+        ):
+            await telegram_bot.handle_attachment(update, context)
+
+        context.bot.get_file.assert_not_called()
+        update.message.reply_text.assert_awaited_once()
+        assert "too large" in update.message.reply_text.await_args.args[0].lower()
+
+
+class TestHandleVoice:
+    """Tests for Telegram voice handling."""
+
+    @pytest.mark.asyncio
+    async def test_voice_in_disabled_returns_before_download(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        update.message.voice = MagicMock(file_id="voice-1", duration=1)
+        update.message.audio = None
+        context = MagicMock()
+        context.bot.get_file = AsyncMock()
+
+        with patch("src.integrations.telegram_bot._authorize_or_reject", AsyncMock(return_value=123)), patch.object(
+            telegram_bot,
+            "VOICE_IN_ENABLED",
+            False,
+        ):
+            await telegram_bot.handle_voice(update, context)
+
+        context.bot.get_file.assert_not_called()
+        update.message.reply_text.assert_awaited_once_with("Voice transcription is disabled for this bot.")
+
+    @pytest.mark.asyncio
+    async def test_voice_rejects_known_oversize_before_download(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        update.message.voice = MagicMock(file_id="voice-1", duration=1, file_size=11)
+        update.message.audio = None
+        context = MagicMock()
+        context.bot.get_file = AsyncMock()
+
+        with patch("src.integrations.telegram_bot._authorize_or_reject", AsyncMock(return_value=123)), patch.object(
+            telegram_bot,
+            "MAX_ATTACHMENT_BYTES",
+            10,
+        ):
+            await telegram_bot.handle_voice(update, context)
+
+        context.bot.get_file.assert_not_called()
+        update.message.reply_text.assert_awaited_once()
+        assert "too large" in update.message.reply_text.await_args.args[0].lower()
 
 
 class TestBackendHeaders:

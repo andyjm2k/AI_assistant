@@ -434,8 +434,9 @@ Key environment variables (see `.env.example` for complete list):
 - `TELEGRAM_VOICE_NOTE_OPUS_BITRATE`: Opus bitrate for Telegram voice-note conversion (default: `32k`)
 - If `TELEGRAM_VOICE_OUT=true`, the bot attempts to transcode TTS output to Telegram-friendly `OGG/Opus` voice notes using `ffmpeg` when needed.
 
-**Optional (proxy):**
-- `TELEGRAM_SECRET`: Shared secret for bot-to-proxy auth when the proxy is reachable beyond localhost (set the same value on both bot and proxy).
+**Proxy auth:**
+- `TELEGRAM_SECRET`: Shared secret for bot-to-proxy auth. Set the same value on both bot and proxy when the proxy is reachable beyond loopback.
+- `TELEGRAM_MAX_ATTACHMENT_BYTES`: Bot-side document/photo size cap before downloads (default: `FILE_OPS_MAX_SIZE_BYTES` or `10485760`).
 - `TELEGRAM_SYSTEM_PROMPT`: System prompt override; overridden by `config/catbot_system_prompt.txt` when that file exists
 - `TELEGRAM_HISTORY_LIMIT`, `TELEGRAM_CHAT_TIMEOUT`: Conversation tuning (defaults 12, 30)
 - `TELEGRAM_CHAT_TIMEOUT_HARD_CAP`, `TELEGRAM_TOOL_FOLLOWUP_TIMEOUT`, `TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP`: Timeout safety limits to prevent hangs while still allowing long-running tools (defaults 120, 45, 10800)
@@ -472,6 +473,9 @@ python scripts/export_autogen_team_config.py
 Security defaults:
 
 - The install wizard generates a real `JWT_SECRET`. If you replace it later, rotate any previously issued JWTs.
+- Public signup is disabled after first-user bootstrap unless `AUTH_ALLOW_PUBLIC_SIGNUP=true` or `AUTH_SIGNUP_INVITE_CODE` is configured.
+- CORS allows local/private origins by default. Set `CATBOT_CORS_ALLOWED_ORIGINS` for deployed clients instead of `CATBOT_CORS_ALLOW_ALL=true`.
+- Server-side fetch/proxy requests block private and loopback targets unless the endpoint is explicitly trusted or `CATBOT_OUTBOUND_ALLOW_PRIVATE=true`.
 - `AUTOGEN_REQUIRE_AUTH=true` keeps `POST /v1/proxy/autogen` behind authentication by default.
 - Browser users should call it with their normal JWT. Internal AutoGen/browser-bridge callers can use `CATBOT_AGENT_SECRET` (or the legacy `AUTOGEN_TEAM_SECRET`) via `X-Agent-Secret`.
 - `AUTOGEN_ENABLE_CODE_EXECUTION=false` leaves the Docker-backed Python execution tool disabled even when the optional AutoGen Docker extras are installed.
@@ -696,7 +700,7 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 1. Create a bot with [@BotFather](https://core.telegram.org/bots#botfather)
 2. Set `TELEGRAM_BOT_TOKEN` in your `.env` file
 3. Configure `TELEGRAM_ADMIN_IDS` or set `TELEGRAM_ALLOW_ALL=true`
-4. Set `TELEGRAM_SECRET` on both bot and proxy (recommended).
+4. Set `TELEGRAM_SECRET` on both bot and proxy when the proxy is reachable beyond loopback.
 5. Ensure the proxy server is running (e.g. port 8002). For Telegram-only use, only the proxy and the bot need to run.
 6. Start the bot: run `python scripts/start_all.py` (the Telegram bot is started automatically), or start it only with `python -m src.integrations.telegram_bot` from the project root. Install the dependency first: `pip install -r requirements.txt` or `pip install "python-telegram-bot[rate-limiter]"`.
 

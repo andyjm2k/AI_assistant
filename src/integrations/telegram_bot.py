@@ -13,6 +13,7 @@ Environment variables:
     TELEGRAM_VOICE_OUT: Set to "true" to enable voice responses
     TELEGRAM_VOICE_NOTE_OPUS_BITRATE: Opus bitrate for Telegram voice notes (default: 32k)
     TELEGRAM_MAX_VOICE_SECONDS: Max accepted voice duration in seconds (default: 300)
+    TELEGRAM_MAX_ATTACHMENT_BYTES: Max accepted document/photo size (default: FILE_OPS_MAX_SIZE_BYTES or 10485760)
     TELEGRAM_SEND_TRANSCRIPT: Set to "false" to suppress transcript echo message
     TELEGRAM_CHAT_TIMEOUT: Backend request timeout in seconds (default: 30)
     TELEGRAM_BOT_CHAT_TIMEOUT_HARD_CAP: Max allowed backend timeout in seconds (default: 10800)
@@ -125,6 +126,15 @@ def _parse_max_voice_seconds() -> int:
         return 300
 
 
+def _parse_max_attachment_bytes() -> int:
+    raw = os.getenv("TELEGRAM_MAX_ATTACHMENT_BYTES") or os.getenv("FILE_OPS_MAX_SIZE_BYTES") or "10485760"
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Invalid TELEGRAM_MAX_ATTACHMENT_BYTES/FILE_OPS_MAX_SIZE_BYTES; using 10485760")
+        return 10485760
+
+
 def _parse_status_update_interval() -> float:
     try:
         raw = float(os.getenv("TELEGRAM_STATUS_POLL_INTERVAL", "2"))
@@ -137,6 +147,7 @@ def _parse_status_update_interval() -> float:
 ADMIN_IDS = _parse_admin_ids()
 CHAT_TIMEOUT = _parse_chat_timeout()
 MAX_VOICE_SECONDS = _parse_max_voice_seconds()
+MAX_ATTACHMENT_BYTES = _parse_max_attachment_bytes()
 STATUS_UPDATE_INTERVAL = _parse_status_update_interval()
 TELEGRAM_TEXT_MESSAGE_LIMIT = 4000
 
@@ -243,6 +254,10 @@ def is_authorized(user_id: int) -> bool:
         logger.warning("No TELEGRAM_ADMIN_IDS configured and TELEGRAM_ALLOW_ALL is false")
         return False
     return user_id in ADMIN_IDS
+
+
+def is_admin_user(user_id: int) -> bool:
+    return bool(ADMIN_IDS and user_id in ADMIN_IDS)
 
 
 async def _poll_status_updates(
@@ -634,6 +649,17 @@ async def _authorize_or_reject(update: Update) -> Optional[int]:
     return None
 
 
+async def _authorize_admin_or_reject(update: Update) -> Optional[int]:
+    if not update.message or not update.effective_user:
+        return None
+    user_id = update.effective_user.id
+    if is_admin_user(user_id):
+        return user_id
+    await update.message.reply_text("You are not authorized to use this admin command.")
+    logger.warning("Unauthorized admin command attempt from user_id=%s", user_id)
+    return None
+
+
 async def _reply_with_backend_answer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -695,16 +721,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    if not update.message or not update.effective_user:
         return
+    admin_lines = ""
+    if is_admin_user(update.effective_user.id):
+        admin_lines = (
+            "\n"
+            "/restart - restart all CATBot services\n"
+            "/backup - create a ZIP backup\n"
+        )
     await update.message.reply_text(
         "*CATBot Telegram Commands*\n\n"
         "/start - initialize chat\n"
         "/help - show this message\n"
         "/status - backend status and usage\n"
         "/clear - clear conversation history\n"
-        "/restart - restart all CATBot services\n"
-        "/backup - create a ZIP backup in C:\\Users\\pc\\CATBot\\backups\n\n"
+        f"{admin_lines}\n"
         "You can send text, voice notes, audio files, photos, or documents.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -819,7 +851,7 @@ def _spawn_backup_worker(chat_id: int, requested_by: int) -> None:
 async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
-    user_id = await _authorize_or_reject(update)
+    user_id = await _authorize_admin_or_reject(update)
     if user_id is None:
         return
 
@@ -839,7 +871,7 @@ async def restart_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def backup_bot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
-    user_id = await _authorize_or_reject(update)
+    user_id = await _authorize_admin_or_reject(update)
     if user_id is None:
         return
 
@@ -901,6 +933,20 @@ def _photo_file_info(photos: List[PhotoSize]) -> tuple[Optional[PhotoSize], str,
     return photo, filename, "image/jpeg"
 
 
+def _telegram_file_size(value: object) -> Optional[int]:
+    try:
+        size = getattr(value, "file_size", None)
+        if size is None:
+            return None
+        return max(0, int(size))
+    except (TypeError, ValueError):
+        return None
+
+
+def _attachment_too_large(size_bytes: Optional[int]) -> bool:
+    return size_bytes is not None and size_bytes > MAX_ATTACHMENT_BYTES
+
+
 def _build_backend_attachment_payload(filename: str, mime_type: str, content: bytes) -> Dict[str, object]:
     return {
         "filename": filename,
@@ -916,6 +962,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = await _authorize_or_reject(update)
     if user_id is None:
         return
+    if not VOICE_IN_ENABLED:
+        await update.message.reply_text("Voice transcription is disabled for this bot.")
+        return
 
     voice = update.message.voice
     audio = update.message.audio
@@ -929,13 +978,29 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"Voice message is too long ({duration}s). Max allowed is {MAX_VOICE_SECONDS}s."
         )
         return
+    source_file = voice or audio
+    if _attachment_too_large(_telegram_file_size(source_file)):
+        await update.message.reply_text(
+            f"Audio attachment is too large. Max allowed is {MAX_ATTACHMENT_BYTES} bytes."
+        )
+        return
 
     file_id = voice.file_id if voice else audio.file_id
     await update.message.chat.send_action(action=ChatAction.TYPING)
 
     try:
         tg_file = await context.bot.get_file(file_id)
+        if _attachment_too_large(_telegram_file_size(tg_file)):
+            await update.message.reply_text(
+                f"Audio attachment is too large. Max allowed is {MAX_ATTACHMENT_BYTES} bytes."
+            )
+            return
         audio_data = await tg_file.download_as_bytearray()
+        if len(audio_data) > MAX_ATTACHMENT_BYTES:
+            await update.message.reply_text(
+                f"Audio attachment is too large. Max allowed is {MAX_ATTACHMENT_BYTES} bytes."
+            )
+            return
         transcript = await call_backend_transcription(filename, mime_type, bytes(audio_data))
     except RuntimeError as exc:
         logger.error("Transcription failed: %s", exc)
@@ -970,15 +1035,35 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         if document:
             filename, mime_type = _document_file_info(document)
+            if _attachment_too_large(_telegram_file_size(document)):
+                await update.message.reply_text(
+                    f"Attachment is too large. Max allowed is {MAX_ATTACHMENT_BYTES} bytes."
+                )
+                return
             tg_file = await context.bot.get_file(document.file_id)
         else:
             photo, filename, mime_type = _photo_file_info(photos)
             if photo is None:
                 await update.message.reply_text("No supported attachment was found.")
                 return
+            if _attachment_too_large(_telegram_file_size(photo)):
+                await update.message.reply_text(
+                    f"Attachment is too large. Max allowed is {MAX_ATTACHMENT_BYTES} bytes."
+                )
+                return
             tg_file = await context.bot.get_file(photo.file_id)
 
+        if _attachment_too_large(_telegram_file_size(tg_file)):
+            await update.message.reply_text(
+                f"Attachment is too large. Max allowed is {MAX_ATTACHMENT_BYTES} bytes."
+            )
+            return
         attachment_bytes = bytes(await tg_file.download_as_bytearray())
+        if len(attachment_bytes) > MAX_ATTACHMENT_BYTES:
+            await update.message.reply_text(
+                f"Attachment is too large. Max allowed is {MAX_ATTACHMENT_BYTES} bytes."
+            )
+            return
         prompt_text = (update.message.caption or "").strip() or "Please review the attached file."
         attachments = [_build_backend_attachment_payload(filename, mime_type, attachment_bytes)]
     except Exception as exc:
@@ -1040,7 +1125,10 @@ def main() -> None:
     app.add_handler(CommandHandler("backup", backup_bot_command))
     app.add_handler(CommandHandler("backup_bot", backup_bot_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_voice))
+    if VOICE_IN_ENABLED:
+        app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_voice))
+    else:
+        logger.info("Incoming Telegram voice transcription is disabled")
     app.add_handler(
         MessageHandler(
             ((filters.Document.ALL | filters.PHOTO) & ~filters.VOICE & ~filters.AUDIO) & ~filters.COMMAND,

@@ -22,7 +22,8 @@ def _get_client():
 
 def _auth_headers():
     """Build Authorization header with a valid JWT so protected proxy routes can be exercised."""
-    from src.servers.proxy_server import create_jwt
+    from src.servers.proxy_server import create_jwt, users_db
+    users_db.setdefault("andyjm2k", {"created_at": "2026-01-01T00:00:00Z"})
     token = create_jwt({"sub": "andyjm2k"})
     return {"Authorization": f"Bearer {token}"}
 
@@ -854,6 +855,21 @@ class TestTelegramClearEndpoint:
 
 class TestTelegramSecret:
     """Tests for TELEGRAM_SECRET validation when set."""
+
+    def test_unset_secret_rejects_non_loopback_request(self):
+        """When TELEGRAM_SECRET is unset, non-loopback callers still need CATBot auth."""
+        from fastapi import HTTPException
+        from src.servers import proxy_server as ps
+
+        request = MagicMock()
+        request.headers = {}
+        request.client.host = "203.0.113.10"
+
+        with patch.object(ps, "TELEGRAM_SECRET", None):
+            with pytest.raises(HTTPException) as exc_info:
+                ps._validate_telegram_secret(request)
+
+        assert exc_info.value.status_code == 401
 
     def test_when_secret_set_missing_header_returns_401(self):
         """When TELEGRAM_SECRET is set, request without secret returns 401."""

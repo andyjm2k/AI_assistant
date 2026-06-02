@@ -207,15 +207,27 @@
             }
 
             attachmentPreview.style.display = 'block';
-            attachmentPreviewList.innerHTML = pendingAttachmentFiles.map((file, index) => `
-                <div class="attachment-chip">
-                    <span class="attachment-chip-name" title="${file.name}">${file.name}</span>
-                    <span class="attachment-chip-size">${formatAttachmentSize(file.size)}</span>
-                    <button type="button" class="attachment-chip-remove" data-attachment-index="${index}" aria-label="Remove attachment">&times;</button>
-                </div>
-            `).join('');
+            attachmentPreviewList.innerHTML = '';
 
-            attachmentPreviewList.querySelectorAll('[data-attachment-index]').forEach((button) => {
+            pendingAttachmentFiles.forEach((file, index) => {
+                const chip = document.createElement('div');
+                chip.className = 'attachment-chip';
+
+                const name = document.createElement('span');
+                name.className = 'attachment-chip-name';
+                name.title = file.name || '';
+                name.textContent = file.name || 'attachment';
+
+                const size = document.createElement('span');
+                size.className = 'attachment-chip-size';
+                size.textContent = formatAttachmentSize(file.size);
+
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'attachment-chip-remove';
+                button.setAttribute('data-attachment-index', String(index));
+                button.setAttribute('aria-label', 'Remove attachment');
+                button.textContent = 'x';
                 button.addEventListener('click', () => {
                     const index = Number(button.getAttribute('data-attachment-index'));
                     if (Number.isInteger(index) && index >= 0) {
@@ -224,6 +236,9 @@
                         syncUserInputUi();
                     }
                 });
+
+                chip.append(name, size, button);
+                attachmentPreviewList.appendChild(chip);
             });
         }
 
@@ -413,7 +428,37 @@
             }
         }
 
-        let authToken = safeLocalStorageGet(AUTH_TOKEN_STORAGE_KEY) || '';
+        function safeSessionStorageGet(key) {
+            try {
+                return window.sessionStorage?.getItem(key) || '';
+            } catch (error) {
+                console.warn(`Could not read ${key} from sessionStorage:`, error);
+                return '';
+            }
+        }
+
+        function safeSessionStorageSet(key, value) {
+            try {
+                window.sessionStorage?.setItem(key, value);
+            } catch (error) {
+                console.warn(`Could not persist ${key} to sessionStorage:`, error);
+            }
+        }
+
+        function safeSessionStorageRemove(key) {
+            try {
+                window.sessionStorage?.removeItem(key);
+            } catch (error) {
+                console.warn(`Could not remove ${key} from sessionStorage:`, error);
+            }
+        }
+
+        const legacyAuthToken = safeLocalStorageGet(AUTH_TOKEN_STORAGE_KEY);
+        if (legacyAuthToken) {
+            safeSessionStorageSet(AUTH_TOKEN_STORAGE_KEY, legacyAuthToken);
+            safeLocalStorageRemove(AUTH_TOKEN_STORAGE_KEY);
+        }
+        let authToken = safeSessionStorageGet(AUTH_TOKEN_STORAGE_KEY) || '';
 
         const authOverlay = document.getElementById('auth-overlay');
         const authUsernameInput = document.getElementById('auth-username');
@@ -438,8 +483,9 @@
 
         function setAuthToken(token) {
             authToken = token || '';
-            if (authToken) safeLocalStorageSet(AUTH_TOKEN_STORAGE_KEY, authToken);
-            else safeLocalStorageRemove(AUTH_TOKEN_STORAGE_KEY);
+            safeLocalStorageRemove(AUTH_TOKEN_STORAGE_KEY);
+            if (authToken) safeSessionStorageSet(AUTH_TOKEN_STORAGE_KEY, authToken);
+            else safeSessionStorageRemove(AUTH_TOKEN_STORAGE_KEY);
         }
 
         function normalizeProxyBaseUrl(baseUrl) {
@@ -555,6 +601,24 @@
             return 'Could not reach CATBot proxy. Check that the CATBot services are running, then try again.';
         }
 
+        function getRequestPathname(requestUrl = '') {
+            try {
+                return new URL(String(requestUrl || ''), window.location.href).pathname;
+            } catch (_) {
+                return String(requestUrl || '').split('?')[0] || '';
+            }
+        }
+
+        function isProxyRouteWithProviderAuthSemantics(requestUrl = '') {
+            const pathname = getRequestPathname(requestUrl);
+            return (
+                pathname === '/v1/proxy/chat/completions' ||
+                pathname === '/v1/proxy/models' ||
+                pathname.startsWith('/v1/proxy/tts/') ||
+                pathname === '/v1/audio/transcriptions'
+            );
+        }
+
         const originalFetch = window.fetch.bind(window);
         window.fetch = async function(input, init = {}) {
             const requestUrl = typeof input === 'string' ? input : input?.url || '';
@@ -563,12 +627,17 @@
 
             if (isProxyRequest && authToken && !isAuthRoute) {
                 const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined) || {});
-                if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${authToken}`);
+                if (!headers.has('X-Auth-Token')) headers.set('X-Auth-Token', authToken);
                 init = { ...init, headers };
             }
 
             const response = await originalFetch(input, init);
-            if (isProxyRequest && response.status === 401 && !isAuthRoute) {
+            if (
+                isProxyRequest &&
+                response.status === 401 &&
+                !isAuthRoute &&
+                !isProxyRouteWithProviderAuthSemantics(requestUrl)
+            ) {
                 showAuthOverlay('Session expired. Please log in again.');
                 setAuthToken('');
             }
@@ -5450,11 +5519,7 @@
             if (settings.live2dScales !== undefined && typeof settings.live2dScales === 'object') live2dScales = settings.live2dScales;
             if (live2dListEl && live2dDropdownEl) {
                 const lines = (live2dListEl.value || '').split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.model3.json'));
-                live2dDropdownEl.innerHTML = lines.map(path => {
-                    const fileName = path.split('/').pop();
-                    const selected = path === modelPath ? ' selected' : '';
-                    return `<option value="${path}"${selected}>${fileName}</option>`;
-                }).join('');
+                setModelDropdownOptions(live2dDropdownEl, lines, modelPath);
                 if (modelPath && lines.indexOf(modelPath) === -1) {
                     const opt = document.createElement('option');
                     opt.value = modelPath;
@@ -5489,7 +5554,7 @@
             if (settings.vrmPositions !== undefined && typeof settings.vrmPositions === 'object') vrmPositions = settings.vrmPositions;
             if (vrmListEl && vrmDropdownEl) {
                 const vrmLines = (vrmListEl.value || '').split('\n').map(l => l.trim()).filter(l => l.length > 0 && l.toLowerCase().endsWith('.vrm'));
-                vrmDropdownEl.innerHTML = vrmLines.map(path => `<option value="${path}">${path.split('/').pop()}</option>`).join('');
+                setModelDropdownOptions(vrmDropdownEl, vrmLines, currentVRMModelPath);
                 if (currentVRMModelPath) {
                     if (vrmLines.indexOf(currentVRMModelPath) !== -1) vrmDropdownEl.value = currentVRMModelPath;
                     else {
@@ -5601,6 +5666,18 @@
                 .filter(line => line.length > 0 && line.toLowerCase().endsWith(extension));
         }
 
+        function setModelDropdownOptions(dropdown, paths, selectedPath = '') {
+            if (!dropdown) return;
+            dropdown.textContent = '';
+            paths.forEach((path) => {
+                const option = document.createElement('option');
+                option.value = path;
+                option.textContent = path.split('/').pop() || path;
+                option.selected = path === selectedPath;
+                dropdown.appendChild(option);
+            });
+        }
+
         function setModelListValue(textarea, paths) {
             if (!textarea) return;
             textarea.value = paths.join('\n');
@@ -5621,11 +5698,7 @@
                 try { localStorage.setItem(L2D_SELECTED_KEY, modelPath); } catch {}
             }
 
-            live2dDropdownEl.innerHTML = lines.map(path => {
-                const fileName = path.split('/').pop();
-                const selected = path === modelPath ? ' selected' : '';
-                return `<option value="${path}"${selected}>${fileName}</option>`;
-            }).join('');
+            setModelDropdownOptions(live2dDropdownEl, lines, modelPath);
 
             if (modelPath) {
                 live2dDropdownEl.value = modelPath;
@@ -5651,7 +5724,7 @@
                 try { localStorage.setItem(VRM_SELECTED_KEY, currentVRMModelPath); } catch {}
             }
 
-            vrmDropdownEl.innerHTML = lines.map(path => `<option value="${path}">${path.split('/').pop()}</option>`).join('');
+            setModelDropdownOptions(vrmDropdownEl, lines, currentVRMModelPath);
 
             if (currentVRMModelPath) {
                 vrmDropdownEl.value = currentVRMModelPath;
@@ -6726,15 +6799,6 @@ function saveWAVFile(wavBlob) {
         }
 
         async function sendAudioToWhisper(audioBlob) {
-            // Validate API key before making request
-            const apiKey = apiKeyInput.value.trim();
-            if (!apiKey || apiKey.length === 0) {
-                // API key is missing, show error and exit
-                console.error('API key is required for transcription');
-                status.textContent = "Transcription failed: API key is missing. Please enter your API key.";
-                return; // Exit early if API key is missing
-            }
-            
             // Use the proxy server endpoint which has CORS configured
             const whisperEndpoint = `${PROXY_BASE_URL}/v1/audio/transcriptions`;
 
@@ -6746,9 +6810,6 @@ function saveWAVFile(wavBlob) {
                 console.log('Sending audio to Whisper...');
                 const response = await fetch(whisperEndpoint, {
                     method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${apiKey}`
-                    },
                     body: formData
                 });
                 
@@ -6767,7 +6828,7 @@ function saveWAVFile(wavBlob) {
                     } catch (parseError) {
                         // If error response is not JSON, use status-based message
                         if (response.status === 401) {
-                            errorMessage = "Transcription failed: Invalid or missing API key. Please check your API key.";
+                            errorMessage = "Transcription failed: sign in again or check the proxy transcription configuration.";
                         } else if (response.status === 404) {
                             errorMessage = "Transcription failed: Endpoint not found. Please check the server configuration.";
                         } else if (response.status >= 500) {
@@ -8898,6 +8959,27 @@ function saveWAVFile(wavBlob) {
             }
         }
 
+        function isConversationContextMemory(mem) {
+            if (!mem || typeof mem !== 'object') {
+                return false;
+            }
+            const category = String(mem.category || '').trim().toLowerCase();
+            const source = String(mem.source || '').trim().toLowerCase();
+            const memoryType = String(mem.memory_type || '').trim().toLowerCase();
+            const text = String(mem.text || '');
+            const blockedCategories = new Set(['task_experience', 'task_learning']);
+            const blockedSources = new Set(['task_execution', 'task_scheduler', 'status_system']);
+            const operationalPattern = /\b(todo|to-?do|task list|my tasks?|due tasks?|overdue tasks?|task execution|task outcome memory|experience hints from similar tasks|repeat for similar tasks|avoid for similar tasks|execution status|status update|awaiting confirmation|paused awaiting feedback|pending tasks?|completed tasks?|cancelled tasks?|task id|current state|list state|working:|done:|failed:)\b/i;
+
+            if (blockedCategories.has(category) || blockedCategories.has(memoryType)) {
+                return false;
+            }
+            if (blockedSources.has(source)) {
+                return false;
+            }
+            return !operationalPattern.test(text);
+        }
+
         function filterHighRelevanceMemories(memories, { minSimilarity = 0.72, scoreWindow = 0.12, maxResults = 3 } = {}) {
             if (!Array.isArray(memories) || memories.length === 0) {
                 return [];
@@ -8910,6 +8992,7 @@ function saveWAVFile(wavBlob) {
             const floor = Math.max(minSimilarity, topScore - scoreWindow);
             return sorted
                 .filter(mem => (Number(mem.similarity) || 0) >= floor)
+                .filter(isConversationContextMemory)
                 .slice(0, maxResults);
         }
 
@@ -9119,6 +9202,69 @@ function saveWAVFile(wavBlob) {
             }
         }
 
+        function evaluateMathExpression(expression) {
+            const input = String(expression || '');
+            let index = 0;
+
+            function peek() {
+                return input[index] || '';
+            }
+
+            function consume(char) {
+                if (peek() === char) {
+                    index += 1;
+                    return true;
+                }
+                return false;
+            }
+
+            function parseNumber() {
+                const start = index;
+                while (/[0-9.]/.test(peek())) index += 1;
+                if (start === index) throw new Error('Expected number');
+                const raw = input.slice(start, index);
+                if ((raw.match(/\./g) || []).length > 1) throw new Error('Invalid number');
+                return Number(raw);
+            }
+
+            function parseFactor() {
+                if (consume('+')) return parseFactor();
+                if (consume('-')) return -parseFactor();
+                if (consume('(')) {
+                    const value = parseExpression();
+                    if (!consume(')')) throw new Error('Missing closing parenthesis');
+                    return value;
+                }
+                return parseNumber();
+            }
+
+            function parseTerm() {
+                let value = parseFactor();
+                while (peek() === '*' || peek() === '/') {
+                    const operator = peek();
+                    index += 1;
+                    const rhs = parseFactor();
+                    value = operator === '*' ? value * rhs : value / rhs;
+                }
+                return value;
+            }
+
+            function parseExpression() {
+                let value = parseTerm();
+                while (peek() === '+' || peek() === '-') {
+                    const operator = peek();
+                    index += 1;
+                    const rhs = parseTerm();
+                    value = operator === '+' ? value + rhs : value - rhs;
+                }
+                return value;
+            }
+
+            const result = parseExpression();
+            if (index !== input.length) throw new Error('Unexpected input');
+            return result;
+        }
+
         async function handleCalculation({ expression }, context) {
             try {
                 console.log('Handling calculation:', expression);
@@ -9155,8 +9301,8 @@ function saveWAVFile(wavBlob) {
                     return { success: false, message: "Invalid mathematical expression" };
                 }
                 
-                // Evaluate the expression
-                const result = eval(cleanExpression);
+                // Evaluate the expression without using eval.
+                const result = evaluateMathExpression(cleanExpression);
                 console.log('Calculation result:', result);
                 
                 if (typeof result !== 'number' || isNaN(result)) {
@@ -14044,37 +14190,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
         });
 
         async function handleNews({ searchTerm, filename }) {
-            // Get News API key from localStorage or input field
-            let API_KEY = '';
             try {
-                const savedSettings = localStorage.getItem('toolSettings');
-                if (savedSettings) {
-                    const settings = JSON.parse(savedSettings);
-                    API_KEY = settings.newsApiKey || '';
-                }
-            } catch (e) {
-                console.warn('Error loading news API key from settings:', e);
-            }
-            
-            // Fallback to input field if not in settings
-            if (!API_KEY && newsApiKeyInput) {
-                API_KEY = newsApiKeyInput.value.trim();
-            }
-            
-            if (!API_KEY) {
-                return {
-                    success: false,
-                    message: 'News API key is not configured. Please enter your News API key in the settings.'
-                };
-            }
-            
-            try {
-                // Fetch news from the API
-                const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(searchTerm)}&apiKey=${API_KEY}`;
+                const url = `${PROXY_BASE_URL}/v1/proxy/news?query=${encodeURIComponent(searchTerm)}`;
                 const response = await fetch(url);
                 
                 if (!response.ok) {
-                    throw new Error(`Failed to fetch news: ${response.statusText}`);
+                    const errorPayload = await response.json().catch(() => ({}));
+                    throw new Error(errorPayload.detail || `Failed to fetch news: ${response.statusText}`);
                 }
                 
                 const data = await response.json();
@@ -14115,7 +14237,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 console.error('News fetch error:', error);
                 return {
                     success: false,
-                    message: `Error fetching news: ${error.message}`
+                    message: `Error fetching news: ${error.message}. Configure NEWS_API_KEY on the CATBot proxy.`
                 };
             }
         }
