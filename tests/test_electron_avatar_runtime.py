@@ -4,6 +4,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ELECTRON_AVATAR = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "avatar.js"
 ELECTRON_AVATAR_HTML = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "avatar.html"
+ELECTRON_VRM_QUALITY = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "vrm-quality.js"
+ELECTRON_MAIN = PROJECT_ROOT / "electron-app" / "main" / "main.js"
+ELECTRON_PRELOAD = PROJECT_ROOT / "electron-app" / "main" / "preload.js"
+ELECTRON_DEFAULT_CONFIG = PROJECT_ROOT / "electron-app" / "config" / "default-desktop-config.json"
 PIXI_STATIC_UNIFORM_SYNC = (
     PROJECT_ROOT
     / "electron-app"
@@ -78,3 +82,46 @@ def test_avatar_model_asset_scheme_and_csp_safe_live2d_patch_are_packaged():
     assert "Global PIXI not found." in static_uniform_sync
     assert "systemCheck:function(){}" in static_uniform_sync
     assert "new Function" not in static_uniform_sync
+
+
+def test_avatar_vrm_quality_profiles_preserve_authored_materials_above_low():
+    avatar = _avatar_js_text()
+    quality = ELECTRON_VRM_QUALITY.read_text(encoding="utf-8")
+
+    assert 'VRM_GRAPHICS_QUALITY_VALUES = Object.freeze(["low", "medium", "high"])' in quality
+    assert 'powerPreference: "high-performance"' in quality
+    assert 'materialMode: "authored"' in quality
+    assert 'textureBudgetBytes: 512 * MIB' in quality
+    assert "createVrmTexturePlan(vrm, renderer, effectiveVrmGraphicsQuality)" in avatar
+    assert 'if (activeVrmQualityProfile.materialMode === "unlit")' in avatar
+    assert "applyDesktopMaterialFallback(vrm);" in avatar
+    assert "VRMUtils.removeUnnecessaryVertices?.(vrm.scene);" in avatar
+
+
+def test_avatar_vrm_quality_change_reloads_context_and_caps_frame_rate():
+    avatar = _avatar_js_text()
+
+    assert "function scheduleGraphicsReloadIfNeeded(state)" in avatar
+    assert "window.setTimeout(() => window.location.reload(), 80);" in avatar
+    assert "activeVrmQualityProfile.targetFps" in avatar
+    assert "pendingFrameDelta += clock.getDelta();" in avatar
+    assert "if (!currentState.visible)" in avatar
+    assert "runningActionKey ||" in avatar
+
+
+def test_electron_vrm_quality_state_and_gpu_diagnostics_are_exposed():
+    main = ELECTRON_MAIN.read_text(encoding="utf-8")
+    preload = ELECTRON_PRELOAD.read_text(encoding="utf-8")
+    html = ELECTRON_AVATAR_HTML.read_text(encoding="utf-8")
+    config = ELECTRON_DEFAULT_CONFIG.read_text(encoding="utf-8")
+
+    assert 'vrmGraphicsQuality: "medium"' in main
+    assert "state.vrmGraphicsQuality = normalizeVrmGraphicsQuality(state.vrmGraphicsQuality);" in main
+    assert 'ipcMain.handle("desktop:get-graphics-diagnostics"' in main
+    assert 'ipcMain.handle("desktop:report-renderer-diagnostics"' in main
+    assert "app.getGPUFeatureStatus()" in main
+    assert 'app.getGPUInfo("basic")' in main
+    assert "getGraphicsDiagnostics:" in preload
+    assert "reportRendererDiagnostics:" in preload
+    assert 'id="hud-vrm-quality"' in html
+    assert '"vrmGraphicsQuality": "medium"' in config

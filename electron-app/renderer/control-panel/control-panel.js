@@ -1,5 +1,7 @@
 const modeSelect = document.getElementById("avatar-mode-select");
 const modelSelect = document.getElementById("avatar-model-select");
+const vrmQualitySelect = document.getElementById("vrm-quality-select");
+const vrmQualityStatus = document.getElementById("vrm-quality-status");
 const scaleRange = document.getElementById("scale-range");
 const opacityRange = document.getElementById("opacity-range");
 const scaleValue = document.getElementById("scale-value");
@@ -52,6 +54,7 @@ const clearProviderKeyBtn = document.getElementById("clear-provider-key-btn");
 
 let currentState = await window.catbotDesktop.getState();
 let currentAuthStatus = await window.catbotDesktop.getAuthStatus();
+let graphicsDiagnostics = {};
 
 function clampNumber(value, min, max, fallback) {
   const parsed = Number(value);
@@ -105,7 +108,8 @@ function getConnectionSettingsPatch() {
     ttsEndpoint: ttsEndpointInput.value.trim(),
     ttsModel: ttsModelInput.value.trim() || "tts-1",
     ttsVoice: ttsVoiceInput.value.trim() || "alloy",
-    speakChatReplies: currentState.speakChatReplies !== false
+    speakChatReplies: currentState.speakChatReplies !== false,
+    vrmGraphicsQuality: vrmQualitySelect?.value || currentState.vrmGraphicsQuality || "medium"
   };
   const typedProviderKey = chatApiKeyInput.value.trim();
   if (typedProviderKey) {
@@ -154,6 +158,8 @@ function renderStatus(state) {
       startToTray: state.startToTray,
       launchAtLogin: state.launchAtLogin,
       expression: state.expression,
+      vrmGraphicsQuality: state.vrmGraphicsQuality || "medium",
+      graphics: graphicsDiagnostics,
       vrmTransform: getCurrentVrmTransform(state),
       webClientUrl: state.webClientUrl,
       proxyBaseUrl: state.proxyBaseUrl,
@@ -281,6 +287,10 @@ function renderState(state) {
   const vrmTransform = getCurrentVrmTransform(state);
 
   modeSelect.value = isVrm ? "vrm" : "live2d";
+  if (vrmQualitySelect) {
+    vrmQualitySelect.value = state.vrmGraphicsQuality || "medium";
+    vrmQualitySelect.disabled = !isVrm;
+  }
   scaleRange.value = String(scale);
   opacityRange.value = String(opacity);
   scaleValue.textContent = `${scale.toFixed(2)}x`;
@@ -327,12 +337,44 @@ function renderState(state) {
   for (const input of [vrmPositionXRange, vrmPositionYRange, vrmRotationRange]) {
     input.disabled = !isVrm;
   }
+  renderGraphicsQualityStatus();
 
   if (modelSelect.value !== state.modelPath || modeSelect.value !== state.mode) {
     populateModels(state.modelPath);
   }
   renderStatusRail(state);
   renderStatus(state);
+}
+
+function renderGraphicsQualityStatus() {
+  if (!vrmQualityStatus) {
+    return;
+  }
+  const renderer = graphicsDiagnostics?.renderer || {};
+  const requested = renderer.requestedQuality || currentState.vrmGraphicsQuality || "medium";
+  const effective = renderer.effectiveQuality || requested;
+  const fps = Number(renderer.fps);
+  const gpu = graphicsDiagnostics?.gpuInfo?.auxAttributes?.glRenderer || "";
+  const details = [
+    `${requested[0].toUpperCase()}${requested.slice(1)} requested`,
+    `${effective[0].toUpperCase()}${effective.slice(1)} active`,
+    Number.isFinite(fps) && fps > 0 ? `${fps.toFixed(0)} FPS` : "",
+    gpu
+  ].filter(Boolean);
+  vrmQualityStatus.textContent = details.join(" · ") || "Changing quality reloads the VRM renderer.";
+}
+
+async function refreshGraphicsDiagnostics() {
+  if (typeof window.catbotDesktop.getGraphicsDiagnostics !== "function") {
+    return;
+  }
+  try {
+    graphicsDiagnostics = await window.catbotDesktop.getGraphicsDiagnostics() || {};
+    renderGraphicsQualityStatus();
+    renderStatus(currentState);
+  } catch (_) {
+    // Diagnostics are optional and must not block avatar controls.
+  }
 }
 
 function renderAuthStatus(status = currentAuthStatus) {
@@ -388,6 +430,10 @@ modeSelect.addEventListener("change", async () => {
 
 modelSelect.addEventListener("change", async () => {
   await updateDesktopState({ modelPath: modelSelect.value });
+});
+
+vrmQualitySelect?.addEventListener("change", async () => {
+  await updateDesktopState({ vrmGraphicsQuality: vrmQualitySelect.value });
 });
 
 scaleRange.addEventListener("input", async () => {
@@ -606,3 +652,5 @@ await populateModels(currentState.modelPath);
 renderState(currentState);
 await populateTtsVoiceOptions(currentState.ttsVoice);
 renderAuthStatus(await window.catbotDesktop.verifyAuth({ proxyBaseUrl: currentState.proxyBaseUrl }));
+await refreshGraphicsDiagnostics();
+window.setInterval(refreshGraphicsDiagnostics, 2500);

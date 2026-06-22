@@ -83,6 +83,7 @@ const DESKTOP_REPLY_EMOTION_RESET_DELAY_MS = 2200;
 const DESKTOP_ERROR_EMOTION_RESET_DELAY_MS = 4500;
 const DESKTOP_AUTH_GREETING_TEXT = "Hi, I'm ready when you are.";
 const DESKTOP_JWT_EXPIRY_LEEWAY_SECONDS = 30;
+const VRM_GRAPHICS_QUALITY_VALUES = new Set(["low", "medium", "high"]);
 const DEFAULT_AUTH_COOKIE_NAME = "catbot_auth_token";
 const CERT_VERIFY_RESULT_DEFAULT = -3;
 const CERT_VERIFY_RESULT_OK = 0;
@@ -106,6 +107,7 @@ let avatarDragState = null;
 let moveModeReturnHudVisible = false;
 let desktopReplyEmotionResetTimer = null;
 let desktopReplyEmotionResetToken = 0;
+let avatarRendererDiagnostics = {};
 let desktopToolingCache = {
   fetchedAt: 0,
   tools: [],
@@ -127,6 +129,87 @@ const actionHarnessRuntime = {
   lastCaptureCleanupAt: 0
 };
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
+
+function normalizeVrmGraphicsQuality(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return VRM_GRAPHICS_QUALITY_VALUES.has(normalized) ? normalized : "medium";
+}
+
+function sanitizeRendererDiagnostics(value = {}) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const safeNumber = (input, fallback = 0) => {
+    const parsed = Number(input);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  return {
+    requestedQuality: normalizeVrmGraphicsQuality(source.requestedQuality),
+    effectiveQuality: normalizeVrmGraphicsQuality(source.effectiveQuality || source.requestedQuality),
+    downgradeReason: String(source.downgradeReason || "").slice(0, 240),
+    materialMode: String(source.materialMode || "").slice(0, 40),
+    renderer: String(source.renderer || "").slice(0, 240),
+    webgl2: Boolean(source.webgl2),
+    antialias: Boolean(source.antialias),
+    precision: String(source.precision || "").slice(0, 24),
+    pixelRatio: safeNumber(source.pixelRatio, 1),
+    maxTextureSize: Math.max(0, Math.round(safeNumber(source.maxTextureSize))),
+    maxAnisotropy: Math.max(1, safeNumber(source.maxAnisotropy, 1)),
+    targetFps: Math.max(1, Math.round(safeNumber(source.targetFps, 60))),
+    fps: Math.max(0, safeNumber(source.fps)),
+    frameTimeP95Ms: Math.max(0, safeNumber(source.frameTimeP95Ms)),
+    drawCalls: Math.max(0, Math.round(safeNumber(source.drawCalls))),
+    triangles: Math.max(0, Math.round(safeNumber(source.triangles))),
+    textures: Math.max(0, Math.round(safeNumber(source.textures))),
+    geometries: Math.max(0, Math.round(safeNumber(source.geometries))),
+    estimatedTextureMemoryMb: Math.max(0, safeNumber(source.estimatedTextureMemoryMb)),
+    textureBudgetMb: Math.max(0, safeNumber(source.textureBudgetMb)),
+    contextLosses: Math.max(0, Math.round(safeNumber(source.contextLosses))),
+    updatedAt: Math.max(0, Math.round(safeNumber(source.updatedAt, Date.now())))
+  };
+}
+
+async function getDesktopGraphicsDiagnostics() {
+  let gpuInfo = {};
+  try {
+    const info = await app.getGPUInfo("basic");
+    gpuInfo = {
+      auxAttributes: {
+        glRenderer: String(info?.auxAttributes?.glRenderer || "").slice(0, 240),
+        glVendor: String(info?.auxAttributes?.glVendor || "").slice(0, 160),
+        glVersion: String(info?.auxAttributes?.glVersion || "").slice(0, 160)
+      },
+      devices: Array.isArray(info?.gpuDevice)
+        ? info.gpuDevice.slice(0, 4).map((device) => ({
+          active: Boolean(device?.active),
+          deviceString: String(device?.deviceString || "").slice(0, 200),
+          vendorId: Number(device?.vendorId) || 0,
+          deviceId: Number(device?.deviceId) || 0,
+          driverVendor: String(device?.driverVendor || "").slice(0, 120),
+          driverVersion: String(device?.driverVersion || "").slice(0, 120)
+        }))
+        : []
+    };
+  } catch (error) {
+    gpuInfo = { error: String(error?.message || error || "GPU information unavailable").slice(0, 240) };
+  }
+  let featureStatus = {};
+  try {
+    featureStatus = app.getGPUFeatureStatus();
+  } catch (_) {
+    featureStatus = {};
+  }
+  let hardwareAccelerationEnabled = true;
+  try {
+    hardwareAccelerationEnabled = app.isHardwareAccelerationEnabled();
+  } catch (_) {
+    // Electron versions without this API use hardware acceleration by default.
+  }
+  return {
+    hardwareAccelerationEnabled,
+    featureStatus,
+    gpuInfo,
+    renderer: avatarRendererDiagnostics
+  };
+}
 
 function clipActionHarnessMemoryText(value, maxChars = 360) {
   return normalizeChatContent(value, maxChars).replace(/\s+/g, " ").trim();
@@ -1820,6 +1903,7 @@ const DEFAULT_STATE = (() => {
       autoCompanionMode: false,
       autoCompanionScreenContext: true,
       autoCompanionDance: true,
+      vrmGraphicsQuality: "medium",
       actionHarness: getDefaultActionHarnessState(),
       trustLocalCertificates: true,
       defaultCompanionId: "",
@@ -1878,6 +1962,7 @@ state.webcamMode = Boolean(state.webcamMode);
 state.autoCompanionMode = Boolean(state.autoCompanionMode);
 state.autoCompanionScreenContext = state.autoCompanionScreenContext !== false;
 state.autoCompanionDance = state.autoCompanionDance !== false;
+state.vrmGraphicsQuality = normalizeVrmGraphicsQuality(state.vrmGraphicsQuality);
 state.actionHarness = normalizeActionHarnessState(state.actionHarness);
 if (isOutdatedActionHarnessDefaultGrid(state.actionHarness.grid)) {
   state.actionHarness.grid = {
@@ -2188,6 +2273,7 @@ function getDesktopCompanionSettingsSnapshot(sourceState = state) {
       autoCompanionMode: Boolean(sourceState.autoCompanionMode),
       autoCompanionScreenContext: sourceState.autoCompanionScreenContext !== false,
       autoCompanionDance: sourceState.autoCompanionDance !== false,
+      vrmGraphicsQuality: normalizeVrmGraphicsQuality(sourceState.vrmGraphicsQuality),
       vrmTransforms: sourceState.vrmTransforms || {}
     }
   };
@@ -2279,6 +2365,9 @@ function applyCompanionSettingsToDesktopState(settings = {}) {
   if (Number.isFinite(companionScale)) {
     nextStatePatch.scale = companionScale;
   }
+  if (desktop.vrmGraphicsQuality != null) {
+    nextStatePatch.vrmGraphicsQuality = normalizeVrmGraphicsQuality(desktop.vrmGraphicsQuality);
+  }
 
   const nextModelPath = nextStatePatch.modelPath || state.modelPath;
   if (mode === "vrm" && nextModelPath) {
@@ -2333,6 +2422,7 @@ function applyCompanionSettingsToDesktopState(settings = {}) {
   state.autoCompanionMode = Boolean(state.autoCompanionMode);
   state.autoCompanionScreenContext = state.autoCompanionScreenContext !== false;
   state.autoCompanionDance = state.autoCompanionDance !== false;
+  state.vrmGraphicsQuality = normalizeVrmGraphicsQuality(state.vrmGraphicsQuality);
 }
 
 function getCompanionProxyOrigin(payload = {}) {
@@ -3365,6 +3455,7 @@ function updateState(partialState = {}) {
   state.autoCompanionMode = Boolean(state.autoCompanionMode);
   state.autoCompanionScreenContext = state.autoCompanionScreenContext !== false;
   state.autoCompanionDance = state.autoCompanionDance !== false;
+  state.vrmGraphicsQuality = normalizeVrmGraphicsQuality(state.vrmGraphicsQuality);
   state.actionHarness = normalizeActionHarnessState(state.actionHarness);
   state.trustLocalCertificates = state.trustLocalCertificates !== false;
   state.defaultCompanionId = String(state.defaultCompanionId || "").trim();
@@ -5443,6 +5534,11 @@ function registerAssetProtocol() {
 }
 
 ipcMain.handle("desktop:get-state", () => getSafeState());
+ipcMain.handle("desktop:get-graphics-diagnostics", () => getDesktopGraphicsDiagnostics());
+ipcMain.handle("desktop:report-renderer-diagnostics", (_event, diagnostics) => {
+  avatarRendererDiagnostics = sanitizeRendererDiagnostics(diagnostics);
+  return true;
+});
 ipcMain.handle("desktop:get-auth-status", () => getDesktopAuthStatus());
 ipcMain.handle("desktop:verify-auth", (_event, payload) => verifyDesktopAuth(payload));
 ipcMain.handle("desktop:authenticate", (_event, payload) => authenticateDesktopUser(payload));

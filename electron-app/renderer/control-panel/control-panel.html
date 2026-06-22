@@ -84,6 +84,14 @@
         <label class="field-label" for="avatar-model-select">Avatar model</label>
         <select id="avatar-model-select"></select>
 
+        <label class="field-label" for="vrm-quality-select">VRM graphics quality</label>
+        <select id="vrm-quality-select">
+          <option value="low">Low — smoother on low-spec devices</option>
+          <option value="medium">Medium — balanced</option>
+          <option value="high">High — full material detail</option>
+        </select>
+        <p id="vrm-quality-status" class="hint-copy">Changing quality reloads the VRM renderer.</p>
+
         <div class="meter-row">
           <label class="field-label" for="scale-range">Scale <span id="scale-value">1.00x</span></label>
           <input id="scale-range" type="range" min="0.25" max="2.5" step="0.05" value="1">

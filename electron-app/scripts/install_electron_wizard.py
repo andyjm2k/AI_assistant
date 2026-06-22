@@ -241,6 +241,7 @@ def main() -> int:
         "chatSystemPrompt": chat_system_prompt,
         "desktopChatHistory": existing_config.get("desktopChatHistory", []),
         "speakChatReplies": speak_chat_replies,
+        "vrmGraphicsQuality": existing_config.get("vrmGraphicsQuality", "medium"),
         "trustLocalCertificates": trust_local_certificates,
         "vrmTransforms": existing_config.get("vrmTransforms", {}),
         "windowBounds": {
