@@ -1003,3 +1003,440 @@ body.hud-sheet-visible .hud-sheet {
 body.move-mode .move-overlay {
   display: block;
 }
+
+/* Adaptive HUD: compact action dock with routed contextual sheets. */
+body.quick-hud-visible .speech-bubble {
+  bottom: max(var(--avatar-speech-bottom), min(112px, 30vh));
+}
+
+.quick-hud {
+  bottom: max(10px, env(safe-area-inset-bottom));
+  width: min(420px, calc(100% - 12px));
+  gap: 6px;
+}
+
+.hud-dock,
+.quick-hud-status {
+  border: 1px solid var(--hud-line);
+  background: var(--hud-bg);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(16px);
+}
+
+.hud-dock {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 5px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px;
+  border-radius: 16px;
+}
+
+.hud-dock .dock-action {
+  display: grid;
+  grid-template-rows: 20px auto;
+  place-items: center;
+  gap: 3px;
+  min-width: 0;
+  min-height: 48px;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 6px 4px 5px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  background: transparent;
+  color: rgba(248, 252, 255, 0.86);
+  font: 700 10px/1.1 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.hud-dock .dock-action:hover,
+.hud-dock .dock-action.is-active {
+  border-color: rgba(82, 214, 139, 0.35);
+  background: rgba(82, 214, 139, 0.14);
+  color: #f8fcff;
+}
+
+.hud-dock .dock-action-primary {
+  background: linear-gradient(135deg, rgba(82, 214, 139, 0.92), rgba(239, 79, 198, 0.78));
+  color: #061014;
+}
+
+.hud-dock .dock-action-primary:hover,
+.hud-dock .dock-action-primary.is-active {
+  border-color: rgba(248, 252, 255, 0.42);
+  background: linear-gradient(135deg, rgba(82, 214, 139, 1), rgba(239, 79, 198, 0.94));
+  color: #061014;
+}
+
+.hud-dock .dock-action.has-attachment {
+  border-color: rgba(244, 193, 92, 0.5);
+  background: rgba(244, 193, 92, 0.2);
+  color: #fff0c7;
+}
+
+.hud-dock .dock-action:active {
+  transform: translateY(1px);
+}
+
+.hud-dock .dock-action svg,
+.sheet-close-btn svg,
+.quick-chat svg {
+  width: 19px;
+  height: 19px;
+  fill: currentColor;
+}
+
+.hud-dock .dock-action span {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quick-hud-status {
+  justify-self: center;
+  min-height: 25px;
+  max-width: calc(100% - 12px);
+  padding: 6px 11px;
+  overflow: hidden;
+  border-radius: 999px;
+  color: rgba(248, 252, 255, 0.82);
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hud-sheet {
+  bottom: 108px;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  width: min(430px, calc(100% - 12px));
+  max-height: min(520px, calc(100% - 120px));
+  padding: 9px;
+  border-radius: 18px;
+}
+
+.sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 36px;
+  margin-bottom: 7px;
+  padding: 0 2px 0 7px;
+}
+
+.sheet-header > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.sheet-header strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--hud-text);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sheet-grip {
+  width: 30px;
+  height: 4px;
+  margin: 0;
+}
+
+.sheet-close-btn {
+  display: grid;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid var(--hud-line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--hud-text);
+  cursor: pointer;
+}
+
+.sheet-tabs {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 8px;
+}
+
+.sheet-tabs button,
+.sheet-actions button,
+.hud-expression-grid button,
+.sheet-title button,
+.hud-context-actions button,
+.hud-toggle-list button,
+#hud-rescan-models-btn {
+  min-width: 0;
+  min-height: 38px;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 7px 9px;
+  font: 700 11px/1.2 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  overflow-wrap: anywhere;
+  text-align: center;
+  white-space: normal;
+}
+
+.sheet-tabs button[aria-selected="true"] {
+  border-color: rgba(82, 214, 139, 0.5);
+  background: linear-gradient(135deg, rgba(82, 214, 139, 0.24), rgba(239, 79, 198, 0.16));
+}
+
+.sheet-panel {
+  gap: 10px;
+  padding: 2px 3px 6px;
+  scroll-padding-top: 8px;
+}
+
+.sheet-panel.is-active {
+  display: grid;
+}
+
+.sheet-panel label {
+  font-size: 12px;
+}
+
+.sheet-panel input,
+.sheet-panel select,
+.sheet-panel textarea {
+  min-height: 38px;
+  font-size: 12px;
+}
+
+.sheet-panel input[type="range"] {
+  min-height: 24px;
+  padding: 0;
+}
+
+.hud-section-card,
+.hud-settings-group {
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid rgba(248, 252, 255, 0.1);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.hud-section-card {
+  display: grid;
+  gap: 9px;
+  padding: 11px;
+}
+
+.hud-settings-group {
+  overflow: hidden;
+}
+
+.hud-settings-group summary {
+  position: relative;
+  min-height: 42px;
+  box-sizing: border-box;
+  padding: 13px 38px 11px 12px;
+  color: var(--hud-text);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.25;
+  cursor: pointer;
+  list-style: none;
+}
+
+.hud-settings-group summary::-webkit-details-marker {
+  display: none;
+}
+
+.hud-settings-group summary::after {
+  content: "+";
+  position: absolute;
+  top: 50%;
+  right: 13px;
+  color: var(--hud-muted);
+  font-size: 17px;
+  transform: translateY(-50%);
+}
+
+.hud-settings-group[open] summary {
+  border-bottom: 1px solid rgba(248, 252, 255, 0.08);
+}
+
+.hud-settings-group[open] summary::after {
+  content: "−";
+}
+
+.hud-settings-content {
+  display: grid;
+  gap: 9px;
+  padding: 11px;
+}
+
+.hud-context-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.hud-context-actions button,
+.hud-toggle-list button {
+  border: 1px solid var(--hud-line);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.055);
+  color: var(--hud-text);
+  cursor: pointer;
+}
+
+.hud-context-actions button[aria-pressed="true"],
+.hud-toggle-list button[aria-pressed="true"] {
+  border-color: rgba(82, 214, 139, 0.48);
+  background: rgba(82, 214, 139, 0.16);
+}
+
+.hud-toggle-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.hud-danger-action {
+  border-color: rgba(255, 107, 122, 0.28) !important;
+  color: #ffb7c0 !important;
+}
+
+.quick-chat {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px;
+  border-radius: 13px;
+  box-shadow: none;
+}
+
+.quick-chat input {
+  min-height: 42px;
+}
+
+.quick-chat button {
+  min-width: 42px;
+  min-height: 42px;
+}
+
+.hud-chat-log {
+  min-height: 92px;
+  max-height: 210px;
+}
+
+.hud-action-preview {
+  max-height: 220px;
+}
+
+.hud-companion-list {
+  max-height: 220px;
+}
+
+.hud-companion-list-actions button {
+  min-width: 0;
+  min-height: 32px;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 6px 8px;
+  font: 800 10px/1.2 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.hud-status-output {
+  max-height: 220px;
+  font-size: 11px;
+}
+
+.hud-dock button:focus-visible,
+.sheet-close-btn:focus-visible,
+.hud-settings-group summary:focus-visible,
+.hud-context-actions button:focus-visible,
+.hud-toggle-list button:focus-visible {
+  outline: 2px solid rgba(82, 214, 139, 0.88);
+  outline-offset: 2px;
+}
+
+@media (max-width: 360px) {
+  .hud-dock {
+    gap: 3px;
+    padding: 5px;
+  }
+
+  .hud-dock .dock-action {
+    min-height: 44px;
+    padding-inline: 2px;
+    font-size: 9px;
+  }
+
+  .hud-context-actions,
+  .hud-toggle-list,
+  .sheet-field-pair {
+    grid-template-columns: 1fr;
+  }
+
+  .hud-expression-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 300px) {
+  .hud-dock {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .hud-dock .dock-action[data-quick-action="screen"] {
+    display: none;
+  }
+
+  .sheet-tabs button {
+    min-height: 42px;
+    padding-inline: 4px;
+    font-size: 10px;
+  }
+
+  .hud-sheet {
+    width: calc(100% - 8px);
+    padding-inline: 6px;
+  }
+}
+
+@media (max-height: 500px) {
+  .hud-sheet {
+    bottom: 76px;
+    max-height: calc(100% - 84px);
+  }
+
+  .quick-hud {
+    bottom: 6px;
+  }
+
+  .hud-dock .dock-action {
+    min-height: 42px;
+  }
+
+  .quick-hud-status {
+    display: none;
+  }
+
+  .sheet-panel-chat {
+    gap: 6px;
+  }
+
+  .sheet-panel-chat .hud-chat-log {
+    min-height: 58px;
+    max-height: 82px;
+  }
+}
