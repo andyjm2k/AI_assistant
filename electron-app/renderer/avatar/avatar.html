@@ -230,6 +230,14 @@
       <div class="sheet-title">
         <span>Avatar Window</span>
       </div>
+      <label>VRM graphics quality
+        <select id="hud-vrm-quality">
+          <option value="low">Low — smoother on low-spec devices</option>
+          <option value="medium">Medium — balanced</option>
+          <option value="high">High — full material detail</option>
+        </select>
+      </label>
+      <p id="hud-vrm-quality-status" class="sheet-hint">Medium quality is the balanced default. Changing quality reloads the VRM renderer.</p>
       <div class="sheet-field-pair">
         <label>Window width <input id="hud-window-width" type="number" min="240" max="1600" step="10" inputmode="numeric"></label>
         <label>Window height <input id="hud-window-height" type="number" min="320" max="1800" step="10" inputmode="numeric"></label>

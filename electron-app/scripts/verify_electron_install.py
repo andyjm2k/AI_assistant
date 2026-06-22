@@ -18,6 +18,7 @@ REQUIRED_FILES = [
     ELECTRON_ROOT / "main" / "preload.js",
     ELECTRON_ROOT / "renderer" / "avatar" / "avatar.html",
     ELECTRON_ROOT / "renderer" / "avatar" / "avatar.js",
+    ELECTRON_ROOT / "renderer" / "avatar" / "vrm-quality.js",
     ELECTRON_ROOT / "renderer" / "control-panel" / "control-panel.html",
     ELECTRON_ROOT / "renderer" / "control-panel" / "control-panel.js",
     ELECTRON_ROOT / "config" / "default-desktop-config.json",

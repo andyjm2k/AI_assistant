@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("catbotDesktop", {
   getState: () => ipcRenderer.invoke("desktop:get-state"),
+  getGraphicsDiagnostics: () => ipcRenderer.invoke("desktop:get-graphics-diagnostics"),
+  reportRendererDiagnostics: (diagnostics) => ipcRenderer.invoke("desktop:report-renderer-diagnostics", diagnostics),
   getAuthStatus: () => ipcRenderer.invoke("desktop:get-auth-status"),
   verifyAuth: (payload) => ipcRenderer.invoke("desktop:verify-auth", payload),
   authenticate: (payload) => ipcRenderer.invoke("desktop:authenticate", payload),

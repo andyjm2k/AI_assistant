@@ -28,6 +28,7 @@
   "autoCompanionMode": false,
   "autoCompanionScreenContext": true,
   "autoCompanionDance": true,
+  "vrmGraphicsQuality": "medium",
   "trustLocalCertificates": true,
   "vrmTransforms": {},
   "windowBounds": {

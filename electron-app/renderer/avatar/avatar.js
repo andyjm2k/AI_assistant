@@ -2,6 +2,16 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
 import { createVRMAnimationClip, VRMAnimationLoaderPlugin } from "@pixiv/three-vrm-animation";
+import {
+  collectMaterialTextures,
+  configureTextureSampling,
+  createCompatibilityMaterial,
+  createVrmTexturePlan,
+  getRendererCapabilitySummary,
+  getVrmQualityProfile,
+  getVrmRendererOptions,
+  normalizeVrmGraphicsQuality
+} from "./vrm-quality.js";
 
 window.PIXI = window.PIXI || PIXI;
 window.EventEmitter3.EventEmitter = EventEmitter3;
@@ -87,6 +97,8 @@ const hudTtsModel = document.getElementById("hud-tts-model");
 const hudTtsVoice = document.getElementById("hud-tts-voice");
 const hudWindowWidth = document.getElementById("hud-window-width");
 const hudWindowHeight = document.getElementById("hud-window-height");
+const hudVrmQuality = document.getElementById("hud-vrm-quality");
+const hudVrmQualityStatus = document.getElementById("hud-vrm-quality-status");
 const hudPlayLoopBudget = document.getElementById("hud-play-loop-budget");
 const hudPlayNudgeInterval = document.getElementById("hud-play-nudge-interval");
 const hudPlayActionDelay = document.getElementById("hud-play-action-delay");
@@ -180,6 +192,23 @@ let renderLoopActive = false;
 let webglContextLost = false;
 let fallbackImageLoading = null;
 let smoothedVrmDelta = 1 / 60;
+let activeVrmGraphicsQuality = normalizeVrmGraphicsQuality(currentState.vrmGraphicsQuality);
+let activeVrmQualityProfile = getVrmQualityProfile(activeVrmGraphicsQuality);
+let effectiveVrmGraphicsQuality = activeVrmGraphicsQuality;
+let graphicsDowngradeReason = "";
+let vrmTextureDiagnostics = null;
+let graphicsDiagnostics = {};
+let contextLossCount = 0;
+let lastRenderedFrameAt = 0;
+let pendingFrameDelta = 0;
+let diagnosticsWindowStartedAt = performance.now();
+let diagnosticsFrameTimes = [];
+let diagnosticsFrameCount = 0;
+let lastMeasuredFps = 0;
+let lastFrameP95Ms = 0;
+let lastTransformSignature = "";
+let graphicsDiagnosticsTimer = 0;
+let graphicsReloadScheduled = false;
 
 const VRM_ACTION_FADE_IN_SECONDS = 0.55;
 const VRM_ACTION_FADE_OUT_SECONDS = 0.85;
@@ -201,9 +230,7 @@ const VRM_MAX_ANIMATION_DELTA_SECONDS = 1 / 24;
 const VRM_MAX_PHYSICS_DELTA_SECONDS = 1 / 45;
 const VRM_DELTA_SMOOTHING = 0.18;
 const VRM_PHYSICS_RESET_DELTA_SECONDS = 0.22;
-const DESKTOP_MAX_TEXTURE_SIZE = 1024;
 const ENABLE_DESKTOP_VRMA_PRELOAD = true;
-const DESKTOP_MATERIAL_TEXTURE_KEYS = ["map", "emissiveMap", "normalMap", "roughnessMap", "metalnessMap", "alphaMap"];
 const SPEECH_BUBBLE_FADE_MS = 220;
 const SPEECH_SENTENCE_GAP_MS = 90;
 const SPEECH_PREVIEW_PCM_INITIAL_BUFFER_SECONDS = 4.00;
@@ -1772,6 +1799,103 @@ async function setHudDefaultCompanion(companionId) {
   setHudCompanionFeedback(companionId ? "Default character profile updated." : "Default character profile cleared.", "success");
 }
 
+function getWebglRendererName() {
+  try {
+    const context = renderer?.getContext?.();
+    const extension = context?.getExtension?.("WEBGL_debug_renderer_info");
+    if (extension) {
+      return String(context.getParameter(extension.UNMASKED_RENDERER_WEBGL) || "");
+    }
+    return String(context?.getParameter?.(context.RENDERER) || "");
+  } catch (_) {
+    return "";
+  }
+}
+
+function getRendererDiagnosticsSnapshot() {
+  const capabilities = renderer
+    ? getRendererCapabilitySummary(renderer, effectiveVrmGraphicsQuality)
+    : {
+      requestedQuality: activeVrmGraphicsQuality,
+      effectiveQuality: effectiveVrmGraphicsQuality,
+      materialMode: activeVrmQualityProfile.materialMode,
+      targetFps: activeVrmQualityProfile.targetFps
+    };
+  return {
+    ...capabilities,
+    requestedQuality: activeVrmGraphicsQuality,
+    effectiveQuality: effectiveVrmGraphicsQuality,
+    downgradeReason: graphicsDowngradeReason,
+    materialMode: activeVrmQualityProfile.materialMode,
+    renderer: getWebglRendererName(),
+    fps: lastMeasuredFps,
+    frameTimeP95Ms: lastFrameP95Ms,
+    drawCalls: Number(renderer?.info?.render?.calls) || 0,
+    triangles: Number(renderer?.info?.render?.triangles) || 0,
+    textures: Number(renderer?.info?.memory?.textures) || vrmTextureDiagnostics?.textures || 0,
+    geometries: Number(renderer?.info?.memory?.geometries) || 0,
+    estimatedTextureMemoryMb: vrmTextureDiagnostics?.estimatedTextureMemoryMb || 0,
+    textureBudgetMb: vrmTextureDiagnostics?.textureBudgetMb || 0,
+    contextLosses: contextLossCount,
+    updatedAt: Date.now()
+  };
+}
+
+function renderHudGraphicsQualityStatus(state = currentState) {
+  if (!hudVrmQualityStatus) {
+    return;
+  }
+  const diagnostics = getRendererDiagnosticsSnapshot();
+  const requested = normalizeVrmGraphicsQuality(state.vrmGraphicsQuality);
+  const effective = diagnostics.effectiveQuality || requested;
+  const parts = [
+    `${getVrmQualityProfile(requested).label} requested`,
+    `${getVrmQualityProfile(effective).label} active`,
+    diagnostics.renderer,
+    diagnostics.fps > 0 ? `${diagnostics.fps.toFixed(0)} FPS` : ""
+  ].filter(Boolean);
+  if (diagnostics.downgradeReason) {
+    parts.push(diagnostics.downgradeReason);
+  }
+  hudVrmQualityStatus.textContent = parts.join(" · ");
+}
+
+async function publishRendererDiagnostics(force = false) {
+  const now = performance.now();
+  const durationMs = Math.max(1, now - diagnosticsWindowStartedAt);
+  if (force || durationMs >= 1000) {
+    lastMeasuredFps = diagnosticsFrameCount * 1000 / durationMs;
+    const sorted = diagnosticsFrameTimes.slice().sort((a, b) => a - b);
+    lastFrameP95Ms = sorted.length
+      ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))]
+      : 0;
+    diagnosticsWindowStartedAt = now;
+    diagnosticsFrameTimes = [];
+    diagnosticsFrameCount = 0;
+  }
+  const snapshot = getRendererDiagnosticsSnapshot();
+  renderHudGraphicsQualityStatus(currentState);
+  if (typeof window.catbotDesktop.reportRendererDiagnostics === "function") {
+    try {
+      await window.catbotDesktop.reportRendererDiagnostics(snapshot);
+    } catch (_) {
+      // Renderer diagnostics are optional.
+    }
+  }
+}
+
+async function refreshGraphicsDiagnostics() {
+  if (typeof window.catbotDesktop.getGraphicsDiagnostics !== "function") {
+    return;
+  }
+  try {
+    graphicsDiagnostics = await window.catbotDesktop.getGraphicsDiagnostics() || {};
+    renderHudGraphicsQualityStatus(currentState);
+  } catch (_) {
+    // GPU diagnostics are optional.
+  }
+}
+
 function renderHudState(state = currentState) {
   renderHudChat(state.desktopChatHistory);
   renderActionHarnessState(state);
@@ -1859,6 +1983,11 @@ function renderHudState(state = currentState) {
   if (hudWindowHeight) {
     hudWindowHeight.value = String(windowHeight);
   }
+  if (hudVrmQuality) {
+    hudVrmQuality.value = normalizeVrmGraphicsQuality(state.vrmGraphicsQuality);
+    hudVrmQuality.disabled = state.mode === "live2d";
+  }
+  renderHudGraphicsQualityStatus(state);
   if (hudPlayLoopBudget) {
     const loopBudget = Number.isFinite(Number(state.actionHarness?.loopBudget))
       ? Math.round(Number(state.actionHarness.loopBudget))
@@ -1921,6 +2050,11 @@ function renderHudState(state = currentState) {
       {
         mode: state.mode,
         model: modelDisplayName(state.modelPath),
+        vrmGraphicsQuality: normalizeVrmGraphicsQuality(state.vrmGraphicsQuality),
+        graphics: {
+          ...(graphicsDiagnostics || {}),
+          renderer: getRendererDiagnosticsSnapshot()
+        },
         window: {
           visible: state.visible,
           clickThrough: state.clickThrough,
@@ -2037,6 +2171,7 @@ function getHudSettingsPatch() {
     ttsEndpoint: hudTtsEndpoint?.value.trim() || "",
     ttsModel: hudTtsModel?.value.trim() || "tts-1",
     ttsVoice: hudTtsVoice?.value.trim() || "alloy",
+    vrmGraphicsQuality: hudVrmQuality?.value || currentState.vrmGraphicsQuality || "medium",
     actionHarness: {
       loopBudget: Number.isFinite(loopBudget) ? loopBudget : currentState.actionHarness?.loopBudget,
       nudgeInterval: Number.isFinite(nudgeInterval) ? nudgeInterval : currentState.actionHarness?.nudgeInterval,
@@ -2053,8 +2188,24 @@ function getHudSettingsPatch() {
   return patch;
 }
 
+function scheduleGraphicsReloadIfNeeded(state) {
+  const requestedQuality = normalizeVrmGraphicsQuality(state?.vrmGraphicsQuality);
+  if (requestedQuality === activeVrmGraphicsQuality || graphicsReloadScheduled) {
+    return false;
+  }
+  graphicsReloadScheduled = true;
+  currentState = state;
+  renderHudState(state);
+  setStatus(`Reloading VRM graphics: ${getVrmQualityProfile(requestedQuality).label}`);
+  window.setTimeout(() => window.location.reload(), 80);
+  return true;
+}
+
 async function updateDesktopStateFromHud(patch) {
   const nextState = await window.catbotDesktop.setState(patch);
+  if (scheduleGraphicsReloadIfNeeded(nextState)) {
+    return nextState;
+  }
   currentState = nextState;
   renderHudState(currentState);
   return nextState;
@@ -2665,6 +2816,11 @@ function setupQuickHud() {
     await updateDesktopStateFromHud({ modelPath: hudAvatarModel.value });
   });
 
+  hudVrmQuality?.addEventListener("change", async () => {
+    setQuickHudStatus("Reloading VRM graphics...");
+    await updateDesktopStateFromHud({ vrmGraphicsQuality: hudVrmQuality.value });
+  });
+
   hudScaleRange?.addEventListener("input", async () => {
     const scale = Number(hudScaleRange.value);
     if (hudScaleValue) {
@@ -3012,25 +3168,51 @@ async function runHudAuth(action) {
   }
 }
 
+function getSafetyAdjustedGraphicsQuality(requestedQuality) {
+  const requested = normalizeVrmGraphicsQuality(requestedQuality);
+  const webglStatus = String(graphicsDiagnostics?.featureStatus?.webgl || "").toLowerCase();
+  if (
+    graphicsDiagnostics?.hardwareAccelerationEnabled === false ||
+    webglStatus.includes("software") ||
+    webglStatus.includes("disabled") ||
+    webglStatus.includes("unavailable")
+  ) {
+    return {
+      quality: "low",
+      reason: graphicsDiagnostics?.hardwareAccelerationEnabled === false
+        ? "hardware-acceleration-disabled"
+        : `webgl-${webglStatus || "unavailable"}`
+    };
+  }
+  if (contextLossCount >= 2 && requested !== "low") {
+    return { quality: "low", reason: "repeated-webgl-context-loss" };
+  }
+  return { quality: requested, reason: "" };
+}
+
 function initializeScene() {
   if (THREE.ColorManagement) {
     THREE.ColorManagement.enabled = true;
+  }
+  activeVrmGraphicsQuality = normalizeVrmGraphicsQuality(currentState.vrmGraphicsQuality);
+  const safetyQuality = getSafetyAdjustedGraphicsQuality(activeVrmGraphicsQuality);
+  effectiveVrmGraphicsQuality = safetyQuality.quality;
+  graphicsDowngradeReason = safetyQuality.reason;
+  activeVrmQualityProfile = getVrmQualityProfile(effectiveVrmGraphicsQuality);
+  try {
+    renderer?.dispose?.();
+  } catch (_) {
+    // Renderer disposal is best-effort during context recovery.
   }
   scene = new THREE.Scene();
   camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
   camera.position.set(0, 0, 5);
   camera.lookAt(0, 0, 0);
 
-  renderer = new THREE.WebGLRenderer({
-    canvas: vrmCanvas,
-    antialias: false,
-    alpha: true,
-    premultipliedAlpha: false,
-    powerPreference: "low-power",
-    precision: "mediump",
-    failIfMajorPerformanceCaveat: false
-  });
-  renderer.setPixelRatio(Math.min(1.25, window.devicePixelRatio || 1));
+  renderer = new THREE.WebGLRenderer(getVrmRendererOptions(effectiveVrmGraphicsQuality, vrmCanvas));
+  renderer.setPixelRatio(
+    Math.min(activeVrmQualityProfile.pixelRatioCap, window.devicePixelRatio || 1)
+  );
   renderer.setClearColor(0x000000, 0);
   if ("outputColorSpace" in renderer && THREE.SRGBColorSpace) {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -3040,12 +3222,20 @@ function initializeScene() {
     renderer.toneMappingExposure = 1;
   }
 
-  const ambient = new THREE.AmbientLight(0x404040, 0.6);
-  const directional = new THREE.DirectionalLight(0xffffff, 0.8);
-  directional.position.set(1, 1, 1);
-  scene.add(ambient, directional);
+  const hemisphere = new THREE.HemisphereLight(0xf4f7ff, 0x30343c, 0.8);
+  const keyLight = new THREE.DirectionalLight(0xffffff, 1.05);
+  keyLight.position.set(1.5, 2.4, 3.2);
+  const fillLight = new THREE.DirectionalLight(0x9fb8ff, 0.35);
+  fillLight.position.set(-2, 0.8, 1.5);
+  scene.add(hemisphere, keyLight, fillLight);
 
   clock = new THREE.Clock();
+  lastRenderedFrameAt = 0;
+  pendingFrameDelta = 0;
+  diagnosticsWindowStartedAt = performance.now();
+  diagnosticsFrameTimes = [];
+  diagnosticsFrameCount = 0;
+  lastTransformSignature = "";
   resizeRenderer();
   const shouldStartRenderLoop = !renderLoopActive;
   renderLoopActive = true;
@@ -3139,6 +3329,8 @@ function removeCurrentVrmModel() {
   disposeThreeObjectResources(vrmModel.scene);
   vrmModel = null;
   vrmRuntime = null;
+  lastTransformSignature = "";
+  vrmTextureDiagnostics = null;
 }
 
 function removeCurrentLive2dModel() {
@@ -3189,47 +3381,8 @@ function getMaterialTexture(material, key) {
   return texture && texture.isTexture ? texture : null;
 }
 
-function getMaterialBaseColor(material) {
-  const color = material?.color || material?.litFactor || material?.uniforms?.litFactor?.value;
-  return color && color.isColor ? color.clone() : new THREE.Color(0xffffff);
-}
-
 function createDesktopFallbackMaterial(sourceMaterial) {
-  const diffuseMap = getMaterialTexture(sourceMaterial, "map");
-  const alphaMap = getMaterialTexture(sourceMaterial, "alphaMap");
-  const alphaTest = Number.isFinite(Number(sourceMaterial?.alphaTest)) ? Number(sourceMaterial.alphaTest) : 0;
-  const options = {
-    color: getMaterialBaseColor(sourceMaterial),
-    map: diffuseMap,
-    alphaMap,
-    transparent: Boolean(sourceMaterial?.transparent) || Number(sourceMaterial?.opacity) < 1 || Boolean(alphaMap),
-    opacity: Number.isFinite(Number(sourceMaterial?.opacity)) ? Number(sourceMaterial.opacity) : 1,
-    alphaTest,
-    side: sourceMaterial?.side ?? THREE.FrontSide,
-    depthWrite: sourceMaterial?.depthWrite ?? true,
-    depthTest: sourceMaterial?.depthTest ?? true
-  };
-  if (sourceMaterial?.vertexColors) {
-    options.vertexColors = sourceMaterial.vertexColors;
-  }
-  const material = new THREE.MeshBasicMaterial(options);
-  material.name = sourceMaterial?.name ? `${sourceMaterial.name}-desktop-fallback` : "desktop-fallback";
-  if (sourceMaterial?.blending != null) {
-    material.blending = sourceMaterial.blending;
-  }
-  if (sourceMaterial?.blendSrc != null) {
-    material.blendSrc = sourceMaterial.blendSrc;
-  }
-  if (sourceMaterial?.blendDst != null) {
-    material.blendDst = sourceMaterial.blendDst;
-  }
-  if (sourceMaterial?.blendEquation != null) {
-    material.blendEquation = sourceMaterial.blendEquation;
-  }
-  if (sourceMaterial?.userData) {
-    material.userData = { ...sourceMaterial.userData };
-  }
-  return material;
+  return createCompatibilityMaterial(sourceMaterial);
 }
 
 function disposeMaterialTexture(texture) {
@@ -3241,8 +3394,7 @@ function disposeMaterialTexture(texture) {
 }
 
 function disposeMaterialTextures(material, disposedTextures = new Set(), retainedTextures = new Set()) {
-  for (const key of DESKTOP_MATERIAL_TEXTURE_KEYS) {
-    const texture = getMaterialTexture(material, key);
+  for (const texture of collectMaterialTextures(material).keys()) {
     if (!texture || retainedTextures.has(texture) || disposedTextures.has(texture)) {
       continue;
     }
@@ -3263,17 +3415,18 @@ function disposeSourceMaterialResources(material, disposedTextures = new Set(), 
   }
 }
 
-function downscaleTextureForDesktop(texture, maxSize = DESKTOP_MAX_TEXTURE_SIZE) {
+function resizeTextureForQuality(texture, targetWidth, targetHeight) {
   const image = texture?.image;
   const width = Number(image?.naturalWidth || image?.videoWidth || image?.width || 0);
   const height = Number(image?.naturalHeight || image?.videoHeight || image?.height || 0);
-  if (!texture || !image || width <= maxSize && height <= maxSize) {
+  const nextWidth = Math.max(1, Math.round(Number(targetWidth) || width || 1));
+  const nextHeight = Math.max(1, Math.round(Number(targetHeight) || height || 1));
+  if (!texture || !image || !width || !height || width === nextWidth && height === nextHeight) {
     return;
   }
-  const scale = Math.min(maxSize / width, maxSize / height);
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(width * scale));
-  canvas.height = Math.max(1, Math.round(height * scale));
+  canvas.width = nextWidth;
+  canvas.height = nextHeight;
   const context = canvas.getContext("2d", { alpha: true });
   if (!context) {
     return;
@@ -3285,24 +3438,29 @@ function downscaleTextureForDesktop(texture, maxSize = DESKTOP_MAX_TEXTURE_SIZE)
   texture.needsUpdate = true;
 }
 
-function downscaleVrmTexturesForDesktop(vrm) {
-  if (!vrm?.scene) {
-    return;
-  }
-  const seenTextures = new Set();
-  vrm.scene.traverse((child) => {
-    const materials = child?.material ? (Array.isArray(child.material) ? child.material : [child.material]) : [];
-    for (const material of materials) {
-      for (const key of DESKTOP_MATERIAL_TEXTURE_KEYS) {
-        const texture = material?.[key];
-        if (!texture || seenTextures.has(texture)) {
-          continue;
-        }
-        seenTextures.add(texture);
-        downscaleTextureForDesktop(texture);
-      }
+function applyVrmTextureQuality(vrm) {
+  const plan = createVrmTexturePlan(vrm, renderer, effectiveVrmGraphicsQuality);
+  for (const entry of plan.entries) {
+    if (
+      entry.targetWidth !== entry.sourceWidth ||
+      entry.targetHeight !== entry.sourceHeight
+    ) {
+      resizeTextureForQuality(entry.texture, entry.targetWidth, entry.targetHeight);
     }
-  });
+    configureTextureSampling(
+      entry.texture,
+      entry.roles,
+      renderer,
+      effectiveVrmGraphicsQuality
+    );
+  }
+  vrmTextureDiagnostics = {
+    textures: plan.sourceTextureCount,
+    estimatedTextureMemoryMb: plan.estimatedMegabytes,
+    textureBudgetMb: plan.budgetMegabytes,
+    capabilityMaxTextureSize: plan.capabilityMaxTextureSize
+  };
+  return plan;
 }
 
 function applyDesktopMaterialFallback(vrm) {
@@ -3691,11 +3849,14 @@ function getStableVrmFrameDeltas(rawDelta) {
     smoothedVrmDelta = 1 / 60;
   }
   const animationDelta = Math.min(finiteDelta, VRM_MAX_ANIMATION_DELTA_SECONDS);
-  const targetPhysicsDelta = Math.min(finiteDelta, VRM_MAX_PHYSICS_DELTA_SECONDS);
+  const profilePhysicsMax = activeVrmQualityProfile.targetFps <= 30
+    ? 1 / 30
+    : VRM_MAX_PHYSICS_DELTA_SECONDS;
+  const targetPhysicsDelta = Math.min(finiteDelta, profilePhysicsMax);
   smoothedVrmDelta += (targetPhysicsDelta - smoothedVrmDelta) * VRM_DELTA_SMOOTHING;
   return {
     animationDelta,
-    physicsDelta: Math.min(smoothedVrmDelta, VRM_MAX_PHYSICS_DELTA_SECONDS)
+    physicsDelta: Math.min(smoothedVrmDelta, profilePhysicsMax)
   };
 }
 
@@ -4754,6 +4915,16 @@ function applyVrmTransform(state = currentState) {
     return;
   }
   const transform = getCurrentVrmTransform(state);
+  const signature = [
+    transform.scale,
+    transform.positionX,
+    transform.positionY,
+    transform.rotation
+  ].join(":");
+  if (signature === lastTransformSignature) {
+    return;
+  }
+  lastTransformSignature = signature;
   vrmModel.scene.scale.setScalar(transform.scale);
   vrmModel.scene.position.set(transform.positionX, transform.positionY, 0);
   vrmModel.scene.rotation.y = (transform.rotation * Math.PI) / 180;
@@ -4961,6 +5132,11 @@ async function loadVrmModel(modelPath) {
     // best-effort optimization only
   }
   try {
+    VRMUtils.removeUnnecessaryVertices?.(vrm.scene);
+  } catch (_) {
+    // Some imported geometries cannot be compacted safely.
+  }
+  try {
     if (isVrm0(vrm) && typeof VRMUtils.rotateVRM0 === "function") {
       VRMUtils.rotateVRM0(vrm);
     }
@@ -4969,10 +5145,25 @@ async function loadVrmModel(modelPath) {
   }
 
   normalizeMaterialColorSpace(vrm);
-  downscaleVrmTexturesForDesktop(vrm);
-  applyDesktopMaterialFallback(vrm);
+  applyVrmTextureQuality(vrm);
+  if (activeVrmQualityProfile.materialMode === "unlit") {
+    applyDesktopMaterialFallback(vrm);
+  }
   hideRenderFallback();
   scene.add(vrm.scene);
+  try {
+    renderer?.compile?.(scene, camera);
+  } catch (error) {
+    if (activeVrmQualityProfile.materialMode !== "unlit") {
+      console.warn("Authored VRM material compilation failed; using Low compatibility materials.", error);
+      applyDesktopMaterialFallback(vrm);
+      activeVrmQualityProfile = getVrmQualityProfile("low");
+      effectiveVrmGraphicsQuality = "low";
+      graphicsDowngradeReason = "authored-material-compilation-failed";
+    } else {
+      throw error;
+    }
+  }
   vrmModel = vrm;
   setupVrmRuntime(vrm);
   ensureLookTarget(vrm);
@@ -4989,6 +5180,7 @@ async function loadVrmModel(modelPath) {
     applyVrmIdlePose(0);
   }
   setReadyStatus();
+  void publishRendererDiagnostics(true);
 }
 
 async function ensureLive2dRuntime() {
@@ -6094,8 +6286,24 @@ function animate() {
     return;
   }
   requestAnimationFrame(animate);
-  const elapsed = clock.getElapsedTime();
-  const rawDelta = clock.getDelta();
+  const frameStartedAt = performance.now();
+  pendingFrameDelta += clock.getDelta();
+  const elapsed = clock.elapsedTime;
+  if (!currentState.visible) {
+    pendingFrameDelta = 0;
+    lastRenderedFrameAt = frameStartedAt;
+    return;
+  }
+  const minimumFrameIntervalMs = 1000 / Math.max(1, activeVrmQualityProfile.targetFps);
+  if (
+    lastRenderedFrameAt &&
+    frameStartedAt - lastRenderedFrameAt < minimumFrameIntervalMs * 0.9
+  ) {
+    return;
+  }
+  const rawDelta = pendingFrameDelta;
+  pendingFrameDelta = 0;
+  lastRenderedFrameAt = frameStartedAt;
 
   if (currentState.mode === "vrm" && vrmModel) {
     const { animationDelta, physicsDelta } = getStableVrmFrameDeltas(rawDelta);
@@ -6121,7 +6329,13 @@ function animate() {
     }
     if (vrmRuntime) {
       const runningActionKey = getPrimaryRunningVrmActionKey();
-      vrmRuntime.lastPoseSnapshot = createVrmPoseSnapshot(vrmRuntime);
+      if (
+        runningActionKey ||
+        vrmRuntime.restorePoseOnNextManualIdle ||
+        vrmRuntime.poseBlend
+      ) {
+        vrmRuntime.lastPoseSnapshot = createVrmPoseSnapshot(vrmRuntime);
+      }
       vrmRuntime.lastFrameHadRunningAction = Boolean(runningActionKey);
     }
   } else if (currentState.mode === "live2d" && live2dModel && live2dContainer) {
@@ -6158,11 +6372,23 @@ function animate() {
       }
     }
   }
+  const frameTimeMs = performance.now() - frameStartedAt;
+  diagnosticsFrameTimes.push(frameTimeMs);
+  if (diagnosticsFrameTimes.length > 180) {
+    diagnosticsFrameTimes.shift();
+  }
+  diagnosticsFrameCount += 1;
+  if (performance.now() - diagnosticsWindowStartedAt >= 1000) {
+    void publishRendererDiagnostics();
+  }
 }
 
 vrmCanvas?.addEventListener("webglcontextlost", (event) => {
   event.preventDefault();
+  contextLossCount += 1;
   webglContextLost = true;
+  graphicsDowngradeReason = "webgl-context-lost";
+  void publishRendererDiagnostics(true);
   if (currentState.mode !== "live2d") {
     renderLoopActive = false;
     showRenderFallback("WebGL context was lost. Showing fallback image.");
@@ -6181,6 +6407,11 @@ vrmCanvas?.addEventListener("webglcontextrestored", async () => {
       currentModelPath = "";
     }
     initializeScene();
+    if (contextLossCount >= 2 && activeVrmGraphicsQuality !== "low") {
+      effectiveVrmGraphicsQuality = "low";
+      activeVrmQualityProfile = getVrmQualityProfile("low");
+      graphicsDowngradeReason = "repeated-webgl-context-loss";
+    }
     if (currentState.mode === "live2d") {
       await loadLive2dModel(currentState.modelPath);
     } else {
@@ -6210,6 +6441,10 @@ try {
   currentState = await window.catbotDesktop.getState();
   syncQuickHudControls(currentState);
   renderHudState(currentState);
+  await refreshGraphicsDiagnostics();
+  if (!graphicsDiagnosticsTimer) {
+    graphicsDiagnosticsTimer = window.setInterval(refreshGraphicsDiagnostics, 2500);
+  }
   await populateHudTtsVoiceOptions(currentState.ttsVoice);
   syncAuthGate(currentAuthStatus, {
     message: currentAuthStatus.authenticated ? "Signed in." : currentAuthStatus.error || "Sign in to continue."
@@ -6224,6 +6459,9 @@ try {
 }
 
 window.catbotDesktop.onStateChanged(async (state) => {
+  if (scheduleGraphicsReloadIfNeeded(state)) {
+    return;
+  }
   currentState = state;
   applyStateToScene(state);
   if (state.authRequired && currentAuthStatus.authenticated) {
