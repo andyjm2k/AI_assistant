@@ -164,8 +164,8 @@ def test_desktop_action_harness_avatar_hud_controls_are_wired():
     assert "action-arming-overlay" in avatar_html
     assert "action-arming-countdown" in avatar_html
     assert "Select the required active window now" in avatar_html
-    assert 'data-hud-panel-button="play"' in avatar_html
-    assert 'data-hud-panel="play"' in avatar_html
+    assert 'data-hud-panel-button="desktop"' in avatar_html
+    assert 'data-hud-panel="desktop"' in avatar_html
     assert "hud-action-start-btn" in avatar_html
     assert "hud-action-capture-btn" in avatar_html
     assert "hud-play-loop-budget" in avatar_html

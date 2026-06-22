@@ -44,10 +44,12 @@ const quickChatInput = document.getElementById("quick-chat-input");
 const quickChatSend = document.getElementById("quick-chat-send");
 const quickHudStatus = document.getElementById("quick-hud-status");
 const hudSheet = document.getElementById("hud-sheet");
+const hudSheetTitle = document.getElementById("hud-sheet-title");
 const hudPanelButtons = Array.from(document.querySelectorAll("[data-hud-panel-button]"));
 const hudPanels = Array.from(document.querySelectorAll("[data-hud-panel]"));
 const hudChatLog = document.getElementById("hud-chat-log");
 const hudClearChatBtn = document.getElementById("hud-clear-chat-btn");
+const hudChatScreenBtn = document.getElementById("hud-chat-screen-btn");
 const hudActionChip = document.getElementById("hud-action-chip");
 const hudActionStatus = document.getElementById("hud-action-status");
 const hudActionStartBtn = document.getElementById("hud-action-start-btn");
@@ -107,6 +109,7 @@ const hudPlayCaptureQuality = document.getElementById("hud-play-capture-quality"
 const hudApplyWindowSizeBtn = document.getElementById("hud-apply-window-size-btn");
 const hudResetWindowSizeBtn = document.getElementById("hud-reset-window-size-btn");
 const hudSaveSettingsBtn = document.getElementById("hud-save-settings-btn");
+const hudSavePlaySettingsBtn = document.getElementById("hud-save-play-settings-btn");
 const hudToggleSpeakBtn = document.getElementById("hud-toggle-speak-btn");
 const hudToggleWebcamBtn = document.getElementById("hud-toggle-webcam-btn");
 const hudToggleAutoCompanionBtn = document.getElementById("hud-toggle-auto-companion-btn");
@@ -116,6 +119,7 @@ const hudClearProviderKeyBtn = document.getElementById("hud-clear-provider-key-b
 const hudOpenWebBtn = document.getElementById("hud-open-web-btn");
 const hudToggleClickthroughBtn = document.getElementById("hud-toggle-clickthrough-btn");
 const hudToggleTopmostBtn = document.getElementById("hud-toggle-topmost-btn");
+const hudMoveAvatarBtn = document.getElementById("hud-move-avatar-btn");
 const hudCenterAvatarBtn = document.getElementById("hud-center-avatar-btn");
 const hudToggleStartTrayBtn = document.getElementById("hud-toggle-start-tray-btn");
 const hudToggleLaunchLoginBtn = document.getElementById("hud-toggle-launch-login-btn");
@@ -127,6 +131,12 @@ const hudOpenBrowserBtn = document.getElementById("hud-open-browser-btn");
 const hudStatusOutput = document.getElementById("hud-status-output");
 
 const ACTION_HARNESS_ARM_COUNTDOWN_MS = 5000;
+const HUD_PANEL_TITLES = Object.freeze({
+  chat: "Chat",
+  character: "Character",
+  desktop: "Desktop",
+  settings: "Settings"
+});
 
 let currentState = await window.catbotDesktop.getState();
 let currentAuthStatus = await window.catbotDesktop.getAuthStatus();
@@ -171,7 +181,6 @@ let speechPreviewStreamCancel = null;
 let speechGeneration = 0;
 let speechExpressionResetTimeout = 0;
 let lookTarget = null;
-let quickHudWasVisible = Boolean(currentState.quickHudVisible);
 let actionArmingCountdownTimer = 0;
 let pendingScreenSnapshot = null;
 let screenContextModeEnabled = Boolean(currentState.screenContextMode);
@@ -1289,40 +1298,59 @@ async function populateHudTtsVoiceOptions(selectedVoice = currentState.ttsVoice)
   }
 }
 
-function setHudPanel(panelName) {
-  activeHudPanel = String(panelName || "");
+function normalizeHudPanelName(panelName) {
+  const requested = String(panelName || "");
+  if (requested === "play") {
+    return "desktop";
+  }
+  if (requested === "models") {
+    return "character";
+  }
+  if (requested === "auth" || requested === "status") {
+    return "settings";
+  }
+  return Object.hasOwn(HUD_PANEL_TITLES, requested) ? requested : "";
+}
+
+function setHudPanel(panelName, options = {}) {
+  activeHudPanel = normalizeHudPanelName(panelName);
   document.body.classList.toggle("hud-sheet-visible", Boolean(activeHudPanel));
+  hudSheet?.setAttribute("aria-hidden", activeHudPanel ? "false" : "true");
+  if (hudSheetTitle) {
+    hudSheetTitle.textContent = HUD_PANEL_TITLES[activeHudPanel] || "CATBot";
+  }
   for (const panel of hudPanels) {
-    panel.classList.toggle("is-active", panel.dataset.hudPanel === activeHudPanel);
+    const isActive = panel.dataset.hudPanel === activeHudPanel;
+    panel.classList.toggle("is-active", isActive);
+    panel.setAttribute("aria-hidden", isActive ? "false" : "true");
+    if (isActive && options.preserveScroll !== true) {
+      panel.scrollTop = 0;
+    }
   }
   for (const button of hudPanelButtons) {
-    button.classList.toggle("is-active", button.dataset.hudPanelButton === activeHudPanel);
+    const isActive = button.dataset.hudPanelButton === activeHudPanel;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+    button.tabIndex = isActive ? 0 : -1;
   }
   for (const button of quickHud?.querySelectorAll("[data-quick-action]") || []) {
     const action = button.dataset.quickAction;
-    button.classList.toggle(
-      "is-active",
-        (action === "focus-chat" && activeHudPanel === "chat") ||
-        (action === "models" && activeHudPanel === "models") ||
-        (action === "character" && activeHudPanel === "character") ||
-        (action === "controls" && activeHudPanel === "settings") ||
-        (action === "play" && (activeHudPanel === "play" || currentState.actionHarness?.playMode)) ||
-        (action === "screen" && screenContextModeEnabled) ||
-        (action === "move" && currentState.moveMode) ||
-        (action === "webcam" && currentState.webcamMode) ||
-        (action === "microphone" && isMicrophoneCaptureActive())
-    );
+    const isActive =
+      (action === "chat" && activeHudPanel === "chat") ||
+      (action === "more" && Boolean(activeHudPanel) && activeHudPanel !== "chat") ||
+      (action === "play" && Boolean(currentState.actionHarness?.playMode)) ||
+      (action === "screen" && screenContextModeEnabled) ||
+      (action === "microphone" && isMicrophoneCaptureActive());
+    button.classList.toggle("is-active", isActive);
+    if (action === "more") {
+      button.setAttribute("aria-expanded", activeHudPanel && activeHudPanel !== "chat" ? "true" : "false");
+    }
   }
-  if (activeHudPanel === "chat") {
+  if (activeHudPanel === "chat" && options.focusInput === true) {
     requestAnimationFrame(() => quickChatInput?.focus());
-  } else if (activeHudPanel === "auth") {
-    requestAnimationFrame(() => hudAuthUsername?.focus());
   } else if (activeHudPanel === "character") {
-    requestAnimationFrame(() => hudCompanionName?.focus());
     void refreshHudCompanions({ silent: true });
-  } else if (activeHudPanel === "status") {
-    requestAnimationFrame(() => hudSpeechText?.focus());
-  } else if (activeHudPanel === "play") {
+  } else if (activeHudPanel === "desktop" && options.focusPrimary === true) {
     requestAnimationFrame(() => hudActionStartBtn?.focus());
   } else if (activeHudPanel === "settings") {
     void populateHudTtsVoiceOptions(hudTtsVoice?.value || currentState.ttsVoice);
@@ -1896,6 +1924,14 @@ async function refreshGraphicsDiagnostics() {
   }
 }
 
+function renderHudToggle(button, label, active) {
+  if (!button) {
+    return;
+  }
+  button.textContent = `${label}: ${active ? "On" : "Off"}`;
+  button.setAttribute("aria-pressed", active ? "true" : "false");
+}
+
 function renderHudState(state = currentState) {
   renderHudChat(state.desktopChatHistory);
   renderActionHarnessState(state);
@@ -2018,33 +2054,16 @@ function renderHudState(state = currentState) {
       : 62;
     hudPlayCaptureQuality.value = String(captureQuality);
   }
-  if (hudToggleSpeakBtn) {
-    hudToggleSpeakBtn.textContent = `Speak Replies: ${state.speakChatReplies === false ? "Off" : "On"}`;
-  }
-  if (hudToggleWebcamBtn) {
-    hudToggleWebcamBtn.textContent = `Webcam Context: ${state.webcamMode ? "On" : "Off"}`;
-  }
-  if (hudToggleAutoCompanionBtn) {
-    hudToggleAutoCompanionBtn.textContent = `Auto Companion: ${state.autoCompanionMode ? "On" : "Off"}`;
-  }
-  if (hudToggleAutoScreenBtn) {
-    hudToggleAutoScreenBtn.textContent = `Auto Screen: ${state.autoCompanionScreenContext === false ? "Off" : "On"}`;
-  }
-  if (hudToggleAutoDanceBtn) {
-    hudToggleAutoDanceBtn.textContent = `Auto Dance: ${state.autoCompanionDance === false ? "Off" : "On"}`;
-  }
-  if (hudToggleClickthroughBtn) {
-    hudToggleClickthroughBtn.textContent = `Click-Through: ${state.clickThrough ? "On" : "Off"}`;
-  }
-  if (hudToggleTopmostBtn) {
-    hudToggleTopmostBtn.textContent = `Always On Top: ${state.alwaysOnTop ? "On" : "Off"}`;
-  }
-  if (hudToggleStartTrayBtn) {
-    hudToggleStartTrayBtn.textContent = `Start To Tray: ${state.startToTray ? "On" : "Off"}`;
-  }
-  if (hudToggleLaunchLoginBtn) {
-    hudToggleLaunchLoginBtn.textContent = `Launch Login: ${state.launchAtLogin ? "On" : "Off"}`;
-  }
+  renderHudToggle(hudChatScreenBtn, "Screen context", Boolean(state.screenContextMode));
+  renderHudToggle(hudToggleSpeakBtn, "Spoken replies", state.speakChatReplies !== false);
+  renderHudToggle(hudToggleWebcamBtn, "Webcam context", Boolean(state.webcamMode));
+  renderHudToggle(hudToggleAutoCompanionBtn, "Auto companion", Boolean(state.autoCompanionMode));
+  renderHudToggle(hudToggleAutoScreenBtn, "Auto screen", state.autoCompanionScreenContext !== false);
+  renderHudToggle(hudToggleAutoDanceBtn, "Auto dance", state.autoCompanionDance !== false);
+  renderHudToggle(hudToggleClickthroughBtn, "Click-through", Boolean(state.clickThrough));
+  renderHudToggle(hudToggleTopmostBtn, "Always on top", Boolean(state.alwaysOnTop));
+  renderHudToggle(hudToggleStartTrayBtn, "Start to tray", Boolean(state.startToTray));
+  renderHudToggle(hudToggleLaunchLoginBtn, "Launch at login", Boolean(state.launchAtLogin));
   if (hudStatusOutput) {
     hudStatusOutput.textContent = JSON.stringify(
       {
@@ -2158,11 +2177,6 @@ function getHudWindowBoundsPatch(widthValue = hudWindowWidth?.value, heightValue
 }
 
 function getHudSettingsPatch() {
-  const loopBudget = Math.round(Number(hudPlayLoopBudget?.value));
-  const nudgeInterval = Math.round(Number(hudPlayNudgeInterval?.value));
-  const actionDelayMs = Math.round(Number(hudPlayActionDelay?.value));
-  const captureMaxImageWidth = Math.round(Number(hudPlayCaptureWidth?.value));
-  const captureJpegQuality = Math.round(Number(hudPlayCaptureQuality?.value));
   const patch = {
     webClientUrl: hudWebUrl?.value.trim() || "",
     proxyBaseUrl: hudProxyUrl?.value.trim() || currentState.proxyBaseUrl,
@@ -2171,21 +2185,30 @@ function getHudSettingsPatch() {
     ttsEndpoint: hudTtsEndpoint?.value.trim() || "",
     ttsModel: hudTtsModel?.value.trim() || "tts-1",
     ttsVoice: hudTtsVoice?.value.trim() || "alloy",
-    vrmGraphicsQuality: hudVrmQuality?.value || currentState.vrmGraphicsQuality || "medium",
-    actionHarness: {
-      loopBudget: Number.isFinite(loopBudget) ? loopBudget : currentState.actionHarness?.loopBudget,
-      nudgeInterval: Number.isFinite(nudgeInterval) ? nudgeInterval : currentState.actionHarness?.nudgeInterval,
-      actionDelayMs: Number.isFinite(actionDelayMs) ? actionDelayMs : currentState.actionHarness?.actionDelayMs,
-      captureMaxImageWidth: Number.isFinite(captureMaxImageWidth) ? captureMaxImageWidth : currentState.actionHarness?.captureMaxImageWidth,
-      captureJpegQuality: Number.isFinite(captureJpegQuality) ? captureJpegQuality : currentState.actionHarness?.captureJpegQuality
-    },
-    ...getHudWindowBoundsPatch()
+    vrmGraphicsQuality: hudVrmQuality?.value || currentState.vrmGraphicsQuality || "medium"
   };
   const typedProviderKey = hudChatApiKey?.value.trim() || "";
   if (typedProviderKey) {
     patch.chatApiKey = typedProviderKey;
   }
   return patch;
+}
+
+function getHudPlaySettingsPatch() {
+  const loopBudget = Math.round(Number(hudPlayLoopBudget?.value));
+  const nudgeInterval = Math.round(Number(hudPlayNudgeInterval?.value));
+  const actionDelayMs = Math.round(Number(hudPlayActionDelay?.value));
+  const captureMaxImageWidth = Math.round(Number(hudPlayCaptureWidth?.value));
+  const captureJpegQuality = Math.round(Number(hudPlayCaptureQuality?.value));
+  return {
+    actionHarness: {
+      loopBudget: Number.isFinite(loopBudget) ? loopBudget : currentState.actionHarness?.loopBudget,
+      nudgeInterval: Number.isFinite(nudgeInterval) ? nudgeInterval : currentState.actionHarness?.nudgeInterval,
+      actionDelayMs: Number.isFinite(actionDelayMs) ? actionDelayMs : currentState.actionHarness?.actionDelayMs,
+      captureMaxImageWidth: Number.isFinite(captureMaxImageWidth) ? captureMaxImageWidth : currentState.actionHarness?.captureMaxImageWidth,
+      captureJpegQuality: Number.isFinite(captureJpegQuality) ? captureJpegQuality : currentState.actionHarness?.captureJpegQuality
+    }
+  };
 }
 
 function scheduleGraphicsReloadIfNeeded(state) {
@@ -2220,12 +2243,18 @@ function updateQuickHudVisualState() {
     const action = button.dataset.quickAction;
     const isActive =
       (action === "microphone" && isRecording) ||
-      (action === "webcam" && Boolean(currentState.webcamMode)) ||
       (action === "screen" && screenContextModeEnabled) ||
-      (action === "play" && Boolean(currentState.actionHarness?.playMode));
+      (action === "play" && Boolean(currentState.actionHarness?.playMode)) ||
+      (action === "chat" && activeHudPanel === "chat") ||
+      (action === "more" && Boolean(activeHudPanel) && activeHudPanel !== "chat");
     button.classList.toggle("is-active", isActive);
-    button.classList.toggle("is-warming", action === "webcam" && Boolean(webcamStartPromise));
     button.classList.toggle("has-attachment", action === "screen" && Boolean(pendingScreenSnapshot));
+    if (action === "microphone" || action === "screen" || action === "play") {
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    }
+    if (action === "more") {
+      button.setAttribute("aria-expanded", isActive ? "true" : "false");
+    }
   }
 }
 
@@ -2245,26 +2274,20 @@ function syncQuickHudControls(state = currentState) {
   for (const button of quickHud.querySelectorAll("[data-quick-action]")) {
     const action = button.dataset.quickAction;
     const isActive =
-      (action === "click-through" && !state.clickThrough) ||
-      (action === "move" && state.moveMode) ||
       (action === "microphone" && isMicrophoneCaptureActive()) ||
-      (action === "webcam" && state.webcamMode) ||
       (action === "screen" && screenContextModeEnabled) ||
-      (action === "play" && (state.actionHarness?.playMode || state.actionHarness?.status === "arming" || activeHudPanel === "play")) ||
-      (action === "speak" && state.speakChatReplies !== false) ||
-      (action === "focus-chat" && activeHudPanel === "chat") ||
-      (action === "models" && activeHudPanel === "models") ||
-      (action === "character" && activeHudPanel === "character") ||
-      (action === "controls" && activeHudPanel === "settings");
+      (action === "play" && (state.actionHarness?.playMode || state.actionHarness?.status === "arming")) ||
+      (action === "chat" && activeHudPanel === "chat") ||
+      (action === "more" && Boolean(activeHudPanel) && activeHudPanel !== "chat");
     button.classList.toggle("is-active", isActive);
-    button.classList.toggle("is-muted", action === "speak" && state.speakChatReplies === false);
-    button.classList.toggle("is-warming", action === "webcam" && Boolean(webcamStartPromise));
     button.classList.toggle("has-attachment", action === "screen" && Boolean(pendingScreenSnapshot));
+    if (action === "microphone" || action === "screen" || action === "play") {
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    }
+    if (action === "more") {
+      button.setAttribute("aria-expanded", isActive ? "true" : "false");
+    }
   }
-  if (isVisible && !quickHudWasVisible) {
-    requestAnimationFrame(() => quickChatInput?.focus());
-  }
-  quickHudWasVisible = isVisible;
   renderHudState(state);
 }
 
@@ -2346,15 +2369,6 @@ async function sendQuickChatMessage(options = {}) {
   const promptNotes = [screenContextIssueNote, actionHarnessIssueNote].filter(Boolean);
   const messageForModel = promptNotes.length ? `${text}\n\n[${promptNotes.join(" ")}]` : text;
   const usedPendingScreenSnapshot = Boolean(pendingScreenSnapshotForPrompt);
-  try {
-    const hiddenState = await window.catbotDesktop.setQuickHudVisible(false);
-    if (hiddenState) {
-      currentState = hiddenState;
-      applyStateToScene(currentState);
-    }
-  } catch (error) {
-    console.warn("Could not autohide quick HUD before sending chat message:", error);
-  }
   try {
     const result = await window.catbotDesktop.sendChatMessage({
       message: messageForModel,
@@ -2438,7 +2452,7 @@ function showActionHarnessPreview(capture) {
 
 async function startActionHarnessFromHud(options = {}) {
   const quickStart = Boolean(options.quickStart);
-  setHudPanel("play");
+  setHudPanel("desktop");
   setQuickHudStatus("Focus the target window now...");
   showActionHarnessPreview(null);
   try {
@@ -2462,7 +2476,7 @@ async function startActionHarnessFromHud(options = {}) {
     const message = formatQuickStatus(error?.message || error || "Could not start play mode.");
     try {
       currentState = await window.catbotDesktop.setQuickHudVisible(true);
-      setHudPanel("play");
+      setHudPanel("desktop", { focusPrimary: true });
     } catch (_) {
       // Keep the original action-harness error visible if the HUD restore fails.
     }
@@ -2723,13 +2737,12 @@ function setupQuickHud() {
     }
     event.preventDefault();
     const action = button.dataset.quickAction;
-    if (isAuthRequired() && action !== "close") {
+    if (isAuthRequired()) {
       syncAuthGate(currentAuthStatus, { message: "Sign in to use CATBot Desktop." });
       return;
     }
-    if (action === "focus-chat") {
-      setHudPanel("chat");
-      quickChatInput?.focus();
+    if (action === "chat") {
+      setHudPanel("chat", { focusInput: true });
     } else if (action === "microphone") {
       await toggleMicrophoneRecording({ autoSend: true });
     } else if (action === "screen") {
@@ -2740,25 +2753,12 @@ function setupQuickHud() {
       } else {
         await startActionHarnessFromHud({ quickStart: true });
       }
-    } else if (action === "webcam") {
-      await toggleWebcamMode();
-    } else if (action === "models") {
-      setHudPanel("models");
-    } else if (action === "character") {
-      setHudPanel("character");
-    } else if (action === "move") {
-      await window.catbotDesktop.toggleMoveMode();
-    } else if (action === "click-through") {
-      await window.catbotDesktop.toggleClickThrough();
-    } else if (action === "controls") {
-      setHudPanel("settings");
-    } else if (action === "speak") {
-      await updateDesktopStateFromHud({ speakChatReplies: currentState.speakChatReplies === false });
-      setQuickHudStatus(currentState.speakChatReplies === false ? "Spoken replies off." : "Spoken replies on.");
-    } else if (action === "hide") {
-      await window.catbotDesktop.setState({ visible: false, quickHudVisible: false });
-    } else if (action === "close") {
-      await window.catbotDesktop.setQuickHudVisible(false);
+    } else if (action === "more") {
+      if (activeHudPanel && activeHudPanel !== "chat") {
+        closeHudPanel();
+      } else {
+        setHudPanel("settings");
+      }
     }
   });
 
@@ -2771,9 +2771,37 @@ function setupQuickHud() {
     event.stopPropagation();
   });
 
-  for (const button of hudPanelButtons) {
+  hudPanelButtons.forEach((button, index) => {
     button.addEventListener("click", () => setHudPanel(button.dataset.hudPanelButton));
-  }
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+        return;
+      }
+      event.preventDefault();
+      let nextIndex = index;
+      if (event.key === "ArrowLeft") {
+        nextIndex = (index - 1 + hudPanelButtons.length) % hudPanelButtons.length;
+      } else if (event.key === "ArrowRight") {
+        nextIndex = (index + 1) % hudPanelButtons.length;
+      } else if (event.key === "Home") {
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        nextIndex = hudPanelButtons.length - 1;
+      }
+      const nextButton = hudPanelButtons[nextIndex];
+      setHudPanel(nextButton.dataset.hudPanelButton);
+      nextButton.focus();
+    });
+  });
+
+  hudChatScreenBtn?.addEventListener("click", async () => {
+    await attachScreenSnapshot();
+  });
+
+  hudMoveAvatarBtn?.addEventListener("click", async () => {
+    currentState = await window.catbotDesktop.toggleMoveMode();
+    renderHudState(currentState);
+  });
 
   for (const button of document.querySelectorAll("[data-hud-panel-close]")) {
     button.addEventListener("click", closeHudPanel);
@@ -2912,6 +2940,11 @@ function setupQuickHud() {
     setQuickHudStatus("Settings saved.");
   });
 
+  hudSavePlaySettingsBtn?.addEventListener("click", async () => {
+    await updateDesktopStateFromHud(getHudPlaySettingsPatch());
+    setQuickHudStatus("Play Mode settings saved.");
+  });
+
   for (const input of [hudProxyUrl, hudTtsEndpoint, hudTtsModel]) {
     input?.addEventListener("change", () => {
       void populateHudTtsVoiceOptions(hudTtsVoice?.value || currentState.ttsVoice);
@@ -3015,7 +3048,6 @@ function setupQuickHud() {
     }
     const durationMs = Math.max(1600, Math.min(8000, text.length * 90));
     await updateDesktopStateFromHud({
-      ...getHudSettingsPatch(),
       speechBubbleText: text,
       speechDurationMs: durationMs,
       speechTriggerId: Date.now()
@@ -3071,26 +3103,19 @@ function setupQuickHud() {
       await sendQuickChatMessage();
     } else if (key === "l") {
       event.preventDefault();
-      closeHudPanel();
-      quickChatInput?.focus();
+      setHudPanel("chat", { focusInput: true });
     } else if (key === "1") {
       event.preventDefault();
-      setHudPanel("chat");
+      setHudPanel("chat", { focusInput: true });
     } else if (key === "2") {
       event.preventDefault();
-      setHudPanel("auth");
+      setHudPanel("character");
     } else if (key === "3") {
       event.preventDefault();
-      setHudPanel("models");
+      setHudPanel("desktop");
     } else if (key === "4") {
       event.preventDefault();
-      setHudPanel("character");
-    } else if (key === "5") {
-      event.preventDefault();
       setHudPanel("settings");
-    } else if (key === "6") {
-      event.preventDefault();
-      setHudPanel("status");
     } else if (key === "s" && event.shiftKey) {
       event.preventDefault();
       await attachScreenSnapshot();
@@ -4896,7 +4921,7 @@ function syncAvatarOverlayPosition(state = currentState) {
     safeTop,
     Math.max(safeTop, height - 72)
   );
-  const speechMinBottom = state?.quickHudVisible ? Math.min(188, height * 0.42) : 28;
+  const speechMinBottom = state?.quickHudVisible ? Math.min(112, height * 0.3) : 28;
   const speechBottom = clampOverlayCoordinate(
     height - (overlayPoint.y + Math.min(240, height * 0.38)),
     speechMinBottom,

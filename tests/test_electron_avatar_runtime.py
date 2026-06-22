@@ -4,6 +4,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ELECTRON_AVATAR = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "avatar.js"
 ELECTRON_AVATAR_HTML = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "avatar.html"
+ELECTRON_AVATAR_CSS = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "avatar.css"
 ELECTRON_VRM_QUALITY = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "vrm-quality.js"
 ELECTRON_MAIN = PROJECT_ROOT / "electron-app" / "main" / "main.js"
 ELECTRON_PRELOAD = PROJECT_ROOT / "electron-app" / "main" / "preload.js"
@@ -125,3 +126,28 @@ def test_electron_vrm_quality_state_and_gpu_diagnostics_are_exposed():
     assert "reportRendererDiagnostics:" in preload
     assert 'id="hud-vrm-quality"' in html
     assert '"vrmGraphicsQuality": "medium"' in config
+
+
+def test_adaptive_hud_uses_a_compact_dock_and_four_contextual_routes():
+    html = ELECTRON_AVATAR_HTML.read_text(encoding="utf-8")
+    css = ELECTRON_AVATAR_CSS.read_text(encoding="utf-8")
+    avatar = _avatar_js_text()
+
+    for action in ["chat", "microphone", "screen", "play", "more"]:
+        assert f'data-quick-action="{action}"' in html
+
+    assert html.count('class="dock-action') == 5
+    for route in ["chat", "character", "desktop", "settings"]:
+        assert f'data-hud-panel-button="{route}"' in html
+        assert f'data-hud-panel="{route}"' in html
+
+    assert 'role="tab"' in html
+    assert 'aria-selected="false"' in html
+    assert 'id="quick-chat-form"' in html.split('data-hud-panel="chat"', 1)[1]
+    assert 'class="hud-settings-group"' in html
+    assert "@media (max-width: 300px)" in css
+    assert '.dock-action[data-quick-action="screen"]' in css
+    assert "function normalizeHudPanelName(panelName)" in avatar
+    assert 'button.setAttribute("aria-selected", isActive ? "true" : "false");' in avatar
+    assert 'setHudPanel("chat", { focusInput: true });' in avatar
+    assert "Could not autohide quick HUD before sending chat message" not in avatar
