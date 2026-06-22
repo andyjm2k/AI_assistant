@@ -84,6 +84,22 @@ def test_build_child_env_sets_project_root_and_active_venv(monkeypatch):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_check_selected_workflow_backend_uses_resolved_venv_python(monkeypatch):
+    from scripts import start_all
+
+    captured = {}
+    monkeypatch.setattr(start_all, "VENV_PYTHON", r"C:\CATBot\venv\Scripts\python.exe")
+
+    def fake_check(python_exe):
+        captured["python_exe"] = python_exe
+        return True, "AG2 OK"
+
+    monkeypatch.setattr(start_all, "check_workflow_backend", fake_check)
+
+    assert start_all._check_selected_workflow_backend() == (True, "AG2 OK")
+    assert captured["python_exe"] == r"C:\CATBot\venv\Scripts\python.exe"
+
+
 def test_launch_in_new_cmd_uses_new_console_flag_on_windows(monkeypatch):
     from scripts import start_all
 
@@ -117,6 +133,7 @@ def test_main_fails_when_service_exits_immediately(monkeypatch):
             return 1
 
     monkeypatch.setattr(start_all.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(start_all, "_check_selected_workflow_backend", lambda: (True, "AG2 OK"))
     monkeypatch.setattr(start_all, "_build_child_env", lambda: {"X": "1"})
     monkeypatch.setattr(start_all, "_resolve_autogenstudio_command", lambda: None)
     monkeypatch.setattr(
@@ -155,6 +172,7 @@ def test_main_retries_without_new_console_after_immediate_exit(monkeypatch):
         return LiveProc()
 
     monkeypatch.setattr(start_all.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(start_all, "_check_selected_workflow_backend", lambda: (True, "AG2 OK"))
     monkeypatch.setattr(start_all, "_build_child_env", lambda: {"X": "1"})
     monkeypatch.setattr(start_all, "_resolve_autogenstudio_command", lambda: None)
     monkeypatch.setattr(
@@ -178,6 +196,7 @@ def test_main_fails_when_ports_never_open(monkeypatch):
             return None
 
     monkeypatch.setattr(start_all.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(start_all, "_check_selected_workflow_backend", lambda: (True, "AG2 OK"))
     monkeypatch.setattr(start_all, "_build_child_env", lambda: {"X": "1"})
     monkeypatch.setattr(start_all, "_resolve_autogenstudio_command", lambda: None)
     monkeypatch.setattr(
@@ -210,6 +229,7 @@ def test_main_warns_for_optional_service_exit_but_succeeds(monkeypatch):
     launch_results = iter([LiveProc(), DeadProc(), DeadProc()])
 
     monkeypatch.setattr(start_all.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(start_all, "_check_selected_workflow_backend", lambda: (True, "AG2 OK"))
     monkeypatch.setattr(start_all, "_build_child_env", lambda: {"X": "1"})
     monkeypatch.setattr(start_all, "_resolve_autogenstudio_command", lambda: None)
     monkeypatch.setattr(

@@ -1,62 +1,39 @@
-#!/usr/bin/env python3
-"""
-Simple test to check MCP communication
-"""
 import asyncio
-import json
 import sys
+
+import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-async def test_mcp():
-    """Test basic MCP communication"""
-    try:
-        # Create a simple test server that just echoes back
-        test_server_code = '''
-import sys
-import json
 
-def main():
-    for line in sys.stdin:
-        try:
-            message = json.loads(line.strip())
-            print(json.dumps({
-                "jsonrpc": "2.0",
-                "id": message.get("id"),
-                "result": {"test": "echo"}
-            }))
-        except:
-            pass
+@pytest.mark.asyncio
+async def test_mcp_stdio_round_trip(tmp_path):
+    server_script = tmp_path / "test_mcp_server.py"
+    server_script.write_text(
+        """
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("catbot-test")
+
+@mcp.tool()
+def echo(value: str) -> str:
+    return value
 
 if __name__ == "__main__":
-    main()
-'''
+    mcp.run(transport="stdio")
+""".strip(),
+        encoding="utf-8",
+    )
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(server_script)],
+        env=None,
+    )
 
-        # Write test server to file
-        with open('test_server.py', 'w') as f:
-            f.write(test_server_code)
-
-        server_params = StdioServerParameters(
-            command=sys.executable,
-            args=['test_server.py'],
-            env=None
-        )
-
+    async with asyncio.timeout(15):
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
+                tools = await session.list_tools()
 
-                # Try tools/list
-                try:
-                    result = await session.list_tools()
-                    print("Tools list result:", result)
-                except Exception as e:
-                    print(f"Tools list error: {e}")
-
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-
-if __name__ == "__main__":
-    asyncio.run(test_mcp())
+    assert [tool.name for tool in tools.tools] == ["echo"]

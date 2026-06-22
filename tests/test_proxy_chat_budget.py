@@ -393,3 +393,105 @@ def test_proxy_models_rejects_untrusted_override_without_auth(monkeypatch):
 
     assert response.status_code == 400
     assert "Endpoint override requires" in response.json()["detail"]
+
+
+def test_proxy_models_allows_authenticated_trusted_private_endpoint(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "http://127.0.0.1:11434/v1")
+    monkeypatch.setattr(proxy_server, "OPENAI_PROXY_ALLOW_PRIVATE", False)
+    monkeypatch.setattr(proxy_server, "PROXY_OUTBOUND_ALLOW_PRIVATE", False)
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            self.is_closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            self.is_closed = True
+
+        async def get(self, endpoint, headers=None):
+            captured["endpoint"] = endpoint
+            return httpx.Response(200, json={"data": [{"id": "local-model"}]})
+
+    monkeypatch.setattr(proxy_server.httpx, "AsyncClient", FakeAsyncClient)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.get(
+            "/v1/proxy/models?endpoint=http://127.0.0.1:11434/v1",
+            headers=_proxy_auth_headers("trusted-local-model-user"),
+        )
+
+    assert response.status_code == 200, response.text
+    assert captured["endpoint"] == "http://127.0.0.1:11434/v1/models"
+
+
+def test_proxy_models_rejects_unauthenticated_private_endpoint_even_when_trusted(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "http://127.0.0.1:11434/v1")
+    monkeypatch.setattr(proxy_server, "OPENAI_PROXY_ALLOW_PRIVATE", False)
+    monkeypatch.setattr(proxy_server, "PROXY_OUTBOUND_ALLOW_PRIVATE", False)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.get(
+            "/v1/proxy/models?endpoint=http://127.0.0.1:11434/v1",
+            headers={"Authorization": "Bearer local-provider-key"},
+        )
+
+    assert response.status_code == 401
+    assert "CATBot authentication is required" in response.json()["detail"]
+
+
+def test_proxy_models_allows_authenticated_private_override_with_scoped_opt_in(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
+    monkeypatch.setattr(proxy_server, "OPENAI_PROXY_ALLOW_PRIVATE", True)
+    monkeypatch.setattr(proxy_server, "PROXY_OUTBOUND_ALLOW_PRIVATE", False)
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            self.is_closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aclose(self):
+            self.is_closed = True
+
+        async def get(self, endpoint, headers=None):
+            captured["endpoint"] = endpoint
+            return httpx.Response(200, json={"data": [{"id": "lan-model"}]})
+
+    monkeypatch.setattr(proxy_server.httpx, "AsyncClient", FakeAsyncClient)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.get(
+            "/v1/proxy/models?endpoint=http://192.168.1.50:1234/v1",
+            headers=_proxy_auth_headers("private-model-opt-in-user"),
+        )
+
+    assert response.status_code == 200, response.text
+    assert captured["endpoint"] == "http://192.168.1.50:1234/v1/models"
+
+
+def test_proxy_models_private_override_error_is_actionable(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_BASE", "https://trusted.example/v1")
+    monkeypatch.setattr(proxy_server, "OPENAI_PROXY_ALLOW_PRIVATE", False)
+    monkeypatch.setattr(proxy_server, "PROXY_OUTBOUND_ALLOW_PRIVATE", False)
+
+    with TestClient(proxy_server.app) as client:
+        response = client.get(
+            "/v1/proxy/models?endpoint=http://192.168.1.50:1234/v1",
+            headers=_proxy_auth_headers("blocked-private-model-user"),
+        )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "OPENAI_PROXY_TRUSTED_BASE_URLS" in detail
+    assert "OPENAI_PROXY_ALLOW_PRIVATE=true" in detail

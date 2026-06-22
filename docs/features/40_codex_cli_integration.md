@@ -64,5 +64,5 @@ flowchart TD
 
 ## Related Docs
 - [GitHub Project Management Skill](35_github_project_management_skill.md)
-- [AutoGen Orchestration](39_autogen_orchestration.md)
+- [Workflow Orchestration](39_autogen_orchestration.md)
 - [Security Controls](45_security_controls.md)

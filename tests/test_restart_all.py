@@ -79,3 +79,55 @@ def test_get_service_signature_hits_matches_studio_absolute_executable_command()
     hits = restart_all._get_service_signature_hits(stop_all_module, required)
 
     assert hits == {restart_all.STUDIO_SERVICE_KEY}
+
+
+def test_check_selected_workflow_backend_uses_resolved_venv_python(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(restart_all, "VENV_PYTHON", r"C:\CATBot\venv\Scripts\python.exe")
+
+    def fake_check(python_exe):
+        captured["python_exe"] = python_exe
+        return True, "AG2 OK"
+
+    monkeypatch.setattr(restart_all, "check_workflow_backend", fake_check)
+
+    assert restart_all._check_selected_workflow_backend() == (True, "AG2 OK")
+    assert captured["python_exe"] == r"C:\CATBot\venv\Scripts\python.exe"
+
+
+def test_main_fails_before_stop_when_workflow_backend_unavailable(monkeypatch):
+    sent_messages = []
+
+    class Args:
+        chat_id = "123"
+        requested_by = "tester"
+        stop_attempts = 1
+        start_attempts = 1
+
+    monkeypatch.setattr(restart_all.sys, "platform", "win32")
+    monkeypatch.setattr(restart_all, "parse_args", lambda: Args())
+    monkeypatch.setattr(restart_all, "_studio_available", lambda: False)
+    monkeypatch.setattr(
+        restart_all,
+        "_check_selected_workflow_backend",
+        lambda: (False, "AG2 backend not available"),
+    )
+    monkeypatch.setattr(
+        restart_all,
+        "_send_telegram_message",
+        lambda chat_id, text: sent_messages.append((chat_id, text)),
+    )
+
+    def fail_load_stop_all():
+        raise AssertionError("stop_all should not be loaded when workflow backend is unavailable")
+
+    monkeypatch.setattr(restart_all, "_load_stop_all_module", fail_load_stop_all)
+
+    assert restart_all.main() == 1
+    assert sent_messages == [
+        (
+            "123",
+            "Restart failed before stop phase: selected workflow backend is not usable "
+            "(AG2 backend not available)",
+        )
+    ]

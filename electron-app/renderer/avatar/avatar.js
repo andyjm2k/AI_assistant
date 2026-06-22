@@ -124,6 +124,8 @@ let companionListCache = [];
 let companionsLoading = false;
 let activeHudPanel = "";
 let currentModelPath = "";
+let avatarModelLoadGeneration = 0;
+let avatarModelLoadTargetKey = "";
 let vrmModel = null;
 let vrmRuntime = null;
 let live2dModel = null;
@@ -260,11 +262,11 @@ const VRM_FINGER_BONE_NAMES = [
 ];
 const VRM_EXPRESSION_ACTION_MAP = {
   neutral: "idle",
-  happy: "love",
+  happy: "happy",
   love: "love",
   think: "think",
   thinking: "think",
-  sad: "cry",
+  sad: "sad",
   cry: "cry",
   angry: "angry",
   surprised: "surprised"
@@ -318,6 +320,28 @@ function hideRenderFallback() {
 function formatLoadError(error) {
   const raw = String(error?.message || error || "unknown error").trim();
   return raw.length > 140 ? `${raw.slice(0, 137)}...` : raw;
+}
+
+function getAvatarModelLoadKey(mode, modelPath) {
+  return `${mode}:${String(modelPath || "").trim()}`;
+}
+
+function beginAvatarModelLoad(mode, modelPath) {
+  const loadKey = getAvatarModelLoadKey(mode, modelPath);
+  if (avatarModelLoadTargetKey !== loadKey) {
+    avatarModelLoadTargetKey = loadKey;
+    avatarModelLoadGeneration += 1;
+  }
+  return avatarModelLoadGeneration;
+}
+
+function invalidateAvatarModelLoads() {
+  avatarModelLoadTargetKey = "";
+  avatarModelLoadGeneration += 1;
+}
+
+function isStaleAvatarModelLoad(loadGeneration) {
+  return loadGeneration !== avatarModelLoadGeneration;
 }
 
 function setReadyStatus() {
@@ -1006,21 +1030,38 @@ function getDanceActionKey(relativePath) {
 }
 
 async function ensureDanceActionsLoaded() {
-  if (!vrmModel || !vrmRuntime?.mixer || vrmRuntime.version !== "1.0") {
+  const activeVrm = vrmModel;
+  const runtime = vrmRuntime;
+  if (!activeVrm || !runtime?.mixer || runtime.version !== "1.0") {
     return [];
   }
   const animations = await refreshVrmAnimationDirectory();
+  if (activeVrm !== vrmModel || runtime !== vrmRuntime) {
+    return [];
+  }
   const danceEntries = Array.isArray(animations.dance) ? animations.dance : [];
   const loadedEntries = [];
   for (const entry of danceEntries) {
+    if (activeVrm !== vrmModel || runtime !== vrmRuntime) {
+      return [];
+    }
     const relativePath = entry?.path || "";
     if (!relativePath) {
       continue;
     }
     const actionKey = getDanceActionKey(relativePath);
-    if (!vrmRuntime.actions?.[actionKey]) {
+    if (!runtime.actions?.[actionKey]) {
       try {
-        vrmRuntime.actions[actionKey] = await loadVrmaAction(vrmModel, vrmRuntime.mixer, actionKey, relativePath);
+        const action = await loadVrmaAction(activeVrm, runtime.mixer, actionKey, relativePath);
+        if (activeVrm !== vrmModel || runtime !== vrmRuntime) {
+          try {
+            action.stop();
+          } catch (_) {
+            // ignore stale dance cleanup issues
+          }
+          return [];
+        }
+        runtime.actions[actionKey] = action;
       } catch (error) {
         console.warn(`Failed to load dance VRMA "${relativePath}":`, error);
         continue;
@@ -1039,6 +1080,9 @@ async function playRandomAutoDance() {
     return false;
   }
   const danceEntries = await ensureDanceActionsLoaded();
+  if (currentState.mode !== "vrm" || !vrmModel || !vrmRuntime?.mixer) {
+    return false;
+  }
   if (!danceEntries.length) {
     setQuickHudStatus(`No dance VRMA files found in ${availableVrmAnimations.danceDirectory || "model_avatar/AutoDance"}.`);
     return false;
@@ -1068,6 +1112,13 @@ async function runAutoCompanionEmote() {
     autoCompanionEmoteTimer = window.setTimeout(async () => {
       autoCompanionEmoteTimer = 0;
       try {
+        const latestState = await window.catbotDesktop.getState();
+        const latestExpression = String(latestState?.expression || "neutral").toLowerCase();
+        if (!latestState?.transientExpression || latestExpression !== expression) {
+          currentState = latestState || currentState;
+          renderHudState(currentState);
+          return;
+        }
         currentState = await window.catbotDesktop.setState({
           expression: "neutral",
           transientExpression: false
@@ -2996,8 +3047,11 @@ function initializeScene() {
 
   clock = new THREE.Clock();
   resizeRenderer();
+  const shouldStartRenderLoop = !renderLoopActive;
   renderLoopActive = true;
-  animate();
+  if (shouldStartRenderLoop) {
+    animate();
+  }
 }
 
 function resizeRenderer() {
@@ -3036,6 +3090,34 @@ function refreshTransparentSurface() {
   }
 }
 
+function disposeThreeObjectResources(root) {
+  if (!root?.traverse) {
+    return;
+  }
+  const disposedTextures = new Set();
+  root.traverse((child) => {
+    if (child.geometry) {
+      child.geometry.dispose();
+    }
+    if (!child.material) {
+      return;
+    }
+    if (Array.isArray(child.material)) {
+      for (const material of child.material) {
+        disposeMaterialTextures(material, disposedTextures);
+        material.dispose();
+      }
+    } else {
+      disposeMaterialTextures(child.material, disposedTextures);
+      child.material.dispose();
+    }
+  });
+}
+
+function disposeGltfSceneResources(gltf) {
+  disposeThreeObjectResources(gltf?.scene);
+}
+
 function removeCurrentVrmModel() {
   if (!vrmModel) {
     return;
@@ -3053,24 +3135,8 @@ function removeCurrentVrmModel() {
     scene.remove(lookTarget);
     lookTarget = null;
   }
-  scene.remove(vrmModel.scene);
-  const disposedTextures = new Set();
-  vrmModel.scene.traverse((child) => {
-    if (child.geometry) {
-      child.geometry.dispose();
-    }
-    if (child.material) {
-      if (Array.isArray(child.material)) {
-        for (const material of child.material) {
-          disposeMaterialTextures(material, disposedTextures);
-          material.dispose();
-        }
-      } else {
-        disposeMaterialTextures(child.material, disposedTextures);
-        child.material.dispose();
-      }
-    }
-  });
+  scene?.remove(vrmModel.scene);
+  disposeThreeObjectResources(vrmModel.scene);
   vrmModel = null;
   vrmRuntime = null;
 }
@@ -3420,6 +3486,7 @@ function setupVrmRuntime(vrm) {
     idleReplayTimerId: 0,
     idleHasPlayedOnce: false,
     emotionTimerId: 0,
+    actionStopTimerIds: new Set(),
     baseStandingPoseSnapshot: null,
     idleReferencePoseSnapshot: null,
     lastPoseSnapshot: null,
@@ -3539,36 +3606,54 @@ function captureVrmActionPoseSnapshot(actionKey, sampleSeconds = 0) {
   }
 }
 
-async function preloadVrmActions(vrm) {
+async function preloadVrmActions(vrm, runtime = vrmRuntime, loadGeneration = avatarModelLoadGeneration) {
   if (!ENABLE_DESKTOP_VRMA_PRELOAD) {
-    return;
+    return false;
   }
-  if (!vrmRuntime || vrmRuntime.version !== "1.0") {
-    return;
+  if (!runtime || runtime.version !== "1.0" || !vrm?.scene) {
+    return false;
   }
 
   const mixer = new THREE.AnimationMixer(vrm.scene);
-  vrmRuntime.mixer = mixer;
-  vrmRuntime.actions = {};
-  vrmRuntime.activeActionKey = "";
+  runtime.mixer = mixer;
+  runtime.actions = {};
+  runtime.activeActionKey = "";
+  runtime.requestedActionKey = "";
 
+  const loadedActions = {};
   await Promise.all(Object.entries(VRM_ANIMATION_LIBRARY).map(async ([actionKey, relativePath]) => {
     try {
-      vrmRuntime.actions[actionKey] = await loadVrmaAction(vrm, mixer, actionKey, relativePath);
+      loadedActions[actionKey] = await loadVrmaAction(vrm, mixer, actionKey, relativePath);
     } catch (error) {
       console.warn(`Failed to preload VRMA action "${actionKey}":`, error);
     }
   }));
 
-  if (!Object.keys(vrmRuntime.actions).length) {
-    vrmRuntime.mixer = null;
-    return;
+  if (isStaleAvatarModelLoad(loadGeneration) || runtime !== vrmRuntime || vrm !== vrmModel) {
+    try {
+      mixer.stopAllAction();
+      mixer.uncacheRoot(vrm.scene);
+    } catch (_) {
+      // ignore stale preload cleanup issues
+    }
+    if (runtime === vrmRuntime && vrm === vrmModel) {
+      runtime.mixer = null;
+      runtime.actions = {};
+    }
+    return false;
   }
 
-  vrmRuntime.idleReferencePoseSnapshot = captureVrmActionPoseSnapshot(
+  runtime.actions = loadedActions;
+  if (!Object.keys(runtime.actions).length) {
+    runtime.mixer = null;
+    return false;
+  }
+
+  runtime.idleReferencePoseSnapshot = captureVrmActionPoseSnapshot(
     "idle",
     VRM_IDLE_REFERENCE_POSE_SAMPLE_SECONDS
   );
+  return true;
 }
 
 function clearVrmAnimationTimers(runtime = vrmRuntime) {
@@ -3582,6 +3667,12 @@ function clearVrmAnimationTimers(runtime = vrmRuntime) {
   if (runtime.emotionTimerId) {
     clearTimeout(runtime.emotionTimerId);
     runtime.emotionTimerId = 0;
+  }
+  if (runtime.actionStopTimerIds?.size) {
+    for (const timerId of runtime.actionStopTimerIds) {
+      clearTimeout(timerId);
+    }
+    runtime.actionStopTimerIds.clear();
   }
 }
 
@@ -3799,17 +3890,23 @@ function stopVrmAction(action, fadeOutSeconds = VRM_ACTION_FADE_OUT_SECONDS) {
   if (!action) {
     return;
   }
+  const runtimeAtStop = vrmRuntime;
   try {
-    if (vrmRuntime?.poseBlend?.actionKey === action.name) {
-      vrmRuntime.poseBlend = null;
+    if (runtimeAtStop?.poseBlend?.actionKey === action.name) {
+      runtimeAtStop.poseBlend = null;
     }
     if (fadeOutSeconds > 0 && action.isRunning?.()) {
       action.fadeOut(fadeOutSeconds);
-      window.setTimeout(() => {
+      const timerId = window.setTimeout(() => {
         try {
+          runtimeAtStop?.actionStopTimerIds?.delete(timerId);
+          if (vrmRuntime !== runtimeAtStop) {
+            action.stop();
+            return;
+          }
           if (!action.isRunning?.() || action.getEffectiveWeight?.() < 0.02) {
-            if (vrmRuntime) {
-              vrmRuntime.restorePoseOnNextManualIdle = true;
+            if (runtimeAtStop) {
+              runtimeAtStop.restorePoseOnNextManualIdle = true;
             }
             action.stop();
           }
@@ -3817,9 +3914,10 @@ function stopVrmAction(action, fadeOutSeconds = VRM_ACTION_FADE_OUT_SECONDS) {
           // ignore delayed stop failures
         }
       }, Math.ceil(fadeOutSeconds * 1000) + 80);
+      runtimeAtStop?.actionStopTimerIds?.add(timerId);
     } else {
-      if (vrmRuntime) {
-        vrmRuntime.restorePoseOnNextManualIdle = true;
+      if (runtimeAtStop) {
+        runtimeAtStop.restorePoseOnNextManualIdle = true;
       }
       action.stop();
     }
@@ -4747,6 +4845,11 @@ function applyVrmExpression(expression) {
         // ignore unsupported blend shapes
       }
     }
+    try {
+      vrmModel.blendShapeProxy.update?.();
+    } catch (_) {
+      // ignore blend shape update failures
+    }
   }
 
   try {
@@ -4796,11 +4899,16 @@ function forceNeutralVrmFaceForSpeech(state = currentState) {
 }
 
 async function loadVrmModel(modelPath) {
+  const loadGeneration = beginAvatarModelLoad("vrm", modelPath);
   if (webglContextLost) {
     return;
   }
   if (!modelPath) {
+    removeCurrentLive2dModel();
+    removeCurrentVrmModel();
+    currentModelPath = "";
     setStatus("No VRM model selected");
+    syncAvatarOverlayPosition(currentState);
     return;
   }
   if (modelPath === currentModelPath && vrmModel) {
@@ -4812,13 +4920,36 @@ async function loadVrmModel(modelPath) {
   const loader = new GLTFLoader();
   loader.register((parser) => new VRMLoaderPlugin(parser));
 
-  const modelUrl = await window.catbotDesktop.resolveAssetUrl(modelPath);
-  const gltf = await new Promise((resolve, reject) => {
-    loader.load(modelUrl, resolve, undefined, reject);
-  });
+  let modelUrl = "";
+  try {
+    modelUrl = await window.catbotDesktop.resolveAssetUrl(modelPath);
+  } catch (error) {
+    if (isStaleAvatarModelLoad(loadGeneration)) {
+      return;
+    }
+    throw error;
+  }
+
+  let gltf = null;
+  try {
+    gltf = await new Promise((resolve, reject) => {
+      loader.load(modelUrl, resolve, undefined, reject);
+    });
+  } catch (error) {
+    if (isStaleAvatarModelLoad(loadGeneration)) {
+      return;
+    }
+    throw error;
+  }
+
+  if (isStaleAvatarModelLoad(loadGeneration)) {
+    disposeGltfSceneResources(gltf);
+    return;
+  }
 
   const vrm = extractVrm(gltf);
   if (!vrm) {
+    disposeGltfSceneResources(gltf);
     throw new Error(`VRM data not found for ${modelPath}`);
   }
 
@@ -4845,10 +4976,13 @@ async function loadVrmModel(modelPath) {
   vrmModel = vrm;
   setupVrmRuntime(vrm);
   ensureLookTarget(vrm);
-  await preloadVrmActions(vrm);
+  currentModelPath = modelPath;
+  await preloadVrmActions(vrm, vrmRuntime, loadGeneration);
+  if (isStaleAvatarModelLoad(loadGeneration) || vrmModel !== vrm) {
+    return;
+  }
   resetVrmPhysicsState(vrm);
   smoothedVrmDelta = 1 / 60;
-  currentModelPath = modelPath;
   applyStateToScene(currentState);
   applyVrmExpression(currentState.expression);
   if (!vrmRuntime?.mixer) {
@@ -4945,11 +5079,13 @@ function setLive2dMouth(value) {
 }
 
 async function loadLive2dModel(modelPath) {
-  if (webglContextLost) {
-    return;
-  }
+  const loadGeneration = beginAvatarModelLoad("live2d", modelPath);
   if (!modelPath) {
+    removeCurrentVrmModel();
+    removeCurrentLive2dModel();
+    currentModelPath = "";
     setStatus("No Live2D model selected");
+    syncAvatarOverlayPosition(currentState);
     return;
   }
   if (modelPath === currentModelPath && live2dModel) {
@@ -4958,12 +5094,46 @@ async function loadLive2dModel(modelPath) {
   }
 
   setStatus("Loading Live2D model...");
-  await ensureLive2dRuntime();
-  const modelUrl = await window.catbotDesktop.resolveAssetUrl(modelPath);
-  const model = await PIXI.live2d.Live2DModel.from(modelUrl, {
-    autoInteract: false,
-    focus: false
-  });
+  try {
+    await ensureLive2dRuntime();
+  } catch (error) {
+    if (isStaleAvatarModelLoad(loadGeneration)) {
+      return;
+    }
+    throw error;
+  }
+  if (isStaleAvatarModelLoad(loadGeneration)) {
+    return;
+  }
+  let modelUrl = "";
+  try {
+    modelUrl = await window.catbotDesktop.resolveAssetUrl(modelPath);
+  } catch (error) {
+    if (isStaleAvatarModelLoad(loadGeneration)) {
+      return;
+    }
+    throw error;
+  }
+  let model = null;
+  try {
+    model = await PIXI.live2d.Live2DModel.from(modelUrl, {
+      autoInteract: false,
+      focus: false
+    });
+  } catch (error) {
+    if (isStaleAvatarModelLoad(loadGeneration)) {
+      return;
+    }
+    throw error;
+  }
+  if (isStaleAvatarModelLoad(loadGeneration)) {
+    try {
+      model?.destroy?.({ children: true, texture: true, baseTexture: true });
+    } catch (_) {
+      // ignore stale Live2D cleanup failures
+    }
+    return;
+  }
 
   removeCurrentVrmModel();
   removeCurrentLive2dModel();
@@ -5835,7 +6005,6 @@ async function playSpeechPreview(state) {
   try {
     let playedAudio = false;
     const shouldUseStreamingSpeech = Boolean(
-      isPocketTtsModelName(state.ttsModel) &&
       typeof window.catbotDesktop.synthesizePreviewSpeechStream === "function"
     );
 
@@ -5921,7 +6090,7 @@ async function playSpeechPreview(state) {
 }
 
 function animate() {
-  if (!renderLoopActive || webglContextLost || !renderer || !scene || !camera) {
+  if (!renderLoopActive || !scene || !camera) {
     return;
   }
   requestAnimationFrame(animate);
@@ -5976,28 +6145,47 @@ function animate() {
     }
   }
 
-  try {
-    renderer.render(scene, camera);
-  } catch (error) {
-    webglContextLost = true;
-    renderLoopActive = false;
-    showRenderFallback("Avatar renderer failed. Showing fallback image.", error);
+  if (!webglContextLost && renderer) {
+    try {
+      renderer.render(scene, camera);
+    } catch (error) {
+      webglContextLost = true;
+      if (currentState.mode !== "live2d") {
+        renderLoopActive = false;
+        showRenderFallback("Avatar renderer failed. Showing fallback image.", error);
+      } else {
+        setStatus("VRM renderer paused; Live2D active");
+      }
+    }
   }
 }
 
 vrmCanvas?.addEventListener("webglcontextlost", (event) => {
   event.preventDefault();
   webglContextLost = true;
-  renderLoopActive = false;
-  showRenderFallback("WebGL context was lost. Showing fallback image.");
+  if (currentState.mode !== "live2d") {
+    renderLoopActive = false;
+    showRenderFallback("WebGL context was lost. Showing fallback image.");
+  } else {
+    setStatus("VRM renderer paused; Live2D active");
+  }
 });
 
 vrmCanvas?.addEventListener("webglcontextrestored", async () => {
   webglContextLost = false;
   hideRenderFallback();
   try {
+    invalidateAvatarModelLoads();
+    if (currentState.mode !== "live2d") {
+      removeCurrentVrmModel();
+      currentModelPath = "";
+    }
     initializeScene();
-    await loadVrmModel(currentState.modelPath);
+    if (currentState.mode === "live2d") {
+      await loadLive2dModel(currentState.modelPath);
+    } else {
+      await loadVrmModel(currentState.modelPath);
+    }
   } catch (error) {
     showRenderFallback(`Failed to restore avatar renderer: ${formatLoadError(error)}`, error);
   }

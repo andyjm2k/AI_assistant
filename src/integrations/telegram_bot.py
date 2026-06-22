@@ -292,7 +292,7 @@ async def _poll_status_updates(
             event_type = str(event.get("type") or "").strip().lower()
             if seq <= last_seq or not state_text:
                 return last_seq, last_state_sent
-            if event_type == "heartbeat" and state_text == last_state_sent:
+            if state_text == last_state_sent:
                 last_seq = seq
                 return last_seq, last_state_sent
             last_seq = seq
@@ -728,7 +728,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         admin_lines = (
             "\n"
             "/restart - restart all CATBot services\n"
-            "/backup - create a ZIP backup\n"
+            f"/backup - create a ZIP backup in {PROJECT_ROOT / 'backups'}\n"
         )
     await update.message.reply_text(
         "*CATBot Telegram Commands*\n\n"

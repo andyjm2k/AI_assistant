@@ -12,6 +12,7 @@ import pytest
 from src.features.task_execution import (
     STATUS_CANCELLED,
     STATUS_AWAITING_CONFIRMATION,
+    STATUS_FAILED,
     TodoTaskExecutor,
 )
 
@@ -470,7 +471,7 @@ def test_initial_messages_tell_model_to_call_tools_immediately():
 
 
 @pytest.mark.asyncio
-async def test_run_loop_does_not_inject_followup_prompt_after_planning_text():
+async def test_run_loop_injects_followup_prompt_after_planning_text():
     tool_executor = AsyncMock()
     executor = TodoTaskExecutor(
         api_key="test-key",
@@ -511,11 +512,116 @@ async def test_run_loop_does_not_inject_followup_prompt_after_planning_text():
     with patch.object(executor, "_call_llm", side_effect=_mock_llm):
         status, message = await executor.run_loop()
 
-    assert status == STATUS_AWAITING_CONFIRMATION
+    assert status == STATUS_FAILED
     assert "Still preparing" in message
     tool_executor.assert_not_awaited()
-    assert not any(
+    assert any(
         msg.get("role") == "user" and "Continue automatically." in str(msg.get("content"))
         for batch in captured_messages
         for msg in batch
     )
+
+
+@pytest.mark.asyncio
+async def test_run_loop_retries_truncated_write_arguments_and_completes():
+    tool_executor = AsyncMock(return_value="Wrote job_listing_latest_1.md (42 bytes).")
+    executor = TodoTaskExecutor(
+        api_key="test-key",
+        task_id=51,
+        task_description="Research jobs and write the report",
+        tool_executor=tool_executor,
+        get_tools_func=AsyncMock(
+            return_value=[
+                {
+                    "name": "filesystem.write_text",
+                    "description": "Write a file",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+            ]
+        ),
+        max_iterations=4,
+    )
+
+    responses = [
+        {
+            "content": "I have enough information. Let me write the report.",
+            "tool_calls": [
+                {
+                    "id": "call_bad",
+                    "type": "function",
+                    "function": {
+                        "name": "filesystem.write_text",
+                        "arguments": '{"path":"job_listing_latest_1.md","content":"truncated',
+                    },
+                }
+            ],
+        },
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_good",
+                    "type": "function",
+                    "function": {
+                        "name": "filesystem.write_text",
+                        "arguments": (
+                            '{"path":"job_listing_latest_1.md",'
+                            '"content":"# Job report\\nComplete output."}'
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "content": "I have finished the work for this task.",
+            "tool_calls": None,
+        },
+    ]
+
+    async def _mock_llm(*args, **kwargs):
+        return responses.pop(0)
+
+    with patch.object(executor, "_call_llm", side_effect=_mock_llm):
+        status, message = await executor.run_loop()
+
+    assert status == STATUS_AWAITING_CONFIRMATION
+    assert message == "Wrote job_listing_latest_1.md (42 bytes)."
+    tool_executor.assert_awaited_once_with(
+        "filesystem.write_text",
+        {"path": "job_listing_latest_1.md", "content": "# Job report\nComplete output."},
+    )
+    malformed_tool_messages = [
+        item
+        for item in executor.messages
+        if item.get("role") == "tool" and item.get("tool_call_id") == "call_bad"
+    ]
+    assert malformed_tool_messages
+    assert "invalid or truncated JSON" in malformed_tool_messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_loop_retries_transient_llm_failure_without_requesting_user_input():
+    executor = TodoTaskExecutor(
+        api_key="test-key",
+        task_id=52,
+        task_description="Finish without human input",
+        get_tools_func=AsyncMock(return_value=[]),
+        max_iterations=3,
+    )
+
+    responses = [
+        None,
+        {"content": "I have finished the work for this task.", "tool_calls": None},
+    ]
+
+    async def _mock_llm(*args, **kwargs):
+        response = responses.pop(0)
+        if response is None:
+            executor.last_error = "temporary provider error"
+        return response
+
+    with patch.object(executor, "_call_llm", side_effect=_mock_llm):
+        status, message = await executor.run_loop()
+
+    assert status == STATUS_AWAITING_CONFIRMATION
+    assert "finished" in message.lower()

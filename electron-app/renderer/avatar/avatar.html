@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; img-src 'self' data: blob: catbot-file:; connect-src 'self' data: blob: http: https:; media-src 'self' data: blob: catbot-file:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; img-src 'self' data: blob: catbot-file:; connect-src 'self' data: blob: catbot-file: http: https:; media-src 'self' data: blob: catbot-file:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'">
   <title></title>
   <script type="importmap">
     {
@@ -18,6 +18,7 @@
   <script src="../vendor/live2dcubismcore/live2dcubismcore.min.js"></script>
   <script src="../vendor/live2dcubismcore/live2d.min.js"></script>
   <script src="../vendor/pixi.js/pixi.min.js"></script>
+  <script src="../vendor/@pixi/unsafe-eval/dist/browser/unsafe-eval.min.js"></script>
   <script src="../vendor/eventemitter3/eventemitter3.min.js"></script>
   <script src="../vendor/pixi-live2d-display/index.min.js"></script>
   <link rel="stylesheet" href="./avatar.css">

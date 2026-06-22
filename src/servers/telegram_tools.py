@@ -40,6 +40,7 @@ _STANDALONE_TOOL_CALL_PATTERN = re.compile(rf"^\s*(?:{_TOOL_CALL_BLOCK_RE})\s*$"
 _THINK_BLOCK_PATTERN = re.compile(r"<think\b[^>]*>[\s\S]*?</think>", re.IGNORECASE)
 
 _TELEGRAM_TOOL_NAME_ALIASES = {
+    "manageMemoryCache": "manageWorkingContext",
     "read_file": "readFile",
     "write_file": "writeFile",
     "list_files": "listFiles",
@@ -48,6 +49,13 @@ _TELEGRAM_TOOL_NAME_ALIASES = {
     "saveToFile": "writeFile",
     "health_check": "healthCheck",
     "run_health_check": "healthCheck",
+    "monitoring": "getMonitoringSnapshot",
+    "monitoring_stats": "getMonitoringSnapshot",
+    "monitoring_info": "getMonitoringSnapshot",
+    "monitoring_logs": "getMonitoringSnapshot",
+    "monitoringDashboard": "getMonitoringSnapshot",
+    "monitoringStats": "getMonitoringSnapshot",
+    "monitoringLogs": "getMonitoringSnapshot",
     # Model sometimes emits the skill name instead of a concrete tool name.
     "googleworkspace_cli": "googleworkspace_cli.gmail_list_unread",
     "slides_create_presentation_from_markdown": "createSlidesPresentation",
@@ -934,6 +942,129 @@ def _safe_calculate(expression: str) -> Optional[float]:
         return None
 
 
+def _format_monitor_bytes(value: Any) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if size < 0:
+        return "n/a"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.1f} {units[unit_index]}"
+
+
+def _format_monitor_duration(seconds: Any) -> str:
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return "n/a"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def _format_monitor_value(value: Any) -> str:
+    if value is None or value == "":
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.1f}"
+    return str(value)
+
+
+def _format_monitoring_snapshot_message(snapshot: Dict[str, Any]) -> str:
+    summary = snapshot.get("summary") if isinstance(snapshot.get("summary"), dict) else {}
+    system_stats = snapshot.get("system_stats") if isinstance(snapshot.get("system_stats"), dict) else {}
+    cpu = system_stats.get("cpu") if isinstance(system_stats.get("cpu"), dict) else {}
+    memory = system_stats.get("memory") if isinstance(system_stats.get("memory"), dict) else {}
+    app_info = snapshot.get("app_info") if isinstance(snapshot.get("app_info"), dict) else {}
+    config = app_info.get("config_summary") if isinstance(app_info.get("config_summary"), dict) else {}
+
+    cpu_percent = cpu.get("cpu_percent")
+    if cpu_percent is None and isinstance(cpu.get("load_average"), dict):
+        load = cpu["load_average"]
+        cpu_text = f"load {load.get('1m', 'n/a')} / {load.get('5m', 'n/a')} / {load.get('15m', 'n/a')}"
+    else:
+        cpu_text = f"{_format_monitor_value(cpu_percent)}%"
+
+    memory_text = (
+        f"{_format_monitor_value(memory.get('percent_used'))}% used "
+        f"({_format_monitor_bytes(memory.get('used_bytes'))} / {_format_monitor_bytes(memory.get('total_bytes'))})"
+    )
+
+    lines = [
+        "CATBot monitoring snapshot",
+        f"Version: {_format_monitor_value(app_info.get('version'))}",
+        f"Generated: {_format_monitor_value(snapshot.get('generated_at_iso'))}",
+        f"Uptime: {_format_monitor_duration(summary.get('uptime_seconds') or system_stats.get('uptime_seconds'))}",
+        f"CPU: {cpu_text} across {_format_monitor_value(cpu.get('processor_count'))} processor(s)",
+        f"Memory: {memory_text}",
+        f"Status sessions: {_format_monitor_value(summary.get('status_sessions_active'))}",
+        (
+            "Active runs: "
+            f"AutoGen {summary.get('autogen_active_runs', 0)}, "
+            f"Browser-use {summary.get('browser_use_active_runs', 0)}, "
+            f"Philosopher {summary.get('philosopher_active_runs', 0)}, "
+            f"Task execution {summary.get('task_execution_active_runs', 0)}"
+        ),
+        (
+            "Config: "
+            f"memory={'on' if config.get('memory_available') else 'off'}, "
+            f"telegram_tools={'on' if config.get('telegram_tools_enabled') else 'off'}, "
+            f"model_key={'configured' if config.get('openai_api_key_configured') else 'missing'}"
+        ),
+    ]
+
+    workflows = snapshot.get("workflows") if isinstance(snapshot.get("workflows"), dict) else {}
+    browser_use = workflows.get("browser_use") if isinstance(workflows.get("browser_use"), dict) else {}
+    health = browser_use.get("health") if isinstance(browser_use.get("health"), dict) else {}
+    health_message = str(health.get("message") or "").strip()
+    if health_message:
+        lines.append(f"Browser health: {health_message[:500]}")
+
+    events = snapshot.get("status_events") if isinstance(snapshot.get("status_events"), list) else []
+    if events:
+        lines.append("")
+        lines.append("Recent status events:")
+        for event in events[-3:]:
+            if not isinstance(event, dict):
+                continue
+            state = str(event.get("state") or event.get("phase") or "unknown").strip()
+            iso = str(event.get("iso") or "").strip()
+            lines.append(f"- {iso}: {state}")
+
+    logs = snapshot.get("logs") if isinstance(snapshot.get("logs"), dict) else {}
+    proxy_log = logs.get("proxy") if isinstance(logs.get("proxy"), dict) else {}
+    browser_log = logs.get("browser_use") if isinstance(logs.get("browser_use"), dict) else {}
+    for label, payload in (("Proxy log", proxy_log), ("Browser-use log", browser_log)):
+        if not payload.get("available"):
+            continue
+        raw_lines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+        rendered_lines = [str(line) for line in raw_lines[-8:] if str(line).strip()]
+        if not rendered_lines:
+            continue
+        lines.append("")
+        lines.append(f"{label} tail:")
+        lines.extend(f"- {line[:350]}" for line in rendered_lines)
+
+    message = "\n".join(lines)
+    return message[:SKILL_RESULT_MESSAGE_MAX_CHARS]
+
+
 async def execute_telegram_tool(
     name: str,
     arguments: Dict[str, Any],
@@ -944,7 +1075,7 @@ async def execute_telegram_tool(
     context must include: conversation_id, and optionally:
     - todo_user_key: str (required for manageTodoList; uses persistent store only)
     - memory_cache_store: Dict[str, list]
-    - do_search, do_fetch, do_news, do_weather, do_autogen, do_browser_agent, do_deep_research (async callables)
+    - do_search, do_fetch, do_news, do_weather, do_workflow, do_browser_agent, do_deep_research (async callables)
     - do_restart_proxy (async callable that schedules proxy restart)
     - read_file_internal, write_file_internal, list_files_internal (callables)
     - send_telegram_file_internal (async callable to send scratch files to current Telegram chat)
@@ -957,6 +1088,12 @@ async def execute_telegram_tool(
     memory_cache_store_raw = context.get("memory_cache_store")
     memory_cache_store = memory_cache_store_raw if isinstance(memory_cache_store_raw, dict) else {}
     todo_user_key = context.get("todo_user_key")
+    memory_namespace = str(
+        context.get("memory_namespace")
+        or todo_user_key
+        or context.get("user_id")
+        or cid
+    ).strip()
 
     def mem_cache() -> List[str]:
         return memory_cache_store.setdefault(cid, [])
@@ -1329,8 +1466,8 @@ async def execute_telegram_tool(
             "data": state,
         }
 
-    # --- manageMemoryCache ---
-    if name == "manageMemoryCache":
+    # --- manageWorkingContext ---
+    if name == "manageWorkingContext":
         action = (arguments.get("action") or "").strip().lower()
         mem_id = arguments.get("memoryId", arguments.get("memId"))
         mem_description = (
@@ -1393,15 +1530,30 @@ async def execute_telegram_tool(
 
     # --- runWorkflow ---
     if name == "runWorkflow":
-        do_autogen = context.get("do_autogen")
-        if not do_autogen:
-            return {"success": False, "message": "Workflow (AutoGen) is not available."}
+        do_workflow = context.get("do_workflow") or context.get("do_autogen")
+        if not do_workflow:
+            return {"success": False, "message": "Workflow backend is not available."}
         prompt = (arguments.get("contentPrompt") or "").strip()
         if not prompt:
             return {"success": False, "message": "contentPrompt is required."}
-        result = await do_autogen(prompt)
-        msg = result.get("output") or result.get("response") or result.get("detail", str(result))
-        return {"success": True, "message": msg, "data": result}
+        try:
+            result = await do_workflow(prompt)
+        except Exception as e:
+            detail = getattr(e, "detail", None) or str(e) or "Workflow execution failed."
+            return {"success": False, "message": f"Workflow failed: {detail}"}
+        if not isinstance(result, dict):
+            return {"success": True, "message": str(result), "data": {"raw": result}}
+        success = bool(result.get("success", True))
+        msg = (
+            result.get("output")
+            or result.get("response")
+            or result.get("summary")
+            or result.get("message")
+            or result.get("detail")
+            or result.get("error")
+            or str(result)
+        )
+        return {"success": success, "message": str(msg), "data": result}
 
     # --- runCodexCli ---
     if name == "runCodexCli":
@@ -1411,17 +1563,24 @@ async def execute_telegram_tool(
         prompt = (arguments.get("prompt") or "").strip()
         if not prompt:
             return {"success": False, "message": "prompt is required."}
-        result = await do_codex(prompt=prompt)
+        timeout_seconds = arguments.get("timeoutSeconds", arguments.get("timeout_seconds"))
+        result = await do_codex(prompt=prompt, timeout_seconds=timeout_seconds)
+        success = bool(result.get("success", False))
         summary_file = result.get("summaryFile")
         events_file = result.get("eventsFile")
         last_message_file = result.get("lastMessageFile")
         exit_code = result.get("exitCode")
         timed_out = result.get("timedOut")
+        status = "finished" if success else "failed"
         message = (
-            f"Codex CLI finished (exit_code={exit_code}, timed_out={timed_out}). "
+            f"Codex CLI {status} (exit_code={exit_code}, timed_out={timed_out}). "
             f"Summary file: {summary_file}. Events file: {events_file}. Last message file: {last_message_file}"
         )
-        return {"success": True, "message": message, "data": result}
+        if not success:
+            error_text = (result.get("stderr") or result.get("error") or "").strip()
+            if error_text:
+                message = f"{message}. Error: {error_text[:500]}"
+        return {"success": success, "message": message, "data": result}
 
     # --- restartProxyServer ---
     if name == "restartProxyServer":
@@ -1778,7 +1937,12 @@ async def execute_telegram_tool(
                     "success": False,
                     "message": "Refused to store transient task/list/status state as memory.",
                 }
-        mid = await mm.store_memory(text=text, category=category, source="telegram")
+        mid = await mm.store_memory(
+            text=text,
+            category=category,
+            source="telegram",
+            namespace=memory_namespace,
+        )
         return {"success": True, "message": "Memory stored.", "data": {"memory_id": mid}}
 
     # --- searchMemories ---
@@ -1789,7 +1953,12 @@ async def execute_telegram_tool(
         query = (arguments.get("query") or "").strip()
         if not query:
             return {"success": False, "message": "query is required."}
-        results = await mm.search_memories(query=query, limit=arguments.get("limit", 5))
+        results = await mm.search_memories(
+            query=query,
+            limit=arguments.get("limit", 5),
+            namespace=memory_namespace,
+            purpose="conversation",
+        )
         items = results or []
         lines = [f"- {m.get('text', '')}" for m in items]
         return {"success": True, "message": "Memories:\n" + "\n".join(lines) if lines else "No matches.", "data": {"memories": items}}
@@ -1800,7 +1969,10 @@ async def execute_telegram_tool(
         if not mm:
             return {"success": False, "message": "Memory system is not available."}
         try:
-            mems = mm.list_memories(limit=arguments.get("limit", 20))
+            mems = mm.list_memories(
+                limit=arguments.get("limit", 20),
+                namespace=memory_namespace,
+            )
         except Exception:
             mems = []
         lines = [f"- {m.get('text', '')}" for m in (mems or [])]
@@ -1815,9 +1987,11 @@ async def execute_telegram_tool(
         if not mid:
             return {"success": False, "message": "memory_id is required."}
         if asyncio.iscoroutinefunction(getattr(mm, "delete_memory", None)):
-            await mm.delete_memory(mid)
+            await mm.delete_memory(mid, namespace=memory_namespace)
         else:
-            mm.delete_memory(mid)
+            deleted = mm.delete_memory(mid, namespace=memory_namespace)
+            if deleted is False:
+                return {"success": False, "message": "Memory not found."}
         return {"success": True, "message": "Memory deleted."}
 
     # --- runBrowserAgent ---
@@ -1853,6 +2027,26 @@ async def execute_telegram_tool(
             msg = out.get("report") or out.get("result")
         msg = msg or str(out)[:500]
         return {"success": success, "message": msg, "data": out}
+
+    # --- getMonitoringSnapshot ---
+    if name == "getMonitoringSnapshot":
+        snapshot_fn = context.get("get_monitoring_snapshot") or context.get("monitoring_snapshot")
+        if not callable(snapshot_fn):
+            return {"success": False, "message": "Monitoring snapshot is not available."}
+        try:
+            try:
+                snapshot = await snapshot_fn(arguments if isinstance(arguments, dict) else {})
+            except TypeError:
+                snapshot = await snapshot_fn()
+        except Exception as e:
+            return {"success": False, "message": f"Monitoring snapshot failed: {e}"}
+        if not isinstance(snapshot, dict):
+            return {"success": False, "message": "Monitoring snapshot returned an invalid response."}
+        return {
+            "success": True,
+            "message": _format_monitoring_snapshot_message(snapshot),
+            "data": snapshot,
+        }
 
     # --- healthCheck ---
     if name == "healthCheck":
@@ -1930,6 +2124,8 @@ async def execute_telegram_tool(
         if not file_path:
             return {"success": False, "message": "filePath is required."}
         out = await upload_internal(file_path, file_name)
+        if not isinstance(out, dict):
+            return {"success": False, "message": "Google Drive upload returned an invalid response."}
         if isinstance(out, dict) and not out.get("success", True):
             return {"success": False, "message": out.get("message", "Upload failed.")}
         return {"success": True, "message": out.get("message", "Uploaded to Google Drive.")}
@@ -1943,7 +2139,9 @@ async def execute_telegram_tool(
         if not prompt:
             return {"success": False, "message": "query or contentPrompt is required."}
         out = await llm_internal(prompt)
-        return {"success": True, "message": out.get("content", str(out)), "data": out}
+        if isinstance(out, dict):
+            return {"success": True, "message": out.get("content", str(out)), "data": out}
+        return {"success": True, "message": str(out), "data": {"raw": out}}
 
     # --- dynamic skill framework tools ---
     skill_executor = context.get("execute_skill_tool")

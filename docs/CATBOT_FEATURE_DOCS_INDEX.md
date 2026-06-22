@@ -52,7 +52,7 @@ Each feature document includes the following sections:
 - [Telegram Admin Skill](features/36_telegram_admin_skill.md)
 - [Telegram Bot Interface](features/37_telegram_bot_interface.md)
 - [Tool-Enabled Telegram](features/38_tool_enabled_telegram.md)
-- [AutoGen Orchestration](features/39_autogen_orchestration.md)
+- [Workflow Orchestration (AutoGen / AG2)](features/39_autogen_orchestration.md)
 - [Codex CLI Integration](features/40_codex_cli_integration.md)
 - [MCP Extensibility](features/41_mcp_extensibility.md)
 - [Skills Framework](features/42_skills_framework.md)

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 
@@ -32,9 +33,47 @@ def test_web_client_window_has_navigation_guards():
 
 
 def test_electron_package_does_not_bundle_env_file():
-    content = ELECTRON_PACKAGE.read_text(encoding="utf-8")
+    package = json.loads(ELECTRON_PACKAGE.read_text(encoding="utf-8"))
+    build = package["build"]
+    packaged_files = build["files"]
 
-    assert '".env"' not in content
+    assert "!**/.env" in packaged_files
+    assert "!**/.env.*" in packaged_files
+    assert all(item not in {".env", ".env.example"} for item in packaged_files)
+    assert build["afterPack"] == "scripts/after-pack-security-audit.js"
+
+
+def test_electron_package_excludes_runtime_secrets_and_memory_data():
+    package = json.loads(ELECTRON_PACKAGE.read_text(encoding="utf-8"))
+    packaged_files = set(package["build"]["files"])
+
+    assert {
+        "!**/*.key",
+        "!**/*.log",
+        "!**/*.p12",
+        "!**/*.pem",
+        "!**/*.pfx",
+        "!**/*.sqlite",
+        "!**/*.sqlite3",
+        "!**/*.zip",
+        "!**/auth_users.json",
+        "!**/desktop-auth.json",
+        "!**/embeddings.npy",
+        "!**/metadata.json",
+        "!**/telegram_user_links.json",
+        "!**/memory_data/**/*",
+    }.issubset(packaged_files)
+
+
+def test_electron_package_excludes_redundant_nested_model_archive():
+    package = json.loads(ELECTRON_PACKAGE.read_text(encoding="utf-8"))
+    model_resource = next(
+        item
+        for item in package["build"]["extraResources"]
+        if item.get("to") == "model_avatar"
+    )
+
+    assert "!**/*.zip" in model_resource["filter"]
 
 
 def test_external_url_and_auth_storage_are_hardened():
@@ -47,9 +86,33 @@ def test_external_url_and_auth_storage_are_hardened():
     assert "chatApiKeySecret" in content
 
 
+def test_desktop_logout_clears_proxy_auth_cookie():
+    content = _main_js_text()
+
+    assert "const DEFAULT_AUTH_COOKIE_NAME = \"catbot_auth_token\"" in content
+    assert "process.env.AUTH_COOKIE_NAME" in content
+    assert "function clearDesktopProxyAuthCookie()" in content
+    assert "session.defaultSession.cookies.remove(cookieOrigin, cookieName)" in content
+    assert "clearDesktopProxyAuthCookie();" in content
+
+
 def test_avatar_csp_allows_blob_connects_for_vrm_texture_loading():
     content = ELECTRON_AVATAR_HTML.read_text(encoding="utf-8")
 
-    assert "connect-src 'self' data: blob: http: https:" in content
+    assert "connect-src 'self' data: blob: catbot-file: http: https:" in content
     assert "img-src 'self' data: blob:" in content
+    assert "script-src 'self' 'unsafe-inline';" in content
+    assert "'unsafe-eval'" not in content
     assert "frame-ancestors" not in content
+
+
+def test_avatar_loads_pixi_static_uniform_sync_before_live2d_plugin():
+    content = ELECTRON_AVATAR_HTML.read_text(encoding="utf-8")
+    pixi_script = '<script src="../vendor/pixi.js/pixi.min.js"></script>'
+    safe_uniform_script = '<script src="../vendor/@pixi/unsafe-eval/dist/browser/unsafe-eval.min.js"></script>'
+    live2d_plugin_script = '<script src="../vendor/pixi-live2d-display/index.min.js"></script>'
+
+    assert pixi_script in content
+    assert safe_uniform_script in content
+    assert live2d_plugin_script in content
+    assert content.index(pixi_script) < content.index(safe_uniform_script) < content.index(live2d_plugin_script)

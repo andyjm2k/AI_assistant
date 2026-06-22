@@ -76,6 +76,38 @@ def check_autogen(python_exe: str | None = None) -> tuple[bool, str]:
     )
 
 
+def check_ag2(python_exe: str | None = None) -> tuple[bool, str]:
+    """Verify AG2 imports and the APIs CATBot's AG2 runner depends on are present."""
+    return _run_python_check(
+        "AG2",
+        (
+            "import importlib.metadata as m; "
+            "import autogen; "
+            "agentchat = getattr(autogen, 'agentchat', None); "
+            "required = ('AssistantAgent', 'UserProxyAgent', 'GroupChat', 'GroupChatManager'); "
+            "missing = [name for name in required if not (hasattr(autogen, name) or (agentchat is not None and hasattr(agentchat, name)))]; "
+            "has_register = hasattr(autogen, 'register_function') or (agentchat is not None and hasattr(agentchat, 'register_function')); "
+            "missing = missing + ([] if has_register else ['register_function']); "
+            "missing and (_ for _ in ()).throw(SystemExit('Incompatible AG2 install: missing ' + ', '.join(missing))); "
+            "version = 'unknown'; "
+            "\ntry:\n    version = m.version('ag2')\nexcept Exception:\n    pass\n"
+            "print('AG2 OK (ag2=' + version + ')')"
+        ),
+        python_exe,
+    )
+
+
+def check_workflow_backend(python_exe: str | None = None) -> tuple[bool, str]:
+    """Verify the workflow backend selected in .env is usable."""
+    values = _load_env_values()
+    framework = (values.get("WORKFLOW_FRAMEWORK", "autogen") or "autogen").strip().lower()
+    if framework not in {"autogen", "ag2"}:
+        return False, f"WORKFLOW_FRAMEWORK must be autogen or ag2 (current: {framework or '(empty)'})"
+    if framework == "ag2":
+        return check_ag2(python_exe)
+    return True, "Workflow backend OK (autogen)"
+
+
 def check_mcp(python_exe: str | None = None) -> tuple[bool, str]:
     """Verify MCP client library."""
     return _run_python_check(
@@ -247,7 +279,7 @@ def check_feature_env() -> tuple[bool, str]:
 
     autogen_require_auth = values.get("AUTOGEN_REQUIRE_AUTH", "true")
     if not _is_truthy(autogen_require_auth):
-        warnings.append("AUTOGEN_REQUIRE_AUTH=false leaves /v1/proxy/autogen publicly reachable")
+        warnings.append("AUTOGEN_REQUIRE_AUTH=false leaves /v1/proxy/autogen and /v1/proxy/workflow publicly reachable")
 
     autogen_code_exec_enabled = _is_truthy(values.get("AUTOGEN_ENABLE_CODE_EXECUTION"))
     if autogen_code_exec_enabled and not _is_truthy(autogen_require_auth):
@@ -259,7 +291,30 @@ def check_feature_env() -> tuple[bool, str]:
         or values.get("MCP_BROWSER_SERVER_SECRET", "").strip()
     )
     if not agent_secret:
-        warnings.append("CATBOT_AGENT_SECRET/AUTOGEN_TEAM_SECRET is not configured for internal AutoGen and browser bridge calls")
+        warnings.append("CATBOT_AGENT_SECRET/AUTOGEN_TEAM_SECRET is not configured for internal workflow and browser bridge calls")
+
+    workflow_framework = (values.get("WORKFLOW_FRAMEWORK", "autogen") or "autogen").strip().lower()
+    if workflow_framework == "ag2":
+        ag2_has_model = bool(
+            values.get("AG2_MODEL", "").strip()
+            or values.get("AUTOGEN_TEAM_MODEL", "").strip()
+            or values.get("OPENROUTER_AUTOGEN_MODEL", "").strip()
+            or values.get("MCP_LLM_MODEL_NAME", "").strip()
+            or values.get("OPENAI_MODEL", "").strip()
+        )
+        ag2_has_key = bool(
+            values.get("AG2_API_KEY", "").strip()
+            or values.get("AUTOGEN_OPENROUTER_API_KEY", "").strip()
+            or values.get("OPENROUTER_API_KEY", "").strip()
+            or values.get("AUTOGEN_MINIMAX_API_KEY", "").strip()
+            or values.get("MINIMAX_API_KEY", "").strip()
+            or values.get("MCP_LLM_OPENAI_API_KEY", "").strip()
+            or values.get("OPENAI_API_KEY", "").strip()
+        )
+        if not ag2_has_model:
+            warnings.append("WORKFLOW_FRAMEWORK=ag2 but no AG2_MODEL or compatible model fallback is configured")
+        if not ag2_has_key:
+            warnings.append("WORKFLOW_FRAMEWORK=ag2 but no AG2_API_KEY or compatible API key fallback is configured")
 
     if warnings:
         return True, "WARN: " + "; ".join(warnings)
@@ -343,6 +398,7 @@ def main() -> int:
     checks = [
         ("Core (FastAPI, uvicorn, httpx, pydantic)", lambda: check_core(python_exe)),
         ("AutoGen", lambda: check_autogen(python_exe)),
+        ("Selected workflow backend", lambda: check_workflow_backend(python_exe)),
         ("MCP", lambda: check_mcp(python_exe)),
         ("Playwright", lambda: check_playwright(python_exe)),
         ("KittenTTS runtime", lambda: check_kitten_tts(python_exe)),

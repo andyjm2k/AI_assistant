@@ -795,7 +795,11 @@ class TestExecuteTelegramTool:
     @pytest.mark.asyncio
     async def test_run_codex_cli_calls_backend(self):
         """runCodexCli uses do_codex and returns summary file info."""
+        captured = {}
+
         async def mock_codex(prompt, timeout_seconds=None):
+            captured["prompt"] = prompt
+            captured["timeout_seconds"] = timeout_seconds
             return {
                 "success": True,
                 "summaryFile": "codex_run_2026-01-01_00-00-00_abcd.txt",
@@ -803,9 +807,32 @@ class TestExecuteTelegramTool:
                 "timedOut": False,
             }
         ctx = {"conversation_id": "c1", "todo_user_key": "u1", "do_codex": mock_codex}
-        r = await tg.execute_telegram_tool("runCodexCli", {"prompt": "do it"}, ctx)
+        r = await tg.execute_telegram_tool("runCodexCli", {"prompt": "do it", "timeoutSeconds": 120}, ctx)
         assert r.get("success") is True
         assert "Summary file" in r.get("message", "")
+        assert captured == {"prompt": "do it", "timeout_seconds": 120}
+
+    @pytest.mark.asyncio
+    async def test_run_codex_cli_propagates_backend_failure(self):
+        """runCodexCli reports Codex nonzero/timeout results as tool failures."""
+        async def mock_codex(prompt, timeout_seconds=None):
+            return {
+                "success": False,
+                "summaryFile": "codex_run_2026-01-01_00-00-00_abcd.txt",
+                "eventsFile": "codex_events_2026-01-01_00-00-00_abcd.jsonl",
+                "lastMessageFile": "codex_last_message_2026-01-01_00-00-00_abcd.txt",
+                "exitCode": 1,
+                "timedOut": False,
+                "stderr": "deprecated flag or CLI error",
+            }
+
+        ctx = {"conversation_id": "c1", "todo_user_key": "u1", "do_codex": mock_codex}
+        r = await tg.execute_telegram_tool("runCodexCli", {"prompt": "do it"}, ctx)
+
+        assert r.get("success") is False
+        assert "failed" in r.get("message", "").lower()
+        assert "exit_code=1" in r.get("message", "")
+        assert "deprecated flag or CLI error" in r.get("message", "")
 
     @pytest.mark.asyncio
     async def test_get_todo_execution_status_no_status_fn_returns_message(self):
@@ -900,6 +927,7 @@ class TestExecuteTelegramTool:
             text="User prefers dark mode",
             category="preference",
             source="telegram",
+            namespace="default",
         )
 
     @pytest.mark.asyncio
@@ -1359,6 +1387,57 @@ class TestExecuteTelegramTool:
         assert "not available" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
+    async def test_get_monitoring_snapshot_returns_chat_summary_and_data(self):
+        """getMonitoringSnapshot should call the backend collector and render a Telegram-sized summary."""
+        observed = {}
+
+        async def fake_snapshot(args):
+            observed.update(args)
+            return {
+                "generated_at_iso": "2026-06-09T00:00:00+00:00",
+                "summary": {
+                    "uptime_seconds": 65,
+                    "status_sessions_active": 1,
+                    "autogen_active_runs": 2,
+                    "browser_use_active_runs": 0,
+                    "philosopher_active_runs": 0,
+                    "task_execution_active_runs": 1,
+                },
+                "system_stats": {
+                    "cpu": {"cpu_percent": 12.5, "processor_count": 8},
+                    "memory": {
+                        "percent_used": 40.0,
+                        "used_bytes": 1024,
+                        "total_bytes": 2048,
+                    },
+                },
+                "app_info": {
+                    "version": "1.2.3",
+                    "config_summary": {
+                        "memory_available": True,
+                        "telegram_tools_enabled": True,
+                        "openai_api_key_configured": True,
+                    },
+                },
+                "status_events": [{"iso": "2026-06-09T00:00:00+00:00", "state": "Running"}],
+                "logs": {"proxy": {"available": True, "lines": ["last line"]}},
+            }
+
+        ctx = {"get_monitoring_snapshot": fake_snapshot}
+        r = await tg.execute_telegram_tool(
+            "monitoring_logs",
+            {"detail": "logs", "includeLogs": True},
+            ctx,
+        )
+
+        assert r.get("success") is True
+        assert observed["detail"] == "logs"
+        assert "CATBot monitoring snapshot" in r.get("message", "")
+        assert "Version: 1.2.3" in r.get("message", "")
+        assert "Proxy log tail" in r.get("message", "")
+        assert isinstance(r.get("data"), dict)
+
+    @pytest.mark.asyncio
     async def test_run_deep_research_propagates_backend_failure(self):
         """runDeepResearch should preserve backend success=False instead of forcing success=True."""
         async def fake_research(_args):
@@ -1401,6 +1480,71 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("runDeepResearch", {"researchTask": "x"}, ctx)
         assert r.get("success") is True
         assert "explicit final findings" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_run_workflow_uses_selected_workflow_callback(self):
+        """runWorkflow should use do_workflow, not require the legacy do_autogen key."""
+        called = {}
+
+        async def fake_workflow(prompt):
+            called["prompt"] = prompt
+            return {"framework": "ag2", "output": "AG2 workflow completed."}
+
+        ctx = {"do_workflow": fake_workflow}
+        r = await tg.execute_telegram_tool("runWorkflow", {"contentPrompt": "build a plan"}, ctx)
+
+        assert r.get("success") is True
+        assert r.get("data", {}).get("framework") == "ag2"
+        assert "AG2 workflow completed" in r.get("message", "")
+        assert called == {"prompt": "build a plan"}
+
+    @pytest.mark.asyncio
+    async def test_run_workflow_prefers_selected_callback_over_legacy_autogen_callback(self):
+        async def fake_workflow(_prompt):
+            return {"framework": "ag2", "output": "selected workflow"}
+
+        async def fake_autogen(_prompt):
+            raise AssertionError("legacy do_autogen should not be called when do_workflow exists")
+
+        ctx = {"do_workflow": fake_workflow, "do_autogen": fake_autogen}
+        r = await tg.execute_telegram_tool("runWorkflow", {"contentPrompt": "x"}, ctx)
+
+        assert r.get("success") is True
+        assert r.get("data", {}).get("framework") == "ag2"
+        assert r.get("message") == "selected workflow"
+
+    @pytest.mark.asyncio
+    async def test_run_workflow_propagates_backend_failure_payload(self):
+        """runWorkflow should not report success when the workflow backend returns success=False."""
+        async def fake_workflow(_prompt):
+            return {"success": False, "framework": "ag2", "error": "AG2 backend unavailable"}
+
+        r = await tg.execute_telegram_tool(
+            "runWorkflow",
+            {"contentPrompt": "build a plan"},
+            {"do_workflow": fake_workflow},
+        )
+
+        assert r.get("success") is False
+        assert "ag2 backend unavailable" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_run_workflow_converts_backend_exception_to_tool_failure(self):
+        """runWorkflow should return a failed tool result instead of bubbling backend exceptions."""
+        class WorkflowBackendError(Exception):
+            detail = "AG2 model configuration is invalid"
+
+        async def fake_workflow(_prompt):
+            raise WorkflowBackendError()
+
+        r = await tg.execute_telegram_tool(
+            "runWorkflow",
+            {"contentPrompt": "build a plan"},
+            {"do_workflow": fake_workflow},
+        )
+
+        assert r.get("success") is False
+        assert "ag2 model configuration is invalid" in r.get("message", "").lower()
 
     @pytest.mark.asyncio
     async def test_pdf_to_power_point_requires_backend_callback(self):
@@ -1464,6 +1608,36 @@ class TestExecuteTelegramTool:
         r = await tg.execute_telegram_tool("createSlidesPresentation", {"prompt": "x"}, {})
         assert r.get("success") is False
         assert "not available" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_upload_to_google_drive_rejects_invalid_backend_response(self):
+        """uploadToGoogleDrive should not crash when its backend returns a non-dict value."""
+        async def fake_upload(_file_path, _file_name=None):
+            return "uploaded"
+
+        r = await tg.execute_telegram_tool(
+            "uploadToGoogleDrive",
+            {"filePath": "report.txt"},
+            {"upload_drive_internal": fake_upload},
+        )
+
+        assert r.get("success") is False
+        assert "invalid response" in r.get("message", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_llm_query_accepts_plain_string_backend_response(self):
+        """llmQuery should handle simple string callbacks as successful text output."""
+        async def fake_llm(_prompt):
+            return "Plain LLM answer"
+
+        r = await tg.execute_telegram_tool(
+            "llmQuery",
+            {"query": "hello"},
+            {"llm_query_internal": fake_llm},
+        )
+
+        assert r.get("success") is True
+        assert r.get("message") == "Plain LLM answer"
 
     @pytest.mark.asyncio
     async def test_unknown_tool_returns_failure(self):

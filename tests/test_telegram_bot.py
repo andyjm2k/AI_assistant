@@ -488,6 +488,48 @@ class TestStatusPoller:
         assert "On it. I'm getting started now." in sent_texts
         assert sent_texts.count("On it. I'm getting started now.") == 1
 
+    @pytest.mark.asyncio
+    async def test_status_poller_skips_duplicate_updates(self):
+        """Status poller suppresses repeated update states, not just heartbeat repeats."""
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        stop_event = asyncio.Event()
+
+        response_1 = MagicMock()
+        response_1.status_code = 200
+        response_1.json.return_value = {
+            "found": True,
+            "event": {"seq": 1, "state": "On it. I'm running that workflow now.", "type": "update"},
+        }
+        response_2 = MagicMock()
+        response_2.status_code = 200
+        response_2.json.return_value = {
+            "found": True,
+            "event": {"seq": 2, "state": "On it. I'm running that workflow now.", "type": "update"},
+        }
+
+        with patch.object(telegram_bot, "STATUS_UPDATE_INTERVAL", 0.01):
+            with patch("src.integrations.telegram_bot.httpx.AsyncClient") as mock_client_cls:
+                mock_client = AsyncMock()
+                mock_client.get = AsyncMock(side_effect=[response_1, response_2, response_2, response_2])
+                mock_client_cls.return_value = mock_client
+
+                task = asyncio.create_task(
+                    telegram_bot._poll_status_updates(
+                        bot,
+                        chat_id=123,
+                        stop_event=stop_event,
+                        conversation_id="123",
+                        request_id="req-1",
+                    )
+                )
+                await asyncio.sleep(0.05)
+                stop_event.set()
+                await task
+
+        sent_texts = [kwargs.get("text") for _, kwargs in bot.send_message.await_args_list]
+        assert sent_texts.count("On it. I'm running that workflow now.") == 1
+
 
 class TestReplyWithBackendAnswer:
     """Regression tests for status-task cleanup in reply flow."""

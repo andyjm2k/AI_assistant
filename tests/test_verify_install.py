@@ -8,6 +8,8 @@ from scripts.verify_install import (
     MCP_BROWSER_USE_DIR,
     check_core,
     check_autogen,
+    check_ag2,
+    check_workflow_backend,
     check_mcp,
     check_playwright,
     check_runtime_optional_deps,
@@ -70,6 +72,64 @@ def test_check_autogen_validates_required_assistant_agent_kwargs(monkeypatch):
     assert "max_tool_iterations" in captured["code"]
     assert "reflect_on_tool_use" in captured["code"]
     assert "tool_call_summary_format" in captured["code"]
+
+
+def test_check_ag2_validates_required_runner_apis(monkeypatch):
+    """check_ag2 should verify the AG2 APIs CATBot's runner depends on."""
+    from scripts import verify_install
+
+    captured = {}
+
+    def fake_run_python_check(description, code, python_exe=None):
+        captured["description"] = description
+        captured["code"] = code
+        captured["python_exe"] = python_exe
+        return True, "ok"
+
+    monkeypatch.setattr(verify_install, "_run_python_check", fake_run_python_check)
+
+    ok, msg = verify_install.check_ag2("C:/fake/python.exe")
+
+    assert ok is True
+    assert msg == "ok"
+    assert captured["description"] == "AG2"
+    assert captured["python_exe"] == "C:/fake/python.exe"
+    assert "AssistantAgent" in captured["code"]
+    assert "UserProxyAgent" in captured["code"]
+    assert "GroupChatManager" in captured["code"]
+    assert "register_function" in captured["code"]
+
+
+def test_check_workflow_backend_default_autogen_returns_ok(monkeypatch):
+    """check_workflow_backend defaults to autogen when .env is absent."""
+    from scripts import verify_install
+
+    root = Path.cwd() / f"verify-env-{next(tempfile._get_candidate_names())}"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        monkeypatch.setattr(verify_install, "PROJECT_ROOT", root)
+        ok, msg = verify_install.check_workflow_backend()
+        assert ok is True
+        assert "autogen" in msg
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_check_workflow_backend_ag2_delegates_to_ag2_check(monkeypatch):
+    """check_workflow_backend validates AG2 when selected."""
+    from scripts import verify_install
+
+    root = Path.cwd() / f"verify-env-{next(tempfile._get_candidate_names())}"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        (root / ".env").write_text("WORKFLOW_FRAMEWORK=ag2\n", encoding="utf-8")
+        monkeypatch.setattr(verify_install, "PROJECT_ROOT", root)
+        monkeypatch.setattr(verify_install, "check_ag2", lambda python_exe=None: (True, "ag2 ok"))
+        ok, msg = verify_install.check_workflow_backend("C:/fake/python.exe")
+        assert ok is True
+        assert msg == "ag2 ok"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_check_mcp_returns_tuple():
@@ -137,6 +197,23 @@ def test_check_feature_env_warns_for_partial_spotify_config(monkeypatch):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_check_feature_env_warns_for_ag2_without_key(monkeypatch):
+    """check_feature_env warns when AG2 is selected without compatible credentials."""
+    from scripts import verify_install
+
+    root = Path.cwd() / f"verify-env-{next(tempfile._get_candidate_names())}"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        (root / ".env").write_text("WORKFLOW_FRAMEWORK=ag2\nAG2_MODEL=test-model\n", encoding="utf-8")
+        monkeypatch.setattr(verify_install, "PROJECT_ROOT", root)
+        ok, msg = verify_install.check_feature_env()
+        assert ok is True
+        assert "WARN:" in msg
+        assert "AG2_API_KEY" in msg
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_main_exits_zero_or_one(monkeypatch):
     """main() exits 0 when all checks pass, 1 when any fail."""
     from scripts import verify_install
@@ -144,6 +221,7 @@ def test_main_exits_zero_or_one(monkeypatch):
     # Patched check functions must accept same signature as originals (python_exe optional)
     monkeypatch.setattr(verify_install, "check_core", lambda *a, **kw: (True, "ok"))
     monkeypatch.setattr(verify_install, "check_autogen", lambda *a, **kw: (True, "ok"))
+    monkeypatch.setattr(verify_install, "check_workflow_backend", lambda *a, **kw: (True, "ok"))
     monkeypatch.setattr(verify_install, "check_mcp", lambda *a, **kw: (True, "ok"))
     monkeypatch.setattr(verify_install, "check_playwright", lambda *a, **kw: (True, "ok"))
     monkeypatch.setattr(verify_install, "check_runtime_optional_deps", lambda *a, **kw: (True, "ok"))

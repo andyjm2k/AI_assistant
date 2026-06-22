@@ -9,7 +9,7 @@ import os
 import re
 from typing import List, Dict, Optional, Any
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.utils.token_budget import (
     estimate_tokens_from_messages,
@@ -35,6 +35,7 @@ class PhilosopherMode:
         api_base: str = None,
         model: str = None,
         memory_manager=None,
+        memory_namespace: str = "legacy-local",
         max_cycles: int = 10,
         similarity_threshold: float = 0.3,
         memory_limit: int = 10,
@@ -65,6 +66,7 @@ class PhilosopherMode:
         self.api_base = api_base or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.memory_manager = memory_manager
+        self.memory_namespace = str(memory_namespace or "legacy-local").strip()
         
         # Configuration parameters
         self.max_cycles = max_cycles
@@ -129,6 +131,8 @@ When contemplating, you should use tools to gather information to inform your ow
                 limit=self.memory_limit,
                 similarity_threshold=self.similarity_threshold,
                 category=None,  # No category filter - get all types
+                namespace=self.memory_namespace,
+                purpose="philosopher",
             )
             
             # Filter out excluded category if specified
@@ -1116,12 +1120,13 @@ Focus on WHAT was concluded, not HOW it was reasoned. This summary will be used 
                 text=summarized_conclusion,  # Embed only the summarized key points
                 category="philosopher_contemplation",
                 source="philosopher_mode",
+                namespace=self.memory_namespace,
                 metadata={
                     "question": question,  # Stored in metadata, not embedded
                     "conclusion": conclusion,  # Full conclusion in metadata for reference
                     "summarized_conclusion": summarized_conclusion,  # Also store summary in metadata
                     "cycle_count": cycle_count,
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "full_text": f"Question: {question}\n\nConclusion: {conclusion}",  # Full text in metadata
                 }
             )

@@ -27,6 +27,16 @@ def test_proxy_auth_interceptor_uses_x_auth_token_not_provider_authorization():
     assert "safeSessionStorageSet(AUTH_TOKEN_STORAGE_KEY, authToken)" in content
 
 
+def test_proxy_endpoint_retry_helper_preserves_catbot_auth():
+    content = _app_js_text()
+    start = content.index("async function fetchProxyEndpoint")
+    end = content.index("function proxyConnectionErrorMessage", start)
+    section = content[start:end]
+
+    assert "headers.set('X-Auth-Token', authToken)" in section
+    assert "fetchWithTimeout(`${baseUrl}${path}`, authenticatedOptions)" in section
+
+
 def test_provider_auth_proxy_401_does_not_clear_login_session():
     content = _app_js_text()
 
@@ -65,6 +75,17 @@ def test_news_tool_uses_proxy_not_browser_api_key_url():
 
     assert "newsapi.org/v2/everything" not in content
     assert "/v1/proxy/news?query=" in content
+
+
+def test_navigation_tools_restrict_protocols_and_use_noopener():
+    content = _app_js_text()
+
+    assert "function normalizeSafeExternalToolUrl(rawUrl, allowedProtocols = ['http:', 'https:'])" in content
+    assert "allowedProtocols.includes(parsed.protocol) ? parsed.href : ''" in content
+    assert "window.open(safeUrl, '_blank', 'noopener,noreferrer')" in content
+    assert "opened.opener = null" in content
+    assert "Only http:// and https:// URLs can be opened." in content
+    assert "normalizeSafeExternalToolUrl(url, ['https:', 'msteams:'])" in content
 
 
 def test_csp_allows_blob_connects_for_vrm_texture_loading():

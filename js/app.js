@@ -581,9 +581,14 @@
 
         async function fetchProxyEndpoint(path, options = {}) {
             let lastError = null;
+            const headers = new Headers(options.headers || {});
+            if (authToken && !headers.has('X-Auth-Token')) {
+                headers.set('X-Auth-Token', authToken);
+            }
+            const authenticatedOptions = { ...options, headers };
             for (const baseUrl of getProxyBaseCandidates()) {
                 try {
-                    const response = await fetchWithTimeout(`${baseUrl}${path}`, options);
+                    const response = await fetchWithTimeout(`${baseUrl}${path}`, authenticatedOptions);
                     setProxyBaseUrl(baseUrl);
                     return response;
                 } catch (error) {
@@ -1244,7 +1249,7 @@
                 events.forEach(ev => {
                     const state = (ev.state || '').trim();
                     if (state) {
-                        addMessageToHistory('system', `⏳ ${state}`);
+                        addMessageToHistory('system', `[status] ${state}`);
                     }
                 });
                 if (typeof data.latest_seq === 'number') {
@@ -1808,7 +1813,11 @@
         let vrmMixer;
         let vrmClock;
         let vrmLipSyncMorphTarget;
+        let vrmLoadGeneration = 0;
+        let vrmActiveModelPath = '';
+        let vrmAnimationFrameId = 0;
         let vrmBlinkTimeout; // Timer id used to schedule periodic blinking
+        let vrmBlinkCloseTimeout = null; // Timer id used to reopen eyes after a blink
         let vrmLovePoseActive = false; // Whether the love pose is active
         let lovePoseTimeoutId = null; // Auto-release timer for love pose
         let isSpeaking = false; // Global speaking state for lip sync/expressions
@@ -1933,6 +1942,55 @@
         const VRM_IDLE_ACTION_FADE_IN_SECONDS = 0.66;
         const VRM_IDLE_ACTION_FADE_OUT_SECONDS = 0.42;
 
+        function isCurrentVrmLoad(loadGeneration, modelPathSnapshot, modelInstance = vrmModel) {
+            return Boolean(
+                loadGeneration === vrmLoadGeneration &&
+                modelPathSnapshot === currentVRMModelPath &&
+                modelInstance &&
+                modelInstance === vrmModel &&
+                document.getElementById('vrm-mode')?.checked
+            );
+        }
+
+        function clearVrmBlinkTimers() {
+            if (vrmBlinkTimeout) { try { clearTimeout(vrmBlinkTimeout); } catch (_) {} vrmBlinkTimeout = null; }
+            if (vrmBlinkCloseTimeout) { try { clearTimeout(vrmBlinkCloseTimeout); } catch (_) {} vrmBlinkCloseTimeout = null; }
+        }
+
+        function flushVrmExpressions(targetVrm = vrmModel) {
+            try { targetVrm?.expressionManager?.update?.(); } catch (_) {}
+            try { targetVrm?.blendShapeProxy?.update?.(); } catch (_) {}
+        }
+
+        function disposeThreeSceneResources(root) {
+            if (!root?.traverse) return;
+            root.traverse((child) => {
+                if (child.geometry) {
+                    try { child.geometry.dispose(); } catch (_) {}
+                }
+                if (child.material) {
+                    const materials = Array.isArray(child.material) ? child.material : [child.material];
+                    materials.forEach((material) => {
+                        try { material.dispose(); } catch (_) {}
+                    });
+                }
+            });
+        }
+
+        function disposeStaleVrmLoadResources(scene, renderer, mixer, vrmInstance, gltfScene = null) {
+            try {
+                if (mixer && vrmInstance?.scene) {
+                    mixer.stopAllAction();
+                    mixer.uncacheRoot(vrmInstance.scene);
+                }
+            } catch (_) {}
+            disposeThreeSceneResources(scene);
+            if (gltfScene && gltfScene !== scene) {
+                disposeThreeSceneResources(gltfScene);
+            }
+            try { renderer?.dispose?.(); } catch (_) {}
+        }
+
         function clearVrmAwaitingTtsStart() {
             vrmAwaitingTtsStart = false;
             if (vrmAwaitingTtsStartTimerId) {
@@ -1969,6 +2027,7 @@
                     ['Smile','Joy','Fun','MouthSmile','Relaxed','Heart','Love','O','BrowUp','BrowUp_L','BrowUp_R','Surprised','Sad','Cry','Sorrow','Angry']
                         .forEach(k => { try { vrmModel.blendShapeProxy.setValue(k, 0.0); } catch (_) {} });
                 }
+                flushVrmExpressions(vrmModel);
             } catch (_) {}
         }
 
@@ -2383,6 +2442,11 @@
 
         function inferLlmSettingsHint(detail = '', statusCode = 0) {
             const normalizedDetail = String(detail || '').toLowerCase();
+            if (
+                /private\/local model endpoint|private or local model endpoint|resolves to a private or local address|points to a local address/.test(normalizedDetail)
+            ) {
+                return 'This is a local/private model URL. Add its exact base URL to OPENAI_PROXY_TRUSTED_BASE_URLS, or enable OPENAI_PROXY_ALLOW_PRIVATE on the CATBot server and restart it.';
+            }
             if (statusCode === 401 || statusCode === 403 || /unauthori[sz]ed|forbidden|api key|authentication|invalid key/.test(normalizedDetail)) {
                 return 'Check the API key or provider credentials in Tool Settings.';
             }
@@ -2587,7 +2651,7 @@
                         const previousModelPath = modelPath;
                         syncLive2DModelControls();
 
-                        if (modelPath && modelPath !== previousModelPath) {
+                        if (modelPath !== previousModelPath) {
                             try { localStorage.setItem(L2D_SELECTED_KEY, modelPath); } catch {}
                             saveToolSettings();
                             if (document.getElementById('live2d-mode')?.checked) {
@@ -2664,7 +2728,7 @@
                         const previousModelPath = currentVRMModelPath;
                         syncVRMModelControls();
 
-                        if (currentVRMModelPath && currentVRMModelPath !== previousModelPath) {
+                        if (currentVRMModelPath !== previousModelPath) {
                             try { localStorage.setItem(VRM_SELECTED_KEY, currentVRMModelPath); } catch {}
                             if (document.getElementById('vrm-mode').checked) {
                                 cleanupVRM();
@@ -2764,7 +2828,7 @@
                     defaultVisionModel = visionModel;
                 }
             } catch (error) {
-                console.error('Error fetching models:', error);
+                console.warn('Model list refresh failed:', error?.message || error);
                 status.textContent = error.message || 'The model list could not be refreshed. Check Tool Settings.';
                 if (toolModelDropdown) {
                     toolModel = populateModelDropdown(
@@ -5401,10 +5465,14 @@
             return true;
         }
 
-        function mergeTtsDefaults(settings, defaults) {
+        function mergeClientDefaults(settings, defaults) {
             if (!defaults || typeof defaults !== 'object') return { settings, applied: false };
             const merged = (settings && typeof settings === 'object') ? { ...settings } : {};
             let applied = false;
+            if (!hasMeaningfulValue(merged.endpoint) && hasMeaningfulValue(defaults.llmEndpoint)) {
+                merged.endpoint = defaults.llmEndpoint;
+                applied = true;
+            }
             if (!hasMeaningfulValue(merged.ttsEndpoint) && hasMeaningfulValue(defaults.ttsEndpoint)) {
                 merged.ttsEndpoint = defaults.ttsEndpoint;
                 applied = true;
@@ -5435,6 +5503,8 @@
                 if (!data || typeof data !== 'object') return null;
                 const defaults = {
                     soulPrompt: data.soulPrompt || '',
+                    llmEndpoint: data.llmEndpoint || '',
+                    llmPrivateNetworksAllowed: data.llmPrivateNetworksAllowed === true,
                     ttsEndpoint: data.ttsEndpoint || '',
                     ttsModel: data.ttsModel || '',
                     ttsVoice: data.ttsVoice || ''
@@ -5634,7 +5704,7 @@
                     : (() => { const s = localStorage.getItem('toolSettings'); return s ? JSON.parse(s) : null; })();
                 let appliedDefaults = false;
                 if (optionalSettings == null) {
-                    const merged = mergeTtsDefaults(settings, envToolDefaults);
+                    const merged = mergeClientDefaults(settings, envToolDefaults);
                     settings = merged.settings;
                     appliedDefaults = merged.applied;
                 }
@@ -5643,7 +5713,7 @@
                     if (appliedDefaults) saveToolSettings();
                     if (optionalSettings == null) console.log('Tool settings loaded from localStorage');
                 } else if (optionalSettings == null && envToolDefaults) {
-                    const merged = mergeTtsDefaults(null, envToolDefaults);
+                    const merged = mergeClientDefaults(null, envToolDefaults);
                     if (merged.settings) {
                         applyToolSettingsToDOM(merged.settings);
                         if (merged.applied) saveToolSettings();
@@ -6419,7 +6489,12 @@
         authPasswordInput?.addEventListener('keydown', handleAuthInputKeydown);
         authLoginBtn?.addEventListener('click', () => performAuth('login'));
         authSignupBtn?.addEventListener('click', () => performAuth('signup'));
-        authLogoutBtn?.addEventListener('click', () => {
+        authLogoutBtn?.addEventListener('click', async () => {
+            try {
+                await fetchProxyEndpoint('/v1/auth/logout', { method: 'POST' });
+            } catch (error) {
+                console.warn('Logout cookie clear request failed:', error);
+            }
             setAuthToken('');
             showAuthOverlay('Logged out.');
         });
@@ -7780,7 +7855,7 @@ function saveWAVFile(wavBlob) {
             {
                 type: "function",
                 function: {
-                    name: "manageMemoryCache",
+                    name: "manageWorkingContext",
                     description: "Manages a persistent memory cache with various operations",
                     parameters: {
                         type: "object",
@@ -7952,13 +8027,13 @@ function saveWAVFile(wavBlob) {
                 type: "function",
                 function: {
                     name: "runCodexCli",
-                    description: "Runs Codex CLI non-interactively to make CATBot code changes or add new tool capabilities. Output is saved to a scratch summary file.",
+                    description: "Runs Codex CLI non-interactively to make CATBot code changes or add new tool capabilities. Provide a clear, self-contained prompt with the user's request, error text, and instructions to inspect the repository. Output is saved to a scratch summary file.",
                     parameters: {
                         type: "object",
                         properties: {
                             prompt: {
                                 type: "string",
-                                description: "Clear instructions for Codex to execute in the CATBot project (e.g. 'add a new proxy tool and update docs')"
+                                description: "Self-contained instructions for Codex to execute in the CATBot project (e.g. 'Fix this runcodexcli error: ... Search the repo, patch the bug, and run focused tests.')"
                             },
                             timeoutSeconds: {
                                 type: "number",
@@ -8457,7 +8532,7 @@ function saveWAVFile(wavBlob) {
                     case "weatherInfo":
                         result = await handleWeatherInfo(args);
                         break;
-                    case "manageMemoryCache":
+                    case "manageWorkingContext":
                         result = await handleMemoryCache(args);
                         break;
                     case "navigateToUrl":
@@ -8909,12 +8984,12 @@ function saveWAVFile(wavBlob) {
 
         async function handleStoreMemory({ text, category }) {
             try {
-                const response = await fetch(`${PROXY_BASE_URL}/v1/memory/store`, {
+                const response = await fetchProxyEndpoint('/v1/memory/store', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         text: text,
-                        category: category || "general",
+                        category: category || "profile_fact",
                         source: "explicit"
                     })
                 });
@@ -8932,7 +9007,7 @@ function saveWAVFile(wavBlob) {
         async function handleSearchMemories({ query, limit, similarity_threshold }) {
             try {
                 const threshold = (typeof similarity_threshold === 'number') ? similarity_threshold : 0.6;
-                const response = await fetch(`${PROXY_BASE_URL}/v1/memory/search`, {
+                const response = await fetchProxyEndpoint('/v1/memory/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -8959,151 +9034,35 @@ function saveWAVFile(wavBlob) {
             }
         }
 
-        function isConversationContextMemory(mem) {
-            if (!mem || typeof mem !== 'object') {
-                return false;
-            }
-            const category = String(mem.category || '').trim().toLowerCase();
-            const source = String(mem.source || '').trim().toLowerCase();
-            const memoryType = String(mem.memory_type || '').trim().toLowerCase();
-            const text = String(mem.text || '');
-            const blockedCategories = new Set(['task_experience', 'task_learning']);
-            const blockedSources = new Set(['task_execution', 'task_scheduler', 'status_system']);
-            const operationalPattern = /\b(todo|to-?do|task list|my tasks?|due tasks?|overdue tasks?|task execution|task outcome memory|experience hints from similar tasks|repeat for similar tasks|avoid for similar tasks|execution status|status update|awaiting confirmation|paused awaiting feedback|pending tasks?|completed tasks?|cancelled tasks?|task id|current state|list state|working:|done:|failed:)\b/i;
-
-            if (blockedCategories.has(category) || blockedCategories.has(memoryType)) {
-                return false;
-            }
-            if (blockedSources.has(source)) {
-                return false;
-            }
-            return !operationalPattern.test(text);
-        }
-
-        function filterHighRelevanceMemories(memories, { minSimilarity = 0.72, scoreWindow = 0.12, maxResults = 3 } = {}) {
-            if (!Array.isArray(memories) || memories.length === 0) {
-                return [];
-            }
-            const sorted = [...memories].sort((a, b) => (Number(b.similarity) || 0) - (Number(a.similarity) || 0));
-            const topScore = Number(sorted[0]?.similarity) || 0;
-            if (topScore < minSimilarity) {
-                return [];
-            }
-            const floor = Math.max(minSimilarity, topScore - scoreWindow);
-            return sorted
-                .filter(mem => (Number(mem.similarity) || 0) >= floor)
-                .filter(isConversationContextMemory)
-                .slice(0, maxResults);
-        }
-
-        // Detect if a question is asking for opinion/knowledge vs an action
-        function isOpinionOrKnowledgeQuestion(prompt) {
-            // Convert to lowercase for case-insensitive matching
-            const lowerPrompt = prompt.toLowerCase().trim();
-            
-            // Patterns that indicate opinion/knowledge questions
-            const opinionKnowledgePatterns = [
-                /what\s+(do\s+you\s+)?think\s+(about|of)/i,
-                /what'?s\s+(your\s+)?(opinion|view|perspective|take|thoughts?)\s+(on|about|of|regarding)/i,
-                /what\s+(do\s+you\s+)?know\s+(about|of)/i,
-                /what\s+(are\s+your\s+)?(thoughts?|views?|beliefs?|ideas?)\s+(on|about|of|regarding)/i,
-                /how\s+do\s+you\s+(feel|see|view|perceive)\s+(about|on|regarding)/i,
-                /tell\s+me\s+(what\s+you\s+)?(think|know|believe|feel)\s+(about|of|on)/i,
-                /what\s+(is|are)\s+your\s+(thoughts?|views?|opinions?|beliefs?|ideas?|insights?)\s+(on|about|of|regarding)/i,
-                /share\s+(your\s+)?(thoughts?|views?|opinions?|perspective)/i,
-                /what\s+(do\s+you\s+)?(believe|understand|consider)\s+(about|of|regarding)/i,
-                /what\s+(are\s+your\s+)?(insights?|reflections?|contemplations?)\s+(on|about|of|regarding)/i
-            ];
-            
-            // Patterns that indicate action-oriented questions (skip memory search)
-            const actionPatterns = [
-                /(search|find|look\s+up|get|fetch|retrieve)\s+(for|information\s+about|details\s+about)/i,
-                /how\s+much\s+(does|do|is|are|cost)/i,
-                /what'?s\s+the\s+(weather|price|cost|temperature|time)/i,
-                /(show|display|list|give\s+me)\s+(me\s+)?(information|data|details|results)/i,
-                /(calculate|compute|determine|find\s+out)\s+(the\s+)?(cost|price|value|amount|total)/i,
-                /(navigate|go\s+to|visit|open|browse)/i,
-                /(read|write|save|load|upload|download)\s+(the\s+)?(file|document|data)/i,
-                /(create|make|build|generate|produce)\s+(a|an|the)/i,
-                /(run|execute|perform|do)\s+(a|an|the)/i
-            ];
-            
-            // Check for action patterns first (higher priority)
-            for (const pattern of actionPatterns) {
-                if (pattern.test(lowerPrompt)) {
-                    return false; // This is an action question, not opinion/knowledge
-                }
-            }
-            
-            // Check for opinion/knowledge patterns
-            for (const pattern of opinionKnowledgePatterns) {
-                if (pattern.test(lowerPrompt)) {
-                    return true; // This is an opinion/knowledge question
-                }
-            }
-            
-            // Default: if it starts with "what do you" or "what's your", treat as opinion/knowledge
-            if (/^what\s+(do\s+you|'?s\s+your)/i.test(lowerPrompt)) {
-                return true;
-            }
-            
-            // Default to false (action-oriented) if no patterns match
-            return false;
-        }
-
-        // Automatically search memories for opinion/knowledge questions (when not in philosopher mode)
-        async function autoSearchMemoriesForQuestion(prompt) {
-            // Only auto-search if not in philosopher mode
+        // Retrieve prompt-safe context through the shared server-side policy.
+        async function fetchConversationMemoryContext(prompt) {
             if (philosopherModeActive) {
-                return null; // Skip auto-search in philosopher mode
+                return null;
             }
-            
-            // Check if this is an opinion/knowledge question
-            if (!isOpinionOrKnowledgeQuestion(prompt)) {
-                return null; // Skip auto-search for action questions
-            }
-            
             try {
-                // Extract topic from the question for better search
-                // Try to extract the main topic after common question patterns
-                let searchQuery = prompt;
-                const topicMatch = prompt.match(/(?:think|opinion|view|know|thoughts?|beliefs?|feel|see|perceive|understand|consider|insights?|reflections?|contemplations?)\s+(?:about|of|on|regarding)\s+(.+?)(?:\?|$)/i);
-                if (topicMatch && topicMatch[1]) {
-                    searchQuery = topicMatch[1].trim();
-                }
-                
-                // Search memories
-                const result = await handleSearchMemories({
-                    query: searchQuery,
-                    limit: 6,
-                    similarity_threshold: 0.55
+                const response = await fetchProxyEndpoint('/v1/memory/context', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        query: prompt,
+                        purpose: 'conversation',
+                        conversation_id: activeConversationId || 'default',
+                        max_items: 4,
+                        max_tokens: 500
+                    })
                 });
-
-                const rawMemories = result?.data?.memories || [];
-                const relevantMemories = filterHighRelevanceMemories(rawMemories, {
-                    minSimilarity: 0.72,
-                    scoreWindow: 0.12,
-                    maxResults: 3
-                });
-
-                if (result.success && relevantMemories.length > 0) {
-                    // Return compact context only (no debug labels/scores)
-                    return relevantMemories
-                        .map((mem, i) => `${i + 1}. ${mem.text}`)
-                        .join('\n');
-                }
-                
-                return null; // No memories found or error
+                const result = await response.json();
+                return result?.success ? (result?.data?.context || null) : null;
             } catch (error) {
                 console.warn('Auto memory search failed:', error);
-                return null; // Fail silently, don't block the request
+                return null;
             }
         }
 
         async function handleListMemories({ limit }) {
             try {
                 const limitParam = limit ? `?limit=${limit}` : '';
-                const response = await fetch(`${PROXY_BASE_URL}/v1/memory/list${limitParam}`, {
+                const response = await fetchProxyEndpoint(`/v1/memory/list${limitParam}`, {
                     method: 'GET',
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -9127,7 +9086,7 @@ function saveWAVFile(wavBlob) {
 
         async function handleDeleteMemory({ memory_id }) {
             try {
-                const response = await fetch(`${PROXY_BASE_URL}/v1/memory/${memory_id}`, {
+                const response = await fetchProxyEndpoint(`/v1/memory/${encodeURIComponent(memory_id)}`, {
                     method: 'DELETE',
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -9156,12 +9115,13 @@ function saveWAVFile(wavBlob) {
                 }
                 
                 // Call the backend to extract and store memories
-                const response = await fetch(`${PROXY_BASE_URL}/v1/memory/extract`, {
+                const response = await fetchProxyEndpoint('/v1/memory/extract', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         messages: recentMessages,
-                        max_memories: 3
+                        max_memories: 3,
+                        conversation_id: activeConversationId || 'default'
                     })
                 });
                 
@@ -9175,11 +9135,35 @@ function saveWAVFile(wavBlob) {
             }
         }
 
+        function normalizeSafeExternalToolUrl(rawUrl, allowedProtocols = ['http:', 'https:']) {
+            const value = String(rawUrl || '').trim();
+            if (!value) return '';
+            try {
+                const parsed = new URL(value);
+                return allowedProtocols.includes(parsed.protocol) ? parsed.href : '';
+            } catch (_) {
+                return '';
+            }
+        }
+
+        function openExternalToolUrl(rawUrl, allowedProtocols = ['http:', 'https:']) {
+            const safeUrl = normalizeSafeExternalToolUrl(rawUrl, allowedProtocols);
+            if (!safeUrl) return false;
+            const opened = window.open(safeUrl, '_blank', 'noopener,noreferrer');
+            if (opened) opened.opener = null;
+            return true;
+        }
+
         async function handleNavigation({ url }) {
             try {
-                const urlObj = new URL(url);
-                if (confirm(`Would you like to open ${url}?`)) {
-                    window.open(url, '_blank');
+                const safeUrl = normalizeSafeExternalToolUrl(url, ['http:', 'https:']);
+                if (!safeUrl) {
+                    return { success: false, message: "Only http:// and https:// URLs can be opened." };
+                }
+                if (confirm(`Would you like to open ${safeUrl}?`)) {
+                    if (!openExternalToolUrl(safeUrl, ['http:', 'https:'])) {
+                        return { success: false, message: "Website opening was blocked." };
+                    }
                     return { success: true, message: "The website has been opened in a new tab." };
                 }
                 return { success: false, message: "Website opening was cancelled." };
@@ -9191,8 +9175,14 @@ function saveWAVFile(wavBlob) {
 
         async function handleTeamsChat({ url }) {
             try {
+                const safeUrl = normalizeSafeExternalToolUrl(url, ['https:', 'msteams:']);
+                if (!safeUrl) {
+                    return { success: false, message: "Only HTTPS or Microsoft Teams URLs can be opened." };
+                }
                 if (confirm(`Would you like to open Teams chat?`)) {
-                            window.open(url, '_blank');
+                    if (!openExternalToolUrl(safeUrl, ['https:', 'msteams:'])) {
+                        return { success: false, message: "Teams chat opening was blocked." };
+                    }
                     return { success: true, message: "Teams chat has been opened" };
                 }
                 return { success: false, message: "Teams chat opening was cancelled." };
@@ -9390,9 +9380,11 @@ function saveWAVFile(wavBlob) {
                 const lastMessageFile = data.lastMessageFile ? `Last message file: ${data.lastMessageFile}` : 'Last message file not provided.';
                 const exitCode = data.exitCode !== undefined ? `exit_code=${data.exitCode}` : 'exit_code=unknown';
                 const timedOut = data.timedOut ? 'timed_out=true' : 'timed_out=false';
+                const statusWord = data.success === false ? 'failed' : 'finished';
+                const stderrPreview = data.success === false && data.stderr ? ` Error: ${String(data.stderr).slice(0, 500)}` : '';
                 return {
                     success: data.success !== false,
-                    message: `Codex CLI finished (${exitCode}, ${timedOut}). ${summaryFile} ${eventsFile} ${lastMessageFile}`
+                    message: `Codex CLI ${statusWord} (${exitCode}, ${timedOut}). ${summaryFile} ${eventsFile} ${lastMessageFile}${stderrPreview}`
                 };
             } catch (error) {
                 console.error('Codex CLI error:', error);
@@ -9888,7 +9880,7 @@ function saveWAVFile(wavBlob) {
                     }
                 }
             },
-            manageMemoryCache: {
+            manageWorkingContext: {
                 patterns: [
                     /(?:remember|memorize|note)(?: that| this)? ["']?([^"']+)["']?/i,
                     /(?:update|change|modify|edit)(?: the)? memory (?:item )?(?:number )?(\d+)(?: (?:to|with) ["']?([^"']+)["']?)?/i,
@@ -10244,7 +10236,7 @@ function saveWAVFile(wavBlob) {
                         context.currentTodoList = [...todoList];
                     }
                     break;
-                case 'manageMemoryCache':
+                case 'manageWorkingContext':
                     // Store the current memory cache state in context
                     if (result.success && memoryCache) {
                         context.currentMemoryCache = [...memoryCache];
@@ -10436,7 +10428,7 @@ Parameters:
     "clearRecurrence": "boolean (update only)"
 }
 
-2. manageMemoryCache
+2. manageWorkingContext
 Description: Manages memory storage
 Parameters:
 {
@@ -10474,10 +10466,10 @@ Parameters:
 }
 
 7. runCodexCli
-Description: Runs Codex CLI non-interactively to make CATBot code changes or add new tool capabilities. Use this when the user asks to modify the CATBot codebase or implement new tools.
+Description: Runs Codex CLI non-interactively to make CATBot code changes or add new tool capabilities. Use this when the user asks to modify the CATBot codebase or implement new tools. The prompt must be self-contained with the user's request, relevant error text, and instructions to inspect/search the repository before editing.
 Parameters:
 {
-    "prompt": "string (clear instructions for Codex to execute)",
+    "prompt": "string (self-contained instructions for Codex to execute)",
     "timeoutSeconds": "number (optional; default 1800, max 7200)"
 }
 
@@ -10557,7 +10549,7 @@ Parameters:
 
 Examples:
 User: "Remember to buy milk"
-Assistant: <tool>manageMemoryCache</tool>
+Assistant: <tool>manageWorkingContext</tool>
 <parameters>
 {
     "action": "add",
@@ -10747,7 +10739,7 @@ Tool calling rules:
 Task-specific rules:
 - For attached files, inspect them with the filesystem read tool before answering.
 - Use pdfToPowerPoint only when the user explicitly asks to convert a PDF or Markdown document into PowerPoint/slides.
-- For CATBot code/tool changes, use runCodexCli.
+- For CATBot code/tool changes, use runCodexCli with a self-contained prompt that includes the user's actual request, error text, and instructions to inspect/search the repository before editing.
 - Call restartProxyServer only with explicit user confirmation.
 - For scratch files, use relative filenames and preserve requested output names.
 
@@ -10783,13 +10775,12 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 effectiveSystemPrompt = `The user you are talking to is named ${userName}.\n\n${effectiveSystemPrompt}`;
             }
             
-            // Automatically search memories for opinion/knowledge questions (when not in philosopher mode)
+            // Retrieve shared, server-ranked conversation memory context.
             let memoryContext = null;
             if (!philosopherModeActive) {
-                memoryContext = await autoSearchMemoriesForQuestion(promptTextForModel);
+                memoryContext = await fetchConversationMemoryContext(promptTextForModel);
                 if (memoryContext) {
-                    // Add memory context to system prompt
-                    effectiveSystemPrompt += `\n\nRelevant context from previous conversations:\n${memoryContext}\n\nUse this context to provide more personalized and relevant responses based on what you've discussed before.`;
+                    effectiveSystemPrompt += `\n\n${memoryContext}`;
                 }
             }
             
@@ -11881,8 +11872,26 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
         // VRM Functions
         function cleanupVRM() {
             try {
+                vrmLoadGeneration += 1;
                 clearVRMResizeHandler();
-                if (!vrmModel) return;
+                clearVrmAwaitingTtsStart();
+                clearVrmIdleReplayTimer();
+                clearVrmBlinkTimers();
+                if (vrmAnimationFrameId) {
+                    try { cancelAnimationFrame(vrmAnimationFrameId); } catch (_) {}
+                    vrmAnimationFrameId = 0;
+                }
+                [
+                    vrmLoveVrmaAction,
+                    vrmThinkVrmaAction,
+                    vrmCryVrmaAction,
+                    vrmAngryVrmaAction,
+                    vrmIdleVrmaAction
+                ].forEach(clearVrmActionStopTimer);
+                vrmProcessingThinkLoopActive = false;
+                vrmTtsStartHandled = false;
+                vrmIdleHasPlayedOnce = false;
+                resetVrmPoseState();
 
             // Stop and uncache animation bindings
             try {
@@ -11893,16 +11902,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             } catch (_) {}
 
             if (vrmScene) {
-                vrmScene.traverse((child) => {
-                    if (child.geometry) child.geometry.dispose();
-                    if (child.material) {
-                        if (Array.isArray(child.material)) {
-                            child.material.forEach(material => material.dispose());
-                        } else {
-                            child.material.dispose();
-                        }
-                    }
-                });
+                disposeThreeSceneResources(vrmScene);
             }
 
             if (vrmRenderer) {
@@ -11920,7 +11920,8 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             vrmThinkVrmaAction = null;
             vrmCryVrmaAction = null;
             vrmAngryVrmaAction = null;
-            if (vrmBlinkTimeout) { try { clearTimeout(vrmBlinkTimeout); } catch (_) {} vrmBlinkTimeout = null; }
+            vrmIdleVrmaAction = null;
+            vrmActiveModelPath = '';
             if (lovePoseTimeoutId) { try { clearTimeout(lovePoseTimeoutId); } catch (_) {} lovePoseTimeoutId = null; }
             if (thinkPoseTimeoutId) { try { clearTimeout(thinkPoseTimeoutId); } catch (_) {} thinkPoseTimeoutId = null; }
             if (cryPoseTimeoutId) { try { clearTimeout(cryPoseTimeoutId); } catch (_) {} cryPoseTimeoutId = null; }
@@ -11936,9 +11937,17 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
         } catch (error) {
             console.warn('Error cleaning up VRM:', error);
         }
-    }
+        }
 
         async function initVRM() {
+            const requestedGeneration = ++vrmLoadGeneration;
+            const requestedModelPath = currentVRMModelPath;
+            let scene = null;
+            let camera = null;
+            let renderer = null;
+            let mixer = null;
+            let gltf = null;
+            let vrm = null;
             try {
                 const container = document.getElementById('vrm-container');
                 const canvas = document.getElementById('vrm-canvas');
@@ -11948,8 +11957,9 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 }
 
                 // Ensure a valid .vrm path is selected
-                if (!currentVRMModelPath || !currentVRMModelPath.toLowerCase().endsWith('.vrm')) {
-                    throw new Error('Selected model path is not a .vrm file. Please provide a valid VRM file.');
+                if (!requestedModelPath || !requestedModelPath.toLowerCase().endsWith('.vrm')) {
+                    console.warn('Selected model path is not a .vrm file. Please provide a valid VRM file.');
+                    return;
                 }
 
                 // Wait for THREE.js and VRM modules to be ready
@@ -11969,6 +11979,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     });
                 }
 
+                if (requestedGeneration !== vrmLoadGeneration || requestedModelPath !== currentVRMModelPath || !document.getElementById('vrm-mode')?.checked) {
+                    return;
+                }
+
                 // Verify THREE.js is available
                 if (!window.THREE) {
                     if (window.__vrmModulesError) {
@@ -11981,10 +11995,12 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 }
 
                 // Initialize Three.js scene
-                const scene = new window.THREE.Scene();
-                const camera = new window.THREE.PerspectiveCamera(45, canvas.clientWidth / canvas.clientHeight, 0.1, 1000);
-                const renderer = new window.THREE.WebGLRenderer({ canvas: canvas, antialias: true });
-                renderer.setSize(canvas.clientWidth, canvas.clientHeight);
+                const viewportWidth = Math.max(container.clientWidth || canvas.clientWidth || 0, 1);
+                const viewportHeight = Math.max(container.clientHeight || canvas.clientHeight || 0, 1);
+                scene = new window.THREE.Scene();
+                camera = new window.THREE.PerspectiveCamera(45, viewportWidth / viewportHeight, 0.1, 1000);
+                renderer = new window.THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+                renderer.setSize(viewportWidth, viewportHeight);
                 renderer.setClearColor(0x000000, 0);
 
                 // Add lighting
@@ -12006,10 +12022,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 }
 
                 // Resolve model path to absolute URL for remote access
-                const resolvedVRMPath = resolveModelPath(currentVRMModelPath);
-                console.log(`Loading VRM model from: ${resolvedVRMPath} (original: ${currentVRMModelPath})`);
+                const resolvedVRMPath = resolveModelPath(requestedModelPath);
+                console.log(`Loading VRM model from: ${resolvedVRMPath} (original: ${requestedModelPath})`);
                 
-                const gltf = await new Promise((resolve, reject) => {
+                gltf = await new Promise((resolve, reject) => {
                     loader.load(
                         resolvedVRMPath,
                         resolve,
@@ -12018,9 +12034,13 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     );
                 });
 
+                if (requestedGeneration !== vrmLoadGeneration || requestedModelPath !== currentVRMModelPath || !document.getElementById('vrm-mode')?.checked) {
+                    disposeStaleVrmLoadResources(scene, renderer, mixer, null, gltf?.scene);
+                    return;
+                }
+
                 // Extract VRM instance from GLTFLoader plugin output
                 // VRM data can be in userData.vrm or extensions.VRM
-                let vrm = null;
                 if (gltf && gltf.userData && gltf.userData.vrm) {
                     vrm = gltf.userData.vrm;
                 } else if (gltf && gltf.parser && gltf.parser.userData && gltf.parser.userData.vrm) {
@@ -12037,6 +12057,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         userDataKeys: gltf?.userData ? Object.keys(gltf.userData) : [],
                         parserUserDataKeys: gltf?.parser?.userData ? Object.keys(gltf.parser.userData) : []
                     });
+                    disposeStaleVrmLoadResources(scene, renderer, mixer, null, gltf?.scene);
                     throw new Error('Loaded GLTF does not contain VRM data. Ensure the file is a valid .vrm model and the VRM version setting matches the model version.');
                 }
 
@@ -12166,7 +12187,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 camera.lookAt(0, 0, 0);
 
                 // Animation mixer
-                const mixer = new window.THREE.AnimationMixer(vrm.scene);
+                mixer = new window.THREE.AnimationMixer(vrm.scene);
                 // Optional: preload VRMA animation clip for love pose (only for VRM 1.0)
                 let loveVrmaAction = null;
                 try {
@@ -12638,6 +12659,11 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 } catch (e) {
                     console.warn('Failed to preload Idle VRMA animation:', e);
                 }
+
+                if (requestedGeneration !== vrmLoadGeneration || requestedModelPath !== currentVRMModelPath || !document.getElementById('vrm-mode')?.checked) {
+                    disposeStaleVrmLoadResources(scene, renderer, mixer, vrm, gltf?.scene);
+                    return;
+                }
                 
                 const clock = new window.THREE.Clock();
 
@@ -12653,6 +12679,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 vrmCryVrmaAction = cryVrmaAction;
                 vrmAngryVrmaAction = angryVrmaAction;
                 vrmIdleVrmaAction = idleVrmaAction;
+                vrmActiveModelPath = requestedModelPath;
                 clearVrmIdleReplayTimer();
                 vrmIdleHasPlayedOnce = false;
                 attachVRMResizeHandler();
@@ -13051,7 +13078,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
 
                 // Start render loop
                 function animate() {
-                    requestAnimationFrame(animate);
+                    if (!isCurrentVrmLoad(requestedGeneration, requestedModelPath, vrm)) {
+                        return;
+                    }
+                    vrmAnimationFrameId = requestAnimationFrame(animate);
 
                     if (vrmClock) {
                         const delta = vrmClock.getDelta();
@@ -13374,6 +13404,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     try { vrm.blendShapeProxy.setValue('Heart', loveEyesVal); } catch (_) {} // Optional custom heart eyes
                                     try { vrm.blendShapeProxy.setValue('Love', loveEyesVal); } catch (_) {} // Optional custom love eyes
                                 }
+                                flushVrmExpressions(vrm);
                             } catch (_) {}
                         } else if (!isSpeaking && lovePoseWeight <= 0.1) {
                             // Fully release smile/eye shapes when pose finished
@@ -13394,6 +13425,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     try { vrm.blendShapeProxy.setValue('Heart', 0.0); } catch (_) {}
                                     try { vrm.blendShapeProxy.setValue('Love', 0.0); } catch (_) {}
                                 }
+                                flushVrmExpressions(vrm);
                             } catch (_) {}
                         }
 
@@ -13414,6 +13446,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     const brow0 = ['BrowUp','BrowUp_L','BrowUp_R','Surprised'];
                                     for (const b of brow0) { try { vrm.blendShapeProxy.setValue(b, POSE_CONFIG.think.browRaiseGain * thinkPoseWeight); } catch(_){} }
                                 }
+                                flushVrmExpressions(vrm);
                             } catch(_){}
                         } else if (!isSpeaking && thinkPoseWeight <= 0.1) {
                             // Release O mouth and brow keys when done
@@ -13426,6 +13459,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                                     try { vrm.blendShapeProxy.setValue('O', 0.0); } catch(_){}
                                     ['BrowUp','BrowUp_L','BrowUp_R','Surprised'].forEach(k => { try { vrm.blendShapeProxy.setValue(k, 0.0); } catch(_){} });
                                 }
+                                flushVrmExpressions(vrm);
                             } catch(_){}
                         }
                     }
@@ -13439,20 +13473,26 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
 
                 // Start periodic blinking after VRM is ready
                 const setBlink = (value) => { // Helper to set blink expression value
+                    if (!isCurrentVrmLoad(requestedGeneration, requestedModelPath, vrm)) return; // Skip stale blink callbacks
                     try { if (vrm.expressionManager) { vrm.expressionManager.setValue('blink', value); } } catch (_) {} // VRM 1.0 blink key
                     try { if (vrm.expressionManager) { vrm.expressionManager.setValue('blinkLeft', value); } } catch (_) {} // Optional left eye key
                     try { if (vrm.expressionManager) { vrm.expressionManager.setValue('blinkRight', value); } } catch (_) {} // Optional right eye key
                     try { if (vrm.blendShapeProxy) { vrm.blendShapeProxy.setValue('Blink', value); } } catch (_) {} // VRM 0.x combined blink
                     try { if (vrm.blendShapeProxy) { vrm.blendShapeProxy.setValue('Blink_L', value); } } catch (_) {} // VRM 0.x left blink
                     try { if (vrm.blendShapeProxy) { vrm.blendShapeProxy.setValue('Blink_R', value); } } catch (_) {} // VRM 0.x right blink
+                    flushVrmExpressions(vrm);
                 }; // End setBlink helper
 
                 const scheduleBlink = () => { // Function to schedule the next blink
-                    if (!vrmModel) return; // Skip if VRM has been cleaned up
+                    if (!isCurrentVrmLoad(requestedGeneration, requestedModelPath, vrm)) return; // Skip if VRM has been cleaned up or swapped
                     const waitMs = 2200 + Math.random() * 2600; // Random delay between blinks (2.2s - 4.8s)
                     vrmBlinkTimeout = setTimeout(() => { // Set timer for blink
+                        vrmBlinkTimeout = null;
+                        if (!isCurrentVrmLoad(requestedGeneration, requestedModelPath, vrm)) return; // Skip stale blink close/open cycle
                         setBlink(1.0); // Close eyelids
-                        setTimeout(() => { // Short delay to reopen eyes
+                        vrmBlinkCloseTimeout = setTimeout(() => { // Short delay to reopen eyes
+                            vrmBlinkCloseTimeout = null;
+                            if (!isCurrentVrmLoad(requestedGeneration, requestedModelPath, vrm)) return; // Skip stale blink reopen
                             setBlink(0.0); // Open eyelids
                             scheduleBlink(); // Schedule subsequent blink
                         }, 120 + Math.random() * 80); // Keep eyes closed 120-200ms
@@ -13463,7 +13503,12 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 console.log('VRM model loaded successfully');
 
             } catch (error) {
-                console.error('Failed to load VRM model:', error);
+                if (requestedGeneration === vrmLoadGeneration) {
+                    if (vrmModel !== vrm) {
+                        disposeStaleVrmLoadResources(scene, renderer, mixer, vrm, gltf?.scene);
+                    }
+                    console.error('Failed to load VRM model:', error);
+                }
             }
         }
 
@@ -13509,6 +13554,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     // For VRM 1.0, vowel keys are typically lowercase: 'aa','ih','ou','ee','oh'
                     const exprKey = key.toLowerCase() === 'a' ? 'aa' : key.toLowerCase();
                     vrmModel.expressionManager.setValue(exprKey, clamped);
+                    flushVrmExpressions(vrmModel);
                     return;
                 }
             } catch (e) {
@@ -13520,6 +13566,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 if (vrmModel.blendShapeProxy) {
                     const proxyKey = key.length === 2 && key === key.toLowerCase() ? key.toUpperCase().charAt(0) : key; // map 'aa'->'A'
                     vrmModel.blendShapeProxy.setValue(proxyKey, clamped);
+                    flushVrmExpressions(vrmModel);
                 }
             } catch (error) {
                 console.warn('Error animating VRM lip sync:', error);
@@ -13560,7 +13607,10 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
             cleanupLive2D();
 
             // Initialize VRM if needed
-            if (!vrmModel) {
+            if (!vrmModel || vrmActiveModelPath !== currentVRMModelPath) {
+                if (vrmModel) {
+                    cleanupVRM();
+                }
                 await initVRM();
             }
 
@@ -13933,11 +13983,28 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     break;
             }
             
-            if (expressionFile) {
-                live2dModel.expression(expressionFile);
-            } else {
-                // Reset to default expression
-                live2dModel.expression(null);
+            const resetLive2DExpression = () => {
+                try {
+                    const resetResult = live2dModel.expression(null);
+                    if (resetResult && typeof resetResult.catch === 'function') {
+                        resetResult.catch(() => {});
+                    }
+                } catch (_) {}
+            };
+
+            try {
+                const expressionResult = expressionFile
+                    ? live2dModel.expression(expressionFile)
+                    : live2dModel.expression(null);
+                if (expressionResult && typeof expressionResult.catch === 'function') {
+                    expressionResult.catch((error) => {
+                        console.warn('Could not apply Live2D expression:', error);
+                        resetLive2DExpression();
+                    });
+                }
+            } catch (error) {
+                console.warn('Could not apply Live2D expression:', error);
+                resetLive2DExpression();
             }
         }
 

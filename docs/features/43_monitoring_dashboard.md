@@ -51,5 +51,5 @@ flowchart TD
 
 ## Related Docs
 - [Scheduled Task Poller](21_scheduled_task_poller.md)
-- [AutoGen Orchestration](39_autogen_orchestration.md)
+- [Workflow Orchestration](39_autogen_orchestration.md)
 - [Telegram Bot Interface](37_telegram_bot_interface.md)

@@ -30,6 +30,22 @@ def test_client_config_prefers_tts_env(monkeypatch):
     assert data["ttsVoice"] == "custom-voice"
 
 
+def test_client_config_includes_safe_llm_proxy_defaults(monkeypatch):
+    from src.servers import proxy_server
+
+    client = _client()
+    monkeypatch.setenv("OPENAI_API_BASE", "http://127.0.0.1:11434/v1")
+    monkeypatch.setattr(proxy_server, "OPENAI_PROXY_ALLOW_PRIVATE", True)
+    monkeypatch.setattr(proxy_server, "PROXY_OUTBOUND_ALLOW_PRIVATE", False)
+
+    response = client.get("/v1/client-config", headers=_auth_headers())
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["llmEndpoint"] == "http://127.0.0.1:11434/v1"
+    assert data["llmPrivateNetworksAllowed"] is True
+
+
 def test_client_config_falls_back_to_telegram(monkeypatch):
     client = _client()
     monkeypatch.delenv("TTS_ENDPOINT", raising=False)

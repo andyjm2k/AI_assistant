@@ -81,10 +81,31 @@ def test_codex_endpoint_user_auth_uses_project_root_workspace():
     }
     mock_run = AsyncMock(return_value=fake_result)
     with patch("src.servers.proxy_server._run_codex_cli", new=mock_run):
-        response = client.post("/v1/proxy/codex", json={"prompt": "test"}, headers=_auth_headers())
+        response = client.post("/v1/proxy/codex", json={"prompt": "test", "timeoutSeconds": 120}, headers=_auth_headers())
     assert response.status_code == 200, response.text
     assert mock_run.await_args.args == ("test",)
     assert mock_run.await_args.kwargs.get("isolated_workspace") is False
+    assert mock_run.await_args.kwargs.get("timeout_seconds") == 120
+
+
+def test_codex_endpoint_preserves_multiline_prompt():
+    client = _client()
+    prompt = "Line one\nLine two\nLine three"
+    fake_result = {
+        "success": True,
+        "summaryFile": "codex_run_2026-01-01_00-00-00_abcd1234.txt",
+        "exitCode": 0,
+        "timedOut": False,
+        "durationMs": 1234,
+        "stdout": "ok",
+        "stderr": "",
+    }
+    mock_run = AsyncMock(return_value=fake_result)
+    with patch("src.servers.proxy_server._run_codex_cli", new=mock_run):
+        response = client.post("/v1/proxy/codex", json={"prompt": prompt}, headers=_auth_headers())
+
+    assert response.status_code == 200, response.text
+    assert mock_run.await_args.args == (prompt,)
 
 
 def test_codex_endpoint_autogen_secret_uses_isolated_workspace(monkeypatch):
@@ -172,15 +193,16 @@ async def test_run_codex_cli_uses_isolated_autogen_workspace(monkeypatch):
         class DummyProc:
             returncode = 0
 
-            async def communicate(self):
+            async def communicate(self, input=None):
                 return (b"ok", b"")
 
             def kill(self):
                 self.returncode = -9
 
-        async def fake_subprocess_exec(*cmd, cwd=None, stdout=None, stderr=None):
+        async def fake_subprocess_exec(*cmd, cwd=None, stdin=None, stdout=None, stderr=None):
             captured["cmd"] = list(cmd)
             captured["cwd"] = cwd
+            captured["stdin"] = stdin
             return DummyProc()
 
         monkeypatch.setattr(proxy_server.asyncio, "create_subprocess_exec", fake_subprocess_exec)
@@ -194,6 +216,12 @@ async def test_run_codex_cli_uses_isolated_autogen_workspace(monkeypatch):
         assert captured["cwd"] == str(workspace_dir)
         command = captured["cmd"]
         assert isinstance(command, list)
+        assert "--full-auto" not in command
+        assert "--ask-for-approval" in command
+        assert command.index("--ask-for-approval") < command.index("exec")
+        assert command[command.index("--ask-for-approval") + 1] == "never"
+        assert "--sandbox" in command
+        assert command[command.index("--sandbox") + 1] == "workspace-write"
         assert "-C" in command
         assert command[command.index("-C") + 1] == str(workspace_dir)
         assert not (workspace_dir / "src").exists()
@@ -202,5 +230,61 @@ async def test_run_codex_cli_uses_isolated_autogen_workspace(monkeypatch):
         readme = workspace_dir / "AUTOGEN_WORKSPACE_README.txt"
         assert readme.exists()
         assert "empty isolated directory" in readme.read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_run_codex_cli_sends_multiline_prompt_via_stdin(monkeypatch):
+    from src.servers import proxy_server
+
+    test_root = Path("scratch") / f"test_codex_multiline_{uuid.uuid4().hex}"
+    project_root = test_root / "project"
+    scratch_dir = project_root / "scratch"
+    prompt = "First instruction\nSecond instruction\nThird instruction"
+    try:
+        project_root.mkdir(parents=True, exist_ok=True)
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(proxy_server, "_PROJECT_ROOT", project_root)
+        monkeypatch.setattr(proxy_server, "SCRATCH_DIR", scratch_dir)
+        monkeypatch.setattr(proxy_server, "CODEX_ENABLED", True)
+        monkeypatch.setattr(proxy_server, "CODEX_CLI_PATH", "codex")
+        monkeypatch.setattr(proxy_server, "CODEX_SANDBOX_MODE", "workspace-write")
+        monkeypatch.setattr(proxy_server, "CODEX_APPROVAL_POLICY", "never")
+        monkeypatch.setattr(proxy_server, "CODEX_ENABLE_SEARCH", False)
+        monkeypatch.setattr(proxy_server, "CODEX_TIMEOUT_SECONDS", 60)
+        monkeypatch.setattr(proxy_server, "CODEX_JSON_EVENTS", False)
+        monkeypatch.setattr(proxy_server, "CODEX_OUTPUT_LAST_MESSAGE", False)
+
+        captured: dict[str, object] = {}
+
+        class DummyProc:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                captured["stdin_bytes"] = input
+                return (b"ok", b"")
+
+            def kill(self):
+                self.returncode = -9
+
+        async def fake_subprocess_exec(*cmd, cwd=None, stdin=None, stdout=None, stderr=None):
+            captured["cmd"] = list(cmd)
+            captured["cwd"] = cwd
+            captured["stdin"] = stdin
+            return DummyProc()
+
+        monkeypatch.setattr(proxy_server.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+
+        result = await proxy_server._run_codex_cli(prompt)
+
+        assert result["success"] is True
+        command = captured["cmd"]
+        assert isinstance(command, list)
+        assert command[-1] == "-"
+        assert prompt not in command
+        assert captured["stdin"] == proxy_server.asyncio.subprocess.PIPE
+        assert captured["stdin_bytes"] == prompt.encode("utf-8")
     finally:
         shutil.rmtree(test_root, ignore_errors=True)

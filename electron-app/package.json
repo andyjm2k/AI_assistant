@@ -15,6 +15,7 @@
     "pack:win": "electron-builder --win portable"
   },
   "devDependencies": {
+    "@pixi/unsafe-eval": "^6.5.10",
     "@pixiv/three-vrm": "^3.4.3",
     "@pixiv/three-vrm-animation": "^3.4.3",
     "electron": "^35.1.5",
@@ -30,19 +31,38 @@
     "productName": "CATBot Desktop Avatar",
     "asar": true,
     "compression": "store",
+    "afterPack": "scripts/after-pack-security-audit.js",
     "files": [
       "main/**/*",
       "renderer/**/*",
       "assets/**/*",
       "config/**/*",
-      "package.json"
+      "package.json",
+      "!**/.env",
+      "!**/.env.*",
+      "!**/*.key",
+      "!**/*.log",
+      "!**/*.p12",
+      "!**/*.pem",
+      "!**/*.pfx",
+      "!**/*.sqlite",
+      "!**/*.sqlite3",
+      "!**/*.map",
+      "!**/*.zip",
+      "!**/auth_users.json",
+      "!**/desktop-auth.json",
+      "!**/embeddings.npy",
+      "!**/metadata.json",
+      "!**/telegram_user_links.json",
+      "!**/memory_data/**/*"
     ],
     "extraResources": [
       {
         "from": "../model_avatar",
         "to": "model_avatar",
         "filter": [
-          "**/*"
+          "**/*",
+          "!**/*.zip"
         ]
       },
       {

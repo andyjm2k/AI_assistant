@@ -289,6 +289,7 @@
                         
                         <label for="endpoint-url">OpenAI API Endpoint:</label>
                         <input type="text" id="endpoint-url" value="http://localhost:1234/v1/chat/completions">
+                        <span class="helper-text">Local or private-network model URLs must be explicitly trusted by the CATBot server with <code>OPENAI_PROXY_TRUSTED_BASE_URLS</code>, or enabled for authenticated users with <code>OPENAI_PROXY_ALLOW_PRIVATE=true</code>.</span>
                         
                         <label for="news-api-key">News API Key:</label>
                         <input type="password" id="news-api-key" placeholder="Enter your News API key">

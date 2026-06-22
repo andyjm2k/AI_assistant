@@ -10,11 +10,12 @@ Operational tooling is the part of CATBot that makes the system runnable and mai
 - Backup tooling can create ZIP archives and integrate with Telegram-triggered backup workflows.
 
 ## How It Works
-- `install.ps1`, `install.sh`, and `scripts/install_wizard.py` guide setup, configuration, and `.env` writing.
-- `scripts/start_all.py` launches the standard CATBot runtime set, including the proxy, frontend server, poller, browser bridge pieces, and optional Telegram process.
-- `scripts/restart_all.py` and `scripts/stop_all.py` handle process lifecycle management for the bundled services.
+- `install.ps1`, `install.sh`, and `scripts/install_wizard.py` guide setup, workflow-backend selection, configuration, and `.env` writing.
+- `scripts/install_optional_workflow_backend.py` installs optional backend dependencies such as `ag2[openai]` when `WORKFLOW_FRAMEWORK=ag2`.
+- `scripts/start_all.py` verifies the selected `WORKFLOW_FRAMEWORK` and then launches the standard CATBot runtime set, including the proxy, frontend server, poller, browser bridge pieces, and optional Telegram process.
+- `scripts/restart_all.py` verifies the selected workflow backend before stopping existing services, then uses `scripts/stop_all.py` and `scripts/start_all.py` for process lifecycle management.
 - `scripts/backup_all.py` creates ZIP backups and is also invoked from the Telegram bot's backup worker flow.
-- `scripts/verify_install.py` performs post-install verification for core runtime pieces such as AutoGen, MCP/browser-use, provider env settings, and optional dependencies.
+- `scripts/verify_install.py` performs post-install verification for core runtime pieces such as AutoGen, the selected workflow backend, MCP/browser-use, provider env settings, and optional dependencies.
 - Supporting scripts such as `scripts/check_prereqs.py` and `scripts/setup_env_and_dirs.py` help enforce a runnable local environment.
 
 ## Expanded Flow Diagram
@@ -37,6 +38,8 @@ flowchart LR
   Shell install path.
 - `scripts/install_wizard.py`
   Guided configuration workflow.
+- `scripts/install_optional_workflow_backend.py`
+  Optional selected workflow-backend dependency install.
 - `scripts/start_all.py`
   Standard service launcher.
 - `scripts/restart_all.py`
@@ -55,7 +58,7 @@ flowchart LR
 ## Data and Dependencies
 - Depends on local runtime prerequisites such as Python, Node.js, browser-use dependencies, and configured `.env` values.
 - Backup workflows depend on a stable project directory layout and writable backup destination.
-- Verification scripts encode CATBot's assumptions about what a healthy local install looks like.
+- Verification scripts encode CATBot's assumptions about what a healthy local install looks like, including the selected `WORKFLOW_FRAMEWORK`.
 
 ## Constraints and Notes
 - These scripts are operationally significant because CATBot is a multi-process local product.

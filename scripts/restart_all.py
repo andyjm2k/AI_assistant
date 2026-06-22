@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.runtime_env import build_script_env, resolve_project_root, resolve_venv_dir, resolve_venv_python
+from scripts.verify_install import check_workflow_backend
 
 PROJECT_ROOT = resolve_project_root()
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -89,6 +90,10 @@ def _studio_available() -> bool:
             return True
 
     return shutil.which("autogenstudio") is not None
+
+
+def _check_selected_workflow_backend() -> Tuple[bool, str]:
+    return check_workflow_backend(VENV_PYTHON)
 
 
 def _required_ports() -> Set[int]:
@@ -412,6 +417,15 @@ def main() -> int:
     _log(f"Restart requested by telegram user {requested_by}")
     if STUDIO_PORT not in required_ports:
         _log("AutoGen Studio not installed; restart health checks will skip port 8084.")
+
+    workflow_ok, workflow_message = _check_selected_workflow_backend()
+    if not workflow_ok:
+        message = f"Restart failed before stop phase: selected workflow backend is not usable ({workflow_message})"
+        _log(message)
+        _send_telegram_message(chat_id, message)
+        return 1
+    _log(f"Selected workflow backend OK: {workflow_message}")
+
     _send_telegram_message(chat_id, "Restart requested. Stopping CATBot services now.")
 
     try:

@@ -26,6 +26,8 @@ import socket
 import struct
 import traceback
 import shutil
+import platform
+import ctypes
 from typing import Dict, List, Optional, Any, Set, Tuple
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
@@ -66,6 +68,9 @@ from src.utils.openai_compat import (
     preferred_api_key_env_names,
     prepare_openai_compatible_chat_payload,
 )
+from src.servers.memory_api import create_memory_router
+from src.workflows.ag2_runner import Ag2WorkflowRunner
+from src.workflows.config import WorkflowConfigError, get_workflow_framework
 try:
     from src.skills.bootstrap import create_default_skill_manager
     from src.skills.skill_server import create_skill_router
@@ -222,6 +227,7 @@ except ValueError:
 
 _proxy_restart_scheduled = False
 PROXY_START_TIME = time.time()
+_SYSTEM_CPU_LAST_TIMES: Optional[Tuple[int, int, int]] = None
 
 # Embedded Kitten TTS settings (disabled by default; set EMBEDDED_KITTEN_TTS_ENABLED=true)
 EMBEDDED_KITTEN_TTS_ENABLED = _env_bool("EMBEDDED_KITTEN_TTS_ENABLED", default=False)
@@ -552,6 +558,7 @@ class TodoCancelRequest(BaseModel):
 
 class CodexExecRequest(BaseModel):
     prompt: str
+    timeout_seconds: Optional[int] = Field(default=None, validation_alias=AliasChoices("timeoutSeconds", "timeout_seconds"))
 
 
 class TodoExecuteResponse(BaseModel):
@@ -637,33 +644,6 @@ class StatusFinishRequest(BaseModel):
     request_id: str
     final_state: Optional[str] = None
     phase: Optional[str] = None
-
-# Pydantic models for memory operations
-class MemoryStoreRequest(BaseModel):
-    text: str
-    category: Optional[str] = None
-    source: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-class MemorySearchRequest(BaseModel):
-    query: str
-    limit: Optional[int] = None
-    similarity_threshold: Optional[float] = None
-    category: Optional[str] = None
-
-class MemoryExtractRequest(BaseModel):
-    messages: List[Dict[str, str]]
-    max_memories: Optional[int] = 3
-
-class MemoryLearningContextRequest(BaseModel):
-    task_description: str
-    limit: Optional[int] = None
-    similarity_threshold: Optional[float] = None
-
-class MemoryResponse(BaseModel):
-    success: bool
-    message: str
-    data: Optional[Dict[str, Any]] = None
 
 # Pydantic models for philosopher mode
 class PhilosopherStartRequest(BaseModel):
@@ -765,28 +745,8 @@ except ValueError:
 CATBOT_SYSTEM_PROMPT_WITH_TOOLS_FILE = _PROJECT_ROOT / "config" / "catbot_system_prompt_with_tools.txt"
 TELEGRAM_TOOLS_ENABLED = os.getenv("TELEGRAM_TOOLS_ENABLED", "false").lower() == "true"
 TELEGRAM_TOOLS_MAX_ITERATIONS = max(1, min(10, int(os.getenv("TELEGRAM_TOOLS_MAX_ITERATIONS", "10"))))
-# Automatic memory injection quality controls (Telegram/web auto-context paths)
-MEMORY_AUTO_SEARCH_MIN_SIMILARITY = max(
-    0.0, min(1.0, float(os.getenv("MEMORY_AUTO_SEARCH_MIN_SIMILARITY", "0.72")))
-)
-MEMORY_AUTO_SEARCH_CANDIDATE_THRESHOLD = max(
-    0.0, min(1.0, float(os.getenv("MEMORY_AUTO_SEARCH_CANDIDATE_THRESHOLD", "0.55")))
-)
+# Shared context result limit for Telegram.
 MEMORY_AUTO_SEARCH_LIMIT = max(1, min(10, int(os.getenv("MEMORY_AUTO_SEARCH_LIMIT", "3"))))
-MEMORY_AUTO_SEARCH_SCORE_WINDOW = max(
-    0.0, min(1.0, float(os.getenv("MEMORY_AUTO_SEARCH_SCORE_WINDOW", "0.12")))
-)
-MEMORY_CONTEXT_BLOCKED_CATEGORIES = {"task_experience", "task_learning"}
-MEMORY_CONTEXT_BLOCKED_SOURCES = {"task_execution", "task_scheduler", "status_system"}
-MEMORY_CONTEXT_OPERATIONAL_PATTERN = re.compile(
-    r"\b(todo|to-?do|task list|my tasks?|due tasks?|overdue tasks?|task execution|"
-    r"task outcome memory|experience hints from similar tasks|repeat for similar tasks|"
-    r"avoid for similar tasks|"
-    r"execution status|status update|awaiting confirmation|paused awaiting feedback|"
-    r"pending tasks?|completed tasks?|cancelled tasks?|task id|current state|"
-    r"list state|working:|done:|failed:)\b",
-    re.IGNORECASE,
-)
 # Optional: map Telegram user_id or conversation_id to app username for shared todo list
 TELEGRAM_USER_LINKS_FILE = _PROJECT_ROOT / "config" / "telegram_user_links.json"
 _TELEGRAM_CHAT_ID_RE = re.compile(r"^-?\d+$")
@@ -857,7 +817,12 @@ class _ProxyLogTeeStream:
 
     def write(self, data: Any) -> int:
         text = data if isinstance(data, str) else str(data)
-        written = self._stream.write(text)
+        try:
+            written = self._stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self._stream, "encoding", None) or "utf-8"
+            safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            written = self._stream.write(safe_text)
         self._log_handle.write(text)
         return written
 
@@ -1053,6 +1018,51 @@ def _format_autogen_conversation_log(
                 error_text,
             ]
         )
+    return "\n".join(lines)
+
+
+def _format_workflow_conversation_log(
+    input_text: str,
+    messages: List[Dict[str, str]],
+    conversation_summary: str,
+    *,
+    framework: str,
+    timestamp_human: str,
+    status: str = "completed",
+    progress_notes: Optional[List[str]] = None,
+    error_text: Optional[str] = None,
+) -> str:
+    framework_label = (framework or "workflow").strip().upper()
+    lines = [
+        f"{framework_label} workflow conversation log",
+        f"Framework: {(framework or 'workflow').strip().lower()}",
+        f"Updated: {timestamp_human}",
+        f"Status: {status}",
+        "",
+        "Input:",
+        input_text or "(empty)",
+        "",
+        "--- Progress ---",
+    ]
+    if progress_notes:
+        for note in progress_notes:
+            lines.append(note if note else "(empty)")
+    else:
+        lines.append("(No progress updates recorded yet)")
+    lines.extend(["", "--- Messages ---"])
+    if messages:
+        for i, msg in enumerate(messages, 1):
+            source = msg.get("source", "unknown")
+            content = _stringify_autogen_message_content(msg.get("content", ""))
+            lines.append(f"[{i}] {source}:")
+            lines.append(content if content else "(empty)")
+            lines.append("")
+    else:
+        lines.append("(No messages returned from workflow)")
+        lines.append("")
+    lines.extend(["--- Conversation Summary ---", "", conversation_summary or "(pending)"])
+    if error_text:
+        lines.extend(["", "--- Error ---", "", error_text])
     return "\n".join(lines)
 
 
@@ -1355,10 +1365,38 @@ async def _finish_status_session(
     return event
 
 
+def _compact_telegram_tool_status_key(tool_name: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(tool_name or "").strip().lower())
+
+
+def _sanitize_telegram_tool_status_name(tool_name: Any) -> str:
+    display_name = re.sub(r"[^A-Za-z0-9_.-]+", " ", str(tool_name or "").strip())
+    display_name = re.sub(r"\s+", " ", display_name).strip(" ._-")
+    if not display_name:
+        return "a tool"
+    if len(display_name) > 48:
+        return f"{display_name[:45].rstrip()}..."
+    return display_name
+
+
+def _canonical_telegram_tool_status_name(tool_name: Any) -> str:
+    raw_name = str(tool_name or "").strip()
+    if not raw_name:
+        return ""
+    telegram_tools_module = globals().get("_telegram_tools")
+    canonicalize = getattr(telegram_tools_module, "_canonicalize_telegram_tool_name", None)
+    if callable(canonicalize):
+        with suppress(Exception):
+            return str(canonicalize(raw_name) or raw_name).strip()
+    return raw_name
+
+
 def _format_telegram_tool_status(tool_name: Any) -> str:
     """Return a user-facing Telegram status update for the given tool."""
     raw_name = str(tool_name or "").strip()
-    lowered = raw_name.lower()
+    canonical_name = _canonical_telegram_tool_status_name(raw_name)
+    lowered = canonical_name.lower()
+    compact_name = _compact_telegram_tool_status_key(canonical_name)
     status_map = {
         "websearch": "On it. I'm looking for the best sources now.",
         "scrapewebsite": "On it. I'm reading through the page now.",
@@ -1367,21 +1405,29 @@ def _format_telegram_tool_status(tool_name: Any) -> str:
         "runbrowseragent": "On it. I'm working through that in the browser now.",
         "rundeepresearch": "On it. I'm gathering sources and comparing them now.",
         "healthcheck": "On it. I'm checking the browser task status now.",
+        "getmonitoringsnapshot": "On it. I'm checking the monitoring dashboard data now.",
         "runworkflow": "On it. I'm running that workflow now.",
+        "runcodexcli": "On it. I'm running Codex for that now.",
         "createslidespresentation": "On it. I'm building the presentation now.",
         "pdftopowerpoint": "On it. I'm converting the document into a PowerPoint now.",
+        "uploadtogoogledrive": "On it. I'm uploading that to Google Drive now.",
+        "sendtelegramfile": "On it. I'm sending the file now.",
+        "managetodolist": "On it. I'm updating the task list now.",
+        "calculate": "On it. I'm calculating that now.",
     }
-    if lowered in status_map:
-        return status_map[lowered]
+    if compact_name in status_map:
+        return status_map[compact_name]
+    if compact_name in {"readfile", "writefile", "listfiles", "searchfiles", "savetofile"}:
+        return "On it. I'm checking the workspace files now."
     if lowered.startswith("googleworkspace_cli."):
         return "On it. I'm checking your Google Workspace data now."
-    if "." in raw_name:
+    if "." in canonical_name:
         prefix = lowered.split(".", 1)[0]
         if prefix == "filesystem":
             return "On it. I'm checking the workspace files now."
-        if prefix == "github":
+        if prefix in {"github", "githubprojectmanager"}:
             return "On it. I'm checking GitHub for that now."
-    return f"On it. I'm using {raw_name or 'a tool'} for that now."
+    return f"On it. I'm using {_sanitize_telegram_tool_status_name(raw_name)} for that now."
 
 
 def _get_latest_status_event(
@@ -1754,6 +1800,7 @@ try:
         STATUS_PAUSED_AWAITING_FEEDBACK,
         STATUS_AWAITING_CONFIRMATION,
         STATUS_CANCELLED,
+        STATUS_FAILED,
     )
     TASK_EXECUTION_AVAILABLE = True
 except ImportError as e:
@@ -1764,6 +1811,7 @@ except ImportError as e:
     STATUS_PAUSED_AWAITING_FEEDBACK = "paused_awaiting_feedback"
     STATUS_AWAITING_CONFIRMATION = "awaiting_confirmation"
     STATUS_CANCELLED = "cancelled"
+    STATUS_FAILED = "failed"
 
 
 def _is_task_execution_terminal_status(status: Optional[str]) -> bool:
@@ -1771,6 +1819,7 @@ def _is_task_execution_terminal_status(status: Optional[str]) -> bool:
     return str(status or "").strip().lower() in {
         STATUS_AWAITING_CONFIRMATION,
         STATUS_CANCELLED,
+        STATUS_FAILED,
     }
 
 
@@ -2136,16 +2185,44 @@ def _looks_like_jwt(token: Optional[str]) -> bool:
     return bool(raw and len(raw.split(".")) == 3)
 
 
+def _catbot_auth_cookie_from_request(request: Request) -> str:
+    try:
+        token = request.cookies.get(AUTH_COOKIE_NAME)
+    except Exception:
+        return ""
+    if not isinstance(token, str):
+        return ""
+    return token.strip()
+
+
+def _catbot_auth_token_from_request(request: Request) -> str:
+    x_auth_token = str(request.headers.get("X-Auth-Token") or "").strip()
+    if _looks_like_jwt(x_auth_token):
+        return x_auth_token
+
+    bearer_token = _bearer_token_from_authorization_header(request.headers.get("Authorization"))
+    if _looks_like_jwt(bearer_token):
+        return bearer_token
+
+    cookie_token = _catbot_auth_cookie_from_request(request)
+    if _looks_like_jwt(cookie_token):
+        return cookie_token
+
+    return ""
+
+
 def _headers_have_valid_catbot_auth(
     authorization: Optional[str] = None,
     x_auth_token: Optional[str] = None,
+    cookie_token: Optional[str] = None,
 ) -> bool:
     jwt_authorization = authorization if _looks_like_jwt(_bearer_token_from_authorization_header(authorization)) else None
     jwt_x_auth_token = x_auth_token if _looks_like_jwt(x_auth_token) else None
-    if not jwt_authorization and not jwt_x_auth_token:
+    jwt_cookie_token = cookie_token if _looks_like_jwt(cookie_token) else None
+    if not jwt_authorization and not jwt_x_auth_token and not jwt_cookie_token:
         return False
     try:
-        get_current_user_from_headers(jwt_authorization, jwt_x_auth_token)
+        get_current_user_from_headers(jwt_authorization, jwt_x_auth_token, jwt_cookie_token)
         return True
     except Exception:
         return False
@@ -2155,6 +2232,7 @@ def _request_has_valid_catbot_auth(request: Request) -> bool:
     return _headers_have_valid_catbot_auth(
         request.headers.get("Authorization"),
         request.headers.get("X-Auth-Token"),
+        _catbot_auth_cookie_from_request(request),
     )
 
 
@@ -2432,13 +2510,20 @@ async def _attempt_mcp_chat_fallback(
         return None, err
 
 
-async def _extract_memories_from_recent_messages_async(recent_messages: List[Dict[str, str]]) -> None:
+async def _extract_memories_from_recent_messages_async(
+    recent_messages: List[Dict[str, str]],
+    *,
+    namespace: str,
+    conversation_id: Optional[str] = None,
+) -> None:
     if not MEMORY_AVAILABLE or not memory_manager or not recent_messages:
         return
     try:
         await memory_manager.extract_memories_from_conversation(
             messages=recent_messages,
             max_memories=3,
+            namespace=namespace,
+            conversation_id=conversation_id,
         )
     except Exception as e:
         print(f"Warning: Failed to extract memories: {e}")
@@ -2619,7 +2704,11 @@ def _get_telegram_system_prompt_with_tools(conversation_id: str, todo_user_key: 
     mem_cache = telegram_memory_cache.get(conversation_id, [])
     todo_block = "\n".join([f"{i + 1}. {t}" for i, t in enumerate(todo_list)]) if todo_list else "(empty)"
     mem_block = "\n".join([f"{i + 1}. {m}" for i, m in enumerate(mem_cache)]) if mem_cache else "(empty)"
-    content = content.replace("{{MEMORY_CACHE}}", mem_block).replace("{{TODO_LIST}}", todo_block)
+    content = (
+        content.replace("{{WORKING_CONTEXT}}", mem_block)
+        .replace("{{MEMORY_CACHE}}", mem_block)
+        .replace("{{TODO_LIST}}", todo_block)
+    )
     native_tool_block = _build_telegram_native_tools_prompt_block()
     if native_tool_block:
         content = f"{content.rstrip()}\n\n{native_tool_block}"
@@ -2712,6 +2801,8 @@ JWT_SECRET = _load_jwt_secret()
 JWT_ALGORITHM = "HS256"
 DEFAULT_JWT_EXPIRATION_SECONDS = 23 * 60 * 60
 JWT_EXPIRATION_SECONDS = int(os.getenv("JWT_EXPIRATION_SECONDS", str(DEFAULT_JWT_EXPIRATION_SECONDS)))
+AUTH_COOKIE_NAME = (os.getenv("AUTH_COOKIE_NAME") or "catbot_auth_token").strip() or "catbot_auth_token"
+AUTH_COOKIE_SECURE = _env_bool("AUTH_COOKIE_SECURE", default=False)
 AUTH_ALLOW_PUBLIC_SIGNUP = _env_bool("AUTH_ALLOW_PUBLIC_SIGNUP", default=False)
 AUTH_BOOTSTRAP_FIRST_USER = _env_bool("AUTH_BOOTSTRAP_FIRST_USER", default=True)
 AUTH_SIGNUP_INVITE_CODE = (os.getenv("AUTH_SIGNUP_INVITE_CODE") or "").strip()
@@ -2802,6 +2893,22 @@ def create_jwt(payload: Dict[str, Any], expires_in: int = JWT_EXPIRATION_SECONDS
     return f"{header_b64}.{payload_b64}.{signature_b64}"
 
 
+def _set_catbot_auth_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=JWT_EXPIRATION_SECONDS,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_catbot_auth_cookie(response: Response) -> None:
+    response.delete_cookie(key=AUTH_COOKIE_NAME, path="/", samesite="lax")
+
+
 def decode_and_validate_jwt(token: str) -> Dict[str, Any]:
     try:
         header_b64, payload_b64, signature_b64 = token.split(".")
@@ -2829,10 +2936,16 @@ def decode_and_validate_jwt(token: str) -> Dict[str, Any]:
     return payload
 
 
-def get_current_user_from_headers(authorization: Optional[str], x_auth_token: Optional[str]) -> Dict[str, Any]:
+def get_current_user_from_headers(
+    authorization: Optional[str],
+    x_auth_token: Optional[str],
+    cookie_token: Optional[str] = None,
+) -> Dict[str, Any]:
     auth_value = authorization
     if not auth_value and x_auth_token:
         auth_value = f"Bearer {x_auth_token}"
+    if not auth_value and cookie_token:
+        auth_value = f"Bearer {cookie_token}"
 
     if not auth_value:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -2866,10 +2979,11 @@ def get_current_user_from_headers(authorization: Optional[str], x_auth_token: Op
 
 
 def get_current_user(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ) -> Dict[str, Any]:
-    return get_current_user_from_headers(authorization, x_auth_token)
+    return get_current_user_from_headers(authorization, x_auth_token, _catbot_auth_cookie_from_request(request))
 
 
 def get_current_user_or_autogen_team(
@@ -2879,7 +2993,7 @@ def get_current_user_or_autogen_team(
 ) -> Dict[str, Any]:
     if _autogen_team_secret_matches(request):
         return {"username": "autogen_team", "auth_type": "agent_secret"}
-    return get_current_user_from_headers(authorization, x_auth_token)
+    return get_current_user_from_headers(authorization, x_auth_token, _catbot_auth_cookie_from_request(request))
 
 
 def get_current_user_or_autogen_team_if_configured(
@@ -3582,7 +3696,7 @@ def _get_telegram_native_tools_mcp_schema() -> List[Dict[str, Any]]:
         },
         {
             "name": "runWorkflow",
-            "description": "Run an AutoGen workflow.",
+            "description": "Run the configured workflow framework.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"contentPrompt": {"type": "string"}},
@@ -3591,10 +3705,13 @@ def _get_telegram_native_tools_mcp_schema() -> List[Dict[str, Any]]:
         },
         {
             "name": "runCodexCli",
-            "description": "Run Codex CLI to make CATBot code or tool changes.",
+            "description": "Run Codex CLI to make CATBot code or tool changes. The prompt must be self-contained with the user's request, any error text, and instructions to inspect/search the repository before editing.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"prompt": {"type": "string"}},
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "timeoutSeconds": {"type": "number"},
+                },
                 "required": ["prompt"],
             },
         },
@@ -3835,7 +3952,7 @@ def _get_telegram_native_tools_mcp_schema() -> List[Dict[str, Any]]:
             },
         },
         {
-            "name": "manageMemoryCache",
+            "name": "manageWorkingContext",
             "description": "Inspect or edit the lightweight in-session Telegram memory cache.",
             "inputSchema": {
                 "type": "object",
@@ -3879,6 +3996,23 @@ def _get_telegram_native_tools_mcp_schema() -> List[Dict[str, Any]]:
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
+            "name": "getMonitoringSnapshot",
+            "description": "Return CATBot monitoring dashboard stats, app info, workflow status, and optional recent logs for Telegram.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "detail": {
+                        "type": "string",
+                        "description": "summary, logs, workflows, or all. Use logs/all when the user asks for recent log lines.",
+                    },
+                    "includeLogs": {"type": "boolean"},
+                    "statusLimit": {"type": "integer"},
+                    "logLimit": {"type": "integer"},
+                    "excludeWorkflows": {"type": "boolean"},
+                },
+            },
+        },
+        {
             "name": "llmQuery",
             "description": "Send a direct query to the language model without other tools.",
             "inputSchema": {
@@ -3912,9 +4046,10 @@ _HTML_CLIENT_NATIVE_TOOL_NAMES: Tuple[str, ...] = (
     "deleteMemory",
     "executeTodoTask",
     "fetchNews",
+    "getMonitoringSnapshot",
     "health_check",
     "listMemories",
-    "manageMemoryCache",
+    "manageWorkingContext",
     "manageTodoList",
     "navigateToUrl",
     "openChatToUser",
@@ -4018,7 +4153,8 @@ async def _execute_html_client_native_tool_for_proxy(
         "do_fetch": _do_proxy_fetch,
         "do_news": _do_proxy_news,
         "do_weather": _do_proxy_weather,
-        "do_autogen": _do_autogen,
+        "do_workflow": _do_workflow,
+        "do_autogen": _do_workflow,
         "do_codex": _run_codex_cli,
         "do_restart_proxy": lambda reason=None: _request_proxy_restart(
             trigger=f"desktop_tool:{(reason or '').strip() or 'requested'}",
@@ -4027,6 +4163,7 @@ async def _execute_html_client_native_tool_for_proxy(
         "do_browser_agent": _do_browser_agent,
         "do_deep_research": lambda tool_args: _do_deep_research(tool_args if isinstance(tool_args, dict) else {}),
         "do_browser_health_check": _do_browser_health_check,
+        "get_monitoring_snapshot": _get_monitoring_snapshot_for_telegram,
         "read_file_internal": _read_file_internal,
         "write_file_internal": _write_file_internal,
         "list_files_internal": _list_files_internal,
@@ -5263,13 +5400,24 @@ async def _warm_autogen_team_after_startup():
         print(traceback.format_exc())
 
 
+def _should_warm_autogen_on_startup() -> bool:
+    """Only warm the legacy AutoGen team when AutoGen is the selected workflow backend."""
+    try:
+        return get_workflow_framework() == "autogen"
+    except WorkflowConfigError as exc:
+        print(f"[WARN] Skipping AutoGen startup warmup due workflow configuration error: {exc}")
+        return False
+
+
 @app.on_event("startup")
 async def startup_event():
     """Log that the application has started successfully."""
     import sys
     await _get_shared_chat_http_client()
     global _autogen_team_warmup_task
-    if _autogen_team_warmup_task is None or _autogen_team_warmup_task.done():
+    if _should_warm_autogen_on_startup() and (
+        _autogen_team_warmup_task is None or _autogen_team_warmup_task.done()
+    ):
         _autogen_team_warmup_task = asyncio.create_task(_warm_autogen_team_after_startup())
     print("🚀 FastAPI application startup event fired", flush=True)
     sys.stdout.flush()
@@ -5440,6 +5588,7 @@ async def require_auth_for_v1_routes(request: Request, call_next):
     exempt_paths = {
         "/v1/auth/signup",
         "/v1/auth/login",
+        "/v1/auth/logout",
         "/v1/tools/log",  # Tool invocation log sink for HTML UI tool calls
         "/v1/audio/transcriptions",  # Whisper endpoint - public for audio transcription
         "/v1/audio/speech",  # Embedded OpenAI-compatible TTS speech endpoint
@@ -5458,18 +5607,25 @@ async def require_auth_for_v1_routes(request: Request, call_next):
     }
     if not AUTOGEN_REQUIRE_AUTH:
         exempt_paths.add("/v1/proxy/autogen")
+        exempt_paths.add("/v1/proxy/workflow")
     autogen_team_secret_paths = {
         "/v1/proxy/autogen",
+        "/v1/proxy/workflow",
         "/v1/proxy/browser-agent",
         "/v1/proxy/deep-research",
         "/v1/proxy/browser-health",
         "/v1/proxy/fetch",
         "/v1/proxy/codex",
     }
+    # These routes enforce CATBot auth and user namespace isolation in their router dependency.
+    router_authenticated_prefixes = (
+        "/v1/memory/",
+    )
     # Telegram bot endpoints are unauthenticated (bot uses TELEGRAM_SECRET when set)
     require_auth = (
         path.startswith("/v1/")
         and path not in exempt_paths
+        and not path.startswith(router_authenticated_prefixes)
         and not path.startswith("/v1/telegram/chat")
     )
     if require_auth:
@@ -5508,6 +5664,7 @@ async def require_auth_for_v1_routes(request: Request, call_next):
             get_current_user_from_headers(
                 auth_header,
                 x_auth_token,
+                _catbot_auth_cookie_from_request(request),
             )
         except HTTPException as exc:
             print(f"🔒 Auth check failed for {path}: {exc.detail}")
@@ -6313,6 +6470,7 @@ def _normalize_url(raw_url: str) -> str:
 
 
 PROXY_OUTBOUND_ALLOW_PRIVATE = _env_bool("CATBOT_OUTBOUND_ALLOW_PRIVATE", default=False)
+OPENAI_PROXY_ALLOW_PRIVATE = _env_bool("OPENAI_PROXY_ALLOW_PRIVATE", default=False)
 PROXY_FETCH_ALLOW_JS_RENDER = _env_bool("PROXY_FETCH_ALLOW_JS_RENDER", default=False)
 try:
     PROXY_FETCH_MAX_REDIRECTS = max(0, min(10, int(os.getenv("PROXY_FETCH_MAX_REDIRECTS", "5"))))
@@ -6370,6 +6528,55 @@ def _validate_outbound_url(raw_url: str, *, allow_private: bool = False) -> str:
         if _hostname_resolves_to_forbidden_address(host, parsed.port):
             raise HTTPException(status_code=400, detail="Outbound URL resolves to a private or local address.")
     return normalized
+
+
+def _openai_proxy_private_network_allowed(
+    request: Request,
+    endpoint: str,
+    *,
+    trusted_endpoint: bool,
+) -> bool:
+    """Authorize private model endpoints without weakening the general outbound policy."""
+    parsed = urlparse(endpoint)
+    host = (parsed.hostname or "").strip()
+    explicit_private_target = host.lower() == "localhost"
+    if not explicit_private_target:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            explicit_private_target = False
+        else:
+            explicit_private_target = _is_forbidden_outbound_ip(host)
+
+    # Exact trusted bases retain their existing DNS-bypass behavior. Explicit local/private
+    # literals still require a CATBot session so public proxy routes cannot reach them.
+    if trusted_endpoint and not explicit_private_target:
+        return True
+
+    targets_private_network = explicit_private_target
+    if not targets_private_network:
+        targets_private_network = _hostname_resolves_to_forbidden_address(host, parsed.port)
+    if not targets_private_network:
+        return False
+
+    if not _request_has_valid_catbot_auth(request):
+        raise HTTPException(
+            status_code=401,
+            detail="CATBot authentication is required to use a private or local model endpoint.",
+        )
+
+    if trusted_endpoint or OPENAI_PROXY_ALLOW_PRIVATE or PROXY_OUTBOUND_ALLOW_PRIVATE:
+        return True
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Private/local model endpoint is blocked by SSRF protection. "
+            "Add its exact base URL to OPENAI_PROXY_TRUSTED_BASE_URLS (recommended), "
+            "or set OPENAI_PROXY_ALLOW_PRIVATE=true to allow authenticated CATBot users "
+            "to reach private model hosts."
+        ),
+    )
 
 
 async def _get_with_outbound_policy(
@@ -7023,7 +7230,11 @@ async def _resolve_weather_location(location: Optional[str], user_id: Optional[s
     if memory_manager is not None and user_id:
         try:
             memories = await memory_manager.search_memories(
-                query=f"{user_id} location city suburb postcode", limit=8, similarity_threshold=0.3
+                query="home location city suburb postcode",
+                limit=8,
+                similarity_threshold=0.3,
+                namespace=user_id,
+                purpose="personal",
             )
             inferred = _extract_memory_location(memories)
             if inferred:
@@ -7223,7 +7434,12 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
     global autogen_team
     if not input_text:
         raise HTTPException(status_code=400, detail="Input parameter is required")
-    monitor_run_id = _monitor_run_start("autogen", "team-run", input_text=input_text)
+    monitor_run_id = _monitor_run_start(
+        "autogen",
+        "team-run",
+        input_text=input_text,
+        metadata={"framework": "autogen"},
+    )
     progress_notes: List[str] = []
     log_filename: Optional[str] = None
 
@@ -7277,7 +7493,7 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
             monitor_run_id,
             status="error",
             summary="AutoGen is not available on this server.",
-            metadata={"autogen_available": False},
+            metadata={"autogen_available": False, "framework": "autogen"},
             log_file=log_filename,
             log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
         )
@@ -7299,6 +7515,7 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
                 monitor_run_id,
                 status="error",
                 summary="AutoGen team could not be loaded.",
+                metadata={"framework": "autogen"},
                 log_file=log_filename,
                 log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
             )
@@ -7405,6 +7622,7 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
             status="completed",
             summary=f"Completed with {len(messages)} messages.",
             metadata={
+                "framework": "autogen",
                 "message_count": len(messages),
                 "sources": [msg.get("source", "unknown") for msg in messages[:12]],
             },
@@ -7412,6 +7630,7 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
             log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
         )
         return {
+            "framework": "autogen",
             "output": conversation_summary,
             "response": conversation_summary,
             "messages": messages,
@@ -7481,6 +7700,7 @@ async def _do_autogen(input_text: str) -> Dict[str, Any]:
             monitor_run_id,
             status="error",
             summary=f"AutoGen execution failed: {error_text}",
+            metadata={"framework": "autogen"},
             log_file=log_filename,
             log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
         )
@@ -7520,6 +7740,240 @@ def _write_autogen_conversation_to_scratch(
     )
     print(f"[AUTOGEN] Wrote conversation to {filepath}", flush=True)
     return filename
+
+
+def _write_workflow_conversation_to_scratch(
+    input_text: str,
+    messages: List[Dict[str, str]],
+    conversation_summary: str,
+    *,
+    framework: str,
+    filename: Optional[str] = None,
+    status: str = "completed",
+    progress_notes: Optional[List[str]] = None,
+    error_text: Optional[str] = None,
+) -> str:
+    """Write or update a generic workflow conversation log in scratch and return filename."""
+    SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().astimezone()
+    timestamp_human = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    safe_framework = re.sub(r"[^a-z0-9_-]+", "_", (framework or "workflow").strip().lower()).strip("_") or "workflow"
+    if not filename:
+        timestamp_file = now.strftime("%Y-%m-%d_%H-%M-%S")
+        suffix = secrets.token_hex(4)
+        filename = f"workflow_{safe_framework}_run_{timestamp_file}_{suffix}.txt"
+    filepath = SCRATCH_DIR / filename
+    filepath.write_text(
+        _format_workflow_conversation_log(
+            input_text,
+            messages,
+            conversation_summary,
+            framework=safe_framework,
+            timestamp_human=timestamp_human,
+            status=status,
+            progress_notes=progress_notes,
+            error_text=error_text,
+        ),
+        encoding="utf-8",
+    )
+    print(f"[WORKFLOW:{safe_framework}] Wrote conversation to {filepath}", flush=True)
+    return filename
+
+
+async def _do_ag2_workflow(input_text: str) -> Dict[str, Any]:
+    """Run the AG2 workflow backend and normalize the result to the AutoGen response shape."""
+    if not input_text:
+        raise HTTPException(status_code=400, detail="Input parameter is required")
+
+    framework = "ag2"
+    monitor_run_id = _monitor_run_start(
+        "autogen",
+        "workflow-run",
+        input_text=input_text,
+        metadata={"framework": framework},
+    )
+    progress_notes: List[str] = []
+    log_filename: Optional[str] = None
+
+    def _persist_workflow_log(
+        *,
+        status: str,
+        messages: Optional[List[Dict[str, str]]] = None,
+        conversation_summary: str = "",
+        error_text: Optional[str] = None,
+        suppress_monitor_note: bool = False,
+    ) -> None:
+        nonlocal log_filename
+        try:
+            log_filename = _write_workflow_conversation_to_scratch(
+                input_text,
+                messages or [],
+                conversation_summary,
+                framework=framework,
+                filename=log_filename,
+                status=status,
+                progress_notes=progress_notes,
+                error_text=error_text,
+            )
+            log_path = _resolve_monitor_log_path(log_filename)
+            _monitor_run_update(
+                monitor_run_id,
+                log_file=log_filename,
+                log_excerpt=_read_monitor_log_excerpt(log_path),
+            )
+        except Exception as log_err:
+            if not suppress_monitor_note:
+                _monitor_run_note(monitor_run_id, f"Failed to update workflow scratch log: {log_err}")
+            print(f"[WORKFLOW:{framework}] Failed to update conversation scratch log: {log_err}", flush=True)
+
+    def _note_workflow_progress(note: str, *, conversation_summary: str = "Workflow run in progress.") -> None:
+        progress_notes.append(note)
+        _monitor_run_note(monitor_run_id, note)
+        _persist_workflow_log(status="running", conversation_summary=conversation_summary)
+
+    _persist_workflow_log(
+        status="running",
+        conversation_summary="AG2 workflow run created.",
+        suppress_monitor_note=True,
+    )
+
+    runner = Ag2WorkflowRunner()
+    availability = runner.available()
+    if not availability.available:
+        error_text = availability.message or "AG2 backend not available."
+        _persist_workflow_log(
+            status="error",
+            conversation_summary="AG2 workflow failed before execution started.",
+            error_text=error_text,
+        )
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary=error_text,
+            metadata={"framework": framework, "available": False},
+            log_file=log_filename,
+            log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
+        )
+        raise HTTPException(status_code=503, detail=error_text)
+
+    try:
+        _note_workflow_progress("Loading AG2 workflow backend.")
+        try:
+            await runner.start()
+        except RuntimeError as exc:
+            error_text = str(exc)
+            _persist_workflow_log(
+                status="error",
+                conversation_summary="AG2 workflow failed during backend initialization.",
+                error_text=error_text,
+            )
+            _monitor_run_finish(
+                monitor_run_id,
+                status="error",
+                summary=f"AG2 workflow initialization failed: {error_text}",
+                metadata={"framework": framework},
+                log_file=log_filename,
+                log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
+            )
+            raise HTTPException(status_code=503, detail=error_text) from exc
+
+        print(f"Running AG2 workflow with input: {input_text[:100]}...")
+        _note_workflow_progress("Running AG2 workflow.")
+        workflow_result = await runner.run(input_text)
+        messages = [message.to_dict() for message in workflow_result.messages]
+        _note_workflow_progress(
+            f"AG2 returned {len(messages)} messages.",
+            conversation_summary="AG2 returned messages and is writing the full transcript.",
+        )
+        conversation_summary = workflow_result.summary or workflow_result.output
+        if not conversation_summary:
+            final_message = _stringify_autogen_message_content(messages[-1].get("content", "")) if messages else ""
+            conversation_summary = (
+                f"Completed with {len(messages)} messages. Final message from {messages[-1].get('source', 'unknown')}:\n{final_message}"
+                if final_message and messages
+                else (f"Completed with {len(messages)} messages." if messages else "No messages returned from AG2 workflow.")
+            )
+        _persist_workflow_log(
+            status="completed",
+            messages=messages,
+            conversation_summary=conversation_summary,
+        )
+        log_path = _resolve_monitor_log_path(log_filename)
+        log_payload = _read_monitor_run_log(log_path)
+        transcript_text = log_payload.get("content") if isinstance(log_payload, dict) else ""
+        if not isinstance(transcript_text, str) or not transcript_text:
+            transcript_text = _format_workflow_conversation_log(
+                input_text,
+                messages,
+                conversation_summary,
+                framework=framework,
+                timestamp_human=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+                status="completed",
+                progress_notes=progress_notes,
+            )
+        _monitor_run_finish(
+            monitor_run_id,
+            status="completed",
+            summary=f"Completed with {len(messages)} messages.",
+            metadata={
+                "framework": framework,
+                "message_count": len(messages),
+                "sources": [msg.get("source", "unknown") for msg in messages[:12]],
+            },
+            log_file=log_filename,
+            log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
+        )
+        return {
+            "framework": framework,
+            "output": conversation_summary,
+            "response": conversation_summary,
+            "messages": messages,
+            "message_count": len(messages),
+            "log_file": log_filename,
+            "log_content": transcript_text,
+            "summary": conversation_summary,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        error_text = str(exc)
+        print(f"AG2 workflow execution error: {error_text}")
+        print(traceback.format_exc())
+        _persist_workflow_log(
+            status="error",
+            conversation_summary="AG2 workflow execution failed.",
+            error_text=error_text,
+        )
+        _monitor_run_finish(
+            monitor_run_id,
+            status="error",
+            summary=f"AG2 workflow execution failed: {error_text}",
+            metadata={"framework": framework},
+            log_file=log_filename,
+            log_excerpt=_read_monitor_log_excerpt((SCRATCH_DIR / log_filename) if log_filename else None),
+        )
+        raise HTTPException(status_code=500, detail=error_text) from exc
+    finally:
+        with suppress(Exception):
+            await runner.stop()
+
+
+async def _do_workflow(input_text: str) -> Dict[str, Any]:
+    """Run the workflow backend selected by WORKFLOW_FRAMEWORK."""
+    if not input_text:
+        raise HTTPException(status_code=400, detail="Input parameter is required")
+    try:
+        framework = get_workflow_framework()
+    except WorkflowConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if framework == "autogen":
+        result = await _do_autogen(input_text)
+        result["framework"] = "autogen"
+        return result
+    if framework == "ag2":
+        return await _do_ag2_workflow(input_text)
+    raise HTTPException(status_code=400, detail=f"Unsupported workflow framework: {framework}")
 
 
 def _write_codex_summary_to_scratch(
@@ -7624,16 +8078,33 @@ def _write_codex_error_to_scratch(
     return filename
 
 
-async def _run_codex_cli(prompt: str, *, isolated_workspace: bool = False) -> Dict[str, Any]:
+def _coerce_codex_timeout_seconds(timeout_seconds: Optional[Any]) -> int:
+    if timeout_seconds is None:
+        timeout = CODEX_TIMEOUT_SECONDS
+        if timeout <= 0:
+            raise HTTPException(status_code=500, detail="CODEX_TIMEOUT_SECONDS must be a positive integer.")
+    else:
+        try:
+            timeout = int(float(timeout_seconds))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="timeoutSeconds must be a number.")
+        if timeout <= 0:
+            raise HTTPException(status_code=400, detail="timeoutSeconds must be a positive integer.")
+    return min(max(timeout, 60), 7200)
+
+
+async def _run_codex_cli(
+    prompt: str,
+    *,
+    isolated_workspace: bool = False,
+    timeout_seconds: Optional[Any] = None,
+) -> Dict[str, Any]:
     if not CODEX_ENABLED:
         raise HTTPException(status_code=503, detail="Codex CLI tool is disabled.")
     prompt = (prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is required.")
-    timeout = CODEX_TIMEOUT_SECONDS
-    if timeout <= 0:
-        raise HTTPException(status_code=500, detail="CODEX_TIMEOUT_SECONDS must be a positive integer.")
-    timeout = min(max(timeout, 60), 7200)
+    timeout = _coerce_codex_timeout_seconds(timeout_seconds)
 
     sandbox_mode = CODEX_SANDBOX_MODE if CODEX_SANDBOX_MODE in ("read-only", "workspace-write") else "workspace-write"
     approval_policy = CODEX_APPROVAL_POLICY if CODEX_APPROVAL_POLICY in ("untrusted", "on-request", "on-failure", "never") else "never"
@@ -7654,6 +8125,8 @@ async def _run_codex_cli(prompt: str, *, isolated_workspace: bool = False) -> Di
     if CODEX_ENABLE_SEARCH:
         # --search is a top-level codex flag and must appear before the subcommand.
         cmd.append("--search")
+    # Approval is a top-level Codex option in current CLI builds; keep it before "exec".
+    cmd.extend(["--ask-for-approval", approval_policy])
     cmd.extend([
         "exec",
         "--sandbox",
@@ -7661,9 +8134,6 @@ async def _run_codex_cli(prompt: str, *, isolated_workspace: bool = False) -> Di
         "-C",
         str(workspace_dir),
     ])
-    if approval_policy == "never":
-        # codex exec no longer accepts -a; --full-auto is the supported non-interactive mode
-        cmd.append("--full-auto")
     events_file = None
     last_message_file = None
     if CODEX_JSON_EVENTS:
@@ -7675,7 +8145,9 @@ async def _run_codex_cli(prompt: str, *, isolated_workspace: bool = False) -> Di
         suffix = secrets.token_hex(4)
         last_message_file = f"codex_last_message_{timestamp_file}_{suffix}.txt"
         cmd.extend(["-o", str(SCRATCH_DIR / last_message_file)])
-    cmd.append(prompt)
+    # Feed the prompt over stdin so multiline tool prompts are not reinterpreted
+    # by the Codex CLI's positional argument parser.
+    cmd.append("-")
 
     start = time.time()
     stdout_text = ""
@@ -7686,11 +8158,15 @@ async def _run_codex_cli(prompt: str, *, isolated_workspace: bool = False) -> Di
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(workspace_dir),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            out_bytes, err_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            out_bytes, err_bytes = await asyncio.wait_for(
+                proc.communicate(prompt.encode("utf-8")),
+                timeout=timeout,
+            )
         except asyncio.TimeoutError:
             timed_out = True
             proc.kill()
@@ -7766,6 +8242,28 @@ async def autogen_chat(
         raise HTTPException(status_code=500, detail=f"Failed to process AutoGen request: {str(e)}")
 
 
+@app.post("/v1/proxy/workflow")
+async def workflow_chat(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user_or_autogen_team_if_configured),
+):
+    """Run the workflow backend selected by WORKFLOW_FRAMEWORK."""
+    try:
+        body = await request.json()
+        input_text = body.get('input')
+        if not input_text:
+            raise HTTPException(status_code=400, detail="Input parameter is required")
+        print(f"Workflow request: {input_text[:100]}...")
+        return await _do_workflow(input_text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Workflow endpoint error: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to process workflow request: {str(e)}")
+
+
 @app.post("/v1/proxy/codex")
 async def proxy_codex_exec(
     request: CodexExecRequest,
@@ -7775,6 +8273,7 @@ async def proxy_codex_exec(
     return await _run_codex_cli(
         request.prompt,
         isolated_workspace=current_user.get("auth_type") == "agent_secret",
+        timeout_seconds=request.timeout_seconds,
     )
 
 
@@ -8177,17 +8676,13 @@ async def list_proxy_tools_openai():
 @app.post("/v1/tools/execute")
 async def execute_proxy_tool(
     request: ProxyToolExecuteRequest,
-    authorization: Optional[str] = Header(default=None),
-    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Execute a tool exposed by /v1/tools/openai using its OpenAI alias or raw tool name."""
     raw_name = str(request.tool_name or "").strip()
     if not raw_name:
         raise HTTPException(status_code=400, detail="tool_name is required")
     arguments = request.arguments if isinstance(request.arguments, dict) else {}
-    authenticated_user: Optional[Dict[str, Any]] = None
-    if authorization or x_auth_token:
-        authenticated_user = get_current_user_from_headers(authorization, x_auth_token)
     tools = await get_all_available_tools()
     _, alias_map = _build_proxy_tool_openai_payload(tools)
     mapping = alias_map.get(raw_name)
@@ -8201,11 +8696,10 @@ async def execute_proxy_tool(
             execute_args["conversation_id"] = request.context.get("conversation_id")
         if request.context.get("user_id") and "user_id" not in execute_args:
             execute_args["user_id"] = request.context.get("user_id")
-    if authenticated_user:
-        username = str(authenticated_user.get("username") or "").strip()
-        if username:
-            execute_args["user_id"] = username
-            execute_args["todo_user_key"] = username
+    username = str(current_user.get("username") or "").strip()
+    if username:
+        execute_args["user_id"] = username
+        execute_args["todo_user_key"] = username
 
     result = await execute_tool_for_philosopher(tool_name, execute_args)
     return {
@@ -8440,7 +8934,7 @@ async def spotify_callback(code: Optional[str] = None, state: Optional[str] = No
     )
 
 @app.post("/v1/auth/signup", response_model=AuthTokenResponse)
-async def auth_signup(request: AuthSignupRequest):
+async def auth_signup(request: AuthSignupRequest, response: Response):
     """Create a new user account and return a signed JWT."""
     username = request.username.strip().lower()
     password = request.password
@@ -8465,6 +8959,7 @@ async def auth_signup(request: AuthSignupRequest):
     save_users_db()
 
     token = create_jwt({"sub": username})
+    _set_catbot_auth_cookie(response, token)
     return AuthTokenResponse(
         access_token=token,
         expires_in=JWT_EXPIRATION_SECONDS,
@@ -8473,7 +8968,7 @@ async def auth_signup(request: AuthSignupRequest):
 
 
 @app.post("/v1/auth/login", response_model=AuthTokenResponse)
-async def auth_login(request: AuthLoginRequest):
+async def auth_login(request: AuthLoginRequest, response: Response):
     """Authenticate a user and return a signed JWT."""
     username = request.username.strip().lower()
     user = users_db.get(username)
@@ -8484,6 +8979,7 @@ async def auth_login(request: AuthLoginRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_jwt({"sub": username})
+    _set_catbot_auth_cookie(response, token)
     return AuthTokenResponse(
         access_token=token,
         expires_in=JWT_EXPIRATION_SECONDS,
@@ -8492,12 +8988,26 @@ async def auth_login(request: AuthLoginRequest):
 
 
 @app.get("/v1/auth/me", response_model=AuthUserResponse)
-async def auth_me(current_user: Dict[str, Any] = Depends(get_current_user)):
+async def auth_me(
+    request: Request,
+    response: Response,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Return the profile of the authenticated user based on JWT bearer token."""
+    token = _catbot_auth_token_from_request(request)
+    if token:
+        _set_catbot_auth_cookie(response, token)
     return AuthUserResponse(
         username=current_user["username"],
         created_at=current_user["created_at"],
     )
+
+
+@app.post("/v1/auth/logout")
+async def auth_logout(response: Response):
+    """Clear the browser auth cookie used by same-origin dashboard navigation."""
+    _clear_catbot_auth_cookie(response)
+    return {"success": True}
 
 
 # ============================================================================
@@ -8743,6 +9253,9 @@ def _write_task_exec_response_to_scratch(
         elif status == STATUS_CANCELLED:
             summary = "Execution was cancelled."
             what_to_do = "You can start a new execution for a task if needed."
+        elif status == STATUS_FAILED:
+            summary = "Execution failed before the task goal was completed."
+            what_to_do = "Review the error details, then start the task again after resolving the provider or tool failure."
         else:
             summary = f"Status: {status}"
             what_to_do = "Check status or resume/cancel as appropriate."
@@ -8867,6 +9380,7 @@ async def _record_task_execution_learning(
     metadata = {
         "user_key": user_key,
         "task_id": state.get("task_id"),
+        "run_id": state.get("run_id"),
         "source_phase": source_phase,
         "iterations": diagnostics.get("iterations"),
         "max_iterations": diagnostics.get("max_iterations"),
@@ -8897,12 +9411,12 @@ async def _run_task_loop_background(user_key: str, task_id: int, executor: Any) 
     so we never leave state stuck as 'executing' on exception or cancel.
     Scheduled runs are auto-completed when they reach awaiting_confirmation.
     """
-    status = STATUS_AWAITING_CONFIRMATION
+    status = STATUS_FAILED
     message = "Execution stopped unexpectedly."
     try:
         status, message = await executor.run_loop()
     except Exception as e:
-        status = STATUS_AWAITING_CONFIRMATION
+        status = STATUS_FAILED
         message = str(e)
         print(f"[TASK_EXEC] run_loop error for user {user_key}: {e}", flush=True)
     finally:
@@ -9032,7 +9546,10 @@ async def _task_execute_start(user_key: str, task_id: int, prompt_override: Opti
         experience_guidance = ""
         if MEMORY_AVAILABLE and memory_manager and hasattr(memory_manager, "build_task_execution_guidance"):
             try:
-                experience_guidance = await memory_manager.build_task_execution_guidance(task_description=task_description)
+                experience_guidance = await memory_manager.build_task_execution_guidance(
+                    task_description=task_description,
+                    namespace=user_key,
+                )
                 if experience_guidance:
                     print(
                         f"[TASK_EXEC] Loaded experience guidance for user {user_key} task {normalized_task_id}",
@@ -9517,109 +10034,6 @@ def _is_todo_list_query(message_text: str) -> bool:
     return any(p in lower for p in phrases)
 
 
-def _is_memory_context_question(message_text: str) -> bool:
-    """
-    Return True when a message is likely asking for opinions/knowledge where memory context helps.
-    Action/tool requests should return False to avoid noisy memory injection.
-    """
-    if not message_text:
-        return False
-
-    lower = message_text.lower().strip()
-    if len(lower) > 800:
-        return False
-
-    action_patterns = (
-        r"(search|find|look\s+up|get|fetch|retrieve)\s+(for|information\s+about|details\s+about)",
-        r"how\s+much\s+(does|do|is|are|cost)",
-        r"what'?s\s+the\s+(weather|price|cost|temperature|time)",
-        r"(show|display|list|give\s+me)\s+(information|data|details|results)",
-        r"(navigate|go\s+to|visit|open|browse)",
-        r"(read|write|save|load|upload|download)\s+(the\s+)?(file|document|data)",
-        r"(create|make|build|generate|produce)\s+(a|an|the)",
-        r"(run|execute|perform|do)\s+(a|an|the)",
-    )
-    if any(re.search(p, lower, re.IGNORECASE) for p in action_patterns):
-        return False
-
-    opinion_patterns = (
-        r"what\s+(do\s+you\s+)?think\s+(about|of)",
-        r"what'?s\s+(your\s+)?(opinion|view|perspective|take|thoughts?)\s+(on|about|of|regarding)",
-        r"what\s+(do\s+you\s+)?know\s+(about|of)",
-        r"how\s+do\s+you\s+(feel|see|view|perceive)\s+(about|on|regarding)",
-        r"tell\s+me\s+(what\s+you\s+)?(think|know|believe|feel)\s+(about|of|on)",
-        r"share\s+(your\s+)?(thoughts?|views?|opinions?|perspective)",
-        r"what\s+(do\s+you\s+)?(believe|understand|consider)\s+(about|of|regarding)",
-    )
-    if any(re.search(p, lower, re.IGNORECASE) for p in opinion_patterns):
-        return True
-
-    return bool(re.search(r"^what\s+(do\s+you|'?s\s+your)", lower, re.IGNORECASE))
-
-
-def _extract_memory_search_query(message_text: str) -> str:
-    """Extract likely topic phrase for memory search; falls back to full message."""
-    if not message_text:
-        return ""
-    match = re.search(
-        r"(?:think|opinion|view|know|thoughts?|beliefs?|feel|see|perceive|understand|consider|"
-        r"insights?|reflections?|contemplations?)\s+(?:about|of|on|regarding)\s+(.+?)(?:\?|$)",
-        message_text,
-        re.IGNORECASE,
-    )
-    topic = (match.group(1).strip() if match and match.group(1) else message_text.strip())
-    return topic[:500]
-
-
-def _filter_high_relevance_memories(
-    memories: List[Dict[str, Any]],
-    memory_manager: Optional[Any] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Keep only high-confidence memory matches:
-    - top hit must pass minimum similarity
-    - keep matches in a score window close to top score
-    - cap final count
-    """
-    if not memories:
-        return []
-
-    sorted_memories = sorted(memories, key=lambda m: float(m.get("similarity", 0.0)), reverse=True)
-    top_score = float(sorted_memories[0].get("similarity", 0.0))
-    if top_score < MEMORY_AUTO_SEARCH_MIN_SIMILARITY:
-        return []
-
-    floor = max(MEMORY_AUTO_SEARCH_MIN_SIMILARITY, top_score - MEMORY_AUTO_SEARCH_SCORE_WINDOW)
-    filtered = [m for m in sorted_memories if float(m.get("similarity", 0.0)) >= floor]
-    context_safe: List[Dict[str, Any]] = []
-    for mem in filtered:
-        category = (mem.get("category") or "").strip().lower()
-        source = (mem.get("source") or "").strip().lower()
-        memory_type = str(mem.get("memory_type") or "").strip().lower()
-        text = str(mem.get("text") or "")
-        if category in MEMORY_CONTEXT_BLOCKED_CATEGORIES:
-            continue
-        if memory_type in MEMORY_CONTEXT_BLOCKED_CATEGORIES:
-            continue
-        if source in MEMORY_CONTEXT_BLOCKED_SOURCES:
-            continue
-        if MEMORY_CONTEXT_OPERATIONAL_PATTERN.search(text):
-            continue
-        context_safe.append(mem)
-
-    if memory_manager:
-        try:
-            filter_fn = getattr(memory_manager, "filter_memories_for_conversation_context", None)
-            if callable(filter_fn):
-                maybe_filtered = filter_fn(context_safe)
-                if isinstance(maybe_filtered, list):
-                    context_safe = maybe_filtered
-        except Exception as e:
-            print(f"Warning: MemoryManager context filter failed: {e}")
-    filtered = context_safe
-    return filtered[:MEMORY_AUTO_SEARCH_LIMIT]
-
-
 def _message_requests_proxy_restart(message_text: str) -> bool:
     """
     Return True for explicit restart command-style phrases.
@@ -9814,45 +10228,33 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
 
     system_prompt = _compose_system_prompt_with_context(system_prompt)
 
-    # Retrieve relevant memories only for opinion/knowledge-style prompts.
+    # Use the shared namespace-scoped retrieval and context policy.
     memory_context = ""
     if (
         MEMORY_AVAILABLE
         and memory_manager
         and not _is_todo_list_query(message_text)
-        and _is_memory_context_question(message_text)
     ):
         try:
-            search_query = _extract_memory_search_query(message_text)
-            candidate_memories = await memory_manager.search_memories(
-                query=search_query,
-                limit=max(5, MEMORY_AUTO_SEARCH_LIMIT * 2),
-                similarity_threshold=MEMORY_AUTO_SEARCH_CANDIDATE_THRESHOLD,
+            context_result = await memory_manager.build_context(
+                namespace=todo_user_key,
+                query=message_text,
+                purpose="conversation",
+                max_items=MEMORY_AUTO_SEARCH_LIMIT,
+                max_tokens=500,
             )
-
-            relevant_memories = _filter_high_relevance_memories(
-                candidate_memories,
-                memory_manager=memory_manager,
-            )
-            if relevant_memories:
+            memory_context = str(context_result.get("context") or "")
+            if memory_context:
                 print(
-                    f"Memory context: kept {len(relevant_memories)}/{len(candidate_memories)} "
-                    f"for query '{search_query[:50]}...'"
+                    f"Memory context: included {context_result.get('count', 0)} "
+                    f"for Telegram namespace '{todo_user_key}'"
                 )
-                memory_context = "\n\nRelevant context from previous conversations:\n"
-                for i, mem in enumerate(relevant_memories, 1):
-                    memory_context += f"{i}. {mem.get('text', '')}\n"
-                memory_context += "\nUse this context to provide more personalized and relevant responses."
-            else:
-                print(f"Memory context: no high-relevance matches for query '{search_query[:50]}...'")
         except Exception as e:
             print(f"Warning: Failed to retrieve memories: {e}")
-            import traceback
-            print(traceback.format_exc())
 
     # Add memory context to system prompt
     if memory_context:
-        system_prompt = system_prompt + memory_context
+        system_prompt = f"{system_prompt}\n\n{memory_context}"
 
     messages: List[Dict[str, str]] = []
     if system_prompt:
@@ -10076,6 +10478,12 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         "filesystem.list_files",
         "filesystem.search_files",
     }
+    _terminal_authoritative_tool_names = {
+        "deleteMemory",
+        "listMemories",
+        "searchMemories",
+        "storeMemory",
+    }
     # Friendly message when tool failed or returned an error (avoid showing raw 404/500 to user)
     _telegram_tool_error_reply = "I wasn't able to get that information just now. Please try again or rephrase your question."
     if TELEGRAM_TOOLS_ENABLED and _telegram_tools is not None:
@@ -10296,6 +10704,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
         planning_chatter_checker = getattr(_telegram_tools, "reply_looks_like_tool_planning", None)
         iterations = 0
         while iterations < TELEGRAM_TOOLS_MAX_ITERATIONS:
+            executed_tool_names: List[str] = []
             native_tool_calls = pending_native_tool_calls if isinstance(pending_native_tool_calls, list) else []
             parsed = _telegram_tools.parse_telegram_tool_response(reply)
             result_message = last_tool_result_message or ""
@@ -10337,7 +10746,8 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 "do_fetch": _do_proxy_fetch,
                 "do_news": _do_proxy_news,
                 "do_weather": _do_proxy_weather,
-                "do_autogen": _do_autogen,
+                "do_workflow": _do_workflow,
+                "do_autogen": _do_workflow,
                 "do_codex": _run_codex_cli,
                 "do_restart_proxy": lambda reason=None: _request_proxy_restart(
                     trigger=f"telegram_tool:{(reason or '').strip() or 'requested'}",
@@ -10350,6 +10760,7 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     body=args if isinstance(args, dict) else {},
                 ),
                 "do_browser_health_check": _do_browser_health_check,
+                "get_monitoring_snapshot": _get_monitoring_snapshot_for_telegram,
                 "read_file_internal": _read_file_internal,
                 "write_file_internal": _write_file_internal,
                 "list_files_internal": _list_files_internal,
@@ -10422,6 +10833,8 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     last_tool_result_message = result_message
                     last_tool_success = tool_result.get("success", True)
                     normalized_tool_name = str(tool_name or "").strip()
+                    if normalized_tool_name:
+                        executed_tool_names.append(normalized_tool_name)
                     if (
                         bool(last_tool_success)
                         and normalized_tool_name
@@ -10460,6 +10873,8 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 last_tool_result_message = result_message
                 last_tool_success = tool_result.get("success", True)
                 normalized_tool_name = str(tool_name or "").strip()
+                if normalized_tool_name:
+                    executed_tool_names.append(normalized_tool_name)
                 if (
                     bool(last_tool_success)
                     and normalized_tool_name
@@ -10470,6 +10885,12 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                 canonical_tool_reply = _telegram_tools.format_telegram_tool_call(tool_name, tool_args)
                 working_messages.append({"role": "assistant", "content": canonical_tool_reply})
                 working_messages.append({"role": "user", "content": f"Tool result: {result_message}"})
+            if executed_tool_names and all(
+                name in _terminal_authoritative_tool_names for name in executed_tool_names
+            ):
+                reply = _build_telegram_result_reply_from_last_tool()
+                iterations += 1
+                break
             reply, pending_native_tool_calls, pending_native_tool_message = await _request_telegram_tool_followup()
             iterations += 1
 
@@ -10541,7 +10962,13 @@ async def telegram_chat_endpoint(raw_request: Request, request: TelegramChatRequ
                     continue
                 memory_messages.append({"role": role, "content": content})
             if memory_messages:
-                asyncio.create_task(_extract_memories_from_recent_messages_async(memory_messages))
+                asyncio.create_task(
+                    _extract_memories_from_recent_messages_async(
+                        memory_messages,
+                        namespace=todo_user_key,
+                        conversation_id=conversation_id,
+                    )
+                )
 
     usage = data.get("usage") if isinstance(data, dict) else None
 
@@ -10638,267 +11065,12 @@ async def status_events(raw_request: Request, conversation_id: str, request_id: 
 # MEMORY SYSTEM ENDPOINTS
 # ============================================================================
 
-@app.post("/v1/memory/store", response_model=MemoryResponse)
-async def store_memory(request: MemoryStoreRequest):
-    """Store a memory explicitly."""
-    if not MEMORY_AVAILABLE or not memory_manager:
-        error_detail = "Memory system is not available."
-        if not MEMORY_AVAILABLE:
-            error_detail += f" Import failed: {memory_import_error}. Check /v1/memory/status for details."
-        elif not memory_manager:
-            error_detail += " Memory manager initialization failed. Check server logs and /v1/memory/status endpoint."
-        raise HTTPException(
-            status_code=503,
-            detail=error_detail
-        )
-    
-    try:
-        # Store the memory
-        memory_id = await memory_manager.store_memory(
-            text=request.text,
-            category=request.category,
-            source=request.source or "explicit",
-            metadata=request.metadata,
-        )
-        
-        return MemoryResponse(
-            success=True,
-            message=f"Memory stored successfully",
-            data={"memory_id": memory_id}
-        )
-    except Exception as e:
-        print(f"Error storing memory: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to store memory: {str(e)}")
-
-@app.post("/v1/memory/search", response_model=MemoryResponse)
-async def search_memories(request: MemorySearchRequest):
-    """Search memories by query."""
-    if not MEMORY_AVAILABLE or not memory_manager:
-        raise HTTPException(
-            status_code=503,
-            detail="Memory system is not available. Check MEMORY_ENABLED setting."
-        )
-    
-    try:
-        # Search for relevant memories
-        results = await memory_manager.search_memories(
-            query=request.query,
-            limit=request.limit,
-            similarity_threshold=request.similarity_threshold,
-            category=request.category,
-        )
-        
-        return MemoryResponse(
-            success=True,
-            message=f"Found {len(results)} relevant memories",
-            data={"memories": results, "count": len(results)}
-        )
-    except Exception as e:
-        print(f"Error searching memories: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to search memories: {str(e)}")
-
-@app.get("/v1/memory/list", response_model=MemoryResponse)
-async def list_memories(limit: Optional[int] = None):
-    """List recent memories."""
-    if not MEMORY_AVAILABLE or not memory_manager:
-        raise HTTPException(
-            status_code=503,
-            detail="Memory system is not available. Check MEMORY_ENABLED setting."
-        )
-    
-    try:
-        # List memories
-        memories = memory_manager.list_memories(limit=limit)
-        
-        return MemoryResponse(
-            success=True,
-            message=f"Retrieved {len(memories)} memories",
-            data={"memories": memories, "count": len(memories), "total": memory_manager.count()}
-        )
-    except Exception as e:
-        print(f"Error listing memories: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to list memories: {str(e)}")
-
-@app.get("/v1/memory/{memory_id}", response_model=MemoryResponse)
-async def get_memory(memory_id: str):
-    """Get a specific memory by ID."""
-    if not MEMORY_AVAILABLE or not memory_manager:
-        raise HTTPException(
-            status_code=503,
-            detail="Memory system is not available. Check MEMORY_ENABLED setting."
-        )
-    
-    try:
-        # Get memory by ID
-        memory = memory_manager.get_memory(memory_id)
-        
-        if not memory:
-            raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-        
-        return MemoryResponse(
-            success=True,
-            message="Memory retrieved successfully",
-            data={"memory": memory}
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error getting memory: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get memory: {str(e)}")
-
-@app.post("/v1/memory/extract", response_model=MemoryResponse)
-async def extract_memories(request: MemoryExtractRequest):
-    """Extract and store memories from a conversation."""
-    if not MEMORY_AVAILABLE or not memory_manager:
-        error_detail = "Memory system is not available."
-        if not MEMORY_AVAILABLE:
-            error_detail += f" Import failed: {memory_import_error}. Check /v1/memory/status for details."
-        elif not memory_manager:
-            error_detail += " Memory manager initialization failed. Check server logs and /v1/memory/status endpoint."
-        raise HTTPException(
-            status_code=503,
-            detail=error_detail
-        )
-    
-    try:
-        # Check if auto-extract is enabled
-        auto_extract = os.getenv("MEMORY_AUTO_EXTRACT", "true").lower() == "true"
-        if not auto_extract:
-            return MemoryResponse(
-                success=False,
-                message="Automatic memory extraction is disabled via MEMORY_AUTO_EXTRACT=false",
-                data={"extracted": 0}
-            )
-        
-        # Extract memories from conversation
-        max_memories = request.max_memories or 1
-        memory_ids = await memory_manager.extract_memories_from_conversation(
-            messages=request.messages,
-            max_memories=max_memories,
-        )
-        
-        return MemoryResponse(
-            success=True,
-            message=f"Extracted and stored {len(memory_ids)} memories",
-            data={"extracted": len(memory_ids), "memory_ids": memory_ids}
-        )
-    except Exception as e:
-        print(f"Error extracting memories: {e}")
-        import traceback
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Failed to extract memories: {str(e)}")
-
-@app.get("/v1/memory/learning/events", response_model=MemoryResponse)
-async def memory_learning_events(limit: int = 50, outcome: Optional[str] = None):
-    """List recent task-learning events (captured from task execution outcomes)."""
-    if not MEMORY_AVAILABLE or not memory_manager:
-        raise HTTPException(
-            status_code=503,
-            detail="Memory system is not available. Check MEMORY_ENABLED setting.",
-        )
-    if not hasattr(memory_manager, "list_task_learning_events"):
-        return MemoryResponse(
-            success=False,
-            message="Task learning events are not supported by this memory manager.",
-            data={"events": [], "count": 0},
-        )
-    safe_limit = max(1, min(200, int(limit or 50)))
-    try:
-        events = memory_manager.list_task_learning_events(limit=safe_limit, outcome=outcome)
-        return MemoryResponse(
-            success=True,
-            message=f"Retrieved {len(events)} task learning events",
-            data={"events": events, "count": len(events)},
-        )
-    except Exception as e:
-        print(f"Error listing task learning events: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to list task learning events: {str(e)}")
-
-@app.post("/v1/memory/learning/context", response_model=MemoryResponse)
-async def memory_learning_context(request: MemoryLearningContextRequest):
-    """Get experience-based learning context and guidance for a task description."""
-    if not MEMORY_AVAILABLE or not memory_manager:
-        raise HTTPException(
-            status_code=503,
-            detail="Memory system is not available. Check MEMORY_ENABLED setting.",
-        )
-    if not hasattr(memory_manager, "get_task_learning_context"):
-        return MemoryResponse(
-            success=False,
-            message="Task learning context is not supported by this memory manager.",
-            data={"context": {}, "guidance": ""},
-        )
-    try:
-        context = await memory_manager.get_task_learning_context(
-            task_description=request.task_description,
-            limit=request.limit,
-            similarity_threshold=request.similarity_threshold,
-        )
-        guidance = ""
-        if hasattr(memory_manager, "build_task_execution_guidance"):
-            guidance = await memory_manager.build_task_execution_guidance(
-                task_description=request.task_description,
-                limit=request.limit or 6,
-            )
-        return MemoryResponse(
-            success=True,
-            message="Retrieved task learning context",
-            data={"context": context, "guidance": guidance},
-        )
-    except Exception as e:
-        print(f"Error retrieving task learning context: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve task learning context: {str(e)}")
-
-@app.get("/v1/memory/status")
-async def memory_status():
-    """Get the status of the memory system."""
-    status = {
-        "available": MEMORY_AVAILABLE,
-        "enabled": os.getenv("MEMORY_ENABLED", "true").lower() == "true",
-        "initialized": memory_manager is not None,
-        "memory_count": memory_manager.count() if memory_manager else 0,
-    }
-    if not MEMORY_AVAILABLE:
-        status["error"] = f"Memory module not available (import failed: {memory_import_error})"
-        if memory_import_error and "numpy" in memory_import_error.lower():
-            status["fix"] = "Install numpy with: pip install numpy"
-    elif not status["enabled"]:
-        status["error"] = "Memory system disabled via MEMORY_ENABLED=false"
-    elif not status["initialized"]:
-        status["error"] = "Memory manager failed to initialize (check server logs)"
-    return status
-
-@app.delete("/v1/memory/{memory_id}", response_model=MemoryResponse)
-async def delete_memory(memory_id: str):
-    """Delete a memory by ID."""
-    if not MEMORY_AVAILABLE or not memory_manager:
-        error_detail = "Memory system is not available."
-        if not MEMORY_AVAILABLE:
-            error_detail += " Memory module import failed."
-        elif not memory_manager:
-            error_detail += " Memory manager initialization failed. Check server logs and /v1/memory/status endpoint."
-        raise HTTPException(
-            status_code=503,
-            detail=error_detail
-        )
-    
-    try:
-        # Delete memory
-        deleted = memory_manager.delete_memory(memory_id)
-        
-        if not deleted:
-            raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-        
-        return MemoryResponse(
-            success=True,
-            message=f"Memory {memory_id} deleted successfully",
-            data={"memory_id": memory_id}
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error deleting memory: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete memory: {str(e)}")
+app.include_router(
+    create_memory_router(
+        manager_provider=lambda: memory_manager if MEMORY_AVAILABLE else None,
+        auth_dependency=get_current_user,
+    )
+)
 
 # ============================================================================
 # END MEMORY SYSTEM ENDPOINTS
@@ -11044,11 +11216,16 @@ async def get_all_available_tools() -> List[Dict]:
     else:
         print("[PHILOSOPHER] File ops not available, skipping delete_file tool")
     
-    # 5. runWorkflow (AutoGen team - code generation and automation)
-    if AUTOGEN_AVAILABLE:
+    # 5. runWorkflow (configured workflow framework - code generation and automation)
+    try:
+        selected_workflow_framework = get_workflow_framework()
+    except WorkflowConfigError:
+        selected_workflow_framework = ""
+    workflow_tool_available = AUTOGEN_AVAILABLE or selected_workflow_framework == "ag2"
+    if workflow_tool_available:
         all_tools.append({
             "name": "runWorkflow",
-            "description": "Execute workflows for code generation and automation tasks using an AutoGen team. Use for tasks like building apps, generating code, or multi-step automation.",
+            "description": "Execute code generation and automation tasks using the configured workflow framework. Use for tasks like building apps, generating code, or multi-step automation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -11063,19 +11240,23 @@ async def get_all_available_tools() -> List[Dict]:
         })
         print("[PHILOSOPHER] Added runWorkflow tool")
     else:
-        print("[PHILOSOPHER] AutoGen not available, skipping runWorkflow tool")
+        print("[PHILOSOPHER] Workflow backend not available, skipping runWorkflow tool")
 
     # 5b. runCodexCli (Codex CLI for CATBot code changes and tooling)
     if CODEX_ENABLED:
         all_tools.append({
             "name": "runCodexCli",
-            "description": "Run Codex CLI in non-interactive mode to make CATBot code changes or add new capabilities. Always provide a clear prompt describing the change. Output is written to a scratch summary file.",
+            "description": "Run Codex CLI in non-interactive mode to make CATBot code changes or add new capabilities. Always provide a clear, self-contained prompt with the user's request, any error text, and instructions to inspect the repository before editing. Output is written to a scratch summary file.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Task instructions for Codex (e.g. 'Add a new /v1/proxy/codex tool in the proxy server and update docs')",
+                        "description": "Self-contained task instructions for Codex (e.g. 'Fix this runcodexcli error: ... Search the repo, patch the bug, and run focused tests.')",
+                    },
+                    "timeoutSeconds": {
+                        "type": "number",
+                        "description": "Optional timeout in seconds (minimum 60, maximum 7200).",
                     },
                 },
                 "required": ["prompt"]
@@ -11418,9 +11599,7 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             content_prompt = (parameters.get("contentPrompt") or parameters.get("content_prompt") or "").strip()
             if not content_prompt:
                 return "Error: 'contentPrompt' is required for runWorkflow"
-            if not AUTOGEN_AVAILABLE:
-                return "Error: Workflow (AutoGen) is not available."
-            result = await _do_autogen(content_prompt)
+            result = await _do_workflow(content_prompt)
             msg = result.get("output") or result.get("response") or str(result)
             return msg
         except HTTPException as e:
@@ -11433,12 +11612,16 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
             codex_prompt = (parameters.get("prompt") or "").strip()
             if not codex_prompt:
                 return "Error: 'prompt' is required for runCodexCli"
-            result = await _run_codex_cli(codex_prompt)
+            result = await _run_codex_cli(
+                codex_prompt,
+                timeout_seconds=parameters.get("timeoutSeconds", parameters.get("timeout_seconds")),
+            )
             summary_file = result.get("summaryFile")
             exit_code = result.get("exitCode")
             timed_out = result.get("timedOut")
+            status = "finished" if result.get("success") is not False else "failed"
             return (
-                f"Codex CLI finished (exit_code={exit_code}, timed_out={timed_out}). "
+                f"Codex CLI {status} (exit_code={exit_code}, timed_out={timed_out}). "
                 f"Summary file: {summary_file}"
             )
         except HTTPException as e:
@@ -11602,8 +11785,16 @@ async def execute_tool_for_philosopher(tool_name: str, parameters: Dict) -> str:
 # PHILOSOPHER MODE ENDPOINTS
 # ============================================================================
 
+
+def _philosopher_scope_key(username: str, conversation_id: str) -> str:
+    return f"{username}:{conversation_id}"
+
+
 @app.post("/v1/philosopher/start", response_model=PhilosopherResponse)
-async def philosopher_start(request: PhilosopherStartRequest):
+async def philosopher_start(
+    request: PhilosopherStartRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Enable philosopher mode for a conversation."""
     if not PHILOSOPHER_MODE_AVAILABLE or not PhilosopherMode:
         raise HTTPException(
@@ -11621,9 +11812,11 @@ async def philosopher_start(request: PhilosopherStartRequest):
     
     # Get conversation ID
     conversation_id = request.conversation_id or request.user_id or "default"
+    username = current_user["username"]
+    scope_key = _philosopher_scope_key(username, conversation_id)
     
     # Check if already active
-    if philosopher_mode_active.get(conversation_id, False):
+    if philosopher_mode_active.get(scope_key, False):
         return PhilosopherResponse(
             success=True,
             message="Philosopher mode is already active for this conversation",
@@ -11653,6 +11846,7 @@ async def philosopher_start(request: PhilosopherStartRequest):
             api_base=api_base,
             model=model,
             memory_manager=memory_manager if MEMORY_AVAILABLE else None,
+            memory_namespace=username,
             max_cycles=int(os.getenv("PHILOSOPHER_MAX_CYCLES", "10")),
             similarity_threshold=float(os.getenv("PHILOSOPHER_SIMILARITY_THRESHOLD", "0.3")),
             memory_limit=int(os.getenv("PHILOSOPHER_MEMORY_LIMIT", "10")),
@@ -11663,8 +11857,8 @@ async def philosopher_start(request: PhilosopherStartRequest):
         )
         
         # Store instance and activate mode
-        philosopher_mode_instances[conversation_id] = philosopher
-        philosopher_mode_active[conversation_id] = True
+        philosopher_mode_instances[scope_key] = philosopher
+        philosopher_mode_active[scope_key] = True
         
         return PhilosopherResponse(
             success=True,
@@ -11680,13 +11874,17 @@ async def philosopher_start(request: PhilosopherStartRequest):
         raise HTTPException(status_code=500, detail=f"Failed to start philosopher mode: {str(e)}")
 
 @app.post("/v1/philosopher/stop", response_model=PhilosopherResponse)
-async def philosopher_stop(request: PhilosopherStopRequest):
+async def philosopher_stop(
+    request: PhilosopherStopRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Disable philosopher mode for a conversation."""
     # Get conversation ID
     conversation_id = request.conversation_id or request.user_id or "default"
+    scope_key = _philosopher_scope_key(current_user["username"], conversation_id)
     
     # Check if active
-    if not philosopher_mode_active.get(conversation_id, False):
+    if not philosopher_mode_active.get(scope_key, False):
         return PhilosopherResponse(
             success=True,
             message="Philosopher mode is not active for this conversation",
@@ -11695,9 +11893,9 @@ async def philosopher_stop(request: PhilosopherStopRequest):
     
     try:
         # Deactivate mode
-        philosopher_mode_active[conversation_id] = False
+        philosopher_mode_active[scope_key] = False
         # Remove instance (optional - could keep for reuse)
-        philosopher_mode_instances.pop(conversation_id, None)
+        philosopher_mode_instances.pop(scope_key, None)
         
         return PhilosopherResponse(
             success=True,
@@ -11709,12 +11907,17 @@ async def philosopher_stop(request: PhilosopherStopRequest):
         raise HTTPException(status_code=500, detail=f"Failed to stop philosopher mode: {str(e)}")
 
 @app.get("/v1/philosopher/status")
-async def philosopher_status(conversation_id: Optional[str] = None, user_id: Optional[str] = None):
+async def philosopher_status(
+    conversation_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Check if philosopher mode is active for a conversation."""
     # Get conversation ID
     conv_id = conversation_id or user_id or "default"
+    scope_key = _philosopher_scope_key(current_user["username"], conv_id)
     
-    is_active = philosopher_mode_active.get(conv_id, False)
+    is_active = philosopher_mode_active.get(scope_key, False)
     
     return {
         "active": is_active,
@@ -11724,7 +11927,10 @@ async def philosopher_status(conversation_id: Optional[str] = None, user_id: Opt
     }
 
 @app.post("/v1/philosopher/contemplate", response_model=PhilosopherResponse)
-async def philosopher_contemplate(request: PhilosopherContemplateRequest):
+async def philosopher_contemplate(
+    request: PhilosopherContemplateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Execute a single contemplation cycle."""
     if not PHILOSOPHER_MODE_AVAILABLE or not PhilosopherMode:
         raise HTTPException(
@@ -11734,16 +11940,17 @@ async def philosopher_contemplate(request: PhilosopherContemplateRequest):
     
     # Get conversation ID
     conversation_id = request.conversation_id or request.user_id or "default"
+    scope_key = _philosopher_scope_key(current_user["username"], conversation_id)
     
     # Check if mode is active
-    if not philosopher_mode_active.get(conversation_id, False):
+    if not philosopher_mode_active.get(scope_key, False):
         raise HTTPException(
             status_code=400,
             detail="Philosopher mode is not active for this conversation. Start it first with /v1/philosopher/start"
         )
     
     # Get philosopher instance
-    philosopher = philosopher_mode_instances.get(conversation_id)
+    philosopher = philosopher_mode_instances.get(scope_key)
     if not philosopher:
         raise HTTPException(
             status_code=500,
@@ -11926,44 +12133,247 @@ def _load_monitor_dashboard_html(*, detail_mode: bool) -> str:
     return html
 
 
-@app.get("/monitor")
-async def monitor_dashboard(request: Request):
-    """Serve the monitoring dashboard HTML."""
-    _require_internal_or_local_access(request, "monitoring")
-    html = _load_monitor_dashboard_html(detail_mode=False)
-    if not html:
-        return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
-    return HTMLResponse(content=html, status_code=200)
+def _round_float(value: Any, digits: int = 3) -> Optional[float]:
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
 
 
-@app.get("/monitor/detail")
-async def monitor_dashboard_detail(request: Request):
-    """Serve the monitoring detail HTML shell."""
-    _require_internal_or_local_access(request, "monitoring")
-    html = _load_monitor_dashboard_html(detail_mode=True)
-    if not html:
-        return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
-    return HTMLResponse(content=html, status_code=200)
+def _get_windows_cpu_times() -> Optional[Tuple[int, int, int]]:
+    if os.name != "nt":
+        return None
+
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", ctypes.c_ulong),
+            ("dwHighDateTime", ctypes.c_ulong),
+        ]
+
+    idle = _FILETIME()
+    kernel = _FILETIME()
+    user = _FILETIME()
+    try:
+        ok = ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+    except Exception:
+        return None
+    if not ok:
+        return None
+
+    def _filetime_to_int(value: _FILETIME) -> int:
+        return (int(value.dwHighDateTime) << 32) + int(value.dwLowDateTime)
+
+    return _filetime_to_int(idle), _filetime_to_int(kernel), _filetime_to_int(user)
 
 
-@app.get("/monitor/summary")
-async def monitor_summary(request: Request):
-    """Return high-level system status summary."""
-    _require_internal_or_local_access(request, "monitoring")
-    uptime_seconds = max(0.0, time.time() - PROXY_START_TIME)
-    openai_key_present = bool(
+def _get_windows_memory_stats() -> Optional[Dict[str, Any]]:
+    if os.name != "nt":
+        return None
+
+    class _MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.dwLength = ctypes.sizeof(self)
+
+    status = _MEMORYSTATUSEX()
+    try:
+        ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    except Exception:
+        return None
+    if not ok:
+        return None
+    total = int(status.ullTotalPhys)
+    available = int(status.ullAvailPhys)
+    used = max(0, total - available)
+    return {
+        "total_bytes": total,
+        "available_bytes": available,
+        "used_bytes": used,
+        "percent_used": _round_float(status.dwMemoryLoad, 1),
+        "source": "windows",
+    }
+
+
+def _get_system_cpu_stats_payload() -> Dict[str, Any]:
+    global _SYSTEM_CPU_LAST_TIMES
+
+    stats: Dict[str, Any] = {
+        "processor_count": os.cpu_count(),
+        "process_cpu_seconds": _round_float(time.process_time(), 3),
+        "cpu_percent": None,
+        "load_average": None,
+        "source": "standard_library",
+    }
+
+    try:
+        import psutil  # type: ignore
+
+        stats.update(
+            {
+                "cpu_percent": _round_float(psutil.cpu_percent(interval=0.0), 1),
+                "per_cpu_percent": [
+                    _round_float(value, 1)
+                    for value in psutil.cpu_percent(interval=0.0, percpu=True)
+                ],
+                "source": "psutil",
+            }
+        )
+        return stats
+    except Exception:
+        pass
+
+    try:
+        load_1, load_5, load_15 = os.getloadavg()
+        stats["load_average"] = {
+            "1m": _round_float(load_1, 3),
+            "5m": _round_float(load_5, 3),
+            "15m": _round_float(load_15, 3),
+        }
+    except (AttributeError, OSError):
+        pass
+
+    windows_times = _get_windows_cpu_times()
+    if windows_times:
+        previous = _SYSTEM_CPU_LAST_TIMES
+        _SYSTEM_CPU_LAST_TIMES = windows_times
+        if previous:
+            idle_delta = windows_times[0] - previous[0]
+            total_delta = (windows_times[1] - previous[1]) + (windows_times[2] - previous[2])
+            if total_delta > 0:
+                busy_ratio = max(0.0, min(1.0, 1.0 - (idle_delta / total_delta)))
+                stats["cpu_percent"] = _round_float(busy_ratio * 100.0, 1)
+                stats["source"] = "windows"
+
+    return stats
+
+
+def _get_system_memory_stats_payload() -> Dict[str, Any]:
+    try:
+        import psutil  # type: ignore
+
+        virtual = psutil.virtual_memory()
+        return {
+            "total_bytes": int(getattr(virtual, "total", 0) or 0),
+            "available_bytes": int(getattr(virtual, "available", 0) or 0),
+            "used_bytes": int(getattr(virtual, "used", 0) or 0),
+            "percent_used": _round_float(getattr(virtual, "percent", None), 1),
+            "source": "psutil",
+        }
+    except Exception:
+        pass
+
+    windows_stats = _get_windows_memory_stats()
+    if windows_stats:
+        return windows_stats
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        total = page_size * total_pages
+        available = page_size * available_pages
+        used = max(0, total - available)
+        percent = (used / total * 100.0) if total else None
+        return {
+            "total_bytes": total,
+            "available_bytes": available,
+            "used_bytes": used,
+            "percent_used": _round_float(percent, 1),
+            "source": "sysconf",
+        }
+    except (AttributeError, OSError, ValueError):
+        return {
+            "total_bytes": None,
+            "available_bytes": None,
+            "used_bytes": None,
+            "percent_used": None,
+            "source": "unavailable",
+        }
+
+
+def _get_system_stats_payload() -> Dict[str, Any]:
+    return {
+        "uptime_seconds": max(0.0, time.time() - PROXY_START_TIME),
+        "started_at_unix": PROXY_START_TIME,
+        "started_at_iso": datetime.fromtimestamp(PROXY_START_TIME, timezone.utc).isoformat(),
+        "cpu": _get_system_cpu_stats_payload(),
+        "memory": _get_system_memory_stats_payload(),
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+    }
+
+
+def _read_catbot_version() -> str:
+    version_file = Path(os.getenv("VERSION_FILE") or (_PROJECT_ROOT / "VERSION"))
+    if not version_file.is_absolute():
+        version_file = (_PROJECT_ROOT / version_file).resolve()
+    try:
+        return version_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _openai_key_configured() -> bool:
+    return bool(
         os.getenv("OPENAI_API_KEY")
         or os.getenv("MCP_LLM_OPENAI_API_KEY")
         or os.getenv("MINIMAX_API_KEY")
         or os.getenv("MCP_LLM_MINIMAX_API_KEY")
     )
+
+
+def _get_app_info_payload() -> Dict[str, Any]:
+    workflow_framework = ""
+    with suppress(Exception):
+        workflow_framework = str(get_workflow_framework() or "").strip()
+    return {
+        "name": "CATBot",
+        "version": _read_catbot_version(),
+        "project_root": str(_PROJECT_ROOT),
+        "config_summary": {
+            "memory_available": MEMORY_AVAILABLE,
+            "telegram_tools_enabled": TELEGRAM_TOOLS_ENABLED,
+            "skills_framework_available": bool(skill_manager is not None),
+            "workflow_framework": workflow_framework,
+            "openai_api_key_configured": _openai_key_configured(),
+            "status_events_file": str(STATUS_EVENTS_FILE),
+            "proxy_log_file": str(PROXY_LOG_FILE) if PROXY_LOG_FILE else "",
+            "browser_use_log_file": str(BROWSER_USE_LOG_FILE or ""),
+            "auth_cookie_name": AUTH_COOKIE_NAME,
+        },
+    }
+
+
+def _get_monitor_summary_payload() -> Dict[str, Any]:
+    uptime_seconds = max(0.0, time.time() - PROXY_START_TIME)
     return {
         "time": time.time(),
         "uptime_seconds": uptime_seconds,
         "memory_available": MEMORY_AVAILABLE,
         "telegram_tools_enabled": TELEGRAM_TOOLS_ENABLED,
         "status_sessions_active": len(status_sessions),
-        "openai_api_key_configured": openai_key_present,
+        "openai_api_key_configured": _openai_key_configured(),
         "status_events_file": str(STATUS_EVENTS_FILE),
         "autogen_active_runs": _get_monitor_runs_payload("autogen")["active_count"],
         "browser_use_active_runs": _get_monitor_runs_payload("browser_use")["active_count"],
@@ -11973,19 +12383,8 @@ async def monitor_summary(request: Request):
     }
 
 
-@app.get("/monitor/status")
-async def monitor_status(request: Request, limit: int = 50):
-    """Return recent status events for dashboard display."""
-    _require_internal_or_local_access(request, "monitoring")
-    limit = max(1, min(200, limit))
-    return {"events": _get_recent_status_events(limit)}
-
-
-@app.get("/monitor/logs")
-async def monitor_logs(request: Request, limit: int = 200):
-    """Return the last N lines from the proxy log file if configured."""
-    _require_internal_or_local_access(request, "monitoring")
-    limit = max(1, min(1000, limit))
+def _get_monitor_logs_payload(limit: int = 200) -> Dict[str, Any]:
+    limit = max(1, min(1000, int(limit)))
     log_path = PROXY_LOG_FILE
     if not log_path or not log_path.exists():
         return {"available": False, "lines": []}
@@ -11994,12 +12393,19 @@ async def monitor_logs(request: Request, limit: int = 200):
     return {"available": True, "lines": lines[-limit:], "path": str(log_path)}
 
 
-@app.get("/monitor/workflows")
-async def monitor_workflows(request: Request):
-    """Return recent AutoGen, Browser-use, Philosopher, and task execution activity."""
-    _require_internal_or_local_access(request, "monitoring")
+def _get_monitor_browser_logs_payload(limit: int = 200) -> Dict[str, Any]:
+    limit = max(1, min(1000, int(limit)))
+    log_path = Path(BROWSER_USE_LOG_FILE) if BROWSER_USE_LOG_FILE else None
+    if not log_path or not log_path.exists():
+        return {"available": False, "lines": []}
+    text = _tail_text_file(log_path, max_lines=limit)
+    lines = text.splitlines()
+    return {"available": True, "lines": lines[-limit:], "path": str(log_path)}
+
+
+async def _get_monitor_workflows_payload(*, refresh_browser_health: bool = True) -> Dict[str, Any]:
     browser_health = dict(monitor_browser_health_snapshot)
-    if _monitor_browser_health_is_stale(browser_health):
+    if refresh_browser_health and _monitor_browser_health_is_stale(browser_health):
         try:
             await _do_browser_health_check({})
             browser_health = dict(monitor_browser_health_snapshot)
@@ -12017,6 +12423,153 @@ async def monitor_workflows(request: Request):
     }
 
 
+async def _get_monitoring_snapshot(
+    *,
+    status_limit: int = 24,
+    log_limit: int = 120,
+    include_logs: bool = True,
+    include_workflows: bool = True,
+) -> Dict[str, Any]:
+    status_limit = max(1, min(200, int(status_limit)))
+    log_limit = max(1, min(1000, int(log_limit)))
+    payload: Dict[str, Any] = {
+        "generated_at": time.time(),
+        "generated_at_iso": datetime.now(timezone.utc).isoformat(),
+        "summary": _get_monitor_summary_payload(),
+        "system_stats": _get_system_stats_payload(),
+        "app_info": _get_app_info_payload(),
+        "status_events": _get_recent_status_events(status_limit),
+    }
+    if include_workflows:
+        payload["workflows"] = await _get_monitor_workflows_payload()
+    if include_logs:
+        payload["logs"] = {
+            "proxy": _get_monitor_logs_payload(log_limit),
+            "browser_use": _get_monitor_browser_logs_payload(log_limit),
+        }
+    return payload
+
+
+async def _get_monitoring_snapshot_for_telegram(arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    args = arguments if isinstance(arguments, dict) else {}
+    detail = str(args.get("detail") or args.get("section") or "summary").strip().lower()
+
+    def _bool_arg(value: Any, *, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    include_logs_raw = args.get("includeLogs", args.get("include_logs"))
+    include_logs = _bool_arg(
+        include_logs_raw,
+        default=detail not in {"stats", "info", "summary_no_logs"},
+    )
+    if detail in {"all", "full", "logs"}:
+        include_logs = True
+    include_workflows = not _bool_arg(
+        args.get("excludeWorkflows", args.get("exclude_workflows")),
+        default=False,
+    )
+    try:
+        status_limit = int(args.get("statusLimit") or args.get("status_limit") or 10)
+    except (TypeError, ValueError):
+        status_limit = 10
+    try:
+        log_limit = int(args.get("logLimit") or args.get("log_limit") or (80 if include_logs else 20))
+    except (TypeError, ValueError):
+        log_limit = 80 if include_logs else 20
+    return await _get_monitoring_snapshot(
+        status_limit=status_limit,
+        log_limit=log_limit,
+        include_logs=include_logs,
+        include_workflows=include_workflows,
+    )
+
+
+@app.get("/monitoring")
+@app.get("/monitor")
+async def monitor_dashboard(request: Request):
+    """Serve the monitoring dashboard HTML."""
+    _require_internal_or_local_access(request, "monitoring")
+    html = _load_monitor_dashboard_html(detail_mode=False)
+    if not html:
+        return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
+    return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/monitoring/detail")
+@app.get("/monitor/detail")
+async def monitor_dashboard_detail(request: Request):
+    """Serve the monitoring detail HTML shell."""
+    _require_internal_or_local_access(request, "monitoring")
+    html = _load_monitor_dashboard_html(detail_mode=True)
+    if not html:
+        return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
+    return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/monitoring/summary")
+@app.get("/monitor/summary")
+async def monitor_summary(request: Request):
+    """Return high-level system status summary."""
+    _require_internal_or_local_access(request, "monitoring")
+    return _get_monitor_summary_payload()
+
+
+@app.get("/monitoring/data")
+@app.get("/monitor/data")
+async def monitor_data(
+    request: Request,
+    status_limit: int = 24,
+    log_limit: int = 120,
+    include_logs: bool = True,
+    include_workflows: bool = True,
+):
+    """Return the dashboard data as one programmatic JSON payload."""
+    _require_internal_or_local_access(request, "monitoring")
+    return await _get_monitoring_snapshot(
+        status_limit=status_limit,
+        log_limit=log_limit,
+        include_logs=include_logs,
+        include_workflows=include_workflows,
+    )
+
+
+@app.get("/monitoring/status")
+@app.get("/monitor/status")
+async def monitor_status(request: Request, limit: int = 50):
+    """Return recent status events for dashboard display."""
+    _require_internal_or_local_access(request, "monitoring")
+    limit = max(1, min(200, limit))
+    return {"events": _get_recent_status_events(limit)}
+
+
+@app.get("/monitoring/logs")
+@app.get("/monitor/logs")
+async def monitor_logs(request: Request, limit: int = 200):
+    """Return the last N lines from the proxy log file if configured."""
+    _require_internal_or_local_access(request, "monitoring")
+    return _get_monitor_logs_payload(limit)
+
+
+@app.get("/monitoring/workflows")
+@app.get("/monitor/workflows")
+async def monitor_workflows(request: Request):
+    """Return recent AutoGen, Browser-use, Philosopher, and task execution activity."""
+    _require_internal_or_local_access(request, "monitoring")
+    return await _get_monitor_workflows_payload()
+
+
+@app.get("/monitoring/workflows/log/{run_id}")
 @app.get("/monitor/workflows/log/{run_id}")
 async def monitor_workflow_log(run_id: str, request: Request):
     """Return the full scratch log for a recent workflow run when available."""
@@ -12035,17 +12588,12 @@ async def monitor_workflow_log(run_id: str, request: Request):
     }
 
 
+@app.get("/monitoring/logs/browser-use")
 @app.get("/monitor/logs/browser-use")
 async def monitor_browser_use_logs(request: Request, limit: int = 200):
     """Return the last N lines from the browser-use log file when configured."""
     _require_internal_or_local_access(request, "monitoring")
-    limit = max(1, min(1000, limit))
-    log_path = Path(BROWSER_USE_LOG_FILE) if BROWSER_USE_LOG_FILE else None
-    if not log_path or not log_path.exists():
-        return {"available": False, "lines": []}
-    text = _tail_text_file(log_path, max_lines=limit)
-    lines = text.splitlines()
-    return {"available": True, "lines": lines[-limit:], "path": str(log_path)}
+    return _get_monitor_browser_logs_payload(limit)
 
 # Health check endpoint
 @app.get("/health")
@@ -12075,6 +12623,10 @@ async def client_config():
     tts_voice = _env_str("TTS_VOICE") or _env_str("TELEGRAM_TTS_VOICE")
     return {
         "soulPrompt": _get_soul_prompt_text(),
+        "llmEndpoint": _env_str("OPENAI_API_BASE"),
+        "llmPrivateNetworksAllowed": bool(
+            OPENAI_PROXY_ALLOW_PRIVATE or PROXY_OUTBOUND_ALLOW_PRIVATE
+        ),
         "ttsEndpoint": _env_str("TTS_ENDPOINT"),
         "ttsModel": tts_model,
         "ttsVoice": tts_voice,
@@ -12098,7 +12650,12 @@ async def proxy_models(request: Request, endpoint: Optional[str] = None):
             request_auth_header=request.headers.get('Authorization', ''),
             request_proxy_auth_token=request.headers.get('X-Auth-Token', ''),
         )
-        endpoint = _validate_outbound_url(endpoint, allow_private=trusted_endpoint)
+        allow_private_endpoint = _openai_proxy_private_network_allowed(
+            request,
+            endpoint,
+            trusted_endpoint=trusted_endpoint,
+        )
+        endpoint = _validate_outbound_url(endpoint, allow_private=allow_private_endpoint)
         minimax_compatible = is_minimax_chat_request(endpoint, None)
 
         headers = {}
@@ -12604,7 +13161,12 @@ async def proxy_chat_completions(request: Request):
             request_proxy_auth_token=request.headers.get('X-Auth-Token', ''),
             model_name=body_clean.get("model"),
         )
-        endpoint = _validate_outbound_url(endpoint, allow_private=trusted_endpoint)
+        allow_private_endpoint = _openai_proxy_private_network_allowed(
+            request,
+            endpoint,
+            trusted_endpoint=trusted_endpoint,
+        )
+        endpoint = _validate_outbound_url(endpoint, allow_private=allow_private_endpoint)
         allow_server_side_fallbacks = using_server_credentials
 
         # Build headers for the forwarded request
@@ -12829,9 +13391,129 @@ async def proxy_whisper_options(request: Request):
     )
 
 # Whisper proxy endpoint to handle CORS; compatible with OpenAI whisper-1 (passes key when needed)
+def _is_openrouter_stt_endpoint(whisper_endpoint: str) -> bool:
+    endpoint_host = (urlparse(whisper_endpoint).hostname or "").lower()
+    return endpoint_host == "openrouter.ai" or endpoint_host.endswith(".openrouter.ai")
+
+
+def _whisper_api_key_candidates(whisper_endpoint: str) -> List[str]:
+    """Return server-side STT credentials without leaking provider keys across endpoints."""
+    candidates: List[str] = []
+    if _is_openrouter_stt_endpoint(whisper_endpoint):
+        openrouter_api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+        return [openrouter_api_key] if openrouter_api_key else []
+
+    whisper_api_key = (os.getenv("WHISPER_API_KEY") or "").strip()
+    if whisper_api_key:
+        candidates.append(whisper_api_key)
+
+    endpoint_host = (urlparse(whisper_endpoint).hostname or "").lower()
+    if endpoint_host == "api.openai.com":
+        openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        if openai_api_key and openai_api_key not in candidates:
+            candidates.append(openai_api_key)
+    return candidates
+
+
+def _openrouter_audio_format(filename: str, content_type: str) -> str:
+    extension = Path(filename or "").suffix.lower().lstrip(".")
+    extension_aliases = {
+        "aif": "aiff",
+        "oga": "ogg",
+        "opus": "ogg",
+        "mpeg": "mp3",
+    }
+    if extension:
+        return extension_aliases.get(extension, extension)
+
+    mime_subtype = (content_type or "").split(";", 1)[0].partition("/")[2].lower()
+    mime_aliases = {
+        "x-wav": "wav",
+        "wave": "wav",
+        "vnd.wave": "wav",
+        "mpeg": "mp3",
+        "mp4": "m4a",
+        "x-m4a": "m4a",
+        "opus": "ogg",
+    }
+    return mime_aliases.get(mime_subtype, mime_subtype or "ogg")
+
+
+def _openrouter_stt_payload(
+    files: Dict[str, Any],
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    file_value = files.get("file")
+    if not isinstance(file_value, tuple) or len(file_value) < 2:
+        raise HTTPException(status_code=400, detail="Audio file is required for transcription.")
+
+    filename = str(file_value[0] or "audio.ogg")
+    file_content = file_value[1]
+    content_type = str(file_value[2] or "") if len(file_value) > 2 else ""
+    if not isinstance(file_content, (bytes, bytearray)) or not file_content:
+        raise HTTPException(status_code=400, detail="Audio file is empty.")
+
+    model = str(data.get("model") or "whisper-1").strip() or "whisper-1"
+    if "/" not in model:
+        model = f"openai/{model}"
+
+    payload: Dict[str, Any] = {
+        "input_audio": {
+            "data": base64.b64encode(bytes(file_content)).decode("ascii"),
+            "format": _openrouter_audio_format(filename, content_type),
+        },
+        "model": model,
+    }
+    language = str(data.get("language") or "").strip()
+    if language:
+        payload["language"] = language
+    temperature = str(data.get("temperature") or "").strip()
+    if temperature:
+        try:
+            payload["temperature"] = float(temperature)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid transcription temperature.") from exc
+    return payload
+
+
+async def _post_whisper_request(
+    client: httpx.AsyncClient,
+    whisper_endpoint: str,
+    files: Dict[str, Any],
+    data: Dict[str, Any],
+) -> httpx.Response:
+    api_keys = _whisper_api_key_candidates(whisper_endpoint)
+    attempts = api_keys or [None]
+
+    for index, api_key in enumerate(attempts):
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        if _is_openrouter_stt_endpoint(whisper_endpoint):
+            response = await client.post(
+                whisper_endpoint,
+                json=_openrouter_stt_payload(files, data),
+                headers=headers,
+            )
+        else:
+            response = await client.post(
+                whisper_endpoint,
+                files=files,
+                data=data,
+                headers=headers,
+            )
+        has_fallback = index + 1 < len(attempts)
+        if response.status_code not in {401, 403, 429} or not has_fallback:
+            return response
+        print(
+            f"[WARN] Whisper credential {index + 1} returned HTTP "
+            f"{response.status_code}; retrying with fallback credential"
+        )
+
+    raise RuntimeError("Whisper request completed without a response")
+
+
 @app.post("/v1/audio/transcriptions")
 async def proxy_whisper(request: Request):
-    """Proxy Whisper transcription requests to handle CORS. Client Authorization is for proxy auth only; upstream uses WHISPER_API_KEY."""
+    """Proxy Whisper transcription requests using server-side STT credentials."""
     try:
         _require_internal_or_local_access(request, "audio transcription")
         # Get the form data from the request
@@ -12844,12 +13526,6 @@ async def proxy_whisper(request: Request):
         )
         
         print(f"ðŸ“ Proxying Whisper request to: {whisper_endpoint}")
-        
-        # Outgoing auth to Whisper/OpenAI uses only WHISPER_API_KEY (client Authorization is for proxy auth, not forwarded)
-        forward_headers = {}
-        whisper_api_key = os.getenv("WHISPER_API_KEY")
-        if whisper_api_key:
-            forward_headers["Authorization"] = f"Bearer {whisper_api_key}"
         
         # Prepare the files and data for forwarding
         files = {}
@@ -12867,11 +13543,11 @@ async def proxy_whisper(request: Request):
         
         # Forward the request to the Whisper service (server key only; client auth stays between client and proxy)
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
+            response = await _post_whisper_request(
+                client,
                 whisper_endpoint,
-                files=files,
-                data=data,
-                headers=forward_headers
+                files,
+                data,
             )
         
         print(f"✅ Whisper response status: {response.status_code}")

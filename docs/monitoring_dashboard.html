@@ -294,6 +294,7 @@
     const POLL_MS = 15000;
     const DETAIL_MODE = window.location.pathname.endsWith("/detail");
     const DETAIL_VIEW = new URLSearchParams(window.location.search).get("view") || "all";
+    const AUTH_TOKEN_STORAGE_KEY = "jwtAuthToken";
     let latestWorkflows = null;
     let activeDrilldown = "all";
     const openRunLogs = new Set();
@@ -700,8 +701,29 @@
       if (headEl) headEl.textContent = headline;
     }
 
+    function storedAuthToken() {
+      try {
+        return window.sessionStorage?.getItem(AUTH_TOKEN_STORAGE_KEY) || window.localStorage?.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
+      } catch (_) {
+        return "";
+      }
+    }
+
+    function monitorFetchOptions(options = {}) {
+      const headers = new Headers(options.headers || {});
+      const token = storedAuthToken();
+      if (token && !headers.has("X-Auth-Token")) {
+        headers.set("X-Auth-Token", token);
+      }
+      return {
+        ...options,
+        headers,
+        credentials: "same-origin",
+      };
+    }
+
     async function fetchJson(url) {
-      const response = await fetch(url, { cache: "no-store" });
+      const response = await fetch(url, monitorFetchOptions({ cache: "no-store" }));
       if (!response.ok) throw new Error(`${url} failed with ${response.status}`);
       return response.json();
     }

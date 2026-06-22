@@ -43,6 +43,7 @@ The installer now does the full dependency path:
 - prepares the forked `mcp-browser-use` checkout with `uv sync --frozen` when `uv.lock` is present
 - creates `.env` and required directories
 - runs the interactive configuration wizard
+- installs optional workflow backend dependencies selected by the wizard, including `ag2[openai]` when `WORKFLOW_FRAMEWORK=ag2`
 - runs `scripts/verify_install.py`
 
 Note:
@@ -53,7 +54,8 @@ Note:
 ## Configuration
 
 The installer wizard writes the core `.env` entries for you and now mirrors provider settings into the standard env names that older CATBot modules still read directly.
-It also generates a real `JWT_SECRET`, configures a shared internal agent secret, keeps `AUTOGEN_REQUIRE_AUTH=true`, and leaves `AUTOGEN_ENABLE_CODE_EXECUTION=false` unless you opt in later.
+It also asks which workflow backend `runWorkflow` should use. AutoGen is the default. If you choose AG2, the installer writes `WORKFLOW_FRAMEWORK=ag2`, stores AG2 model/base/key settings when provided, installs `ag2[openai]`, and verifies the AG2 APIs before finishing.
+The wizard also generates a real `JWT_SECRET`, configures a shared internal agent secret, keeps `AUTOGEN_REQUIRE_AUTH=true`, and leaves both `AUTOGEN_ENABLE_CODE_EXECUTION=false` and `AG2_ENABLE_CODE_EXECUTION=false` unless you opt in later.
 
 Required for a basic install:
 
@@ -68,8 +70,9 @@ Recommended for day-one usability:
 
 Recommended for a private deployment:
 
-- keep `AUTOGEN_REQUIRE_AUTH=true` so `/v1/proxy/autogen` is not public
+- keep `AUTOGEN_REQUIRE_AUTH=true` so `/v1/proxy/autogen` and `/v1/proxy/workflow` are not public
 - leave `AUTOGEN_ENABLE_CODE_EXECUTION=false` unless you intentionally want the Docker execution tool
+- leave `AG2_ENABLE_CODE_EXECUTION=false` unless you intentionally want AG2 code execution
 - treat `JWT_SECRET` and `CATBOT_AGENT_SECRET` as secrets and rotate existing JWTs if you replace `JWT_SECRET`
 
 Optional sections in [.env.example](/C:/Users/pc/CATBot/.env.example) to review before first full test:
@@ -82,6 +85,7 @@ Optional sections in [.env.example](/C:/Users/pc/CATBot/.env.example) to review 
 - image generation: `IMAGE_GENERATION_*`, `OPENROUTER_*`
 - memory overrides: `MEMORY_*`, `EMBEDDINGS_*`, `MEMORY_EXTRACTOR_*`
 - Codex tool: `CODEX_*`
+- Workflow backend: `WORKFLOW_FRAMEWORK`, `AG2_*`, `AUTOGEN_*`
 
 ## Forked browser-use
 
@@ -109,6 +113,15 @@ Re-run post-install verification:
 ```bash
 python scripts/verify_install.py
 ```
+
+If you switch an existing install to AG2 after the wizard, run:
+
+```bash
+python scripts/install_optional_workflow_backend.py
+python scripts/verify_install.py
+```
+
+`scripts/start_all.py` and `scripts/restart_all.py` also verify the selected workflow backend before launching services. When `WORKFLOW_FRAMEWORK=ag2`, they check the installed AG2 APIs first; restart performs this check before stopping existing services.
 
 Check prerequisites only:
 
@@ -181,4 +194,5 @@ npm run dist:win
 - `uv not found`: install `uv` first, then rerun the installer
 - `mcp-browser-use` verification fails: rerun `uv sync --frozen` and `uv run playwright install` inside `mcp-browser-use`
 - embedded Kitten TTS warnings: install `espeak-ng`
+- AG2 workflow warnings: set `WORKFLOW_FRAMEWORK=ag2`, install `ag2[openai]`, and configure `AG2_MODEL` plus `AG2_API_KEY` or compatible fallback provider vars
 - feature sanity warnings in `verify_install.py`: finish the matching `.env` section for that feature before testing it

@@ -7,7 +7,7 @@ import pytest
 import tempfile
 import shutil
 from pathlib import Path
-from src.memory import MemoryManager, EmbeddingsClient, VectorStore
+from src.memory import MemoryManager, EmbeddingsClient
 
 
 class TestMemoryIntegration:
@@ -46,12 +46,12 @@ class TestMemoryIntegration:
     @pytest.fixture
     def memory_manager(self, temp_dir, mock_embeddings_client):
         """Create a test memory manager."""
-        vector_store = VectorStore(storage_path=temp_dir)
-        return MemoryManager(
+        manager = MemoryManager(
             storage_path=temp_dir,
             embeddings_client=mock_embeddings_client,
-            vector_store=vector_store,
         )
+        yield manager
+        manager.close()
 
     @pytest.mark.asyncio
     async def test_store_and_retrieve_memory(self, memory_manager):
@@ -110,11 +110,11 @@ class TestMemoryIntegration:
         # Store memories
         memory_id1 = await memory_manager.store_memory(
             text="Memory 1",
-            category="test",
+            category="profile_fact",
         )
         memory_id2 = await memory_manager.store_memory(
             text="Memory 2",
-            category="test",
+            category="profile_fact",
         )
         
         # List all memories
@@ -141,20 +141,26 @@ class TestMemoryIntegration:
             storage_path=temp_dir,
             embeddings_client=mock_embeddings_client,
         )
-        memory_id = await manager1.store_memory(
-            text="Persistent memory",
-            category="test",
-        )
-        
-        # Create second manager and verify memory persists
-        manager2 = MemoryManager(
-            storage_path=temp_dir,
-            embeddings_client=mock_embeddings_client,
-        )
-        
-        memory = manager2.get_memory(memory_id)
-        assert memory is not None
-        assert memory["text"] == "Persistent memory"
+        manager2 = None
+        try:
+            memory_id = await manager1.store_memory(
+                text="Persistent memory",
+                category="profile_fact",
+            )
+
+            # Create second manager and verify memory persists
+            manager2 = MemoryManager(
+                storage_path=temp_dir,
+                embeddings_client=mock_embeddings_client,
+            )
+
+            memory = manager2.get_memory(memory_id)
+            assert memory is not None
+            assert memory["text"] == "Persistent memory"
+        finally:
+            manager1.close()
+            if manager2 is not None:
+                manager2.close()
 
     @pytest.mark.asyncio
     async def test_category_filtering(self, memory_manager):

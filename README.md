@@ -74,7 +74,7 @@ For embedded Kitten TTS, install `espeak-ng` on the host and ensure `espeak-ng` 
   ```powershell
   .\install.ps1
   ```
-  or double-click `install.bat`. The installer now uses `npm ci` when the lockfile is present, prepares the forked `mcp-browser-use` checkout with `uv sync --frozen` when `uv.lock` exists, runs a configuration wizard, and then verifies the install. The wizard writes both the MCP-prefixed provider vars and the standard provider aliases still used by older CATBot modules. Then start with `start.bat` or `python scripts/start_all.py`.
+  or double-click `install.bat`. The installer now uses `npm ci` when the lockfile is present, prepares the forked `mcp-browser-use` checkout with `uv sync --frozen` when `uv.lock` exists, runs a configuration wizard, installs optional workflow backend dependencies when selected, and then verifies the install. The wizard writes both the MCP-prefixed provider vars and the standard provider aliases still used by older CATBot modules, and can configure `WORKFLOW_FRAMEWORK=ag2` for the optional AG2 backend. Then start with `start.bat` or `python scripts/start_all.py`.
 - **Linux/macOS:** From project root run:
   ```bash
   ./install.sh
@@ -368,6 +368,8 @@ Key environment variables (see `.env.example` for complete list):
 - `OPENAI_API_KEY`: OpenAI API key
 - `OPENAI_API_BASE`: OpenAI-compatible endpoint base URL
 - `OPENAI_MODEL`: Model name to use
+- `OPENAI_PROXY_TRUSTED_BASE_URLS`: comma-separated exact model endpoint bases that CATBot may proxy to, including local Ollama, LM Studio, or vLLM servers
+- `OPENAI_PROXY_ALLOW_PRIVATE`: allow authenticated CATBot users to use private/local model endpoint overrides without adding each base URL to the exact allowlist
 - `GOOGLE_API_KEY`: Google AI API key (for Gemini)
 - `ANTHROPIC_API_KEY`: Anthropic API key (for Claude)
 
@@ -446,7 +448,7 @@ Key environment variables (see `.env.example` for complete list):
 - `TELEGRAM_TOOLS_ENABLED`: Set to `"true"` to enable tools in Telegram (search, files, todo, memory, workflows, etc.). When enabled, the proxy uses `config/catbot_system_prompt_with_tools.txt` and runs a tool loop.
 - `TELEGRAM_TOOLS_MAX_ITERATIONS`: Max tool-loop iterations per message (default: 5)
 - `LIST_FILES_TOOL_MAX_ENTRIES`: Caps `listFiles` output rows sent back to the model (default: 60) so large scratch directories do not bloat chat context.
-- When tools are enabled, the following are used by specific tools if set (same as web UI): `BRAVE_API_KEY` (webSearch; else DuckDuckGo), `NEWS_API_KEY` (fetchNews), `GOOGLE_DRIVE_*` (uploadToGoogleDrive), memory/vector-store settings for store/search/list/delete memories. File tools use the proxy scratch directory; runWorkflow uses AutoGen/team-config.
+- When tools are enabled, the following are used by specific tools if set (same as web UI): `BRAVE_API_KEY` (webSearch; else DuckDuckGo), `NEWS_API_KEY` (fetchNews), `GOOGLE_DRIVE_*` (uploadToGoogleDrive), memory/vector-store settings for store/search/list/delete memories. File tools use the proxy scratch directory; runWorkflow uses the configured workflow backend.
 - `listFiles` accepts optional `path` (subdirectory under `scratch/`) and `recursive` (default `false`) for scoped listings.
 - Security note: `sendTelegramFile` only sends files from the proxy `scratch/` directory and still enforces path + size checks. Subdirectory paths like `images/generated/file.png` are supported.
 
@@ -458,9 +460,22 @@ Key environment variables (see `.env.example` for complete list):
 
 See `config/telegram_env_example.txt` for the full list and examples.
 
-### Team Configuration (AutoGen)
+### Workflow Configuration (AutoGen / AG2)
 
-The AutoGen team source of truth is now [`src/autogen/team_builder.py`](src/autogen/team_builder.py). The proxy loads that Python-defined team directly at runtime.
+`WORKFLOW_FRAMEWORK` selects the backend used by the `runWorkflow` tool and `POST /v1/proxy/workflow`. It defaults to `autogen`.
+
+```env
+WORKFLOW_FRAMEWORK=autogen
+# allowed: autogen, ag2
+```
+
+The AutoGen team source of truth is [`src/autogen/team_builder.py`](src/autogen/team_builder.py). The proxy loads that Python-defined team directly at runtime.
+
+For automated installs, the wizard asks for the workflow backend. If you choose `ag2`, the installer runs `scripts/install_optional_workflow_backend.py` after the wizard and installs `ag2[openai]` into the main venv before verification. For manual installs, activate the venv and run:
+
+```bash
+pip install "ag2[openai]"
+```
 
 `config/team-config.json` is still kept for tools such as AutoGen Studio, but it is a generated export, not the primary definition. Refresh it with:
 
@@ -468,18 +483,20 @@ The AutoGen team source of truth is now [`src/autogen/team_builder.py`](src/auto
 python scripts/export_autogen_team_config.py
 ```
 
-`scripts/start_all.py` runs that export automatically before launching AutoGen Studio.
+`scripts/start_all.py` runs that export automatically before launching AutoGen Studio. It also preflights the selected `WORKFLOW_FRAMEWORK`; if `WORKFLOW_FRAMEWORK=ag2`, startup fails early with a clear AG2 dependency/API error instead of launching a partially usable stack. `scripts/restart_all.py` runs the same selected-backend check before stopping existing services.
 
 Security defaults:
 
 - The install wizard generates a real `JWT_SECRET`. If you replace it later, rotate any previously issued JWTs.
 - Public signup is disabled after first-user bootstrap unless `AUTH_ALLOW_PUBLIC_SIGNUP=true` or `AUTH_SIGNUP_INVITE_CODE` is configured.
 - CORS allows local/private origins by default. Set `CATBOT_CORS_ALLOWED_ORIGINS` for deployed clients instead of `CATBOT_CORS_ALLOW_ALL=true`.
-- Server-side fetch/proxy requests block private and loopback targets unless the endpoint is explicitly trusted or `CATBOT_OUTBOUND_ALLOW_PRIVATE=true`.
-- `AUTOGEN_REQUIRE_AUTH=true` keeps `POST /v1/proxy/autogen` behind authentication by default.
+- Server-side fetch/proxy requests block private and loopback targets unless explicitly allowed. For local model servers, prefer `OPENAI_PROXY_TRUSTED_BASE_URLS`; `OPENAI_PROXY_ALLOW_PRIVATE=true` is a broader model-only opt-in for authenticated users. `CATBOT_OUTBOUND_ALLOW_PRIVATE=true` remains the global outbound-policy override.
+- `AUTOGEN_REQUIRE_AUTH=true` keeps `POST /v1/proxy/autogen` and `POST /v1/proxy/workflow` behind authentication by default.
 - Browser users should call it with their normal JWT. Internal AutoGen/browser-bridge callers can use `CATBOT_AGENT_SECRET` (or the legacy `AUTOGEN_TEAM_SECRET`) via `X-Agent-Secret`.
 - `AUTOGEN_ENABLE_CODE_EXECUTION=false` leaves the Docker-backed Python execution tool disabled even when the optional AutoGen Docker extras are installed.
 - If you enable code execution later, ensure Docker is installed and running. The proxy server manages that executor lifecycle (start before first run, stop on reload or app shutdown).
+- `POST /v1/proxy/autogen` remains an AutoGen-only compatibility route. Use `POST /v1/proxy/workflow` for the selected backend.
+- AG2 is optional and lazy-loaded. When `WORKFLOW_FRAMEWORK=ag2`, configure `AG2_MODEL`, `AG2_BASE_URL`, `AG2_API_KEY`, `AG2_API_TYPE`, `AG2_MAX_ROUNDS`, and `AG2_ENABLE_CODE_EXECUTION`; unset values fall back to compatible existing AutoGen/OpenAI/OpenRouter env vars where possible. If AG2 is selected but not installed, the automated installer, `scripts/verify_install.py`, `scripts/start_all.py`, and `scripts/restart_all.py` report it clearly, and workflow execution returns a backend-not-available error.
 
 **Resources:**
 - [AutoGen Documentation](https://microsoft.github.io/autogen/)
@@ -587,6 +604,7 @@ To access from a remote device:
 
 **AI & Chat:**
 - `POST /v1/proxy/autogen` - AutoGen team-based chat endpoint (auth required by default; accepts JWT or internal agent secret)
+- `POST /v1/proxy/workflow` - Selected workflow backend endpoint (`WORKFLOW_FRAMEWORK=autogen` or `ag2`; auth behavior matches AutoGen)
 - `POST /v1/proxy/codex` - Codex CLI non-interactive runner (auth required; writes summary to scratch)
 - `POST /v1/proxy/restart` - Restart proxy server process to reload tool/code changes (auth required)
 - `POST /v1/telegram/chat` - Telegram bot chat endpoint
@@ -713,9 +731,9 @@ Telegram users talk to the CATBot assistant via a polling bot. The bot forwards 
 **Telegram tools (optional):**  
 Set `TELEGRAM_TOOLS_ENABLED=true` in the proxy environment to enable the same tool set as the web client. When enabled, the model can use tools (e.g. web search, read/write files in scratch, todo list, memory cache, workflows, news, calculate, store/search memories). The proxy parses `<tool>...</tool><parameters>...</parameters>` from the model reply, executes the tool server-side, and sends the result back to the model for a natural-language reply.
 
-- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageMemoryCache, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (AutoGen), runCodexCli (Codex CLI for CATBot code changes), restartProxyServer (restart proxy to load new/updated tools), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, sendTelegramFile (attach file from `scratch/` into current Telegram chat), storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). For JavaScript-heavy sites, pass `render_js=true` and optional `render_engine`, `wait_for_selector`, `js_wait_ms`. The same behaviour is supported in the web (HTML) client.
+- **Available in Telegram:** manageTodoList, executeTodoTask (run task with tools; human confirms completion), manageWorkingContext, navigateToUrl (returns link text), openChatToUser, calculate, runWorkflow (configured workflow backend), runCodexCli (Codex CLI for CATBot code changes), restartProxyServer (restart proxy to load new/updated tools), scrapeWebsite, webSearch, fetchNews, readFile, writeFile, listFiles, sendTelegramFile (attach file from `scratch/` into current Telegram chat), storeMemory, searchMemories, listMemories, deleteMemory, runBrowserAgent, runDeepResearch, uploadToGoogleDrive, llmQuery (or web-only message). Todo list is persistent and stored per user (or per Telegram chat if not linked). **scrapeWebsite** accepts a single `url` or an optional `urls` array; when `urls` is provided (e.g. from a prior webSearch), the backend tries each URL in order until one succeeds (scrape-with-retry). For JavaScript-heavy sites, pass `render_js=true` and optional `render_engine`, `wait_for_selector`, `js_wait_ms`. The same behaviour is supported in the web (HTML) client.
 - **Available in web and Telegram:** PDF to PowerPoint (`pdfToPowerPoint`) accepts PDF or Markdown sources from uploads, scratch-relative paths, and URLs, then produces a `.pptx` presentation.
-- **Config:** `config/catbot_system_prompt_with_tools.txt` (included) defines the tool list and format; placeholders `{{MEMORY_CACHE}}` and `{{TODO_LIST}}` are filled per conversation. Max tool-loop iterations per message: `TELEGRAM_TOOLS_MAX_ITERATIONS` (default 5).
+- **Config:** `config/catbot_system_prompt_with_tools.txt` (included) defines the tool list and format; placeholders `{{WORKING_CONTEXT}}` and `{{TODO_LIST}}` are filled per conversation. Max tool-loop iterations per message: `TELEGRAM_TOOLS_MAX_ITERATIONS` (default 5).
 
 ## Project Structure
 
@@ -878,11 +896,12 @@ Install all Python dependencies with: `pip install -r requirements.txt`
    - If the model returns tool calls inside fenced code blocks (```), Telegram will ignore them.
    - Check proxy logs for `Codex CLI not found` or `Codex CLI tool is disabled`.
 
-9. **AutoGen Workflow Returns 401**
-   - Confirm you are signed in before calling `/v1/proxy/autogen` from the web UI.
+9. **Workflow Returns 401 or AG2 Is Unavailable**
+   - Confirm you are signed in before calling `/v1/proxy/autogen` or `/v1/proxy/workflow` from the web UI.
    - For internal callers, set `CATBOT_AGENT_SECRET` (or `AUTOGEN_TEAM_SECRET`) and send it as `X-Agent-Secret`.
    - Leave `AUTOGEN_REQUIRE_AUTH=true` unless you intentionally want a public endpoint.
    - Leave `AUTOGEN_ENABLE_CODE_EXECUTION=false` unless you intentionally want Docker-backed execution inside the AutoGen team.
+   - If `WORKFLOW_FRAMEWORK=ag2`, run `python scripts/install_optional_workflow_backend.py` or `pip install "ag2[openai]"`, then rerun `python scripts/verify_install.py`.
 
 10. **MCP Browser Server Connection Issues**
    - Verify MCP Browser-Use server is running

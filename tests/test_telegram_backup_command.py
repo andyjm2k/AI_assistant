@@ -10,8 +10,11 @@ async def test_help_command_includes_backup() -> None:
     update = MagicMock()
     update.message = MagicMock()
     update.message.reply_text = AsyncMock()
+    update.effective_user = MagicMock()
+    update.effective_user.id = 123
 
-    await telegram_bot.help_command(update, MagicMock())
+    with patch("src.integrations.telegram_bot.is_admin_user", return_value=True):
+        await telegram_bot.help_command(update, MagicMock())
 
     update.message.reply_text.assert_awaited_once()
     text = update.message.reply_text.await_args.args[0]
@@ -27,7 +30,7 @@ async def test_backup_bot_command_starts_worker() -> None:
     update.effective_chat.id = 555
 
     with patch(
-        "src.integrations.telegram_bot._authorize_or_reject",
+        "src.integrations.telegram_bot._authorize_admin_or_reject",
         new=AsyncMock(return_value=123),
     ), patch("src.integrations.telegram_bot._spawn_backup_worker") as mock_spawn:
         await telegram_bot.backup_bot_command(update, MagicMock())
@@ -47,7 +50,7 @@ async def test_backup_bot_command_reports_launch_failure() -> None:
     update.effective_chat.id = 555
 
     with patch(
-        "src.integrations.telegram_bot._authorize_or_reject",
+        "src.integrations.telegram_bot._authorize_admin_or_reject",
         new=AsyncMock(return_value=123),
     ), patch(
         "src.integrations.telegram_bot._spawn_backup_worker",

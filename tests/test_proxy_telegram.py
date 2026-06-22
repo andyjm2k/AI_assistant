@@ -36,6 +36,14 @@ def _mock_openai_response(reply_text: str = "Mocked reply"):
     }
 
 
+@pytest.fixture(autouse=True)
+def _isolate_telegram_secret(monkeypatch):
+    """Keep Telegram endpoint tests independent of a locally configured .env secret."""
+    from src.servers import proxy_server as ps
+
+    monkeypatch.setattr(ps, "TELEGRAM_SECRET", None)
+
+
 def test_skill_tool_alias_maps_markdown_to_slides_variants_to_googleworkspace_cli():
     from src.servers import proxy_server as ps
 
@@ -581,6 +589,72 @@ class TestTelegramChatEndpoint:
         )
         assert assistant_turn["reasoning_details"][0]["text"] == "internal plan"
 
+    def test_memory_list_result_is_returned_without_llm_followup(self):
+        """Memory listings are authoritative and must not be rewritten by a fallback model."""
+        client = _get_client()
+        first_response = MagicMock()
+        first_response.status_code = 200
+        first_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_memory_list",
+                                "type": "function",
+                                "function": {
+                                    "name": "listMemories",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        hallucinated_followup = MagicMock()
+        hallucinated_followup.status_code = 200
+        hallucinated_followup.json.return_value = _mock_openai_response(
+            "There are memories stored for Patrick."
+        )
+        mock_memory_manager = MagicMock()
+        mock_memory_manager.list_memories.return_value = []
+
+        def getenv(key, default=None):
+            if key in ("OPENAI_API_KEY", "MCP_LLM_OPENAI_API_KEY"):
+                return "test-key"
+            if key == "MEMORY_AUTO_EXTRACT":
+                return "false"
+            return os.environ.get(key, default)
+
+        with patch("src.servers.proxy_server.TELEGRAM_TOOLS_ENABLED", True), patch(
+            "src.servers.proxy_server.MEMORY_AVAILABLE", True
+        ), patch("src.servers.proxy_server.memory_manager", mock_memory_manager), patch(
+            "src.servers.proxy_server.os.getenv", side_effect=getenv
+        ), patch("src.servers.proxy_server.httpx.AsyncClient") as mock_aclient:
+            mock_client_instance = MagicMock()
+            mock_client_instance.post = AsyncMock(
+                side_effect=[first_response, hallucinated_followup]
+            )
+            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+            mock_client_instance.__aexit__ = AsyncMock(return_value=None)
+            mock_aclient.return_value = mock_client_instance
+
+            resp = client.post(
+                "/v1/telegram/chat",
+                json={
+                    "message": "List my memories",
+                    "conversation_id": "memory-list-authoritative",
+                    "user_id": "6644154165",
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("reply") == "Here's what I found:\n\nNo memories."
+        assert mock_client_instance.post.await_count == 1
+        mock_memory_manager.list_memories.assert_called_once()
+
     def test_telegram_system_prompt_appends_native_tool_json_rules(self):
         from src.servers import proxy_server as ps
 
@@ -922,11 +996,21 @@ class TestTelegramToolsLoop:
 
         assert ps._format_telegram_tool_status("webSearch") == "On it. I'm looking for the best sources now."
         assert ps._format_telegram_tool_status("runDeepResearch") == "On it. I'm gathering sources and comparing them now."
+        assert ps._format_telegram_tool_status("run_deep_research") == "On it. I'm gathering sources and comparing them now."
         assert ps._format_telegram_tool_status("createSlidesPresentation") == "On it. I'm building the presentation now."
         assert ps._format_telegram_tool_status("pdfToPowerPoint") == "On it. I'm converting the document into a PowerPoint now."
+        assert ps._format_telegram_tool_status("health_check") == "On it. I'm checking the browser task status now."
+        assert ps._format_telegram_tool_status("filesystem.write_text") == (
+            "On it. I'm checking the workspace files now."
+        )
+        assert ps._format_telegram_tool_status("GitHubProjectManager.list_issues") == (
+            "On it. I'm checking GitHub for that now."
+        )
         assert ps._format_telegram_tool_status("googleworkspace_cli.gmail_list_unread") == (
             "On it. I'm checking your Google Workspace data now."
         )
+        fallback = ps._format_telegram_tool_status("customTool\n<script>")
+        assert fallback == "On it. I'm using customTool script for that now."
 
     def test_tool_loop_executes_native_tool_calls_and_returns_final_reply(self):
         """When LLM returns native message.tool_calls, proxy executes tools and returns final reply."""
@@ -1944,46 +2028,6 @@ class TestTelegramSkillPromptBlock:
         assert "<tool>googleworkspace_cli.gmail_list_all</tool>" in block
         assert "<tool>googleworkspace_cli.gmail_get_message</tool>" in block
         assert "googleworkspace_cli.run_readonly_command" not in block
-
-
-class TestAutoMemorySearchHelpers:
-    """Tests for Telegram auto-memory relevance helper logic."""
-
-    def test_is_memory_context_question_true_for_opinion_prompt(self):
-        from src.servers.proxy_server import _is_memory_context_question
-        assert _is_memory_context_question("What do you think about Rust for backend APIs?") is True
-
-    def test_is_memory_context_question_false_for_action_prompt(self):
-        from src.servers.proxy_server import _is_memory_context_question
-        assert _is_memory_context_question("Search for information about Rust web frameworks") is False
-
-    def test_filter_high_relevance_memories_drops_low_confidence_set(self):
-        from src.servers.proxy_server import _filter_high_relevance_memories
-        memories = [
-            {"text": "A", "similarity": 0.60},
-            {"text": "B", "similarity": 0.58},
-        ]
-        assert _filter_high_relevance_memories(memories) == []
-
-    def test_filter_high_relevance_memories_keeps_close_top_hits(self):
-        from src.servers.proxy_server import _filter_high_relevance_memories
-        memories = [
-            {"text": "Top", "similarity": 0.83},
-            {"text": "Close", "similarity": 0.78},
-            {"text": "Far", "similarity": 0.62},
-        ]
-        out = _filter_high_relevance_memories(memories)
-        assert [m["text"] for m in out] == ["Top", "Close"]
-
-    def test_filter_high_relevance_memories_excludes_task_learning_and_operational(self):
-        from src.servers.proxy_server import _filter_high_relevance_memories
-        memories = [
-            {"text": "Useful preference", "category": "preference", "similarity": 0.86},
-            {"text": "Task outcome memory. Task: deploy app", "category": "task_experience", "source": "task_execution", "similarity": 0.84},
-            {"text": "Todo list: 1. buy milk", "category": "general", "similarity": 0.83},
-        ]
-        out = _filter_high_relevance_memories(memories)
-        assert [m.get("text") for m in out] == ["Useful preference"]
 
 
 class TestResolveTodoUserForTelegram:

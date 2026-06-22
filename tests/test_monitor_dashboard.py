@@ -2,15 +2,33 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 
 def _client():
     from src.servers.proxy_server import app
     return TestClient(app)
+
+
+def _install_monitor_test_user(monkeypatch, username="monitor-user", password="password123"):
+    from src.servers import proxy_server as ps
+
+    monkeypatch.setattr(
+        ps,
+        "users_db",
+        {
+            username: {
+                **ps.create_password_record(password),
+                "created_at": "2026-06-05T00:00:00+00:00",
+            }
+        },
+    )
+    monkeypatch.setattr(ps, "save_users_db", lambda: None)
+    return username, password
 
 
 def test_monitor_summary_exposes_agent_run_counts():
@@ -35,6 +53,136 @@ def test_monitor_summary_exposes_agent_run_counts():
     assert data["browser_use_active_runs"] == 1
     assert data["philosopher_active_runs"] == 1
     assert data["task_execution_active_runs"] == 1
+
+
+def test_monitor_access_accepts_catbot_auth_cookie_for_remote_request(monkeypatch):
+    from src.servers import proxy_server as ps
+
+    username, _ = _install_monitor_test_user(monkeypatch)
+    token = ps.create_jwt({"sub": username})
+    request = MagicMock()
+    request.headers = {}
+    request.cookies = {ps.AUTH_COOKIE_NAME: token}
+    request.client.host = "203.0.113.10"
+
+    ps._require_internal_or_local_access(request, "monitoring")
+
+
+def test_monitor_summary_accepts_auth_cookie_for_remote_client(monkeypatch):
+    from src.servers import proxy_server as ps
+
+    username, _ = _install_monitor_test_user(monkeypatch)
+    token = ps.create_jwt({"sub": username})
+    with TestClient(
+        ps.app,
+        client=("203.0.113.10", 50000),
+        cookies={ps.AUTH_COOKIE_NAME: token},
+    ) as client:
+        response = client.get("/monitor/summary")
+
+    assert response.status_code == 200, response.text
+    assert "uptime_seconds" in response.json()
+
+
+def test_monitoring_alias_accepts_auth_cookie_for_remote_client(monkeypatch):
+    from src.servers import proxy_server as ps
+
+    username, _ = _install_monitor_test_user(monkeypatch)
+    token = ps.create_jwt({"sub": username})
+    with TestClient(
+        ps.app,
+        client=("203.0.113.10", 50000),
+        cookies={ps.AUTH_COOKIE_NAME: token},
+    ) as client:
+        response = client.get("/monitoring")
+
+    assert response.status_code == 200, response.text
+    assert "CATBot Monitoring Dashboard" in response.text
+
+
+def test_login_then_monitoring_alias_uses_auth_cookie(monkeypatch):
+    from src.servers import proxy_server as ps
+
+    username, password = _install_monitor_test_user(monkeypatch)
+    with TestClient(ps.app, client=("203.0.113.10", 50000)) as client:
+        login_response = client.post("/v1/auth/login", json={"username": username, "password": password})
+        dashboard_response = client.get("/monitoring")
+
+    assert login_response.status_code == 200, login_response.text
+    assert dashboard_response.status_code == 200, dashboard_response.text
+    assert "CATBot Monitoring Dashboard" in dashboard_response.text
+
+
+def test_auth_me_accepts_auth_cookie_without_header(monkeypatch):
+    from src.servers import proxy_server as ps
+
+    username, _ = _install_monitor_test_user(monkeypatch)
+    token = ps.create_jwt({"sub": username})
+    with TestClient(ps.app, cookies={ps.AUTH_COOKIE_NAME: token}) as client:
+        response = client.get("/v1/auth/me")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["username"] == username
+
+
+def test_monitor_data_returns_programmatic_snapshot():
+    client = _client()
+    response = client.get("/monitoring/data?status_limit=2&log_limit=2&include_workflows=false")
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert "summary" in data
+    assert "system_stats" in data
+    assert "app_info" in data
+    assert "status_events" in data
+    assert "logs" in data
+    assert "cpu" in data["system_stats"]
+    assert "memory" in data["system_stats"]
+
+
+def test_telegram_native_tools_register_monitoring_snapshot():
+    from src.servers import proxy_server as ps
+
+    tools = ps._get_telegram_native_tools_mcp_schema()
+    names = {item["name"] for item in tools}
+
+    assert "getMonitoringSnapshot" in names
+
+
+def test_monitor_access_rejects_remote_request_without_catbot_auth():
+    from src.servers import proxy_server as ps
+
+    request = MagicMock()
+    request.headers = {}
+    request.cookies = {}
+    request.client.host = "203.0.113.10"
+
+    with pytest.raises(HTTPException) as exc_info:
+        ps._require_internal_or_local_access(request, "monitoring")
+    assert exc_info.value.status_code == 401
+
+
+def test_auth_login_sets_monitor_cookie(monkeypatch):
+    from src.servers import proxy_server as ps
+
+    username, password = _install_monitor_test_user(monkeypatch)
+    client = _client()
+    response = client.post("/v1/auth/login", json={"username": username, "password": password})
+
+    assert response.status_code == 200, response.text
+    assert response.cookies.get(ps.AUTH_COOKIE_NAME)
+
+
+def test_auth_me_refreshes_monitor_cookie_from_existing_header_token(monkeypatch):
+    from src.servers import proxy_server as ps
+
+    username, _ = _install_monitor_test_user(monkeypatch)
+    token = ps.create_jwt({"sub": username})
+    client = _client()
+    response = client.get("/v1/auth/me", headers={"X-Auth-Token": token})
+
+    assert response.status_code == 200, response.text
+    assert response.cookies.get(ps.AUTH_COOKIE_NAME) == token
 
 
 def test_monitor_workflows_returns_recent_autogen_and_browser_use_activity():
@@ -172,6 +320,9 @@ def test_monitor_dashboard_html_links_tiles_to_detail_route():
     assert 'id="detail-breadcrumb"' in html
     assert 'Back to overview' in html
     assert 'if (detailLayout) detailLayout.hidden = !DETAIL_MODE;' in html
+    assert 'const AUTH_TOKEN_STORAGE_KEY = "jwtAuthToken";' in html
+    assert 'headers.set("X-Auth-Token", token);' in html
+    assert 'credentials: "same-origin"' in html
     assert "Proxy Uptime" not in html
 
 

@@ -1,66 +1,68 @@
 # Automatic Memory-Aware Conversation
 
 ## Product Purpose
-CATBot can proactively search memory before answering certain kinds of questions. Instead of waiting for the model to choose a memory tool call, the web client detects opinion- and knowledge-style prompts and injects relevant memory context into the request automatically.
+
+CATBot retrieves relevant durable memory before a response so Electron and
+Telegram can personalize answers without relying on the model to call a memory
+tool.
 
 ## User-Facing Behavior
-- When the user asks a reflective or knowledge-oriented question, CATBot can answer with remembered preferences, prior discussions, and stored context.
-- Action-oriented prompts skip this automatic memory search so operational requests do not get cluttered with irrelevant conversational memory.
-- Philosopher mode suppresses the normal auto-search path because it manages its own reflective memory context.
-- The memory search happens before the main reply and is intended to be invisible unless it materially changes the answer quality.
+
+- Normal conversations can use remembered preferences, profile facts, and
+  relevant prior interactions.
+- Retrieval is scoped to the authenticated user.
+- Task execution records do not enter normal conversation context.
+- Philosopher mode uses its own scoped retrieval path.
+- Retrieval failures do not block the main conversation.
 
 ## How It Works
-- `js/app.js` implements `isOpinionOrKnowledgeQuestion(prompt)`, which uses pattern matching to distinguish reflective or informational prompts from action requests.
-- If the prompt qualifies, `autoSearchMemoriesForQuestion(prompt)` calls the backend memory search path and requests a small, relevant set of memories using tuned thresholds.
-- During main message preparation, the frontend checks whether philosopher mode is active. If it is not, memory context from `autoSearchMemoriesForQuestion()` is appended to `effectiveSystemPrompt`.
-- The injected block explicitly tells the model that the appended snippets are relevant context from previous conversations and should be used to personalize the answer.
-- On the backend, `src/servers/proxy_server.py` exposes `/v1/memory/search`, and Telegram has a similar but separate memory-aware flow using `_extract_memory_search_query()` and Telegram-specific thresholds when tool-enabled conversation is running there.
-- The underlying memory results come from `MemoryManager.search_memories()` and then inherit any filtering rules defined for conversational context.
 
-## Expanded Flow Diagram
+The Electron client calls `POST /v1/memory/context` with the current prompt,
+conversation ID, item limit, and token budget. The server:
+
+1. Derives the namespace from the authenticated username.
+2. Filters active, unexpired conversation-memory kinds before ranking.
+3. Combines lexical and compatible semantic scores.
+4. Deduplicates and diversifies the results.
+5. Escapes memory text and returns a bounded `<memory_evidence>` block that
+   explicitly labels the content as untrusted data.
+
+Telegram calls the same `MemoryManager.build_context()` policy with its
+server-owned user key. Neither channel implements its own memory classifier,
+ranking thresholds, or prompt formatter.
+
+## Flow
+
 ```mermaid
 flowchart TD
-    Prompt[User prompt] --> Detect[isOpinionOrKnowledgeQuestion]
-    Detect -->|Action request| Direct[Skip auto memory search]
-    Detect -->|Opinion or knowledge| Search[autoSearchMemoriesForQuestion]
-    Search --> Proxy[/v1/memory/search]
-    Proxy --> Manager[MemoryManager.search_memories]
-    Manager --> Vector[Vector store similarity search]
-    Vector --> Results[Ranked memory snippets]
-    Results --> Filter[Conversation-context filtering]
-    Filter --> Inject[Append memory context to effectiveSystemPrompt]
-    Direct --> Request[Main chat request]
-    Inject --> Request
-    Request --> Model[Final model response]
+    Prompt[User prompt] --> Endpoint[/v1/memory/context]
+    Endpoint --> Auth[Authenticated namespace]
+    Auth --> Retrieve[Shared hybrid retrieval]
+    Retrieve --> Safe[Safe bounded evidence block]
+    Safe --> Inject[Append to system prompt]
+    Inject --> Model[Generate response]
 ```
 
 ## Primary Code References
-- `js/app.js`
-  Key detection logic: `isOpinionOrKnowledgeQuestion(prompt)`.
-- `js/app.js`
-  Key retrieval logic: `autoSearchMemoriesForQuestion(prompt)`.
-- `js/app.js`
-  Request assembly path where `memoryContext` is appended to `effectiveSystemPrompt` before the main send.
-- `src/servers/proxy_server.py`
-  Memory query helper: `_extract_memory_search_query(message_text)` for Telegram-side topic extraction.
-- `src/servers/proxy_server.py`
-  Memory route: `@app.post("/v1/memory/search")`.
-- `src/memory/memory_manager.py`
-  Retrieval path: `search_memories(...)` and `filter_memories_for_conversation_context(...)`.
-- `docs/SYSTEM_FLOW_DIAGRAM.md`
-  Cross-system explanation of the opinion/action branching and auto-search behavior.
 
-## Data and Dependencies
-- Depends on the long-term memory system being initialized and embeddings being available.
-- Uses the current prompt text itself as the basis for retrieval, sometimes after extracting a more focused search phrase.
-- The injected context is ephemeral per request; it is not itself a permanent prompt rewrite.
+- `js/app.js`: `fetchConversationMemoryContext(prompt)` and request assembly.
+- `src/servers/memory_api.py`: authenticated context endpoint.
+- `src/memory/retrieval_service.py`: candidate filtering and hybrid ranking.
+- `src/memory/context_builder.py`: prompt-safe context construction.
+- `src/servers/proxy_server.py`: Telegram conversation integration.
 
-## Constraints and Notes
-- This feature is intentionally selective. If every prompt triggered memory retrieval, the assistant would overfit to stale or irrelevant context.
-- Browser and Telegram flows are similar in intent but not identical in implementation detail.
-- The quality of this feature depends on both retrieval accuracy and the memory-quality filters that keep noisy operational state out of the conversational context set.
+## Constraints
+
+- Memory evidence can be stale or malicious and must never be treated as
+  instructions.
+- The server owns namespace selection; client-supplied user identifiers are not
+  trusted.
+- Context is bounded by both result count and token estimate.
+- Explicit memory tools remain available for user-directed inspection and
+  management.
 
 ## Related Docs
+
 - [Prompt and Persona Layering](12_prompt_and_persona_layering.md)
 - [Long-Term Memory System](14_long_term_memory_system.md)
 - [Memory Quality Controls](15_memory_quality_controls.md)

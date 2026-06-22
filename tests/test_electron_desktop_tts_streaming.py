@@ -82,6 +82,33 @@ def test_desktop_tts_treats_octet_stream_pcm_as_audio_for_pocket_fast_path():
     assert "buildDesktopWavArrayBufferFromPcm" in main
 
 
+def test_desktop_tts_uses_embedded_routes_when_tts_and_catbot_share_an_origin():
+    main = ELECTRON_MAIN.read_text(encoding="utf-8")
+
+    assert "function areSameUrlOrigins(left, right)" in main
+    assert "const useEmbeddedTtsEndpoint = areSameUrlOrigins(apiOrigin, ttsEndpointOrigin);" in main
+    assert "? `${apiOrigin}/v1/audio/speech`" in main
+    assert 'const voicesPath = useEmbeddedTtsEndpoint ? "/v1/audio/voices" : "/v1/proxy/tts/voices";' in main
+
+
+def test_desktop_renderer_lets_main_process_resolve_streaming_backend():
+    avatar = ELECTRON_AVATAR.read_text(encoding="utf-8")
+
+    streaming_guard = avatar.split("const shouldUseStreamingSpeech = Boolean(", 1)[1].split(");", 1)[0]
+    assert "synthesizePreviewSpeechStream" in streaming_guard
+    assert "isPocketTtsModelName(state.ttsModel)" not in streaming_guard
+
+
+def test_desktop_client_config_fetch_includes_desktop_auth():
+    main = ELECTRON_MAIN.read_text(encoding="utf-8")
+
+    client_config_fetch = main.split("async function getDesktopClientConfig", 1)[1].split(
+        "const DESKTOP_OPENAI_TTS_FALLBACK_VOICES", 1
+    )[0]
+    assert 'net.fetch(`${apiOrigin}/v1/client-config`' in client_config_fetch
+    assert 'headers: buildProxyRequestHeaders({ Accept: "application/json" })' in client_config_fetch
+
+
 def test_desktop_pocket_streaming_uses_quality_buffering_defaults():
     main = ELECTRON_MAIN.read_text(encoding="utf-8")
     avatar = ELECTRON_AVATAR.read_text(encoding="utf-8")

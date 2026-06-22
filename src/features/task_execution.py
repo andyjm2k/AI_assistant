@@ -31,6 +31,7 @@ STATUS_EXECUTING = "executing"
 STATUS_PAUSED_AWAITING_FEEDBACK = "paused_awaiting_feedback"
 STATUS_AWAITING_CONFIRMATION = "awaiting_confirmation"
 STATUS_CANCELLED = "cancelled"
+STATUS_FAILED = "failed"
 
 # Phrases in LLM content that trigger pause or done (case-insensitive)
 PAUSE_PHRASES = [
@@ -44,6 +45,18 @@ DONE_PHRASES = [
     "completed the task", "task has been completed", "i've completed", "i have completed the task",
 ]
 _GENERIC_DONE_MESSAGE_MAX_CHARS = 140
+_MAX_CONSECUTIVE_LLM_FAILURES = 3
+_AUTOMATIC_CONTINUE_PROMPT = (
+    "Continue automatically. No human input is required. Keep working toward the todo goal. "
+    "If you described a next step, perform it now with the appropriate tool. "
+    "Do not stop until the requested deliverable has been created and verified, or you explicitly "
+    "need information or a decision that only the user can provide."
+)
+_MALFORMED_TOOL_ARGUMENTS_MESSAGE = (
+    "The tool call arguments were invalid or truncated JSON, so the tool was not executed. "
+    "Retry the tool call now with complete valid JSON. For a large filesystem.write_text payload, "
+    "write a smaller first chunk and then use additional calls with append=true."
+)
 _GENERIC_DONE_PHRASES = tuple(
     sorted(
         {
@@ -481,10 +494,11 @@ class TodoTaskExecutor:
             "Response rules: when another tool is needed, call the tool immediately instead of narrating the next step. "
             "Do not say you will use a tool later; either emit the tool call now or give a substantive progress update/result. "
             "Do not ask the user to repeat filenames, URLs, search results, or prior tool output already available in the conversation. "
-            "Tool selection: For CATBot codebase changes or new tool capabilities, prefer runCodexCli with a clear prompt. "
+            "Tool selection: For CATBot codebase changes or new tool capabilities, prefer runCodexCli with a clear, self-contained prompt that includes the user's actual request, any relevant error text, and instructions to inspect/search the repository before editing. Do not call runCodexCli with a generic prompt like 'do it' or 'read files'. "
             "For other coding tasks (building apps, generating code, creating scripts), prefer runWorkflow with a clear contentPrompt rather than writing code manually with filesystem.write_text. "
             "For web tasks that need browser actions (navigate, click, fill forms, automate a site), use run_browser_agent with an instruction. "
             "For in-depth research (compare sources, gather information across many pages, produce a research report), use run_deep_research with a research_task. "
+            "When writing a long final document, keep each filesystem.write_text call small enough to fit safely in one tool call; write the first chunk with append=false, then add further chunks with append=true. "
             "Before finishing: always write the final output (report, summary, code, or results) to a file using the filesystem.write_text tool so the user has a persistent copy; then say you have finished the work for this task."
         )
         self.messages = [{"role": "system", "content": system}]
@@ -573,7 +587,7 @@ class TodoTaskExecutor:
         messages: List[Dict],
         tools: Optional[List[Dict]] = None,
         temperature: float = 0.6,
-        max_tokens: int = 2000,
+        max_tokens: int = 8192,
         allow_summarize: bool = True,
         _retry_on_context_error: bool = True,
     ) -> Optional[Dict]:
@@ -713,6 +727,7 @@ class TodoTaskExecutor:
         tools = await self._get_tools()
         last_message = ""
         last_successful_tool_result = ""
+        consecutive_llm_failures = 0
         await self._emit_progress(
             "workflow_start",
             task_id=self.task_id,
@@ -748,16 +763,39 @@ class TodoTaskExecutor:
             )
             llm_response = await self._call_llm(self.messages, tools=tools if tools else None)
             if not llm_response:
+                consecutive_llm_failures += 1
+                if (
+                    consecutive_llm_failures < _MAX_CONSECUTIVE_LLM_FAILURES
+                    and self.iteration_count < self.max_iterations
+                ):
+                    await self._emit_progress(
+                        "llm_retry",
+                        task_id=self.task_id,
+                        workflow_name=self.task_description,
+                        phase="executing",
+                        message=(
+                            "The model/provider did not return a usable response; "
+                            f"retrying automatically ({consecutive_llm_failures}/"
+                            f"{_MAX_CONSECUTIVE_LLM_FAILURES - 1})."
+                        ),
+                        current_step=self.iteration_count,
+                        total_steps=self.max_iterations,
+                    )
+                    continue
                 await self._emit_progress(
                     "llm_no_response",
                     task_id=self.task_id,
                     workflow_name=self.task_description,
-                    phase="awaiting_confirmation",
-                    message="Task execution stopped because the model returned no response.",
+                    phase=STATUS_FAILED,
+                    message="Task execution failed because the model/provider repeatedly returned no usable response.",
                     current_step=self.iteration_count,
                     total_steps=self.max_iterations,
                 )
-                return (STATUS_AWAITING_CONFIRMATION, last_message or self.last_error or "Execution stopped (no response).")
+                error_message = self.last_error or "Execution stopped after repeated model/provider failures."
+                if last_message:
+                    error_message = f"{error_message}\n\nLast progress update: {last_message}"
+                return (STATUS_FAILED, error_message)
+            consecutive_llm_failures = 0
             content = (llm_response.get("content") or "").strip()
             tool_calls = llm_response.get("tool_calls")
             pending_status: Optional[str] = None
@@ -793,41 +831,69 @@ class TodoTaskExecutor:
                     total_steps=self.max_iterations,
                     tool_call_count=len(tool_calls),
                 )
-                self.messages.append(
+                assistant_history = dict(
                     llm_response.get("message") or {
                         "role": "assistant",
                         "content": content or None,
-                        "tool_calls": tool_calls,
                     }
                 )
+                history_tool_calls = []
                 for tc in tool_calls:
+                    history_tc = dict(tc)
+                    history_tc["function"] = dict(tc.get("function") or {})
+                    history_tool_calls.append(history_tc)
+                assistant_history["tool_calls"] = history_tool_calls
+                self.messages.append(assistant_history)
+                tool_batch_failed = False
+                for tc, history_tc in zip(tool_calls, history_tool_calls):
                     fn = tc.get("function", {})
                     name = fn.get("name")
                     raw_args = fn.get("arguments", "{}")
                     args = raw_args
+                    parse_error: Optional[str] = None
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as exc:
                             args = {}
+                            parse_error = str(exc)
+                    if not isinstance(args, dict):
+                        parse_error = parse_error or "Tool arguments must decode to a JSON object."
+                        args = {}
                     # Log raw arguments when empty or when file-write calls lack a target path.
-                    if not args or (
+                    if parse_error or not args or (
                         name in {"write_file", "filesystem.write_text"}
                         and not (args.get("filename") or args.get("path") or args.get("content"))
                     ):
                         print(f"[TASK_EXEC] Tool {name!r} raw arguments: {raw_args!r}", flush=True)
+                    if parse_error:
+                        history_tc["function"]["arguments"] = "{}"
+                        tool_batch_failed = True
+                        error_text = f"Error: {_MALFORMED_TOOL_ARGUMENTS_MESSAGE} Parser detail: {parse_error}"
+                        self._record_tool_usage(name, error_text, errored=True)
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id"),
+                            "content": error_text,
+                        })
+                        continue
+                    history_tc["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
                     try:
                         result = await self.tool_executor(name, args)
+                        result_is_error = self._looks_like_tool_error_result(result)
                         self._record_tool_usage(name, result, errored=False)
                         result_text = str(result).strip()
-                        if result_text:
+                        if result_text and not result_is_error:
                             last_successful_tool_result = result_text
+                        if result_is_error:
+                            tool_batch_failed = True
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": tc.get("id"),
                             "content": str(result),
                         })
                     except Exception as e:
+                        tool_batch_failed = True
                         self._record_tool_usage(name, str(e), errored=True)
                         self.messages.append({
                             "role": "tool",
@@ -835,7 +901,9 @@ class TodoTaskExecutor:
                             "content": f"Error: {e}",
                         })
                 last_message = content or last_message
-                if pending_status:
+                if pending_status and (
+                    pending_status == STATUS_PAUSED_AWAITING_FEEDBACK or not tool_batch_failed
+                ):
                     final_message = _select_completion_message(last_message or content or "", last_successful_tool_result)
                     print(
                         f"[TASK_EXEC] Detected {pending_status} in assistant message after tool execution "
@@ -851,6 +919,16 @@ class TodoTaskExecutor:
                         total_steps=self.max_iterations,
                     )
                     return (pending_status, final_message or last_message or content or "")
+                if pending_status == STATUS_AWAITING_CONFIRMATION and tool_batch_failed:
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous completion claim cannot be accepted because at least one required "
+                                "tool call failed. Continue automatically and retry or repair the failed step."
+                            ),
+                        }
+                    )
                 continue
             self.messages.append({"role": "assistant", "content": content or "(No content)"})
             last_message = content
@@ -870,27 +948,32 @@ class TodoTaskExecutor:
                     )
                     return (status, final_message or last_message)
             if self.iteration_count >= self.max_iterations:
-                print(f"[TASK_EXEC] Reached max iterations ({self.max_iterations}), returning awaiting_confirmation")
+                print(f"[TASK_EXEC] Reached max iterations ({self.max_iterations}) before completion")
                 await self._emit_progress(
                     "max_iterations_reached",
                     task_id=self.task_id,
                     workflow_name=self.task_description,
-                    phase="awaiting_confirmation",
-                    message=f"Reached max iterations ({self.max_iterations}).",
+                    phase=STATUS_FAILED,
+                    message=f"Reached the safety limit of {self.max_iterations} iterations before completion.",
                     current_step=self.iteration_count,
                     total_steps=self.max_iterations,
                 )
-                return (STATUS_AWAITING_CONFIRMATION, last_message or f"Reached max iterations ({self.max_iterations}).")
+                message = f"Reached the safety limit of {self.max_iterations} iterations before the task was completed."
+                if last_message:
+                    message += f"\n\nLast progress update: {last_message}"
+                return (STATUS_FAILED, message)
+            if content:
+                self.messages.append({"role": "user", "content": _AUTOMATIC_CONTINUE_PROMPT})
         await self._emit_progress(
-            "workflow_complete",
+            "workflow_incomplete",
             task_id=self.task_id,
             workflow_name=self.task_description,
-            phase="awaiting_confirmation",
-            message=last_message or "Done.",
+            phase=STATUS_FAILED,
+            message=last_message or "Task execution ended before completion.",
             current_step=self.iteration_count,
             total_steps=self.max_iterations,
         )
-        return (STATUS_AWAITING_CONFIRMATION, last_message or "Done.")
+        return (STATUS_FAILED, last_message or "Task execution ended before completion.")
 
     def add_user_message(self, text: str) -> None:
         self.messages.append({"role": "user", "content": (text or "").strip()})

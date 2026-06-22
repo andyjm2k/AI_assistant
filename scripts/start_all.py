@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.runtime_env import build_script_env, resolve_project_root, resolve_venv_dir, resolve_venv_python
+from scripts.verify_install import check_workflow_backend
 
 PROJECT_ROOT = resolve_project_root()
 BASE_REQUIRED_PORTS = {8000, 8002, 5001, 8383}
@@ -48,6 +49,10 @@ def _resolve_autogenstudio_command() -> str | None:
 
 def _build_child_env() -> dict[str, str]:
     return build_script_env(PROJECT_ROOT, python_exe=VENV_PYTHON)
+
+
+def _check_selected_workflow_backend() -> tuple[bool, str]:
+    return check_workflow_backend(VENV_PYTHON)
 
 
 def _launch_in_new_cmd(
@@ -138,6 +143,13 @@ def _wait_for_required_ports(ports: set[int], timeout_seconds: float = STARTUP_V
 
 
 def main() -> int:
+    workflow_ok, workflow_message = _check_selected_workflow_backend()
+    if not workflow_ok:
+        print("Selected workflow backend check failed:")
+        print(f"  {workflow_message}")
+        return 1
+    print(f"Selected workflow backend OK: {workflow_message}")
+
     # Keep AutoGen Studio's JSON input in sync with the Python source of truth.
     child_env = _build_child_env()
     subprocess.run(

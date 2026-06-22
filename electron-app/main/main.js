@@ -83,6 +83,7 @@ const DESKTOP_REPLY_EMOTION_RESET_DELAY_MS = 2200;
 const DESKTOP_ERROR_EMOTION_RESET_DELAY_MS = 4500;
 const DESKTOP_AUTH_GREETING_TEXT = "Hi, I'm ready when you are.";
 const DESKTOP_JWT_EXPIRY_LEEWAY_SECONDS = 30;
+const DEFAULT_AUTH_COOKIE_NAME = "catbot_auth_token";
 const CERT_VERIFY_RESULT_DEFAULT = -3;
 const CERT_VERIFY_RESULT_OK = 0;
 const AVATAR_WINDOW_TOP_CHROME_GUARD_PX = 32;
@@ -281,6 +282,12 @@ function extractOriginFromUrlLike(value) {
     const match = normalized.match(/^(https?:\/\/[^/]+)/i);
     return match ? match[1] : normalized.replace(/\/v1$/i, "");
   }
+}
+
+function areSameUrlOrigins(left, right) {
+  const leftOrigin = extractOriginFromUrlLike(left);
+  const rightOrigin = extractOriginFromUrlLike(right);
+  return Boolean(leftOrigin && rightOrigin && leftOrigin.toLowerCase() === rightOrigin.toLowerCase());
 }
 
 function parseUrlLike(value) {
@@ -1987,6 +1994,34 @@ function saveDesktopAuth() {
   });
 }
 
+function getCatbotAuthCookieName() {
+  const env = readSimpleEnv(ENV_FILE);
+  const projectEnv = readSimpleEnv(PROJECT_ENV_FILE);
+  return String(process.env.AUTH_COOKIE_NAME || projectEnv.AUTH_COOKIE_NAME || env.AUTH_COOKIE_NAME || DEFAULT_AUTH_COOKIE_NAME).trim() || DEFAULT_AUTH_COOKIE_NAME;
+}
+
+function getDesktopProxyCookieOrigin() {
+  const parsed = parseUrlLike(state.proxyBaseUrl || DEFAULT_STATE.proxyBaseUrl || DEFAULT_PROXY_BASE_URL);
+  if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+    return "";
+  }
+  return parsed.origin;
+}
+
+function clearDesktopProxyAuthCookie() {
+  const cookieOrigin = getDesktopProxyCookieOrigin();
+  const cookieName = getCatbotAuthCookieName();
+  if (!cookieOrigin || !cookieName || !session?.defaultSession?.cookies?.remove) {
+    return Promise.resolve(false);
+  }
+  return session.defaultSession.cookies.remove(cookieOrigin, cookieName)
+    .then(() => true)
+    .catch((error) => {
+      appendRuntimeLog(`[auth] failed to clear proxy auth cookie: ${String(error?.message || error)}`);
+      return false;
+    });
+}
+
 function hasUsableDesktopAuthToken(options = {}) {
   if (isDesktopJwtTokenUsable(desktopAuth?.accessToken)) {
     return true;
@@ -2021,6 +2056,7 @@ function clearDesktopAuth(options = {}) {
   const shouldBroadcast = options.broadcast !== false;
   desktopAuth = { ...desktopAuth, accessToken: "", username: "" };
   saveDesktopAuth();
+  clearDesktopProxyAuthCookie();
   if (shouldApplyWindowState) {
     applyAvatarWindowState();
   }
@@ -4237,7 +4273,7 @@ async function getDesktopClientConfig(apiOrigin, options = {}) {
   try {
     const response = await net.fetch(`${apiOrigin}/v1/client-config`, {
       method: "GET",
-      headers: { Accept: "application/json" },
+      headers: buildProxyRequestHeaders({ Accept: "application/json" }),
       signal: controller.signal
     });
     const responseText = await response.text();
@@ -4382,6 +4418,7 @@ async function listDesktopTtsVoices(payload = {}) {
   }
 
   const cacheKey = JSON.stringify([apiOrigin, endpointOrigin, ttsModel]);
+  const useEmbeddedTtsEndpoint = areSameUrlOrigins(apiOrigin, endpointOrigin);
   let fetchedVoices = [];
   if (
     desktopTtsVoiceCache.key === cacheKey &&
@@ -4393,12 +4430,17 @@ async function listDesktopTtsVoices(payload = {}) {
     const providerApiKey = String(payload.chatApiKey || desktopAuth.chatApiKey || "").trim();
     const proxyAuthToken = String(desktopAuth.accessToken || "").trim();
     if (shouldAllowEndpointOverride(endpointOrigin, providerApiKey, proxyAuthToken)) {
-      const query = new URLSearchParams({ endpoint: endpointOrigin });
+      const query = new URLSearchParams();
+      if (!useEmbeddedTtsEndpoint) {
+        query.set("endpoint", endpointOrigin);
+      }
       if (ttsModel) {
         query.set("model", ttsModel);
       }
+      const voicesPath = useEmbeddedTtsEndpoint ? "/v1/audio/voices" : "/v1/proxy/tts/voices";
+      const voicesUrl = `${apiOrigin}${voicesPath}?${query.toString()}`;
       try {
-        const response = await net.fetch(`${apiOrigin}/v1/proxy/tts/voices?${query.toString()}`, {
+        const response = await net.fetch(voicesUrl, {
           method: "GET",
           headers: buildProxyRequestHeaders({ Accept: "application/json" }, { providerApiKey })
         });
@@ -5292,6 +5334,7 @@ async function buildDesktopPreviewSpeechRequest(payload = {}) {
     ? String(clientConfig.ttsVoice || "").trim()
     : requestedVoice;
   const usePocketFastPath = isPocketTtsModelName(ttsModel);
+  const useEmbeddedTtsEndpoint = areSameUrlOrigins(apiOrigin, ttsEndpointOrigin);
   const requestBody = {
     input: ttsInputText,
     stream: usePocketFastPath,
@@ -5311,11 +5354,14 @@ async function buildDesktopPreviewSpeechRequest(payload = {}) {
   return {
     apiOrigin,
     providerApiKey,
-    proxyUrl: ttsEndpointOrigin
+    proxyUrl: useEmbeddedTtsEndpoint
+      ? `${apiOrigin}/v1/audio/speech`
+      : ttsEndpointOrigin
       ? `${apiOrigin}/v1/proxy/tts/speech?endpoint=${encodeURIComponent(ttsEndpointOrigin)}`
       : `${apiOrigin}/v1/proxy/tts/speech`,
     requestBody,
-    usePocketFastPath
+    usePocketFastPath,
+    useEmbeddedTtsEndpoint
   };
 }
 

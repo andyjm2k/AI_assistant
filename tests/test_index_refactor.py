@@ -99,16 +99,15 @@ class TestIndexRefactorAssets:
         assert "type: 'image_url'" in content
         assert "hasPendingImageAttachments" in content
 
-    def test_app_js_filters_auto_memory_context_noise(self):
-        """Browser auto-memory injection should exclude task-learning and operational memories."""
+    def test_app_js_uses_shared_prompt_safe_memory_context(self):
+        """Browser memory injection must delegate filtering and formatting to the server."""
         path = PROJECT_ROOT / "js" / "app.js"
         content = path.read_text(encoding="utf-8")
-        assert "function isConversationContextMemory(mem)" in content
-        assert "task_experience" in content
-        assert "task_learning" in content
-        assert "task_execution" in content
-        assert "operationalPattern" in content
-        assert ".filter(isConversationContextMemory)" in content
+        assert "async function fetchConversationMemoryContext(prompt)" in content
+        assert "fetchProxyEndpoint('/v1/memory/context'" in content
+        assert "purpose: 'conversation'" in content
+        assert "function isConversationContextMemory(mem)" not in content
+        assert ".filter(isConversationContextMemory)" not in content
 
     def test_app_js_can_resolve_scratch_relative_pdfs_for_pdf_to_powerpoint(self):
         """pdfToPowerPoint should resolve PDF and Markdown sources from multiple source types."""

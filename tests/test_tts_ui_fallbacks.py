@@ -50,6 +50,12 @@ def test_app_js_has_small_talk_progress_suppression_helpers():
     assert "function shouldStartProgressUpdatesForPrompt(promptText = '')" in content
 
 
+def test_app_js_uses_ascii_status_history_prefix():
+    content = _app_js_text()
+    assert "addMessageToHistory('system', `[status] ${state}`);" in content
+    assert "addMessageToHistory('system', `\u23f3 ${state}`);" not in content
+
+
 def test_app_js_only_starts_progress_updates_for_request_like_prompts():
     content = _app_js_text()
     assert "if (shouldStartProgressUpdatesForPrompt(promptTextForModel)) {" in content
@@ -117,6 +123,9 @@ def test_app_js_surfaces_llm_endpoint_errors_and_model_refresh_failures():
     assert "The assistant could not get a response from the model endpoint." in content
     assert "The model list could not be refreshed." in content
     assert "status.textContent = error.message || 'The model list could not be refreshed. Check Tool Settings.';" in content
+    assert "OPENAI_PROXY_TRUSTED_BASE_URLS" in content
+    assert "OPENAI_PROXY_ALLOW_PRIVATE" in content
+    assert "console.warn('Model list refresh failed:', error?.message || error);" in content
     assert "renderAssistantErrorResponse(userErrorMessage);" in content
 
 
@@ -128,3 +137,10 @@ def test_app_js_debounces_model_refresh_and_normalizes_model_payloads():
     assert "endpointInput.addEventListener('input', queueAvailableModelsRefresh);" in content
     assert "function normalizeAvailableModelsResponse(responseData)" in content
     assert "const normalizedModels = normalizeAvailableModelsResponse(data);" in content
+
+
+def test_app_js_uses_server_llm_endpoint_for_unsaved_settings():
+    content = _app_js_text()
+    assert "llmEndpoint: data.llmEndpoint || ''" in content
+    assert "function mergeClientDefaults(settings, defaults)" in content
+    assert "merged.endpoint = defaults.llmEndpoint;" in content

@@ -11,7 +11,7 @@ echo "CATBot installer — project root: $PROJECT_ROOT"
 
 # 1. Prerequisites check
 echo ""
-echo "[1/10] Checking prerequisites..."
+echo "[1/11] Checking prerequisites..."
 python3 scripts/check_prereqs.py 2>/dev/null || python scripts/check_prereqs.py
 if [ $? -ne 0 ]; then
   echo "Prerequisites check failed. Install missing tools and run install.sh again." >&2
@@ -20,7 +20,7 @@ fi
 
 # 2. mcp-browser-use: initialize existing checkout if present, else clone CATBot fork
 echo ""
-echo "[2/10] Initializing mcp-browser-use..."
+echo "[2/11] Initializing mcp-browser-use..."
 MCP_DIR="$PROJECT_ROOT/mcp-browser-use"
 MCP_REPO_URL="https://github.com/andyjm2k/mcp-browser-use.git"
 if [ -d "$PROJECT_ROOT/.git" ]; then
@@ -47,7 +47,7 @@ fi
 
 # 3. Python venv and pip install
 echo ""
-echo "[3/10] Creating venv and installing Python dependencies..."
+echo "[3/11] Creating venv and installing Python dependencies..."
 VENV_PYTHON="$PROJECT_ROOT/venv/bin/python"
 VENV_PIP="$PROJECT_ROOT/venv/bin/pip"
 if [ ! -x "$VENV_PYTHON" ]; then
@@ -73,7 +73,7 @@ fi
 
 # 4. Playwright (main venv)
 echo ""
-echo "[4/10] Installing Playwright browsers..."
+echo "[4/11] Installing Playwright browsers..."
 "$VENV_PYTHON" -m playwright install
 if [ $? -ne 0 ]; then
   echo "Playwright install failed." >&2
@@ -82,7 +82,7 @@ fi
 
 # 5. Node dependencies
 echo ""
-echo "[5/10] Installing Node.js dependencies..."
+echo "[5/11] Installing Node.js dependencies..."
 npm ci 2>/dev/null || npm install
 if [ $? -ne 0 ]; then
   echo "Node dependency install failed." >&2
@@ -91,7 +91,7 @@ fi
 
 # 6. Codex CLI (optional)
 echo ""
-echo "[6/10] Installing Codex CLI (optional)..."
+echo "[6/11] Installing Codex CLI (optional)..."
 if ! command -v codex >/dev/null 2>&1; then
   echo "Codex CLI not found; installing via npm..."
   npm install -g @openai/codex || echo "Codex CLI install failed (optional). You can install it later and set CODEX_CLI_PATH."
@@ -101,7 +101,7 @@ fi
 
 # 7. mcp-browser-use: uv sync and playwright
 echo ""
-echo "[7/10] Setting up mcp-browser-use (uv sync + playwright)..."
+echo "[7/11] Setting up mcp-browser-use (uv sync + playwright)..."
 (cd "$MCP_DIR" && if [ -f uv.lock ]; then uv sync --frozen; else uv sync; fi && uv run playwright install)
 if [ $? -ne 0 ]; then
   echo "mcp-browser-use setup failed." >&2
@@ -110,7 +110,7 @@ fi
 
 # 8. .env and directories
 echo ""
-echo "[8/10] Creating .env and required directories..."
+echo "[8/11] Creating .env and required directories..."
 "$VENV_PYTHON" scripts/setup_env_and_dirs.py
 if [ $? -ne 0 ]; then
   echo "setup_env_and_dirs failed." >&2
@@ -119,16 +119,25 @@ fi
 
 # 9. Configuration wizard (interactive; collects API keys and writes .env)
 echo ""
-echo "[9/10] Configuration wizard (API keys, Telegram, etc.)..."
+echo "[9/11] Configuration wizard (API keys, workflow backend, Telegram, etc.)..."
 "$VENV_PYTHON" scripts/install_wizard.py
 if [ $? -ne 0 ]; then
   echo "Wizard failed." >&2
   exit 1
 fi
 
-# 10. Verification
+# 10. Optional workflow backend dependencies
 echo ""
-echo "[10/10] Verifying installation..."
+echo "[10/11] Installing selected workflow backend dependencies..."
+"$VENV_PYTHON" scripts/install_optional_workflow_backend.py
+if [ $? -ne 0 ]; then
+  echo "Workflow backend dependency install failed." >&2
+  exit 1
+fi
+
+# 11. Verification
+echo ""
+echo "[11/11] Verifying installation..."
 export CATBOT_VERIFY_PYTHON="$VENV_PYTHON"
 "$VENV_PYTHON" scripts/verify_install.py
 if [ $? -ne 0 ]; then
@@ -140,8 +149,10 @@ echo ""
 echo "CATBot install complete."
 echo "Next steps:"
 echo "  If you skipped the wizard or need to change settings: edit .env"
-echo "  AutoGen workflow requests now require auth by default (AUTOGEN_REQUIRE_AUTH=true)."
+echo "  runWorkflow uses WORKFLOW_FRAMEWORK (autogen by default, ag2 optional)."
+echo "  Workflow requests require auth by default (AUTOGEN_REQUIRE_AUTH=true)."
 echo "  Docker-backed AutoGen code execution stays off until you explicitly set AUTOGEN_ENABLE_CODE_EXECUTION=true."
+echo "  AG2 code execution stays off until you explicitly set AG2_ENABLE_CODE_EXECUTION=true."
 echo "  If using Telegram tools/file attachments, set TELEGRAM_SECRET on both bot and proxy."
 echo "  Telegram listFiles now supports path/recursive; sendTelegramFile accepts subdirectory paths under scratch/."
 echo "  Built-in image_generation skill is available (see docs/SKILL_FRAMEWORK.md)."

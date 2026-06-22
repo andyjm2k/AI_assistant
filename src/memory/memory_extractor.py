@@ -52,11 +52,11 @@ class MemoryExtractor:
         # Build chat endpoint URL
         self.chat_url = f"{self.api_base}/chat/completions"
         
-        # Categories for memory classification
+        # Kinds for memory classification
         self.categories = [
             "preference",  # User preferences (e.g., "likes dark mode")
             "habit",       # User habits (e.g., "works late nights")
-            "fact",        # Facts about user (e.g., "lives in New York")
+            "profile_fact", # Facts about user (e.g., "lives in New York")
             "need",        # User needs (e.g., "needs help with Python")
             "relationship", # Relationships (e.g., "has a dog named Max")
         ]
@@ -100,16 +100,22 @@ Do NOT include:
 - Generic statements or advice that could apply to anyone
 - Anything you are unsure about; when in doubt, omit it
 
-Categories (only if you extract): preference, habit, fact, need, relationship.
+Kinds (only if you extract): preference, habit, profile_fact, need, relationship.
 
 Extract at most {max_memories} items. Often there will be zero. If nothing in this conversation meets the bar above, respond with an empty array: []
 
 For each item you do extract, provide:
-1. "text": concise statement (1-2 sentences)
-2. "category": one of preference, habit, fact, need, relationship
-3. "confidence": use "high" only when the user clearly stated it; otherwise "medium" or "low"
+1. "text": concise third-person statement (1-2 sentences)
+2. "kind": one of preference, habit, profile_fact, need, relationship
+3. "subject": normally "user", or a specifically named related person/entity
+4. "memory_key": a stable snake_case key when this is a replaceable profile value, otherwise null
+5. "value": the concise value represented by the memory
+6. "confidence": use "high" only when the user clearly stated it; otherwise "medium" or "low"
+7. "evidence_quote": a short exact quote copied from a USER message that directly supports the memory
 
-Respond with a JSON array only, e.g. [] or [{{"text": "...", "category": "...", "confidence": "high"}}].
+Never infer a memory from assistant text. The evidence quote must appear verbatim in a user message.
+
+Respond with a JSON array only, e.g. [] or [{{"text": "User lives in London.", "kind": "profile_fact", "subject": "user", "memory_key": "home_location", "value": "London", "confidence": "high", "evidence_quote": "I live in London"}}].
 
 Conversation:
 {conversation_text}
@@ -219,8 +225,13 @@ JSON:"""
                     if isinstance(mem, dict) and "text" in mem:
                         extracted_memories.append({
                             "text": mem.get("text", ""),
-                            "category": mem.get("category", "general"),
+                            "kind": mem.get("kind", mem.get("category", "profile_fact")),
+                            "category": mem.get("kind", mem.get("category", "profile_fact")),
+                            "subject": mem.get("subject", "user"),
+                            "memory_key": mem.get("memory_key"),
+                            "value": mem.get("value"),
                             "confidence": mem.get("confidence", "medium"),
+                            "evidence_quote": mem.get("evidence_quote", ""),
                             "source": "conversation",
                         })
                 

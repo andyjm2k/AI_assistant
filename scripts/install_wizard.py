@@ -285,8 +285,27 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
         codex_search = _prompt_yes_no("   Enable Codex web search?", True)
         codex_timeout = _prompt("   Codex timeout seconds", "1800")
 
-    # 6. Telegram
-    use_telegram = _prompt_yes_no("8) Enable Telegram bot?", False)
+    # 6. Workflow backend for runWorkflow
+    workflow_backend = _prompt("8) Workflow backend for runWorkflow (autogen/ag2)", "autogen").strip().lower()
+    if workflow_backend not in {"autogen", "ag2"}:
+        print("   Unknown workflow backend; using autogen.")
+        workflow_backend = "autogen"
+    ag2_model = ""
+    ag2_base_url = ""
+    ag2_api_key = ""
+    ag2_max_rounds = "24"
+    ag2_code_execution = False
+    if workflow_backend == "ag2":
+        default_ag2_base_url = _derive_openai_compatible_base_url(provider, endpoint)
+        ag2_model = _prompt("   AG2 model", model)
+        ag2_base_url = _prompt("   AG2 base URL", default_ag2_base_url)
+        ag2_api_key = _prompt("   AG2 API key (leave blank to reuse provider key/env fallback)", "", secret=True)
+        ag2_max_rounds = _prompt("   AG2 max rounds", "24")
+        ag2_code_execution = _prompt_yes_no("   Enable AG2 code execution?", False)
+        print("   The installer will install ag2[openai] after the wizard.")
+
+    # 7. Telegram
+    use_telegram = _prompt_yes_no("9) Enable Telegram bot?", False)
     telegram_token = ""
     telegram_admins = ""
     telegram_allow_all = "false"
@@ -312,13 +331,13 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
             if set_secret:
                 telegram_secret = _prompt("   TELEGRAM_SECRET value (same on bot and proxy)", "", secret=True)
 
-    # 7. Web UI TTS defaults (optional)
-    tts_endpoint = _prompt("9) Default TTS endpoint for web UI (optional; press Enter to skip)", "")
-    tts_model = _prompt("10) Default TTS model for web UI (optional; used as UI fallback on voice-fetch failure)", "")
-    tts_voice = _prompt("11) Default TTS voice for web UI (optional; used as UI fallback on voice-fetch failure)", "")
+    # 8. Web UI TTS defaults (optional)
+    tts_endpoint = _prompt("10) Default TTS endpoint for web UI (optional; press Enter to skip)", "")
+    tts_model = _prompt("11) Default TTS model for web UI (optional; used as UI fallback on voice-fetch failure)", "")
+    tts_voice = _prompt("12) Default TTS voice for web UI (optional; used as UI fallback on voice-fetch failure)", "")
 
-    # 8. HTTPS certificate hostname (for LAN access; used by https_server and proxy_server)
-    https_hostname = _prompt("12) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
+    # 9. HTTPS certificate hostname (for LAN access; used by https_server and proxy_server)
+    https_hostname = _prompt("13) HTTPS certificate hostname (for LAN access; used in cert generation and URLs)", "anton.local")
     if not https_hostname.strip():
         https_hostname = "anton.local"
     else:
@@ -385,8 +404,18 @@ def run_wizard(project_root: Path, env_path: Path) -> bool:
     content = _set_key_in_env_content(content, "JWT_SECRET", jwt_secret)
     content = _set_key_in_env_content(content, "MCP_BROWSER_SERVER_SECRET", shared_agent_secret)
     content = _set_key_in_env_content(content, "CATBOT_AGENT_SECRET", shared_agent_secret)
+    content = _set_key_in_env_content(content, "WORKFLOW_FRAMEWORK", workflow_backend)
     content = _set_key_in_env_content(content, "AUTOGEN_REQUIRE_AUTH", "true")
     content = _set_key_in_env_content(content, "AUTOGEN_ENABLE_CODE_EXECUTION", "false")
+    if workflow_backend == "ag2":
+        content = _set_key_in_env_content(content, "AG2_MODEL", ag2_model or model)
+        if ag2_base_url:
+            content = _set_key_in_env_content(content, "AG2_BASE_URL", ag2_base_url)
+        if ag2_api_key or api_key:
+            content = _set_key_in_env_content(content, "AG2_API_KEY", ag2_api_key or api_key)
+    content = _set_key_in_env_content(content, "AG2_API_TYPE", "openai")
+    content = _set_key_in_env_content(content, "AG2_MAX_ROUNDS", ag2_max_rounds or "24")
+    content = _set_key_in_env_content(content, "AG2_ENABLE_CODE_EXECUTION", "true" if ag2_code_execution else "false")
     content = _set_key_in_env_content(content, "CODEX_ENABLED", "true" if use_codex else "false")
     if use_codex:
         content = _set_key_in_env_content(content, "CODEX_CLI_PATH", codex_path or "codex")
