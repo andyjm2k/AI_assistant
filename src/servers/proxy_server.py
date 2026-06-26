@@ -12133,6 +12133,192 @@ def _load_monitor_dashboard_html(*, detail_mode: bool) -> str:
     return html
 
 
+def _monitor_login_response(request: Request, *, detail_mode: bool = False) -> HTMLResponse:
+    """Render a browser login prompt for protected monitoring dashboard navigation."""
+    target_path = request.url.path or ("/monitor/detail" if detail_mode else "/monitor")
+    target_query = request.url.query
+    next_path = f"{target_path}?{target_query}" if target_query else target_path
+    escaped_next = html.escape(next_path, quote=True)
+    next_path_json = json.dumps(next_path)
+    content = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CATBot Monitoring Login</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #07111c;
+      --panel: #0c1827;
+      --line: rgba(165, 188, 211, .18);
+      --text: #edf4fb;
+      --muted: #98adc3;
+      --cyan: #5bd3ff;
+      --mint: #67efc2;
+      --rose: #ff7c90;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background:
+        radial-gradient(circle at top left, rgba(91, 211, 255, .18), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(103, 239, 194, .14), transparent 28%),
+        linear-gradient(180deg, #06101a 0%, var(--bg) 100%);
+      color: var(--text);
+      font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
+    }}
+    main {{
+      width: min(420px, 100%);
+      padding: 26px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(255,255,255,.035), transparent 120%), var(--panel);
+      box-shadow: 0 22px 60px rgba(0, 0, 0, .32);
+    }}
+    .eyebrow {{
+      display: inline-flex;
+      padding: 7px 11px;
+      border: 1px solid rgba(91, 211, 255, .24);
+      border-radius: 999px;
+      background: rgba(91, 211, 255, .10);
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }}
+    h1 {{ margin: 14px 0 8px; font-size: 32px; line-height: 1; letter-spacing: -.04em; }}
+    p {{ margin: 0 0 18px; color: var(--muted); font-size: 14px; line-height: 1.55; }}
+    form {{ display: grid; gap: 12px; }}
+    label {{ display: grid; gap: 6px; color: #c8d7e7; font-size: 12px; font-weight: 700; }}
+    input {{
+      width: 100%;
+      min-height: 42px;
+      padding: 10px 12px;
+      border: 1px solid rgba(165, 188, 211, .18);
+      border-radius: 12px;
+      outline: none;
+      background: rgba(4, 10, 18, .6);
+      color: var(--text);
+      font: inherit;
+    }}
+    input:focus {{
+      border-color: rgba(91, 211, 255, .72);
+      box-shadow: 0 0 0 3px rgba(91, 211, 255, .13);
+    }}
+    button {{
+      min-height: 44px;
+      border: 1px solid rgba(103, 239, 194, .3);
+      border-radius: 999px;
+      background: rgba(103, 239, 194, .14);
+      color: var(--mint);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }}
+    button:disabled {{ opacity: .68; cursor: wait; }}
+    .status {{ min-height: 18px; margin-top: 12px; font-size: 13px; color: var(--muted); }}
+    .status.error {{ color: var(--rose); }}
+    .target {{ overflow-wrap: anywhere; font-size: 12px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">CATBot Monitor</div>
+    <h1>Sign in required</h1>
+    <p>Authentication is required to access monitoring. Sign in with your CATBot account to continue.</p>
+    <p class="target">Destination: {escaped_next}</p>
+    <form id="monitor-login-form">
+      <label>Username <input id="monitor-username" name="username" autocomplete="username" required autofocus></label>
+      <label>Password <input id="monitor-password" name="password" type="password" autocomplete="current-password" required></label>
+      <button id="monitor-login-button" type="submit">Log in</button>
+    </form>
+    <div class="status" id="monitor-login-status" role="status" aria-live="polite">Waiting for credentials.</div>
+  </main>
+  <script>
+    const NEXT_PATH = {next_path_json};
+    const AUTH_TOKEN_STORAGE_KEY = "jwtAuthToken";
+    const form = document.getElementById("monitor-login-form");
+    const button = document.getElementById("monitor-login-button");
+    const statusEl = document.getElementById("monitor-login-status");
+
+    function setStatus(message, isError = false) {{
+      statusEl.textContent = message;
+      statusEl.classList.toggle("error", Boolean(isError));
+    }}
+
+    function storedAuthToken() {{
+      try {{
+        return window.sessionStorage?.getItem(AUTH_TOKEN_STORAGE_KEY) || window.localStorage?.getItem(AUTH_TOKEN_STORAGE_KEY) || "";
+      }} catch (_) {{
+        return "";
+      }}
+    }}
+
+    function rememberAuthToken(token) {{
+      if (!token) return;
+      try {{ window.sessionStorage?.setItem(AUTH_TOKEN_STORAGE_KEY, token); }} catch (_) {{}}
+      try {{ window.localStorage?.setItem(AUTH_TOKEN_STORAGE_KEY, token); }} catch (_) {{}}
+    }}
+
+    async function tryExistingToken() {{
+      const token = storedAuthToken();
+      if (!token) return;
+      try {{
+        const response = await fetch("/v1/auth/me", {{
+          method: "GET",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: {{ "X-Auth-Token": token }}
+        }});
+        if (response.ok) {{
+          window.location.replace(NEXT_PATH);
+        }}
+      }} catch (_) {{}}
+    }}
+
+    form.addEventListener("submit", async (event) => {{
+      event.preventDefault();
+      button.disabled = true;
+      setStatus("Signing in...");
+      try {{
+        const response = await fetch("/v1/auth/login", {{
+          method: "POST",
+          credentials: "same-origin",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            username: document.getElementById("monitor-username").value,
+            password: document.getElementById("monitor-password").value
+          }})
+        }});
+        const payload = await response.json().catch(() => ({{}}));
+        if (!response.ok) {{
+          throw new Error(payload.detail || `Login failed with HTTP ${{response.status}}`);
+        }}
+        rememberAuthToken(payload.access_token);
+        setStatus("Signed in. Opening monitoring...");
+        window.location.replace(NEXT_PATH);
+      }} catch (error) {{
+        setStatus(String(error?.message || error || "Login failed."), true);
+        button.disabled = false;
+      }}
+    }});
+
+    tryExistingToken();
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=content, status_code=401)
+
+
 def _round_float(value: Any, digits: int = 3) -> Optional[float]:
     try:
         return round(float(value), digits)
@@ -12499,7 +12685,8 @@ async def _get_monitoring_snapshot_for_telegram(arguments: Optional[Dict[str, An
 @app.get("/monitor")
 async def monitor_dashboard(request: Request):
     """Serve the monitoring dashboard HTML."""
-    _require_internal_or_local_access(request, "monitoring")
+    if not _request_has_internal_or_local_access(request):
+        return _monitor_login_response(request)
     html = _load_monitor_dashboard_html(detail_mode=False)
     if not html:
         return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)
@@ -12510,7 +12697,8 @@ async def monitor_dashboard(request: Request):
 @app.get("/monitor/detail")
 async def monitor_dashboard_detail(request: Request):
     """Serve the monitoring detail HTML shell."""
-    _require_internal_or_local_access(request, "monitoring")
+    if not _request_has_internal_or_local_access(request):
+        return _monitor_login_response(request, detail_mode=True)
     html = _load_monitor_dashboard_html(detail_mode=True)
     if not html:
         return HTMLResponse(content="<h1>Monitoring dashboard not found.</h1>", status_code=404)

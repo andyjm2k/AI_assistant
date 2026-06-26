@@ -5,6 +5,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ELECTRON_AVATAR = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "avatar.js"
 ELECTRON_AVATAR_HTML = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "avatar.html"
 ELECTRON_AVATAR_CSS = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "avatar.css"
+ELECTRON_CONTROL_PANEL_CSS = (
+    PROJECT_ROOT / "electron-app" / "renderer" / "control-panel" / "control-panel.css"
+)
 ELECTRON_VRM_QUALITY = PROJECT_ROOT / "electron-app" / "renderer" / "avatar" / "vrm-quality.js"
 ELECTRON_MAIN = PROJECT_ROOT / "electron-app" / "main" / "main.js"
 ELECTRON_PRELOAD = PROJECT_ROOT / "electron-app" / "main" / "preload.js"
@@ -151,3 +154,20 @@ def test_adaptive_hud_uses_a_compact_dock_and_four_contextual_routes():
     assert 'button.setAttribute("aria-selected", isActive ? "true" : "false");' in avatar
     assert 'setHudPanel("chat", { focusInput: true });' in avatar
     assert "Could not autohide quick HUD before sending chat message" not in avatar
+
+
+def test_desktop_hud_button_labels_and_expanded_panels_remain_accessible():
+    avatar_css = ELECTRON_AVATAR_CSS.read_text(encoding="utf-8")
+    control_panel_css = ELECTRON_CONTROL_PANEL_CSS.read_text(encoding="utf-8")
+
+    assert "grid-auto-rows: max-content;" in avatar_css
+    assert avatar_css.count("overflow-wrap: anywhere;") >= 2
+    assert avatar_css.count("white-space: normal;") >= 2
+
+    button_rule = control_panel_css.split("\nbutton {\n", 1)[1].split("}", 1)[0]
+    assert "min-width: 0;" in button_rule
+    assert "max-width: 100%;" in button_rule
+    assert "box-sizing: border-box;" in button_rule
+    assert "overflow: hidden;" in button_rule
+    assert "overflow-wrap: anywhere;" in button_rule
+    assert "white-space: normal;" in button_rule

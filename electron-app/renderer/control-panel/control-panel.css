@@ -357,12 +357,20 @@ kbd {
 }
 
 button {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
   border: 0;
   border-radius: 15px;
   padding: 12px 14px;
   color: var(--text);
   font: inherit;
   font-weight: 700;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+  text-align: center;
+  white-space: normal;
   cursor: pointer;
   transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
 }

@@ -100,6 +100,31 @@ def test_monitoring_alias_accepts_auth_cookie_for_remote_client(monkeypatch):
     assert "CATBot Monitoring Dashboard" in response.text
 
 
+def test_monitoring_alias_prompts_login_for_remote_client_without_auth():
+    from src.servers import proxy_server as ps
+
+    with TestClient(ps.app, client=("203.0.113.10", 50000)) as client:
+        response = client.get("/monitoring")
+
+    assert response.status_code == 401
+    assert "text/html" in response.headers["content-type"]
+    assert "CATBot Monitoring Login" in response.text
+    assert "Authentication is required to access monitoring." in response.text
+    assert 'fetch("/v1/auth/login"' in response.text
+
+
+def test_monitor_detail_login_prompt_preserves_requested_target_for_remote_client():
+    from src.servers import proxy_server as ps
+
+    with TestClient(ps.app, client=("203.0.113.10", 50000)) as client:
+        response = client.get("/monitoring/detail?view=browser")
+
+    assert response.status_code == 401
+    assert "CATBot Monitoring Login" in response.text
+    assert "Destination: /monitoring/detail?view=browser" in response.text
+    assert 'const NEXT_PATH = "/monitoring/detail?view=browser";' in response.text
+
+
 def test_login_then_monitoring_alias_uses_auth_cookie(monkeypatch):
     from src.servers import proxy_server as ps
 
@@ -160,6 +185,17 @@ def test_monitor_access_rejects_remote_request_without_catbot_auth():
     with pytest.raises(HTTPException) as exc_info:
         ps._require_internal_or_local_access(request, "monitoring")
     assert exc_info.value.status_code == 401
+
+
+def test_monitor_data_still_returns_json_401_for_remote_client_without_auth():
+    from src.servers import proxy_server as ps
+
+    with TestClient(ps.app, client=("203.0.113.10", 50000)) as client:
+        response = client.get("/monitoring/data")
+
+    assert response.status_code == 401
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["detail"] == "Authentication is required to access monitoring."
 
 
 def test_auth_login_sets_monitor_cookie(monkeypatch):

@@ -9,7 +9,7 @@ Set-Location $ProjectRoot
 Write-Host ('CATBot installer - project root: ' + $ProjectRoot) -ForegroundColor Cyan
 
 # 1. Prerequisites check
-Write-Host ([Environment]::NewLine + '[1/10] Checking prerequisites...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[1/11] Checking prerequisites...') -ForegroundColor Yellow
 & py scripts/check_prereqs.py
 if ($LASTEXITCODE -ne 0) {
     Write-Host 'Prerequisites check failed. Install missing tools and run install.ps1 again.' -ForegroundColor Red
@@ -17,7 +17,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 2. mcp-browser-use: initialize existing checkout if present, else clone CATBot fork
-Write-Host ([Environment]::NewLine + '[2/10] Initializing mcp-browser-use...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[2/11] Initializing mcp-browser-use...') -ForegroundColor Yellow
 $mcpDir = Join-Path $ProjectRoot 'mcp-browser-use'
 $mcpRepoUrl = 'https://github.com/andyjm2k/mcp-browser-use.git'
 $projectGitDir = Join-Path $ProjectRoot '.git'
@@ -47,7 +47,7 @@ if (-not (Test-Path $mcpDir)) {
 }
 
 # 3. Python venv and pip install
-Write-Host ([Environment]::NewLine + '[3/10] Creating venv and installing Python dependencies...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[3/11] Creating venv and installing Python dependencies...') -ForegroundColor Yellow
 $venvPath = Join-Path $ProjectRoot 'venv'
 $venvPython = Join-Path $venvPath 'Scripts\python.exe'
 $venvPip = Join-Path $venvPath 'Scripts\pip.exe'
@@ -100,12 +100,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 4. Playwright (main venv)
-Write-Host ([Environment]::NewLine + '[4/10] Installing Playwright browsers...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[4/11] Installing Playwright browsers...') -ForegroundColor Yellow
 & $venvPython -m playwright install
 if ($LASTEXITCODE -ne 0) { Write-Host 'Playwright install failed.' -ForegroundColor Red; exit 1 }
 
 # 5. Node dependencies
-Write-Host ([Environment]::NewLine + '[5/10] Installing Node.js dependencies...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[5/11] Installing Node.js dependencies...') -ForegroundColor Yellow
 if (Test-Path (Join-Path $ProjectRoot 'package-lock.json')) {
     & npm ci
 } else {
@@ -114,7 +114,7 @@ if (Test-Path (Join-Path $ProjectRoot 'package-lock.json')) {
 if ($LASTEXITCODE -ne 0) { Write-Host 'Node dependency install failed.' -ForegroundColor Red; exit 1 }
 
 # 6. Codex CLI (optional)
-Write-Host ([Environment]::NewLine + '[6/10] Installing Codex CLI (optional)...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[6/11] Installing Codex CLI (optional)...') -ForegroundColor Yellow
 $codexCmd = Get-Command codex -ErrorAction SilentlyContinue
 if (-not $codexCmd) {
     Write-Host 'Codex CLI not found; installing via npm...' -ForegroundColor Cyan
@@ -127,7 +127,7 @@ if (-not $codexCmd) {
 }
 
 # 7. mcp-browser-use: uv sync and playwright
-Write-Host ([Environment]::NewLine + '[7/10] Setting up mcp-browser-use (uv sync + playwright)...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[7/11] Setting up mcp-browser-use (uv sync + playwright)...') -ForegroundColor Yellow
 Push-Location $mcpDir
 try {
     $uvSyncArgs = @('sync')
@@ -143,17 +143,22 @@ try {
 }
 
 # 8. .env and directories
-Write-Host ([Environment]::NewLine + '[8/10] Creating .env and required directories...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[8/11] Creating .env and required directories...') -ForegroundColor Yellow
 & $venvPython scripts/setup_env_and_dirs.py
 if ($LASTEXITCODE -ne 0) { Write-Host 'setup_env_and_dirs failed.' -ForegroundColor Red; exit 1 }
 
 # 9. Configuration wizard (interactive; collects API keys and writes .env)
-Write-Host ([Environment]::NewLine + '[9/10] Configuration wizard (API keys, Telegram, etc.)...') -ForegroundColor Yellow
+Write-Host ([Environment]::NewLine + '[9/11] Configuration wizard (API keys, workflow backend, Telegram, etc.)...') -ForegroundColor Yellow
 & $venvPython scripts/install_wizard.py
 if ($LASTEXITCODE -ne 0) { Write-Host 'Wizard failed.' -ForegroundColor Red; exit 1 }
 
-# 10. Verification
-Write-Host ([Environment]::NewLine + '[10/10] Verifying installation...') -ForegroundColor Yellow
+# 10. Optional workflow backend dependencies
+Write-Host ([Environment]::NewLine + '[10/11] Installing selected workflow backend dependencies...') -ForegroundColor Yellow
+& $venvPython scripts/install_optional_workflow_backend.py
+if ($LASTEXITCODE -ne 0) { Write-Host 'Workflow backend dependency install failed.' -ForegroundColor Red; exit 1 }
+
+# 11. Verification
+Write-Host ([Environment]::NewLine + '[11/11] Verifying installation...') -ForegroundColor Yellow
 $env:CATBOT_VERIFY_PYTHON = $venvPython
 & $venvPython scripts/verify_install.py
 if ($LASTEXITCODE -ne 0) {
@@ -164,8 +169,10 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host ([Environment]::NewLine + 'CATBot install complete.') -ForegroundColor Green
 Write-Host 'Next steps:' -ForegroundColor Cyan
 Write-Host '  If you skipped the wizard or need to change settings: edit .env'
-Write-Host '  AutoGen workflow requests now require auth by default (`AUTOGEN_REQUIRE_AUTH=true`).'
+Write-Host '  runWorkflow uses WORKFLOW_FRAMEWORK (autogen by default, ag2 optional).'
+Write-Host '  Workflow requests require auth by default (`AUTOGEN_REQUIRE_AUTH=true`).'
 Write-Host '  Docker-backed AutoGen code execution stays off until you explicitly set AUTOGEN_ENABLE_CODE_EXECUTION=true.'
+Write-Host '  AG2 code execution stays off until you explicitly set AG2_ENABLE_CODE_EXECUTION=true.'
 Write-Host '  If using Telegram tools/file attachments, set TELEGRAM_SECRET on both bot and proxy.'
 Write-Host '  Telegram listFiles now supports path/recursive; sendTelegramFile accepts subdirectory paths under scratch/.'
 Write-Host '  Built-in image_generation skill is available (see docs/SKILL_FRAMEWORK.md).'

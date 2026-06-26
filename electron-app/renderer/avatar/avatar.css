@@ -629,6 +629,7 @@ body.hud-sheet-visible .hud-sheet {
 
 .sheet-panel.is-active {
   display: grid;
+  grid-auto-rows: max-content;
   align-content: start;
   gap: 9px;
 }
