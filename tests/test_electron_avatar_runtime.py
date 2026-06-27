@@ -171,3 +171,30 @@ def test_desktop_hud_button_labels_and_expanded_panels_remain_accessible():
     assert "overflow: hidden;" in button_rule
     assert "overflow-wrap: anywhere;" in button_rule
     assert "white-space: normal;" in button_rule
+
+
+def test_avatar_window_size_settings_allow_oversized_user_values():
+    avatar = _avatar_js_text()
+    html = ELECTRON_AVATAR_HTML.read_text(encoding="utf-8")
+    main = ELECTRON_MAIN.read_text(encoding="utf-8")
+
+    assert 'id="hud-window-width" type="number" min="240" step="10"' in html
+    assert 'id="hud-window-height" type="number" min="320" step="10"' in html
+    assert 'id="hud-window-width" type="number" min="240" max=' not in html
+    assert 'id="hud-window-height" type="number" min="320" max=' not in html
+
+    assert "const windowWidth = Math.max(240, Math.round(Number(windowBounds.width) || 480));" in avatar
+    assert "const windowHeight = Math.max(320, Math.round(Number(windowBounds.height) || 640));" in avatar
+    assert "const width = Math.max(240, Math.round(Number(widthValue) || Number(currentBounds.width) || 480));" in avatar
+    assert "const height = Math.max(320, Math.round(Number(heightValue) || Number(currentBounds.height) || 640));" in avatar
+    assert "Math.min(1600, Math.round(Number(windowBounds.width)" not in avatar
+    assert "Math.min(1800, Math.round(Number(windowBounds.height)" not in avatar
+    assert "Math.min(1600, Math.round(Number(widthValue)" not in avatar
+    assert "Math.min(1800, Math.round(Number(heightValue)" not in avatar
+
+    assert "function clampBoundsToWorkArea(bounds, workArea, minimum = {}, options = {})" in main
+    assert "const allowOversized = options.allowOversized === true;" in main
+    assert "const width = allowOversized ? requestedWidth : Math.min(requestedWidth, availableWidth);" in main
+    assert "const height = allowOversized ? requestedHeight : Math.min(requestedHeight, availableHeight);" in main
+    assert "allowOversized: true" in main
+    assert "allowOversized: config.allowOversized" in main

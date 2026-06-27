@@ -1881,6 +1881,13 @@
         let vrmTtsStartHandled = false; // One-shot guard for the first playback event of a TTS session
         let vrmIdleReplayTimerId = null; // Timer for delayed idle replays
         let vrmIdleHasPlayedOnce = false; // Tracks whether the initial idle pass has already happened
+        let smoothedVrmDelta = 1 / 60; // Smoothed physics delta to keep browser VRM motion close to Electron
+        let vrmPoseSnapshotBones = {}; // Humanoid bones used to preserve visible pose across VRMA transitions
+        let vrmBaseStandingPoseSnapshot = null; // Initial relaxed pose snapshot for the active model
+        let vrmLastPoseSnapshot = null; // Last visible animated/manual pose before an action releases bindings
+        let vrmLastFrameHadRunningAction = false; // Whether the previous frame had any VRMA action owning the rig
+        let vrmRestorePoseOnNextManualIdle = false; // Guard to bridge stopped actions back into manual idle
+        let vrmPoseBlend = null; // Active bridge from current visible pose into a newly-started VRMA action
 
         // Pose configuration (tweak these numbers to adjust poses)
         const POSE_CONFIG = {
@@ -1937,10 +1944,42 @@
             }
         };
 
-        const VRM_ACTION_FADE_IN_SECONDS = 0.36;
-        const VRM_ACTION_FADE_OUT_SECONDS = 0.5;
-        const VRM_IDLE_ACTION_FADE_IN_SECONDS = 0.66;
-        const VRM_IDLE_ACTION_FADE_OUT_SECONDS = 0.42;
+        const VRM_ACTION_FADE_IN_SECONDS = 0.55;
+        const VRM_ACTION_FADE_OUT_SECONDS = 0.85;
+        const VRM_IDLE_ACTION_FADE_IN_SECONDS = 0.95;
+        const VRM_IDLE_ACTION_FADE_OUT_SECONDS = 0.8;
+        const VRM_MAX_ANIMATION_DELTA_SECONDS = 1 / 24;
+        const VRM_MAX_PHYSICS_DELTA_SECONDS = 1 / 45;
+        const VRM_DELTA_SMOOTHING = 0.18;
+        const VRM_PHYSICS_RESET_DELTA_SECONDS = 0.22;
+        const VRM_BROWSER_TARGET_FPS = 60;
+        const VRM_BROWSER_PIXEL_RATIO_CAP = 1.25;
+        const VRM_POSE_TO_ACTION_BLEND_MS = 420;
+        const VRM_IDLE_POSE_TO_ACTION_BLEND_MS = 560;
+        const VRM_POSE_SNAPSHOT_BONE_NAMES = [
+            'hips',
+            'spine',
+            'chest',
+            'upperChest',
+            'neck',
+            'head',
+            'leftShoulder',
+            'rightShoulder',
+            'leftUpperArm',
+            'rightUpperArm',
+            'leftLowerArm',
+            'rightLowerArm',
+            'leftHand',
+            'rightHand',
+            'leftUpperLeg',
+            'rightUpperLeg',
+            'leftLowerLeg',
+            'rightLowerLeg',
+            'leftFoot',
+            'rightFoot',
+            'leftToes',
+            'rightToes'
+        ];
 
         function isCurrentVrmLoad(loadGeneration, modelPathSnapshot, modelInstance = vrmModel) {
             return Boolean(
@@ -1960,6 +1999,219 @@
         function flushVrmExpressions(targetVrm = vrmModel) {
             try { targetVrm?.expressionManager?.update?.(); } catch (_) {}
             try { targetVrm?.blendShapeProxy?.update?.(); } catch (_) {}
+        }
+
+        function resetVrmPhysicsState(targetVrm = vrmModel) {
+            try { targetVrm?.springBoneManager?.reset?.(); } catch (_) {}
+        }
+
+        function getStableVrmFrameDeltas(rawDelta) {
+            const finiteDelta = Number.isFinite(rawDelta) && rawDelta > 0 ? rawDelta : 1 / 60;
+            if (finiteDelta > VRM_PHYSICS_RESET_DELTA_SECONDS) {
+                resetVrmPhysicsState();
+                smoothedVrmDelta = 1 / 60;
+            }
+            const animationDelta = Math.min(finiteDelta, VRM_MAX_ANIMATION_DELTA_SECONDS);
+            const physicsMax = VRM_BROWSER_TARGET_FPS <= 30 ? 1 / 30 : VRM_MAX_PHYSICS_DELTA_SECONDS;
+            const targetPhysicsDelta = Math.min(finiteDelta, physicsMax);
+            smoothedVrmDelta += (targetPhysicsDelta - smoothedVrmDelta) * VRM_DELTA_SMOOTHING;
+            return {
+                animationDelta,
+                physicsDelta: Math.min(smoothedVrmDelta, physicsMax)
+            };
+        }
+
+        function configureVrmRenderer(rendererInstance) {
+            if (!rendererInstance) return;
+            try {
+                rendererInstance.setPixelRatio(Math.min(VRM_BROWSER_PIXEL_RATIO_CAP, window.devicePixelRatio || 1));
+            } catch (_) {}
+            try {
+                if ('outputColorSpace' in rendererInstance && window.THREE?.SRGBColorSpace) {
+                    rendererInstance.outputColorSpace = window.THREE.SRGBColorSpace;
+                }
+            } catch (_) {}
+            try {
+                if ('toneMapping' in rendererInstance && window.THREE?.NoToneMapping !== undefined) {
+                    rendererInstance.toneMapping = window.THREE.NoToneMapping;
+                    rendererInstance.toneMappingExposure = 1;
+                }
+            } catch (_) {}
+        }
+
+        function getVrmPoseSnapshotBone(key) {
+            return vrmPoseSnapshotBones?.[key] || null;
+        }
+
+        function createVrmBonePoseSnapshot(bone) {
+            if (!bone) {
+                return null;
+            }
+            return {
+                rotation: {
+                    x: bone.rotation.x,
+                    y: bone.rotation.y,
+                    z: bone.rotation.z
+                },
+                position: {
+                    x: bone.position.x,
+                    y: bone.position.y,
+                    z: bone.position.z
+                }
+            };
+        }
+
+        function createVrmPoseSnapshot() {
+            const snapshot = {};
+            for (const boneName of VRM_POSE_SNAPSHOT_BONE_NAMES) {
+                const pose = createVrmBonePoseSnapshot(getVrmPoseSnapshotBone(boneName));
+                if (pose) {
+                    snapshot[boneName] = pose;
+                }
+            }
+            return Object.keys(snapshot).length ? snapshot : null;
+        }
+
+        function restoreVrmPoseSnapshot(snapshot) {
+            if (!snapshot) {
+                return;
+            }
+            for (const [boneName, pose] of Object.entries(snapshot)) {
+                const bone = getVrmPoseSnapshotBone(boneName);
+                if (!bone) {
+                    continue;
+                }
+                if (pose.rotation) {
+                    bone.rotation.set(pose.rotation.x, pose.rotation.y, pose.rotation.z);
+                }
+                if (pose.position) {
+                    bone.position.set(pose.position.x, pose.position.y, pose.position.z);
+                }
+                try { bone.updateMatrixWorld?.(true); } catch (_) {}
+            }
+        }
+
+        function lerpVrmPoseValue(fromValue, toValue, weight) {
+            const from = Number.isFinite(Number(fromValue)) ? Number(fromValue) : 0;
+            const to = Number.isFinite(Number(toValue)) ? Number(toValue) : from;
+            return from + (to - from) * weight;
+        }
+
+        function lerpVrmPoseAngle(fromValue, toValue, weight) {
+            const from = Number.isFinite(Number(fromValue)) ? Number(fromValue) : 0;
+            const to = Number.isFinite(Number(toValue)) ? Number(toValue) : from;
+            const delta = Math.atan2(Math.sin(to - from), Math.cos(to - from));
+            return from + delta * weight;
+        }
+
+        function getVrmPoseBlendWeight(progress) {
+            const t = Math.max(0, Math.min(1, Number(progress) || 0));
+            return t * t * (3 - 2 * t);
+        }
+
+        function applyBlendedVrmPoseSnapshot(fromSnapshot, toSnapshot, weight) {
+            if (!fromSnapshot || !toSnapshot) {
+                return;
+            }
+            const amount = Math.max(0, Math.min(1, Number(weight) || 0));
+            const snapshotKeys = new Set([
+                ...Object.keys(fromSnapshot),
+                ...Object.keys(toSnapshot)
+            ]);
+            for (const boneName of snapshotKeys) {
+                const bone = getVrmPoseSnapshotBone(boneName);
+                const fromPose = fromSnapshot[boneName];
+                const toPose = toSnapshot[boneName];
+                if (!bone || !fromPose || !toPose) {
+                    continue;
+                }
+                if (fromPose.rotation && toPose.rotation) {
+                    bone.rotation.set(
+                        lerpVrmPoseAngle(fromPose.rotation.x, toPose.rotation.x, amount),
+                        lerpVrmPoseAngle(fromPose.rotation.y, toPose.rotation.y, amount),
+                        lerpVrmPoseAngle(fromPose.rotation.z, toPose.rotation.z, amount)
+                    );
+                }
+                if (fromPose.position && toPose.position) {
+                    bone.position.set(
+                        lerpVrmPoseValue(fromPose.position.x, toPose.position.x, amount),
+                        lerpVrmPoseValue(fromPose.position.y, toPose.position.y, amount),
+                        lerpVrmPoseValue(fromPose.position.z, toPose.position.z, amount)
+                    );
+                }
+                try { bone.updateMatrixWorld?.(true); } catch (_) {}
+            }
+        }
+
+        function getVrmActionList() {
+            return [
+                vrmLoveVrmaAction,
+                vrmThinkVrmaAction,
+                vrmCryVrmaAction,
+                vrmAngryVrmaAction,
+                vrmIdleVrmaAction
+            ].filter(Boolean);
+        }
+
+        function isVrmActionRunning(action) {
+            return Boolean(action && typeof action.isRunning === 'function' && action.isRunning());
+        }
+
+        function hasRunningVrmAction() {
+            return getVrmActionList().some(isVrmActionRunning);
+        }
+
+        function markVrmPoseForManualRestore() {
+            const snapshot = createVrmPoseSnapshot();
+            if (snapshot) {
+                vrmLastPoseSnapshot = snapshot;
+                vrmRestorePoseOnNextManualIdle = true;
+            }
+        }
+
+        function startVrmPoseBlendToAction(action, fromSnapshot, durationMs) {
+            if (!action || !fromSnapshot) {
+                vrmPoseBlend = null;
+                return;
+            }
+            vrmPoseBlend = {
+                action,
+                fromSnapshot,
+                startTime: performance.now(),
+                durationMs: Math.max(80, Number(durationMs) || VRM_POSE_TO_ACTION_BLEND_MS)
+            };
+            vrmRestorePoseOnNextManualIdle = false;
+            restoreVrmPoseSnapshot(fromSnapshot);
+            resetVrmPhysicsState();
+            smoothedVrmDelta = 1 / 60;
+        }
+
+        function updateVrmPoseBlend(now = performance.now()) {
+            if (!vrmPoseBlend) {
+                return false;
+            }
+            const { action, fromSnapshot, startTime, durationMs } = vrmPoseBlend;
+            if (!fromSnapshot || !isVrmActionRunning(action)) {
+                vrmPoseBlend = null;
+                return false;
+            }
+
+            const targetSnapshot = createVrmPoseSnapshot();
+            if (!targetSnapshot) {
+                vrmPoseBlend = null;
+                return false;
+            }
+
+            const progress = (now - startTime) / durationMs;
+            const weight = getVrmPoseBlendWeight(progress);
+            applyBlendedVrmPoseSnapshot(fromSnapshot, targetSnapshot, weight);
+
+            if (progress >= 1) {
+                vrmPoseBlend = null;
+                resetVrmPhysicsState();
+                smoothedVrmDelta = 1 / 60;
+            }
+            return true;
         }
 
         function disposeThreeSceneResources(root) {
@@ -2042,17 +2294,24 @@
             clearVrmActionStopTimer(action);
             action.__vrmStopTimerId = setTimeout(() => {
                 action.__vrmStopTimerId = null;
-                try { action.stop(); } catch (_) {}
+                try {
+                    markVrmPoseForManualRestore();
+                    action.stop();
+                } catch (_) {}
             }, Math.max(0, Math.round(fadeSeconds * 1000) + 80));
         }
 
         function stopVrmAction(action, fadeSeconds = VRM_ACTION_FADE_OUT_SECONDS) {
             if (!action) return;
             try {
+                if (vrmPoseBlend?.action === action) {
+                    vrmPoseBlend = null;
+                }
                 const effectiveWeight = typeof action.getEffectiveWeight === 'function' ? action.getEffectiveWeight() : 0;
                 const isActive = (typeof action.isRunning === 'function' && action.isRunning()) || effectiveWeight > 0.001;
                 if (!isActive || fadeSeconds <= 0) {
                     clearVrmActionStopTimer(action);
+                    markVrmPoseForManualRestore();
                     action.stop();
                     return;
                 }
@@ -2082,6 +2341,17 @@
                 vrmAngryVrmaAction,
                 vrmIdleVrmaAction
             ];
+            const canFadeFromRunningAction = fadeInSeconds > 0 && actionsToFade.some(action => (
+                action &&
+                action !== nextAction &&
+                isVrmActionRunning(action)
+            ));
+            const poseBlendFromSnapshot = canFadeFromRunningAction
+                ? null
+                : createVrmPoseSnapshot() || vrmLastPoseSnapshot || vrmBaseStandingPoseSnapshot;
+            const poseBlendDurationMs = nextAction === vrmIdleVrmaAction
+                ? VRM_IDLE_POSE_TO_ACTION_BLEND_MS
+                : VRM_POSE_TO_ACTION_BLEND_MS;
 
             actionsToFade.forEach(action => {
                 if (!action || action === nextAction) return;
@@ -2102,8 +2372,15 @@
                 nextAction.setEffectiveWeight(1.0);
                 nextAction.setEffectiveTimeScale(1.0);
                 nextAction.enabled = true;
-                nextAction.fadeIn(fadeInSeconds);
+                if (canFadeFromRunningAction) {
+                    vrmPoseBlend = null;
+                    nextAction.fadeIn(fadeInSeconds);
+                }
                 nextAction.play();
+                if (!canFadeFromRunningAction && poseBlendFromSnapshot) {
+                    try { vrmMixer?.update?.(0); } catch (_) {}
+                    startVrmPoseBlendToAction(nextAction, poseBlendFromSnapshot, poseBlendDurationMs);
+                }
                 return true;
             } catch (e) {
                 console.warn('Failed to transition VRM action smoothly:', e);
@@ -11892,6 +12169,12 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 vrmTtsStartHandled = false;
                 vrmIdleHasPlayedOnce = false;
                 resetVrmPoseState();
+                vrmPoseSnapshotBones = {};
+                vrmBaseStandingPoseSnapshot = null;
+                vrmLastPoseSnapshot = null;
+                vrmLastFrameHadRunningAction = false;
+                vrmRestorePoseOnNextManualIdle = false;
+                vrmPoseBlend = null;
 
             // Stop and uncache animation bindings
             try {
@@ -11999,7 +12282,16 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 const viewportHeight = Math.max(container.clientHeight || canvas.clientHeight || 0, 1);
                 scene = new window.THREE.Scene();
                 camera = new window.THREE.PerspectiveCamera(45, viewportWidth / viewportHeight, 0.1, 1000);
-                renderer = new window.THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+                renderer = new window.THREE.WebGLRenderer({
+                    canvas: canvas,
+                    antialias: true,
+                    alpha: true,
+                    premultipliedAlpha: false,
+                    powerPreference: 'default',
+                    precision: 'highp',
+                    failIfMajorPerformanceCaveat: false
+                });
+                configureVrmRenderer(renderer);
                 renderer.setSize(viewportWidth, viewportHeight);
                 renderer.setClearColor(0x000000, 0);
 
@@ -12680,6 +12972,8 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 vrmAngryVrmaAction = angryVrmaAction;
                 vrmIdleVrmaAction = idleVrmaAction;
                 vrmActiveModelPath = requestedModelPath;
+                smoothedVrmDelta = 1 / 60;
+                resetVrmPhysicsState(vrm);
                 clearVrmIdleReplayTimer();
                 vrmIdleHasPlayedOnce = false;
                 attachVRMResizeHandler();
@@ -12721,11 +13015,53 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                 const leftLowerArm = getBone('leftLowerArm'); // Left lower arm bone
                 const rightLowerArm = getBone('rightLowerArm'); // Right lower arm bone
                 const spineBone = getBone('spine'); // Spine bone
+                const hipsBone = getBone('hips'); // Hips bone
+                const chestBone = getBone('chest'); // Chest bone
+                const upperChestBone = getBone('upperChest'); // Upper chest bone
                 const neckBone = getBone('neck'); // Neck bone for head rotation blending
                 const headBone = getBone('head'); // Head bone for direct head rotation
+                const leftShoulder = getBone('leftShoulder'); // Left shoulder bone
+                const rightShoulder = getBone('rightShoulder'); // Right shoulder bone
                 const leftHand = getBone('leftHand'); // Left hand bone for love pose
                 const rightHand = getBone('rightHand'); // Right hand bone for love pose
+                const leftUpperLeg = getBone('leftUpperLeg'); // Left upper leg bone
+                const rightUpperLeg = getBone('rightUpperLeg'); // Right upper leg bone
+                const leftLowerLeg = getBone('leftLowerLeg'); // Left lower leg bone
+                const rightLowerLeg = getBone('rightLowerLeg'); // Right lower leg bone
+                const leftFoot = getBone('leftFoot'); // Left foot bone
+                const rightFoot = getBone('rightFoot'); // Right foot bone
+                const leftToes = getBone('leftToes'); // Left toe bone
+                const rightToes = getBone('rightToes'); // Right toe bone
                 const rightForeArm = getBone('rightLowerArm') || rightLowerArm; // Alias
+                vrmPoseSnapshotBones = {
+                    hips: hipsBone,
+                    spine: spineBone,
+                    chest: chestBone,
+                    upperChest: upperChestBone,
+                    neck: neckBone,
+                    head: headBone,
+                    leftShoulder,
+                    rightShoulder,
+                    leftUpperArm,
+                    rightUpperArm,
+                    leftLowerArm,
+                    rightLowerArm,
+                    leftHand,
+                    rightHand,
+                    leftUpperLeg,
+                    rightUpperLeg,
+                    leftLowerLeg,
+                    rightLowerLeg,
+                    leftFoot,
+                    rightFoot,
+                    leftToes,
+                    rightToes
+                };
+                vrmBaseStandingPoseSnapshot = createVrmPoseSnapshot();
+                vrmLastPoseSnapshot = vrmBaseStandingPoseSnapshot;
+                vrmLastFrameHadRunningAction = false;
+                vrmRestorePoseOnNextManualIdle = false;
+                vrmPoseBlend = null;
                 // Optional: load target arm/hand rotations from VRM pose JSON (skip when VRMA is used)
                 let jsonPoseTargets = null;
                 if (!POSE_CONFIG?.love?.useVrma) {
@@ -13084,15 +13420,12 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     vrmAnimationFrameId = requestAnimationFrame(animate);
 
                     if (vrmClock) {
-                        const delta = vrmClock.getDelta();
-                        // Update VRM BEFORE mixer so it doesn't override animation
-                        // VRM update handles expressions, look-at, and physics
-                        if (vrmModel && typeof vrmModel.update === 'function') {
-                            try { vrmModel.update(delta); } catch (_) {}
-                        }
-                        // Update mixer AFTER VRM so animation has final control over bones
+                        const rawDelta = vrmClock.getDelta();
+                        const { animationDelta, physicsDelta } = getStableVrmFrameDeltas(rawDelta);
+                        // Update mixer with a capped animation delta so action transitions do not jump after browser stalls.
                         if (vrmMixer) {
-                            vrmMixer.update(delta);
+                            vrmMixer.update(animationDelta);
+                            updateVrmPoseBlend(performance.now());
                             
                             // Check if any other animation is running
                             const hasActiveAnimation = 
@@ -13113,7 +13446,7 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                             } else if (vrmIdleVrmaAction && hasActiveAnimation) {
                                 // Stop idle animation when other animations are playing
                                 if (vrmIdleVrmaAction.isRunning()) {
-                                    vrmIdleVrmaAction.stop();
+                                    stopVrmAction(vrmIdleVrmaAction, VRM_IDLE_ACTION_FADE_OUT_SECONDS);
                                 }
                             }
                             
@@ -13198,8 +13531,12 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                     try { if (rightLowerArm && dRLower && neutral.RLower) { rightLowerArm.quaternion.copy(neutral.RLower.clone().multiply(dRLower)); } } catch(_){}
                     try { if (leftHand && dLHand && neutral.LHand) { leftHand.quaternion.copy(neutral.LHand.clone().multiply(dLHand)); } } catch(_){}
                     try { if (rightHand && dRHand && neutral.RHand) { rightHand.quaternion.copy(neutral.RHand.clone().multiply(dRHand)); } } catch(_){}
-                } else if (!(vrmLoveVrmaAction && vrmLoveVrmaAction.isRunning()) && !(vrmThinkVrmaAction && vrmThinkVrmaAction.isRunning()) && !(vrmCryVrmaAction && vrmCryVrmaAction.isRunning()) && !(vrmAngryVrmaAction && vrmAngryVrmaAction.isRunning())) {
+                } else if (!hasRunningVrmAction()) {
                     // Only apply manual pose control if VRMA animations are NOT running
+                    if (vrmLastPoseSnapshot && (vrmLastFrameHadRunningAction || vrmRestorePoseOnNextManualIdle)) {
+                        restoreVrmPoseSnapshot(vrmLastPoseSnapshot);
+                        vrmRestorePoseOnNextManualIdle = false;
+                    }
                     // For VRM 0.0, set arms to natural rest pose (slightly rotated inward, hanging naturally)
                     if (vrmVersion === '0.0' && vrm && vrm.meta && vrm.meta.metaVersion === '0') {
                         try {
@@ -13464,6 +13801,16 @@ Todo execution: Task IDs are stable and are not list indexes. When the user asks
                         }
                     }
                     } // End else block for VRM 1.0 idle animation
+
+                    // Update VRM after mixer/manual pose writes so look-at and spring physics use a stable delta.
+                    if (vrmModel && typeof vrmModel.update === 'function') {
+                        try { vrmModel.update(physicsDelta); } catch (_) {}
+                    }
+                    const runningVrmActionThisFrame = hasRunningVrmAction();
+                    if (runningVrmActionThisFrame || vrmLastFrameHadRunningAction || vrmRestorePoseOnNextManualIdle || vrmPoseBlend) {
+                        vrmLastPoseSnapshot = createVrmPoseSnapshot() || vrmLastPoseSnapshot;
+                    }
+                    vrmLastFrameHadRunningAction = runningVrmActionThisFrame;
 
                     if (vrmRenderer && vrmScene && vrmCamera) {
                         vrmRenderer.render(vrmScene, vrmCamera);

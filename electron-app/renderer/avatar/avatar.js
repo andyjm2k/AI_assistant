@@ -2011,8 +2011,8 @@ function renderHudState(state = currentState) {
     setHudTtsVoiceValue(state.ttsVoice || "alloy");
   }
   const windowBounds = state.windowBounds || {};
-  const windowWidth = Math.max(240, Math.min(1600, Math.round(Number(windowBounds.width) || 480)));
-  const windowHeight = Math.max(320, Math.min(1800, Math.round(Number(windowBounds.height) || 640)));
+  const windowWidth = Math.max(240, Math.round(Number(windowBounds.width) || 480));
+  const windowHeight = Math.max(320, Math.round(Number(windowBounds.height) || 640));
   if (hudWindowWidth) {
     hudWindowWidth.value = String(windowWidth);
   }
@@ -2164,8 +2164,8 @@ function getHudVrmTransformPatch() {
 
 function getHudWindowBoundsPatch(widthValue = hudWindowWidth?.value, heightValue = hudWindowHeight?.value) {
   const currentBounds = currentState.windowBounds || {};
-  const width = Math.max(240, Math.min(1600, Math.round(Number(widthValue) || Number(currentBounds.width) || 480)));
-  const height = Math.max(320, Math.min(1800, Math.round(Number(heightValue) || Number(currentBounds.height) || 640)));
+  const width = Math.max(240, Math.round(Number(widthValue) || Number(currentBounds.width) || 480));
+  const height = Math.max(320, Math.round(Number(heightValue) || Number(currentBounds.height) || 640));
   return {
     windowBounds: {
       x: Math.round(Number.isFinite(Number(currentBounds.x)) ? Number(currentBounds.x) : 80),

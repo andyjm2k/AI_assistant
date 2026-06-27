@@ -2721,20 +2721,25 @@ function getNearestDisplayWorkArea(bounds) {
   return bestDisplay.workArea;
 }
 
-function clampBoundsToWorkArea(bounds, workArea, minimum = {}) {
+function clampBoundsToWorkArea(bounds, workArea, minimum = {}, options = {}) {
+  const allowOversized = options.allowOversized === true;
   const availableWidth = Math.max(1, Math.round(Number(workArea.width) || 1));
   const availableHeight = Math.max(1, Math.round(Number(workArea.height) || 1));
   const minimumWidth = Math.min(Math.max(1, Math.round(Number(minimum.width) || 120)), availableWidth);
   const minimumHeight = Math.min(Math.max(1, Math.round(Number(minimum.height) || 120)), availableHeight);
-  const width = Math.min(Math.max(minimumWidth, Math.round(Number(bounds.width) || minimumWidth)), availableWidth);
-  const height = Math.min(Math.max(minimumHeight, Math.round(Number(bounds.height) || minimumHeight)), availableHeight);
+  const requestedWidth = Math.max(minimumWidth, Math.round(Number(bounds.width) || minimumWidth));
+  const requestedHeight = Math.max(minimumHeight, Math.round(Number(bounds.height) || minimumHeight));
+  const width = allowOversized ? requestedWidth : Math.min(requestedWidth, availableWidth);
+  const height = allowOversized ? requestedHeight : Math.min(requestedHeight, availableHeight);
   const minX = Math.round(Number(workArea.x) || 0);
   const minY = Math.round(Number(workArea.y) || 0);
-  const maxX = Math.round(minX + availableWidth - width);
-  const maxY = Math.round(minY + availableHeight - height);
+  const minAllowedX = width > availableWidth ? Math.round(minX + availableWidth - width) : minX;
+  const minAllowedY = height > availableHeight ? Math.round(minY + availableHeight - height) : minY;
+  const maxX = width > availableWidth ? minX : Math.round(minX + availableWidth - width);
+  const maxY = height > availableHeight ? minY : Math.round(minY + availableHeight - height);
   return {
-    x: Math.round(clampNumber(Math.round(Number(bounds.x) || minX), minX, maxX)),
-    y: Math.round(clampNumber(Math.round(Number(bounds.y) || minY), minY, maxY)),
+    x: Math.round(clampNumber(Math.round(Number(bounds.x) || minX), minAllowedX, maxX)),
+    y: Math.round(clampNumber(Math.round(Number(bounds.y) || minY), minAllowedY, maxY)),
     width,
     height
   };
@@ -2749,9 +2754,14 @@ function boundsEqual(first = {}, second = {}) {
   );
 }
 
-function centerBoundsInWorkArea(bounds, workArea) {
-  const width = Math.min(Math.max(1, bounds.width), Math.max(1, workArea.width));
-  const height = Math.min(Math.max(1, bounds.height), Math.max(1, workArea.height));
+function centerBoundsInWorkArea(bounds, workArea, options = {}) {
+  const allowOversized = options.allowOversized === true;
+  const width = allowOversized
+    ? Math.max(1, bounds.width)
+    : Math.min(Math.max(1, bounds.width), Math.max(1, workArea.width));
+  const height = allowOversized
+    ? Math.max(1, bounds.height)
+    : Math.min(Math.max(1, bounds.height), Math.max(1, workArea.height));
   return {
     x: Math.round(workArea.x + (workArea.width - width) / 2),
     y: Math.round(workArea.y + (workArea.height - height) / 2),
@@ -2760,10 +2770,10 @@ function centerBoundsInWorkArea(bounds, workArea) {
   };
 }
 
-function normalizeBoundsForDisplays(bounds, fallback, minimum = {}) {
+function normalizeBoundsForDisplays(bounds, fallback, minimum = {}, options = {}) {
   const coerced = coerceWindowBounds(bounds, fallback, minimum);
   try {
-    return clampBoundsToWorkArea(coerced, getNearestDisplayWorkArea(coerced), minimum);
+    return clampBoundsToWorkArea(coerced, getNearestDisplayWorkArea(coerced), minimum, options);
   } catch (_) {
     return coerced;
   }
@@ -2784,13 +2794,16 @@ function getWindowBoundsConfig(windowKey) {
   }
   return {
     fallback: DEFAULT_STATE.windowBounds,
-    minimum: { width: 240, height: 320 }
+    minimum: { width: 240, height: 320 },
+    allowOversized: true
   };
 }
 
 function constrainWindowBounds(windowKey, bounds) {
   const config = getWindowBoundsConfig(windowKey);
-  return normalizeBoundsForDisplays(bounds, config.fallback, config.minimum);
+  return normalizeBoundsForDisplays(bounds, config.fallback, config.minimum, {
+    allowOversized: config.allowOversized
+  });
 }
 
 function constrainBrowserWindowToDisplays(windowKey, browserWindow, options = {}) {
@@ -3359,7 +3372,12 @@ function centerAvatarOnPrimaryDisplay() {
   const fallbackBounds = coerceWindowBounds(state.windowBounds, DEFAULT_STATE.windowBounds, { width: 240, height: 320 });
   let nextBounds = fallbackBounds;
   try {
-    nextBounds = clampBoundsToWorkArea(centerBoundsInWorkArea(fallbackBounds, screen.getPrimaryDisplay().workArea), screen.getPrimaryDisplay().workArea, { width: 240, height: 320 });
+    nextBounds = clampBoundsToWorkArea(
+      centerBoundsInWorkArea(fallbackBounds, screen.getPrimaryDisplay().workArea, { allowOversized: true }),
+      screen.getPrimaryDisplay().workArea,
+      { width: 240, height: 320 },
+      { allowOversized: true }
+    );
   } catch (_) {
     // keep fallback bounds if display lookup fails
   }
